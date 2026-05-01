@@ -113,8 +113,8 @@ fn collect_scenarios() -> Vec<PathBuf> {
 fn run_scenario(dir: &Path) -> Result<(), String> {
     let manifest_text = std::fs::read_to_string(dir.join("manifest.toml"))
         .map_err(|e| format!("read manifest: {e}"))?;
-    let manifest: Manifest = toml::from_str(&manifest_text)
-        .map_err(|e| format!("parse manifest: {e}"))?;
+    let manifest: Manifest =
+        toml::from_str(&manifest_text).map_err(|e| format!("parse manifest: {e}"))?;
     let ext = manifest
         .input_ext
         .clone()
@@ -174,8 +174,7 @@ fn run_scenario(dir: &Path) -> Result<(), String> {
             }
             for needle in &manifest.expected.notes_contain {
                 if !notes.iter().any(|n| n.message.contains(needle)) {
-                    let messages: Vec<&str> =
-                        notes.iter().map(|n| n.message.as_str()).collect();
+                    let messages: Vec<&str> = notes.iter().map(|n| n.message.as_str()).collect();
                     return Err(format!(
                         "[{}] expected a note containing {:?}, saw {:?}",
                         manifest.description, needle, messages
@@ -185,10 +184,7 @@ fn run_scenario(dir: &Path) -> Result<(), String> {
             // Sanity check: a merged outcome must not carry conflict markers.
             // A handler that wrote markers but reported Merged would silently
             // smuggle conflicts past CI.
-            if s.contains("<<<<<<< ours")
-                || s.contains("=======")
-                || s.contains(">>>>>>> theirs")
-            {
+            if s.contains("<<<<<<< ours") || s.contains("=======") || s.contains(">>>>>>> theirs") {
                 return Err(format!(
                     "[{}] merged outcome contains conflict markers — handler {:?} is buggy\n--- output ---\n{s}\n",
                     manifest.description, result.handler
@@ -214,8 +210,7 @@ fn run_scenario(dir: &Path) -> Result<(), String> {
             }
             for needle in &manifest.expected.region_descriptions_contain {
                 if !regions.iter().any(|r| r.description.contains(needle)) {
-                    let descs: Vec<&str> =
-                        regions.iter().map(|r| r.description.as_str()).collect();
+                    let descs: Vec<&str> = regions.iter().map(|r| r.description.as_str()).collect();
                     return Err(format!(
                         "[{}] expected a region with description containing {:?}, saw {:?}",
                         manifest.description, needle, descs

@@ -101,7 +101,12 @@ fn build_genesis() -> Setup {
     let auth_bytes = signed.serialize();
     let auth_id = blake3_hash(&auth_bytes);
     let repo_id = auth.repo_id.to_hex();
-    Setup { sk, auth_id, repo_id, auth_bytes }
+    Setup {
+        sk,
+        auth_id,
+        repo_id,
+        auth_bytes,
+    }
 }
 
 /// Build a single-file commit. Each successive call uses different
@@ -339,7 +344,12 @@ async fn dogfood_three_instance_scenario() {
             let sk = SecretKey::from_seed(seed);
             let client = Client::new(base);
             let (pack, cid, _) = build_commit(
-                &sk, auth_id, "a.txt", b"fourth\n", Some(prev), 1_700_000_020_000_000,
+                &sk,
+                auth_id,
+                "a.txt",
+                b"fourth\n",
+                Some(prev),
+                1_700_000_020_000_000,
             );
             let manifest = PushManifest {
                 authority_hash: auth_id.to_hex(),
@@ -453,9 +463,19 @@ async fn dogfood_three_instance_scenario() {
     })
     .await
     .unwrap();
-    assert_eq!(a_obj, b_obj, "A and B must serve byte-identical head commits");
-    assert_eq!(a_obj, c_obj, "A and C must serve byte-identical head commits");
-    assert_eq!(blake3_hash(&a_obj), head, "object hash must match the requested id");
+    assert_eq!(
+        a_obj, b_obj,
+        "A and B must serve byte-identical head commits"
+    );
+    assert_eq!(
+        a_obj, c_obj,
+        "A and C must serve byte-identical head commits"
+    );
+    assert_eq!(
+        blake3_hash(&a_obj),
+        head,
+        "object hash must match the requested id"
+    );
 
     a_task.abort();
     b_task.abort();

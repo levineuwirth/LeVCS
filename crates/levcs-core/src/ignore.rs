@@ -21,7 +21,9 @@ struct Rule {
 }
 
 impl Ignore {
-    pub fn empty() -> Self { Self::default() }
+    pub fn empty() -> Self {
+        Self::default()
+    }
 
     /// Parse a `.levcsignore` file's contents.
     pub fn parse(text: &str) -> Self {
@@ -43,15 +45,33 @@ impl Ignore {
             };
             // Always include `.levcs/` itself in the ignored set.
             if let Ok(pattern) = Pattern::new(body) {
-                rules.push(Rule { pattern, negate, anchored });
+                rules.push(Rule {
+                    pattern,
+                    negate,
+                    anchored,
+                });
             }
         }
         // Always ignore `.levcs/`
         if let Ok(pattern) = Pattern::new(".levcs") {
-            rules.insert(0, Rule { pattern, negate: false, anchored: true });
+            rules.insert(
+                0,
+                Rule {
+                    pattern,
+                    negate: false,
+                    anchored: true,
+                },
+            );
         }
         if let Ok(pattern) = Pattern::new(".levcs/**") {
-            rules.insert(0, Rule { pattern, negate: false, anchored: true });
+            rules.insert(
+                0,
+                Rule {
+                    pattern,
+                    negate: false,
+                    anchored: true,
+                },
+            );
         }
         Self { rules }
     }
@@ -63,8 +83,7 @@ impl Ignore {
                 r.pattern.matches(rel_path)
             } else {
                 // Match against any suffix path component sequence.
-                r.pattern.matches(rel_path)
-                    || rel_path.split('/').any(|c| r.pattern.matches(c))
+                r.pattern.matches(rel_path) || rel_path.split('/').any(|c| r.pattern.matches(c))
             };
             if matched {
                 ignored = !r.negate;

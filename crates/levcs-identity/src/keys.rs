@@ -14,11 +14,17 @@ use crate::error::{IdentityError, Result};
 pub struct PublicKey(pub [u8; 32]);
 
 impl PublicKey {
-    pub fn from_bytes(b: [u8; 32]) -> Self { Self(b) }
+    pub fn from_bytes(b: [u8; 32]) -> Self {
+        Self(b)
+    }
 
-    pub fn as_bytes(&self) -> &[u8; 32] { &self.0 }
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
 
-    pub fn to_levcs(&self) -> String { format!("ed25519:{}", hex::encode(self.0)) }
+    pub fn to_levcs(&self) -> String {
+        format!("ed25519:{}", hex::encode(self.0))
+    }
 
     pub fn parse_levcs(s: &str) -> Result<Self> {
         let rest = s
@@ -27,7 +33,8 @@ impl PublicKey {
         let bytes = hex::decode(rest)?;
         if bytes.len() != 32 {
             return Err(IdentityError::InvalidKey(format!(
-                "expected 32 bytes, got {}", bytes.len()
+                "expected 32 bytes, got {}",
+                bytes.len()
             )));
         }
         let mut arr = [0u8; 32];
@@ -39,7 +46,8 @@ impl PublicKey {
         let vk = VerifyingKey::from_bytes(&self.0)
             .map_err(|e| IdentityError::Crypto(format!("public key: {e}")))?;
         let sig = Signature::from_bytes(signature);
-        vk.verify(msg, &sig).map_err(|_| IdentityError::BadSignature)?;
+        vk.verify(msg, &sig)
+            .map_err(|_| IdentityError::BadSignature)?;
         Ok(())
     }
 }
@@ -63,7 +71,9 @@ pub struct SecretKey {
 }
 
 impl SecretKey {
-    pub fn from_seed(seed: [u8; 32]) -> Self { Self { seed } }
+    pub fn from_seed(seed: [u8; 32]) -> Self {
+        Self { seed }
+    }
 
     pub fn generate() -> Self {
         let mut seed = [0u8; 32];
@@ -71,7 +81,9 @@ impl SecretKey {
         Self { seed }
     }
 
-    pub fn seed(&self) -> &[u8; 32] { &self.seed }
+    pub fn seed(&self) -> &[u8; 32] {
+        &self.seed
+    }
 
     pub fn public(&self) -> PublicKey {
         let sk = SigningKey::from_bytes(&self.seed);
@@ -84,7 +96,9 @@ impl SecretKey {
         sig.to_bytes()
     }
 
-    pub fn to_levcs(&self) -> String { format!("ed25519:{}", hex::encode(self.seed)) }
+    pub fn to_levcs(&self) -> String {
+        format!("ed25519:{}", hex::encode(self.seed))
+    }
 
     pub fn parse_levcs(s: &str) -> Result<Self> {
         let rest = s
@@ -93,7 +107,8 @@ impl SecretKey {
         let bytes = hex::decode(rest)?;
         if bytes.len() != 32 {
             return Err(IdentityError::InvalidKey(format!(
-                "expected 32 bytes, got {}", bytes.len()
+                "expected 32 bytes, got {}",
+                bytes.len()
             )));
         }
         let mut seed = [0u8; 32];

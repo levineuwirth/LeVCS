@@ -182,11 +182,15 @@ pub fn handshake_dial<S: Read + Write>(
         return Err(P2pError::PeerError(decode_error(&payload)));
     }
     if tag != TAG_HELLO_ACK {
-        return Err(P2pError::UnexpectedTag { got: tag, expected: TAG_HELLO_ACK });
+        return Err(P2pError::UnexpectedTag {
+            got: tag,
+            expected: TAG_HELLO_ACK,
+        });
     }
     if payload.len() != 32 + 32 + 64 {
         return Err(P2pError::Malformed(format!(
-            "HelloAck payload length {} (want 128)", payload.len()
+            "HelloAck payload length {} (want 128)",
+            payload.len()
         )));
     }
     let mut peer_pub_bytes = [0u8; 32];
@@ -221,10 +225,19 @@ pub fn handshake_dial<S: Read + Write>(
     match tag {
         TAG_OK => {}
         TAG_ERROR => return Err(P2pError::PeerError(decode_error(&payload))),
-        other => return Err(P2pError::UnexpectedTag { got: other, expected: TAG_OK }),
+        other => {
+            return Err(P2pError::UnexpectedTag {
+                got: other,
+                expected: TAG_OK,
+            })
+        }
     }
 
-    Ok(Session { stream, peer_key: peer_pub, transcript })
+    Ok(Session {
+        stream,
+        peer_key: peer_pub,
+        transcript,
+    })
 }
 
 /// Run the deployer (sender) side of the handshake.
@@ -242,11 +255,15 @@ pub fn handshake_listen<S: Read + Write>(
     // 1 ← Hello: dialer's pub + challenge.
     let (tag, payload) = read_frame(&mut stream)?;
     if tag != TAG_HELLO {
-        return Err(P2pError::UnexpectedTag { got: tag, expected: TAG_HELLO });
+        return Err(P2pError::UnexpectedTag {
+            got: tag,
+            expected: TAG_HELLO,
+        });
     }
     if payload.len() != 64 {
         return Err(P2pError::Malformed(format!(
-            "Hello payload length {} (want 64)", payload.len()
+            "Hello payload length {} (want 64)",
+            payload.len()
         )));
     }
     let mut peer_pub_bytes = [0u8; 32];
@@ -286,11 +303,15 @@ pub fn handshake_listen<S: Read + Write>(
         return Err(P2pError::PeerError(decode_error(&payload)));
     }
     if tag != TAG_AUTH {
-        return Err(P2pError::UnexpectedTag { got: tag, expected: TAG_AUTH });
+        return Err(P2pError::UnexpectedTag {
+            got: tag,
+            expected: TAG_AUTH,
+        });
     }
     if payload.len() != 64 {
         return Err(P2pError::Malformed(format!(
-            "Auth payload length {} (want 64)", payload.len()
+            "Auth payload length {} (want 64)",
+            payload.len()
         )));
     }
     let mut peer_sig = [0u8; 64];
@@ -302,7 +323,11 @@ pub fn handshake_listen<S: Read + Write>(
     // 4 → Ok.
     write_frame(&mut stream, TAG_OK, &[])?;
 
-    Ok(Session { stream, peer_key: peer_pub, transcript })
+    Ok(Session {
+        stream,
+        peer_key: peer_pub,
+        transcript,
+    })
 }
 
 impl<S: Write> Session<S> {
@@ -331,7 +356,10 @@ impl<S: Read> Session<S> {
             return Err(P2pError::PeerError(decode_error(&payload)));
         }
         if tag != TAG_MANIFEST {
-            return Err(P2pError::UnexpectedTag { got: tag, expected: TAG_MANIFEST });
+            return Err(P2pError::UnexpectedTag {
+                got: tag,
+                expected: TAG_MANIFEST,
+            });
         }
         Ok(serde_json::from_slice(&payload)?)
     }
@@ -342,7 +370,10 @@ impl<S: Read> Session<S> {
             return Err(P2pError::PeerError(decode_error(&payload)));
         }
         if tag != TAG_PACK {
-            return Err(P2pError::UnexpectedTag { got: tag, expected: TAG_PACK });
+            return Err(P2pError::UnexpectedTag {
+                got: tag,
+                expected: TAG_PACK,
+            });
         }
         Ok(payload)
     }
@@ -352,7 +383,10 @@ impl<S: Read> Session<S> {
         match tag {
             TAG_DONE => Ok(()),
             TAG_ERROR => Err(P2pError::PeerError(decode_error(&payload))),
-            other => Err(P2pError::UnexpectedTag { got: other, expected: TAG_DONE }),
+            other => Err(P2pError::UnexpectedTag {
+                got: other,
+                expected: TAG_DONE,
+            }),
         }
     }
 }
@@ -375,7 +409,10 @@ fn compute_transcript(
 /// Write one P2P frame. Exposed so external transports and fuzzers can
 /// drive the codec without going through a `Session`.
 pub fn write_frame<W: Write>(w: &mut W, tag: u8, payload: &[u8]) -> Result<(), P2pError> {
-    let total = payload.len().checked_add(1).ok_or(P2pError::FrameTooLarge(usize::MAX))?;
+    let total = payload
+        .len()
+        .checked_add(1)
+        .ok_or(P2pError::FrameTooLarge(usize::MAX))?;
     if total > MAX_FRAME_BYTES {
         return Err(P2pError::FrameTooLarge(total));
     }
@@ -415,8 +452,7 @@ fn decode_error(payload: &[u8]) -> String {
 }
 
 fn fill_random(buf: &mut [u8]) -> Result<(), P2pError> {
-    getrandom::getrandom(buf)
-        .map_err(|e| P2pError::Malformed(format!("getrandom: {e}")))
+    getrandom::getrandom(buf).map_err(|e| P2pError::Malformed(format!("getrandom: {e}")))
 }
 
 #[cfg(test)]
@@ -457,13 +493,18 @@ mod tests {
             q.extend(buf);
             Ok(buf.len())
         }
-        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
     fn duplex() -> (DuplexEnd, DuplexEnd) {
         let a = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
         let b = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
         (
-            DuplexEnd { read: a.clone(), write: b.clone() },
+            DuplexEnd {
+                read: a.clone(),
+                write: b.clone(),
+            },
             DuplexEnd { read: b, write: a },
         )
     }
@@ -500,8 +541,7 @@ mod tests {
         let (dialer_end, deployer_end) = duplex();
 
         let deployer_handle = std::thread::spawn(move || {
-            handshake_listen(deployer_end, &deployer_sk, &dialer_pub)
-                .map(|s| s.peer_key)
+            handshake_listen(deployer_end, &deployer_sk, &dialer_pub).map(|s| s.peer_key)
         });
         let dialer_session = handshake_dial(dialer_end, &dialer_sk, &deployer_pub).unwrap();
         let deployer_peer = deployer_handle.join().unwrap().unwrap();
@@ -541,9 +581,8 @@ mod tests {
         let deployer_pub = deployer_sk.public();
         let (dialer_end, deployer_end) = duplex();
 
-        let deployer_handle = std::thread::spawn(move || {
-            handshake_listen(deployer_end, &deployer_sk, &imposter_pub)
-        });
+        let deployer_handle =
+            std::thread::spawn(move || handshake_listen(deployer_end, &deployer_sk, &imposter_pub));
         // Dialer presents itself with its real key; deployer is
         // expecting the imposter's key, so must reject.
         let _ = handshake_dial(dialer_end, &dialer_sk, &deployer_pub);

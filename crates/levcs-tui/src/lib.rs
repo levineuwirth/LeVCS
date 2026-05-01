@@ -185,7 +185,11 @@ fn draw(frame: &mut ratatui::Frame, state: &ReviewState) {
     let area = frame.area();
     let outer = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(3), Constraint::Length(2)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(2),
+        ])
         .split(area);
 
     draw_title(frame, outer[0], state);
@@ -200,7 +204,11 @@ fn draw_title(frame: &mut ratatui::Frame, area: Rect, state: &ReviewState) {
         .iter()
         .filter(|f| matches!(f.status, MergeStatus::Conflict { .. }))
         .count();
-    let mode = if state.read_only { "--explain" } else { "--review" };
+    let mode = if state.read_only {
+        "--explain"
+    } else {
+        "--review"
+    };
     let title = format!(" levcs merge {mode}   {total} file(s), {conflicted} with conflicts  ");
     frame.render_widget(
         Paragraph::new(title)
@@ -223,8 +231,20 @@ fn draw_main(frame: &mut ratatui::Frame, area: Rect, state: &ReviewState) {
     draw_file_list(frame, cols[0], state);
     if let Some(file) = state.current_file() {
         let region = file.conflict_regions().get(state.selected_region);
-        draw_pane(frame, cols[1], "ours", &file.ours, region.map(|r| r.ours.clone()));
-        draw_pane(frame, cols[2], "base", &file.base, region.map(|r| r.base.clone()));
+        draw_pane(
+            frame,
+            cols[1],
+            "ours",
+            &file.ours,
+            region.map(|r| r.ours.clone()),
+        );
+        draw_pane(
+            frame,
+            cols[2],
+            "base",
+            &file.base,
+            region.map(|r| r.base.clone()),
+        );
         draw_pane(
             frame,
             cols[3],
@@ -317,7 +337,11 @@ fn draw_pane(
     }
 
     let p = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(title.to_string()))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title.to_string()),
+        )
         .wrap(Wrap { trim: false });
     frame.render_widget(p, area);
 }
@@ -423,9 +447,15 @@ mod key_tests {
         FileEntry {
             path: path.into(),
             status: if regions == 0 {
-                MergeStatus::Merged { content: vec![], notes: vec![] }
+                MergeStatus::Merged {
+                    content: vec![],
+                    notes: vec![],
+                }
             } else {
-                MergeStatus::Conflict { regions: regs, partial: vec![] }
+                MergeStatus::Conflict {
+                    regions: regs,
+                    partial: vec![],
+                }
             },
             current: vec![],
             ours: vec![],

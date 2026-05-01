@@ -10,7 +10,9 @@ pub struct Blob {
 }
 
 impl Blob {
-    pub fn new(bytes: Vec<u8>) -> Self { Self { bytes } }
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self { bytes }
+    }
 
     pub fn serialize(&self) -> Vec<u8> {
         frame_unsigned(ObjectType::Blob, &self.bytes)

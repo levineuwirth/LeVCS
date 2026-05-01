@@ -100,10 +100,17 @@ impl PluginHandler {
             Engine::new(&config).map_err(|e| PluginError::Other(format!("engine: {e}")))?;
         let module = Module::new(&engine, wasm_bytes)
             .map_err(|e| PluginError::Other(format!("compile: {e}")))?;
-        Ok(Self { name: cfg.name, hash: cfg.hash, engine, module })
+        Ok(Self {
+            name: cfg.name,
+            hash: cfg.hash,
+            engine,
+            module,
+        })
     }
 
-    pub fn hash(&self) -> &[u8; 32] { &self.hash }
+    pub fn hash(&self) -> &[u8; 32] {
+        &self.hash
+    }
 
     fn run_merge(
         &self,
@@ -209,7 +216,10 @@ impl PluginHandler {
                 .read(store.as_context(), ptr, &mut buf)
                 .map_err(|e| PluginError::Other(format!("read: {e}")))?;
         }
-        Ok(PluginOutput { conflict, bytes: buf })
+        Ok(PluginOutput {
+            conflict,
+            bytes: buf,
+        })
     }
 }
 
@@ -220,7 +230,9 @@ struct PluginOutput {
 }
 
 impl MergeHandler for PluginHandler {
-    fn name(&self) -> &str { &self.name }
+    fn name(&self) -> &str {
+        &self.name
+    }
 
     fn applicable(&self, _path: &Path, _b: &[u8], _o: &[u8], _t: &[u8]) -> bool {
         // Selection is handled by config rules, not by extension; the engine
@@ -272,7 +284,10 @@ impl MergeHandler for PluginHandler {
 pub enum PluginError {
     #[error("plugin hash mismatch: expected blake3:{} got blake3:{}",
         hex_encode(.expected), hex_encode(.actual))]
-    HashMismatch { expected: [u8; 32], actual: [u8; 32] },
+    HashMismatch {
+        expected: [u8; 32],
+        actual: [u8; 32],
+    },
     #[error("plugin missing required export: {0}")]
     MissingExport(&'static str),
     #[error("plugin trapped: {0}")]
@@ -363,7 +378,10 @@ mod tests {
     fn plugin_returns_ours_unchanged() {
         let (bytes, hash) = build(RETURN_OURS_WAT);
         let h = PluginHandler::new(
-            PluginConfig { name: "test:return_ours".into(), hash },
+            PluginConfig {
+                name: "test:return_ours".into(),
+                hash,
+            },
             &bytes,
         )
         .unwrap();
@@ -378,7 +396,10 @@ mod tests {
     fn plugin_conflict_bit_produces_conflict_status() {
         let (bytes, hash) = build(CONFLICT_WAT);
         let h = PluginHandler::new(
-            PluginConfig { name: "test:always_conflict".into(), hash },
+            PluginConfig {
+                name: "test:always_conflict".into(),
+                hash,
+            },
             &bytes,
         )
         .unwrap();
@@ -391,7 +412,10 @@ mod tests {
         let (bytes, _real) = build(RETURN_OURS_WAT);
         let bad_hash = [0u8; 32];
         let err = PluginHandler::new(
-            PluginConfig { name: "test:bad_hash".into(), hash: bad_hash },
+            PluginConfig {
+                name: "test:bad_hash".into(),
+                hash: bad_hash,
+            },
             &bytes,
         )
         .err()
@@ -409,7 +433,12 @@ mod tests {
         config.epoch_interruption(true);
         let engine = Engine::new(&config).unwrap();
         let module = Module::new(&engine, &bytes).unwrap();
-        let h = PluginHandler { name: "test:loop".into(), hash, engine, module };
+        let h = PluginHandler {
+            name: "test:loop".into(),
+            hash,
+            engine,
+            module,
+        };
 
         // Spawn a fast bumper rather than waiting the full 10s.
         let engine_clone = h.engine.clone();

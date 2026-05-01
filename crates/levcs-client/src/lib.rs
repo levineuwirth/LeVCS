@@ -51,25 +51,41 @@ impl Client {
 
     pub fn instance_info(&self) -> Result<InstanceInfo, ClientError> {
         let url = format!("{}/instance/info", self.base);
-        let res = self.http.get(&url).header("user-agent", &self.user_agent).send()?;
+        let res = self
+            .http
+            .get(&url)
+            .header("user-agent", &self.user_agent)
+            .send()?;
         check(res)?.json::<InstanceInfo>().map_err(Into::into)
     }
 
     pub fn repo_info(&self, repo_id: &str) -> Result<InfoResponse, ClientError> {
         let url = format!("{}/repos/{repo_id}/info", self.base);
-        let res = self.http.get(&url).header("user-agent", &self.user_agent).send()?;
+        let res = self
+            .http
+            .get(&url)
+            .header("user-agent", &self.user_agent)
+            .send()?;
         check(res)?.json::<InfoResponse>().map_err(Into::into)
     }
 
     pub fn refs(&self, repo_id: &str) -> Result<RefList, ClientError> {
         let url = format!("{}/repos/{repo_id}/refs", self.base);
-        let res = self.http.get(&url).header("user-agent", &self.user_agent).send()?;
+        let res = self
+            .http
+            .get(&url)
+            .header("user-agent", &self.user_agent)
+            .send()?;
         check(res)?.json::<RefList>().map_err(Into::into)
     }
 
     pub fn get_object(&self, repo_id: &str, id: ObjectId) -> Result<Vec<u8>, ClientError> {
         let url = format!("{}/repos/{repo_id}/objects/{}", self.base, id.to_hex());
-        let res = self.http.get(&url).header("user-agent", &self.user_agent).send()?;
+        let res = self
+            .http
+            .get(&url)
+            .header("user-agent", &self.user_agent)
+            .send()?;
         let res = check(res)?;
         Ok(res.bytes()?.to_vec())
     }
@@ -88,7 +104,11 @@ impl Client {
             have_q.join(","),
             want_q.join(",")
         );
-        let res = self.http.get(&url).header("user-agent", &self.user_agent).send()?;
+        let res = self
+            .http
+            .get(&url)
+            .header("user-agent", &self.user_agent)
+            .send()?;
         let bytes = check(res)?.bytes()?;
         Pack::decode(&bytes).map_err(|e| ClientError::Decode(e.to_string()))
     }
@@ -103,7 +123,8 @@ impl Client {
         // Body: pack bytes followed by 4 bytes manifest length, manifest JSON,
         // then manifest signature (64 bytes).
         let pack_bytes = pack.encode();
-        let manifest_json = serde_json::to_vec(manifest).map_err(|e| ClientError::Decode(e.to_string()))?;
+        let manifest_json =
+            serde_json::to_vec(manifest).map_err(|e| ClientError::Decode(e.to_string()))?;
         let mut body = Vec::with_capacity(pack_bytes.len() + 4 + manifest_json.len() + 64);
         body.extend_from_slice(&pack_bytes);
         body.extend_from_slice(&(manifest_json.len() as u32).to_le_bytes());
@@ -118,7 +139,8 @@ impl Client {
             path_with_query: &path,
             body: &body,
         };
-        let (key, ts, nonce, sig) = sign_request(sk, &req).map_err(|e| ClientError::Auth(e.to_string()))?;
+        let (key, ts, nonce, sig) =
+            sign_request(sk, &req).map_err(|e| ClientError::Auth(e.to_string()))?;
 
         let mut headers = HeaderMap::new();
         headers.insert("LeVCS-Key", key.parse().unwrap());
@@ -150,7 +172,8 @@ impl Client {
             path_with_query: &path,
             body: authority_object,
         };
-        let (key, ts, nonce, sig) = sign_request(sk, &req).map_err(|e| ClientError::Auth(e.to_string()))?;
+        let (key, ts, nonce, sig) =
+            sign_request(sk, &req).map_err(|e| ClientError::Auth(e.to_string()))?;
         let mut headers = HeaderMap::new();
         headers.insert("LeVCS-Key", key.parse().unwrap());
         headers.insert("LeVCS-Timestamp", ts.parse().unwrap());

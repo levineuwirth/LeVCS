@@ -200,13 +200,30 @@ pub struct GcArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum KeyCmd {
-    Generate { label: String, #[arg(long)] encrypt: bool },
+    Generate {
+        label: String,
+        #[arg(long)]
+        encrypt: bool,
+    },
     List,
-    Show { label: String },
-    Export { label: String, path: PathBuf },
-    Import { label: String, path: PathBuf },
-    Remove { label: String },
-    Rename { old: String, new: String },
+    Show {
+        label: String,
+    },
+    Export {
+        label: String,
+        path: PathBuf,
+    },
+    Import {
+        label: String,
+        path: PathBuf,
+    },
+    Remove {
+        label: String,
+    },
+    Rename {
+        old: String,
+        new: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -215,18 +232,24 @@ pub enum AuthorityCmd {
     List,
     Add {
         key: String,
-        #[arg(long)] role: String,
-        #[arg(long)] handle: Option<String>,
-        #[arg(long = "signing-key")] signing_key: Option<String>,
+        #[arg(long)]
+        role: String,
+        #[arg(long)]
+        handle: Option<String>,
+        #[arg(long = "signing-key")]
+        signing_key: Option<String>,
     },
     Remove {
         key: String,
-        #[arg(long = "signing-key")] signing_key: Option<String>,
+        #[arg(long = "signing-key")]
+        signing_key: Option<String>,
     },
     Promote {
         key: String,
-        #[arg(long)] role: String,
-        #[arg(long = "signing-key")] signing_key: Option<String>,
+        #[arg(long)]
+        role: String,
+        #[arg(long = "signing-key")]
+        signing_key: Option<String>,
     },
 }
 

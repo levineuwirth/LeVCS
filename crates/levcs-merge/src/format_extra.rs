@@ -49,7 +49,9 @@ fn yaml_to_json(v: serde_yaml::Value) -> Value {
             if let Some(i) = n.as_i64() {
                 Value::from(i)
             } else if let Some(f) = n.as_f64() {
-                serde_json::Number::from_f64(f).map(Value::Number).unwrap_or(Value::Null)
+                serde_json::Number::from_f64(f)
+                    .map(Value::Number)
+                    .unwrap_or(Value::Null)
             } else {
                 Value::Null
             }
@@ -98,7 +100,9 @@ fn json_to_yaml(v: &Value) -> serde_yaml::Value {
 }
 
 impl MergeHandler for YamlHandler {
-    fn name(&self) -> &str { "yaml" }
+    fn name(&self) -> &str {
+        "yaml"
+    }
 
     fn applicable(&self, path: &Path, _b: &[u8], _o: &[u8], _t: &[u8]) -> bool {
         matches!(
@@ -128,12 +132,20 @@ impl MergeHandler for YamlHandler {
         let status = if conflicts.is_empty() {
             MergeStatus::Merged {
                 content: bytes,
-                notes: vec![MergeNote { message: "structural YAML three-way merge".into() }],
+                notes: vec![MergeNote {
+                    message: "structural YAML three-way merge".into(),
+                }],
             }
         } else {
-            MergeStatus::Conflict { regions: conflicts, partial: bytes }
+            MergeStatus::Conflict {
+                regions: conflicts,
+                partial: bytes,
+            }
         };
-        MergeResult { handler: self.name().into(), status }
+        MergeResult {
+            handler: self.name().into(),
+            status,
+        }
     }
 }
 
@@ -150,14 +162,20 @@ struct MdSection {
 
 fn split_markdown(src: &str) -> Vec<MdSection> {
     let mut out: Vec<MdSection> = Vec::new();
-    let mut cur = MdSection { heading: None, text: String::new() };
+    let mut cur = MdSection {
+        heading: None,
+        text: String::new(),
+    };
     for line in src.split_inclusive('\n') {
         let trimmed = line.trim_start();
         if trimmed.starts_with('#') {
             if !cur.text.is_empty() || cur.heading.is_some() {
                 out.push(std::mem::replace(
                     &mut cur,
-                    MdSection { heading: None, text: String::new() },
+                    MdSection {
+                        heading: None,
+                        text: String::new(),
+                    },
                 ));
             }
             // Extract heading text (without leading #s).
@@ -179,7 +197,9 @@ fn split_markdown(src: &str) -> Vec<MdSection> {
 }
 
 impl MergeHandler for MarkdownHandler {
-    fn name(&self) -> &str { "markdown" }
+    fn name(&self) -> &str {
+        "markdown"
+    }
 
     fn applicable(&self, path: &Path, _b: &[u8], _o: &[u8], _t: &[u8]) -> bool {
         matches!(
@@ -257,8 +277,13 @@ impl MergeHandler for MarkdownHandler {
                     } else {
                         output.push(s.text.clone());
                         conflicts.push(ConflictRegion {
-                            description: format!("section '{}' modified vs deleted", s.heading.clone().unwrap_or_default()),
-                            base: 0..0, ours: 0..0, theirs: 0..0,
+                            description: format!(
+                                "section '{}' modified vs deleted",
+                                s.heading.clone().unwrap_or_default()
+                            ),
+                            base: 0..0,
+                            ours: 0..0,
+                            theirs: 0..0,
                         });
                     }
                 }
@@ -287,7 +312,8 @@ impl MergeHandler for MarkdownHandler {
                                         output.push(String::from_utf8_lossy(&partial).to_string());
                                         let h = s.heading.clone().unwrap_or_default();
                                         for mut r in regions {
-                                            r.description = format!("section '{h}': {}", r.description);
+                                            r.description =
+                                                format!("section '{h}': {}", r.description);
                                             conflicts.push(r);
                                         }
                                     }
@@ -318,7 +344,9 @@ impl MergeHandler for MarkdownHandler {
                                 "section '{}' deleted by ours, modified by theirs",
                                 s.heading.clone().unwrap_or_default()
                             ),
-                            base: 0..0, ours: 0..0, theirs: 0..0,
+                            base: 0..0,
+                            ours: 0..0,
+                            theirs: 0..0,
                         });
                     }
                 }
@@ -329,12 +357,20 @@ impl MergeHandler for MarkdownHandler {
         let status = if conflicts.is_empty() {
             MergeStatus::Merged {
                 content: merged.into_bytes(),
-                notes: vec![MergeNote { message: "section-based markdown merge".into() }],
+                notes: vec![MergeNote {
+                    message: "section-based markdown merge".into(),
+                }],
             }
         } else {
-            MergeStatus::Conflict { regions: conflicts, partial: merged.into_bytes() }
+            MergeStatus::Conflict {
+                regions: conflicts,
+                partial: merged.into_bytes(),
+            }
         };
-        MergeResult { handler: self.name().into(), status }
+        MergeResult {
+            handler: self.name().into(),
+            status,
+        }
     }
 }
 
@@ -364,16 +400,17 @@ fn split_paragraphs(s: &str) -> Vec<String> {
 }
 
 impl MergeHandler for ProseHandler {
-    fn name(&self) -> &str { "prose" }
+    fn name(&self) -> &str {
+        "prose"
+    }
 
     fn applicable(&self, path: &Path, _b: &[u8], _o: &[u8], _t: &[u8]) -> bool {
         matches!(path.extension().and_then(|e| e.to_str()), Some("txt"))
     }
 
     fn merge(&self, path: &Path, base: &[u8], ours: &[u8], theirs: &[u8]) -> MergeResult {
-        let to_paras = |b: &[u8]| -> Option<Vec<String>> {
-            std::str::from_utf8(b).ok().map(split_paragraphs)
-        };
+        let to_paras =
+            |b: &[u8]| -> Option<Vec<String>> { std::str::from_utf8(b).ok().map(split_paragraphs) };
         let (b, o, t) = match (to_paras(base), to_paras(ours), to_paras(theirs)) {
             (Some(b), Some(o), Some(t)) => (b, o, t),
             _ => {
@@ -383,9 +420,7 @@ impl MergeHandler for ProseHandler {
                 };
             }
         };
-        let key = |p: &str| -> String {
-            blake3::hash(p.trim().as_bytes()).to_hex().to_string()
-        };
+        let key = |p: &str| -> String { blake3::hash(p.trim().as_bytes()).to_hex().to_string() };
         // Paragraph identity is content-only, so a modification looks like
         // delete+add. To avoid silently concatenating two divergent edits
         // (which would lose their conflict), check that every base paragraph
@@ -444,7 +479,9 @@ impl MergeHandler for ProseHandler {
             handler: self.name().into(),
             status: MergeStatus::Merged {
                 content: merged.into_bytes(),
-                notes: vec![MergeNote { message: "paragraph-level prose merge".into() }],
+                notes: vec![MergeNote {
+                    message: "paragraph-level prose merge".into(),
+                }],
             },
         }
     }
@@ -487,7 +524,11 @@ fn xml_parse(src: &[u8]) -> Option<Vec<XmlNode>> {
             }
             Event::End(_) => {
                 let (name, attrs, children) = stack.pop()?;
-                let node = XmlNode::Element { name, attrs, children };
+                let node = XmlNode::Element {
+                    name,
+                    attrs,
+                    children,
+                };
                 if let Some(parent) = stack.last_mut() {
                     parent.2.push(node);
                 } else {
@@ -503,7 +544,11 @@ fn xml_parse(src: &[u8]) -> Option<Vec<XmlNode>> {
                     attrs.push((k, v));
                 }
                 attrs.sort();
-                let node = XmlNode::Element { name, attrs, children: Vec::new() };
+                let node = XmlNode::Element {
+                    name,
+                    attrs,
+                    children: Vec::new(),
+                };
                 if let Some(parent) = stack.last_mut() {
                     parent.2.push(node);
                 } else {
@@ -540,7 +585,11 @@ fn write_node(n: &XmlNode, out: &mut String) {
         XmlNode::Text(t) => {
             out.push_str(&xml_escape_text(t));
         }
-        XmlNode::Element { name, attrs, children } => {
+        XmlNode::Element {
+            name,
+            attrs,
+            children,
+        } => {
             out.push('<');
             out.push_str(name);
             for (k, v) in attrs {
@@ -570,7 +619,9 @@ fn xml_escape_text(s: &str) -> String {
 }
 
 fn xml_escape_attr(s: &str) -> String {
-    s.replace('&', "&amp;").replace('"', "&quot;").replace('<', "&lt;")
+    s.replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
 }
 
 fn merge_xml_children(
@@ -604,20 +655,26 @@ fn merge_xml_children(
             (None, None, Some(t)) => merged.push(t.clone()),
             (Some(_), None, None) => {}
             (Some(b), Some(o), None) => {
-                if b == o { /* deleted in theirs */ } else {
+                if b == o { /* deleted in theirs */
+                } else {
                     merged.push(o.clone());
                     conflicts.push(ConflictRegion {
                         description: format!("{path}[{i}]: modified by ours, deleted by theirs"),
-                        base: 0..0, ours: 0..0, theirs: 0..0,
+                        base: 0..0,
+                        ours: 0..0,
+                        theirs: 0..0,
                     });
                 }
             }
             (Some(b), None, Some(t)) => {
-                if b == t { /* deleted in ours */ } else {
+                if b == t { /* deleted in ours */
+                } else {
                     merged.push(t.clone());
                     conflicts.push(ConflictRegion {
                         description: format!("{path}[{i}]: deleted by ours, modified by theirs"),
-                        base: 0..0, ours: 0..0, theirs: 0..0,
+                        base: 0..0,
+                        ours: 0..0,
+                        theirs: 0..0,
                     });
                 }
             }
@@ -627,8 +684,12 @@ fn merge_xml_children(
                 } else {
                     merged.push(o.clone());
                     conflicts.push(ConflictRegion {
-                        description: format!("{path}[{i}]: independently added with different values"),
-                        base: 0..0, ours: 0..0, theirs: 0..0,
+                        description: format!(
+                            "{path}[{i}]: independently added with different values"
+                        ),
+                        base: 0..0,
+                        ours: 0..0,
+                        theirs: 0..0,
                     });
                 }
             }
@@ -659,20 +720,35 @@ fn merge_xml_node(
     }
     match (base, ours, theirs) {
         (
-            XmlNode::Element { name: bn, attrs: ba, children: bc },
-            XmlNode::Element { name: on, attrs: oa, children: oc },
-            XmlNode::Element { name: tn, attrs: ta, children: tc },
+            XmlNode::Element {
+                name: bn,
+                attrs: ba,
+                children: bc,
+            },
+            XmlNode::Element {
+                name: on,
+                attrs: oa,
+                children: oc,
+            },
+            XmlNode::Element {
+                name: tn,
+                attrs: ta,
+                children: tc,
+            },
         ) if bn == on && on == tn => {
             // Merge attributes structurally via JSON.
             let to_obj = |v: &[(String, String)]| -> Value {
                 let mut m = serde_json::Map::new();
-                for (k, val) in v { m.insert(k.clone(), Value::String(val.clone())); }
+                for (k, val) in v {
+                    m.insert(k.clone(), Value::String(val.clone()));
+                }
                 Value::Object(m)
             };
             let (am, ac) = merge_value(&to_obj(ba), &to_obj(oa), &to_obj(ta), &format!("{path}.@"));
             let attrs: Vec<(String, String)> = match am {
                 Value::Object(m) => {
-                    let mut v: Vec<_> = m.into_iter()
+                    let mut v: Vec<_> = m
+                        .into_iter()
                         .map(|(k, val)| (k, val.as_str().unwrap_or("").to_string()))
                         .collect();
                     v.sort();
@@ -684,7 +760,11 @@ fn merge_xml_node(
             let mut conflicts = ac;
             conflicts.extend(cc);
             (
-                XmlNode::Element { name: on.clone(), attrs, children: cm },
+                XmlNode::Element {
+                    name: on.clone(),
+                    attrs,
+                    children: cm,
+                },
                 conflicts,
             )
         }
@@ -694,7 +774,9 @@ fn merge_xml_node(
                 ours.clone(),
                 vec![ConflictRegion {
                     description: format!("{path}: structural mismatch between ours and theirs"),
-                    base: 0..0, ours: 0..0, theirs: 0..0,
+                    base: 0..0,
+                    ours: 0..0,
+                    theirs: 0..0,
                 }],
             )
         }
@@ -702,7 +784,9 @@ fn merge_xml_node(
 }
 
 impl MergeHandler for XmlHandler {
-    fn name(&self) -> &str { "xml" }
+    fn name(&self) -> &str {
+        "xml"
+    }
 
     fn applicable(&self, path: &Path, _b: &[u8], _o: &[u8], _t: &[u8]) -> bool {
         matches!(
@@ -727,12 +811,20 @@ impl MergeHandler for XmlHandler {
         let status = if conflicts.is_empty() {
             MergeStatus::Merged {
                 content: bytes,
-                notes: vec![MergeNote { message: "structural XML merge".into() }],
+                notes: vec![MergeNote {
+                    message: "structural XML merge".into(),
+                }],
             }
         } else {
-            MergeStatus::Conflict { regions: conflicts, partial: bytes }
+            MergeStatus::Conflict {
+                regions: conflicts,
+                partial: bytes,
+            }
         };
-        MergeResult { handler: self.name().into(), status }
+        MergeResult {
+            handler: self.name().into(),
+            status,
+        }
     }
 }
 

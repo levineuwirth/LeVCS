@@ -83,7 +83,10 @@ fn build_genesis() -> Setup {
             added_micros: now,
             added_by: pk,
         }],
-        policy: vec![PolicyEntry { key: "public_read".into(), value: vec![0x01] }],
+        policy: vec![PolicyEntry {
+            key: "public_read".into(),
+            value: vec![0x01],
+        }],
     };
     auth.normalize().unwrap();
     auth.assign_genesis_repo_id().unwrap();
@@ -91,18 +94,19 @@ fn build_genesis() -> Setup {
     let auth_bytes = signed.serialize();
     let auth_id = blake3_hash(&auth_bytes);
     let repo_id = auth.repo_id.to_hex();
-    Setup { sk, auth_id, repo_id, auth_bytes }
+    Setup {
+        sk,
+        auth_id,
+        repo_id,
+        auth_bytes,
+    }
 }
 
 /// Build a single root commit whose tree carries one blob with the
 /// provided contents. Different `marker` strings give different
 /// commit hashes — useful when we want two commits with no shared
 /// ancestry beyond the genesis state.
-fn build_commit(
-    sk: &SecretKey,
-    auth_id: ObjectId,
-    marker: &str,
-) -> (Pack, ObjectId) {
+fn build_commit(sk: &SecretKey, auth_id: ObjectId, marker: &str) -> (Pack, ObjectId) {
     let pk = sk.public();
     let blob = Blob::new(format!("hello-{marker}\n").into_bytes());
     let blob_bytes = blob.serialize();

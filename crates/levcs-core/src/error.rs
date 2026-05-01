@@ -52,7 +52,10 @@ pub enum Error {
 
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
-        Error::Io { path: None, source: e }
+        Error::Io {
+            path: None,
+            source: e,
+        }
     }
 }
 
@@ -70,6 +73,9 @@ pub trait IoExt<T> {
 
 impl<T> IoExt<T> for std::result::Result<T, std::io::Error> {
     fn ctx(self, path: impl Into<PathBuf>) -> Result<T> {
-        self.map_err(|e| Error::Io { path: Some(path.into()), source: e })
+        self.map_err(|e| Error::Io {
+            path: Some(path.into()),
+            source: e,
+        })
     }
 }

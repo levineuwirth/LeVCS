@@ -105,7 +105,11 @@ impl ObjectHeader {
             return Err(Error::MalformedObject("reserved bytes nonzero".into()));
         }
         let body_len = LittleEndian::read_u64(&bytes[8..16]);
-        Ok(Self { object_type, format_version, body_len })
+        Ok(Self {
+            object_type,
+            format_version,
+            body_len,
+        })
     }
 }
 
@@ -132,7 +136,10 @@ impl SignatureEntry {
         let mut sg = [0u8; 64];
         pk.copy_from_slice(&bytes[0..32]);
         sg.copy_from_slice(&bytes[32..96]);
-        Ok(Self { public_key: pk, signature: sg })
+        Ok(Self {
+            public_key: pk,
+            signature: sg,
+        })
     }
 }
 
@@ -148,7 +155,11 @@ pub struct SignedObject {
 
 impl SignedObject {
     pub fn new(object_type: ObjectType, body: Vec<u8>) -> Self {
-        Self { object_type, body, signatures: Vec::new() }
+        Self {
+            object_type,
+            body,
+            signatures: Vec::new(),
+        }
     }
 
     /// The 32-byte hash that signers sign: BLAKE3(header || body).
@@ -175,7 +186,8 @@ impl SignedObject {
         .encode();
         let n = self.signatures.len();
         assert!(n <= 255, "too many signatures");
-        let mut out = Vec::with_capacity(HEADER_SIZE + self.body.len() + 1 + n * SIGNATURE_ENTRY_SIZE);
+        let mut out =
+            Vec::with_capacity(HEADER_SIZE + self.body.len() + 1 + n * SIGNATURE_ENTRY_SIZE);
         out.extend_from_slice(&header);
         out.extend_from_slice(&self.body);
         out.push(n as u8);
@@ -229,7 +241,9 @@ impl SignedObject {
         let mut signatures = Vec::with_capacity(count);
         for i in 0..count {
             let off = trailer_start + i * SIGNATURE_ENTRY_SIZE;
-            signatures.push(SignatureEntry::decode(&bytes[off..off + SIGNATURE_ENTRY_SIZE])?);
+            signatures.push(SignatureEntry::decode(
+                &bytes[off..off + SIGNATURE_ENTRY_SIZE],
+            )?);
         }
         if bytes.len() != trailer_end {
             return Err(Error::MalformedObject(format!(
@@ -289,13 +303,19 @@ impl RawObject {
             let mut sigs = Vec::with_capacity(count);
             for i in 0..count {
                 let off = trailer_start + i * SIGNATURE_ENTRY_SIZE;
-                sigs.push(SignatureEntry::decode(&bytes[off..off + SIGNATURE_ENTRY_SIZE])?);
+                sigs.push(SignatureEntry::decode(
+                    &bytes[off..off + SIGNATURE_ENTRY_SIZE],
+                )?);
             }
             sigs
         } else {
             Vec::new()
         };
-        Ok(Self { object_type: header.object_type, body, signatures })
+        Ok(Self {
+            object_type: header.object_type,
+            body,
+            signatures,
+        })
     }
 
     /// Serialize a raw object (with empty trailer for unsigned types).
@@ -308,7 +328,11 @@ impl RawObject {
         .encode();
         let signed = self.object_type.is_signed();
         let n = self.signatures.len();
-        let trailer_size = if signed { 1 + n * SIGNATURE_ENTRY_SIZE } else { 0 };
+        let trailer_size = if signed {
+            1 + n * SIGNATURE_ENTRY_SIZE
+        } else {
+            0
+        };
         let mut out = Vec::with_capacity(HEADER_SIZE + self.body.len() + trailer_size);
         out.extend_from_slice(&header);
         out.extend_from_slice(&self.body);
@@ -321,7 +345,9 @@ impl RawObject {
         out
     }
 
-    pub fn object_id(&self) -> ObjectId { blake3_hash(&self.serialize()) }
+    pub fn object_id(&self) -> ObjectId {
+        blake3_hash(&self.serialize())
+    }
 }
 
 /// Helper used by unsigned object types (Blob, Tree) to wrap a body in the
@@ -346,7 +372,11 @@ mod tests {
 
     #[test]
     fn header_roundtrip() {
-        let h = ObjectHeader { object_type: ObjectType::Blob, format_version: 1, body_len: 42 };
+        let h = ObjectHeader {
+            object_type: ObjectType::Blob,
+            format_version: 1,
+            body_len: 42,
+        };
         let bytes = h.encode();
         let h2 = ObjectHeader::decode(&bytes).unwrap();
         assert_eq!(h, h2);
@@ -355,7 +385,10 @@ mod tests {
     #[test]
     fn signed_object_roundtrip() {
         let mut so = SignedObject::new(ObjectType::Commit, b"hello".to_vec());
-        so.signatures.push(SignatureEntry { public_key: [7u8; 32], signature: [9u8; 64] });
+        so.signatures.push(SignatureEntry {
+            public_key: [7u8; 32],
+            signature: [9u8; 64],
+        });
         let bytes = so.serialize();
         let so2 = SignedObject::parse(&bytes).unwrap();
         assert_eq!(so.object_type, so2.object_type);

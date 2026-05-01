@@ -13,8 +13,8 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use levcs_core::object::{
-    ObjectHeader, ObjectType, RawObject, SignatureEntry, SignedObject, FORMAT_VERSION,
-    HEADER_SIZE, SIGNATURE_ENTRY_SIZE,
+    ObjectHeader, ObjectType, RawObject, SignatureEntry, SignedObject, FORMAT_VERSION, HEADER_SIZE,
+    SIGNATURE_ENTRY_SIZE,
 };
 use levcs_core::{Commit, Release, Tree};
 

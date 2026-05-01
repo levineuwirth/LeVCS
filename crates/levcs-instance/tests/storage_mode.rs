@@ -15,9 +15,7 @@ use std::path::PathBuf;
 use levcs_client::{Client, ClientError};
 use levcs_core::hash::blake3_hash;
 use levcs_core::object::ObjectType;
-use levcs_core::{
-    Blob, Commit, CommitFlags, EntryType, FileMode, Tree, TreeEntry, ZERO_ID,
-};
+use levcs_core::{Blob, Commit, CommitFlags, EntryType, FileMode, Tree, TreeEntry, ZERO_ID};
 use levcs_identity::authority::{AuthorityBody, MemberEntry, PolicyEntry, Role};
 use levcs_identity::keys::SecretKey;
 use levcs_identity::sign::{sign_authority, sign_commit};
@@ -81,7 +79,10 @@ fn build_genesis() -> Setup {
             added_micros: now,
             added_by: pk,
         }],
-        policy: vec![PolicyEntry { key: "public_read".into(), value: vec![0x01] }],
+        policy: vec![PolicyEntry {
+            key: "public_read".into(),
+            value: vec![0x01],
+        }],
     };
     auth.normalize().unwrap();
     auth.assign_genesis_repo_id().unwrap();
@@ -89,7 +90,12 @@ fn build_genesis() -> Setup {
     let auth_bytes = signed.serialize();
     let auth_id = blake3_hash(&auth_bytes);
     let repo_id = auth.repo_id.to_hex();
-    Setup { sk, auth_id, repo_id, auth_bytes }
+    Setup {
+        sk,
+        auth_id,
+        repo_id,
+        auth_bytes,
+    }
 }
 
 /// Build a single-blob, single-commit pack for a push test. Returns
@@ -251,7 +257,10 @@ async fn full_mode_accepts_branch_push() {
     })
     .await
     .unwrap();
-    assert!(result.is_ok(), "full mode must accept branch push: {result:?}");
+    assert!(
+        result.is_ok(),
+        "full mode must accept branch push: {result:?}"
+    );
     task.abort();
     let _ = std::fs::remove_dir_all(root);
 }

@@ -73,7 +73,8 @@ fn fork_end_to_end() {
     // 1. Boot an instance.
     let instance_root = tempdir("levcs-fork-instance");
     let instance_root_for_task = instance_root.clone();
-    let (addr, server_task) = runtime.block_on(async move { start_instance(instance_root_for_task).await });
+    let (addr, server_task) =
+        runtime.block_on(async move { start_instance(instance_root_for_task).await });
     let base_url = format!("http://{addr}/levcs/v1");
 
     // 2. Source repo.
@@ -133,7 +134,10 @@ fn fork_end_to_end() {
     // 4. Verify the fork.
     let fork_dir = fork_parent.join("myfork");
     assert!(fork_dir.is_dir(), "fork directory not created");
-    assert!(fork_dir.join("README").is_file(), "source content not checked out");
+    assert!(
+        fork_dir.join("README").is_file(),
+        "source content not checked out"
+    );
     assert_eq!(
         std::fs::read_to_string(fork_dir.join("README")).unwrap(),
         "source repo content\n"
@@ -160,7 +164,10 @@ fn fork_end_to_end() {
     );
     // Bob is the sole owner of the new genesis.
     assert_eq!(fork_body.members.len(), 1);
-    assert_eq!(fork_body.members[0].role, levcs_identity::authority::Role::Owner);
+    assert_eq!(
+        fork_body.members[0].role,
+        levcs_identity::authority::Role::Owner
+    );
 
     // 6. Confirm the fork commit has both flags set and a single parent.
     let head_hex = std::fs::read_to_string(fork_dir.join(".levcs/refs/branches/main"))

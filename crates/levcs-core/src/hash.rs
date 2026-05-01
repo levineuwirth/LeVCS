@@ -10,13 +10,21 @@ pub struct ObjectId(pub [u8; 32]);
 pub const ZERO_ID: ObjectId = ObjectId([0u8; 32]);
 
 impl ObjectId {
-    pub const fn from_bytes(b: [u8; 32]) -> Self { Self(b) }
+    pub const fn from_bytes(b: [u8; 32]) -> Self {
+        Self(b)
+    }
 
-    pub fn as_bytes(&self) -> &[u8; 32] { &self.0 }
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
 
-    pub fn to_hex(&self) -> String { hex::encode(self.0) }
+    pub fn to_hex(&self) -> String {
+        hex::encode(self.0)
+    }
 
-    pub fn is_zero(&self) -> bool { self.0 == [0u8; 32] }
+    pub fn is_zero(&self) -> bool {
+        self.0 == [0u8; 32]
+    }
 
     pub fn from_hex(s: &str) -> Result<Self, Error> {
         let bytes = hex::decode(s)?;
@@ -46,7 +54,9 @@ impl fmt::Display for ObjectId {
 
 impl FromStr for ObjectId {
     type Err = Error;
-    fn from_str(s: &str) -> Result<Self, Error> { Self::from_hex(s) }
+    fn from_str(s: &str) -> Result<Self, Error> {
+        Self::from_hex(s)
+    }
 }
 
 /// Compute a BLAKE3 hash with no key, returning an `ObjectId`.
@@ -59,7 +69,9 @@ pub fn blake3_hash(data: &[u8]) -> ObjectId {
 pub struct Hasher(blake3::Hasher);
 
 impl Hasher {
-    pub fn new() -> Self { Self(blake3::Hasher::new()) }
+    pub fn new() -> Self {
+        Self(blake3::Hasher::new())
+    }
     pub fn update(&mut self, data: &[u8]) -> &mut Self {
         self.0.update(data);
         self
@@ -70,5 +82,7 @@ impl Hasher {
 }
 
 impl Default for Hasher {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }

@@ -95,12 +95,23 @@ impl Repository {
     fn open_at(workdir: PathBuf, levcs_dir: PathBuf) -> Self {
         let objects = ObjectStore::new(levcs_dir.join("objects"));
         let refs = Refs::new(levcs_dir.clone());
-        Self { workdir, levcs_dir, objects, refs }
+        Self {
+            workdir,
+            levcs_dir,
+            objects,
+            refs,
+        }
     }
 
-    pub fn index_path(&self) -> PathBuf { self.levcs_dir.join("index") }
-    pub fn config_path(&self) -> PathBuf { self.levcs_dir.join("config") }
-    pub fn ignore_path(&self) -> PathBuf { self.workdir.join(".levcsignore") }
+    pub fn index_path(&self) -> PathBuf {
+        self.levcs_dir.join("index")
+    }
+    pub fn config_path(&self) -> PathBuf {
+        self.levcs_dir.join("config")
+    }
+    pub fn ignore_path(&self) -> PathBuf {
+        self.workdir.join(".levcsignore")
+    }
 
     pub fn read_index(&self) -> Result<Index> {
         Index::read_from(&self.index_path())
@@ -260,7 +271,11 @@ impl Repository {
     }
 
     /// Find the path within a tree (recursively) and return (entry_type, hash).
-    pub fn lookup_path(&self, tree_id: ObjectId, path: &str) -> Result<Option<(EntryType, ObjectId)>> {
+    pub fn lookup_path(
+        &self,
+        tree_id: ObjectId,
+        path: &str,
+    ) -> Result<Option<(EntryType, ObjectId)>> {
         let raw = self.objects.read_typed(tree_id, ObjectType::Tree)?;
         let tree = Tree::parse_body(&raw.body)?;
         let mut comps = path.split('/').filter(|c| !c.is_empty());
@@ -293,7 +308,9 @@ impl Repository {
 
 fn mode_from_index(m: u8) -> FileMode {
     let mut bits = 0u8;
-    if m & 0o111 != 0 { bits |= 0b01; }
+    if m & 0o111 != 0 {
+        bits |= 0b01;
+    }
     FileMode(bits)
 }
 
@@ -312,7 +329,10 @@ impl TreeBuilder {
                 self.files.push((first.to_string(), hash, mode));
             }
             Some(rest) => {
-                self.dirs.entry(first.to_string()).or_default().insert(rest, hash, mode);
+                self.dirs
+                    .entry(first.to_string())
+                    .or_default()
+                    .insert(rest, hash, mode);
             }
         }
     }
@@ -320,7 +340,12 @@ impl TreeBuilder {
     fn write(self, repo: &Repository) -> Result<ObjectId> {
         let mut tree = Tree::new();
         for (name, hash, mode) in self.files {
-            tree.entries.push(TreeEntry { name, entry_type: EntryType::Blob, mode, hash });
+            tree.entries.push(TreeEntry {
+                name,
+                entry_type: EntryType::Blob,
+                mode,
+                hash,
+            });
         }
         for (name, sub) in self.dirs {
             let sub_id = sub.write(repo)?;

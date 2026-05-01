@@ -1,21 +1,21 @@
 //! levcs-identity: keychains, authority objects, signing, verification.
 
-pub mod error;
-pub mod keys;
-pub mod keychain;
 pub mod authority;
+pub mod error;
+pub mod keychain;
+pub mod keys;
 pub mod sign;
 pub mod verify;
 
-pub use error::IdentityError;
-pub use keys::{KeyLabel, PublicKey, SecretKey};
-pub use keychain::{Keychain, KeychainEntry};
 pub use authority::{
-    AuthorityBody, MemberEntry, PolicyEntry, Role, AUTHORITY_SCHEMA_VERSION,
-    parse_toml_authority, render_toml_authority,
+    parse_toml_authority, render_toml_authority, AuthorityBody, MemberEntry, PolicyEntry, Role,
+    AUTHORITY_SCHEMA_VERSION,
 };
-pub use sign::{sign_commit, sign_release, sign_authority, sign_message};
+pub use error::IdentityError;
+pub use keychain::{Keychain, KeychainEntry};
+pub use keys::{KeyLabel, PublicKey, SecretKey};
+pub use sign::{sign_authority, sign_commit, sign_message, sign_release};
 pub use verify::{
-    verify_signed_object, verify_commit, verify_authority_chain, verify_genesis,
-    Verification, VerifyError,
+    verify_authority_chain, verify_commit, verify_genesis, verify_signed_object, Verification,
+    VerifyError,
 };

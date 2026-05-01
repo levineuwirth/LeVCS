@@ -22,11 +22,17 @@ pub enum Head {
 
 impl Refs {
     pub fn new(levcs_dir: impl Into<PathBuf>) -> Self {
-        Self { levcs_dir: levcs_dir.into() }
+        Self {
+            levcs_dir: levcs_dir.into(),
+        }
     }
 
-    pub fn refs_dir(&self) -> PathBuf { self.levcs_dir.join("refs") }
-    pub fn head_path(&self) -> PathBuf { self.levcs_dir.join("HEAD") }
+    pub fn refs_dir(&self) -> PathBuf {
+        self.levcs_dir.join("refs")
+    }
+    pub fn head_path(&self) -> PathBuf {
+        self.levcs_dir.join("HEAD")
+    }
 
     pub fn ref_path(&self, name: &str) -> Result<PathBuf> {
         validate_ref_name(name)?;
@@ -38,7 +44,10 @@ impl Refs {
         match fs::read_to_string(&path) {
             Ok(s) => Ok(Some(parse_ref_value(&s)?)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(Error::Io { path: Some(path), source: e }),
+            Err(e) => Err(Error::Io {
+                path: Some(path),
+                source: e,
+            }),
         }
     }
 
@@ -55,7 +64,10 @@ impl Refs {
         match fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(Error::Io { path: Some(path), source: e }),
+            Err(e) => Err(Error::Io {
+                path: Some(path),
+                source: e,
+            }),
         }
     }
 
@@ -64,7 +76,10 @@ impl Refs {
         match fs::read_to_string(&path) {
             Ok(s) => Ok(Some(parse_head(&s)?)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(Error::Io { path: Some(path), source: e }),
+            Err(e) => Err(Error::Io {
+                path: Some(path),
+                source: e,
+            }),
         }
     }
 
@@ -121,7 +136,9 @@ impl Refs {
     pub fn list_branches(&self) -> Result<Vec<(String, ObjectId)>> {
         let dir = self.refs_dir().join("branches");
         let mut out = Vec::new();
-        if !dir.is_dir() { return Ok(out); }
+        if !dir.is_dir() {
+            return Ok(out);
+        }
         for ent in fs::read_dir(&dir).ctx(dir.clone())? {
             let ent = ent.ctx(dir.clone())?;
             let name = ent.file_name().to_string_lossy().to_string();
@@ -137,7 +154,9 @@ impl Refs {
     pub fn list_releases(&self) -> Result<Vec<(String, ObjectId)>> {
         let dir = self.refs_dir().join("releases");
         let mut out = Vec::new();
-        if !dir.is_dir() { return Ok(out); }
+        if !dir.is_dir() {
+            return Ok(out);
+        }
         for ent in fs::read_dir(&dir).ctx(dir.clone())? {
             let ent = ent.ctx(dir.clone())?;
             let name = ent.file_name().to_string_lossy().to_string();
@@ -157,10 +176,14 @@ pub fn validate_ref_name(name: &str) -> Result<()> {
     }
     for comp in name.split('/') {
         if comp.is_empty() {
-            return Err(Error::InvalidReference(format!("empty component in {name}")));
+            return Err(Error::InvalidReference(format!(
+                "empty component in {name}"
+            )));
         }
         if comp == "." || comp == ".." {
-            return Err(Error::InvalidReference(format!("reserved component: {comp}")));
+            return Err(Error::InvalidReference(format!(
+                "reserved component: {comp}"
+            )));
         }
         if comp.contains('\0') {
             return Err(Error::InvalidReference("null byte".into()));
@@ -218,7 +241,11 @@ mod tests {
 
     #[test]
     fn valid_names_accepted() {
-        for n in ["refs/branches/main", "refs/releases/v1.0", "refs/authority/current"] {
+        for n in [
+            "refs/branches/main",
+            "refs/releases/v1.0",
+            "refs/authority/current",
+        ] {
             validate_ref_name(n).unwrap();
         }
     }

@@ -94,10 +94,7 @@ pub fn handler_rank(name: &str) -> u8 {
 /// motivating example is "I don't trust the Rust handler today, force
 /// `*.rs` back to textual." Returns the merged config or, on
 /// promotion attempt, the offending glob.
-pub fn layer_local_over(
-    repo: &MergeConfig,
-    local: &MergeConfig,
-) -> Result<MergeConfig, String> {
+pub fn layer_local_over(repo: &MergeConfig, local: &MergeConfig) -> Result<MergeConfig, String> {
     let mut merged = repo.clone();
     for local_rule in &local.rules {
         let local_rank = handler_rank(&local_rule.handler);
@@ -163,7 +160,9 @@ impl Default for CascadeEngine {
 }
 
 impl CascadeEngine {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     pub fn with_config(mut self, cfg: MergeConfig) -> Self {
         self.rules = cfg.rules;
@@ -188,7 +187,10 @@ impl CascadeEngine {
             let bytes = fetch(entry)?;
             let hash = parse_hash(&entry.hash)?;
             let plugin = PluginHandler::new(
-                PluginConfig { name: entry.name.clone(), hash },
+                PluginConfig {
+                    name: entry.name.clone(),
+                    hash,
+                },
                 &bytes,
             )
             .map_err(|e| format!("plugin {}: {e}", entry.name))?;
@@ -231,13 +233,7 @@ impl CascadeEngine {
         self.handlers.iter().find(|h| h.name() == pref).cloned()
     }
 
-    pub fn merge_file(
-        &self,
-        path: &Path,
-        base: &[u8],
-        ours: &[u8],
-        theirs: &[u8],
-    ) -> MergeResult {
+    pub fn merge_file(&self, path: &Path, base: &[u8], ours: &[u8], theirs: &[u8]) -> MergeResult {
         if let Some(h) = self.pick(path) {
             if h.applicable(path, base, ours, theirs) {
                 let result = h.merge(path, base, ours, theirs);
@@ -264,10 +260,22 @@ impl CascadeEngine {
 /// repository policy checks (§6.6.4) to expand the "builtin" alias and to
 /// reject merge-record entries that reference unknown handlers.
 pub const BUILTIN_HANDLERS: &[&str] = &[
-    "json", "yaml", "toml", "xml", "markdown", "prose", "textual",
-    "tree-sitter:rust", "tree-sitter:python", "tree-sitter:javascript",
-    "tree-sitter:typescript", "tree-sitter:go", "tree-sitter:c",
-    "tree-sitter:cpp", "tree-sitter:java", "tree-sitter:ruby",
+    "json",
+    "yaml",
+    "toml",
+    "xml",
+    "markdown",
+    "prose",
+    "textual",
+    "tree-sitter:rust",
+    "tree-sitter:python",
+    "tree-sitter:javascript",
+    "tree-sitter:typescript",
+    "tree-sitter:go",
+    "tree-sitter:c",
+    "tree-sitter:cpp",
+    "tree-sitter:java",
+    "tree-sitter:ruby",
     "tree-sitter:shell",
 ];
 
@@ -278,8 +286,7 @@ pub const BUILTIN_HANDLERS: &[&str] = &[
 pub const FLOW_HANDLERS: &[&str] = &["ours-only", "theirs-only", "delete", "no-auto", "none"];
 
 pub fn is_builtin_handler(name: &str) -> bool {
-    BUILTIN_HANDLERS.iter().any(|b| *b == name)
-        || FLOW_HANDLERS.iter().any(|b| *b == name)
+    BUILTIN_HANDLERS.iter().any(|b| *b == name) || FLOW_HANDLERS.iter().any(|b| *b == name)
 }
 
 /// Decide whether a `(handler, handler_hash)` tuple is permitted by the
@@ -321,16 +328,18 @@ pub fn check_handler_allowed(handler: &str, handler_hash: &str, allowed: &[Strin
         let hash = handler_hash.strip_prefix("blake3:").unwrap_or(handler_hash);
         Some(format!("{handler}:blake3:{hash}"))
     };
-    allowed.iter().any(|s| {
-        s == handler
-            || needle_with_hash.as_deref().map(|n| s == n).unwrap_or(false)
-    })
+    allowed
+        .iter()
+        .any(|s| s == handler || needle_with_hash.as_deref().map(|n| s == n).unwrap_or(false))
 }
 
 fn parse_hash(s: &str) -> Result<[u8; 32], String> {
     let trimmed = s.strip_prefix("blake3:").unwrap_or(s);
     if trimmed.len() != 64 {
-        return Err(format!("expected 64-char blake3 hash, got {} chars", trimmed.len()));
+        return Err(format!(
+            "expected 64-char blake3 hash, got {} chars",
+            trimmed.len()
+        ));
     }
     let mut out = [0u8; 32];
     for (i, byte) in out.iter_mut().enumerate() {
@@ -464,7 +473,10 @@ mod tests {
             policy: None,
         };
         let err = layer_local_over(&repo, &local).expect_err("must reject");
-        assert!(err.contains("promote"), "error must mention promotion: {err}");
+        assert!(
+            err.contains("promote"),
+            "error must mention promotion: {err}"
+        );
     }
 
     #[test]

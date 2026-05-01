@@ -207,7 +207,9 @@ fn pack_decode_survives_mutation_of_valid_pack() {
             0 => {
                 let flips = (lcg(&mut seed) % 4 + 1) as usize;
                 for _ in 0..flips {
-                    if buf.is_empty() { break; }
+                    if buf.is_empty() {
+                        break;
+                    }
                     let idx = (lcg(&mut seed) as usize) % buf.len();
                     let bit = (lcg(&mut seed) % 8) as u8;
                     buf[idx] ^= 1 << bit;

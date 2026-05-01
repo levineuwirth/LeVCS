@@ -83,7 +83,15 @@ fn authority_chain_round_trip() {
     let (_, bob_pub, _) = run(&["key", "show", "bob"], &work, &xdg);
     let bob_pub = bob_pub.trim().to_string();
     let (code, _, e) = run(
-        &["authority", "add", &bob_pub, "--role", "contributor", "--handle", "bob"],
+        &[
+            "authority",
+            "add",
+            &bob_pub,
+            "--role",
+            "contributor",
+            "--handle",
+            "bob",
+        ],
         &work,
         &xdg,
     );
@@ -152,13 +160,19 @@ fn gc_grace_period_keeps_young_objects_and_deletes_old_ones() {
     // younger than that, so it must be kept.
     let (code, _, e) = run(&["gc"], &work, &xdg);
     assert_eq!(code, 0, "gc default: {e}");
-    assert!(stray.is_file(), "young unreachable object must be kept under default grace");
+    assert!(
+        stray.is_file(),
+        "young unreachable object must be kept under default grace"
+    );
     assert!(e.contains("kept"), "gc must report kept count: {e}");
 
     // Force grace=0 and the stray file must go.
     let (code, _, e) = run(&["gc", "--grace-days=0"], &work, &xdg);
     assert_eq!(code, 0, "gc grace=0: {e}");
-    assert!(!stray.is_file(), "with grace=0 the unreachable object must be deleted");
+    assert!(
+        !stray.is_file(),
+        "with grace=0 the unreachable object must be deleted"
+    );
     assert!(e.contains("removed"), "gc must report deletion count: {e}");
 
     let _ = std::fs::remove_dir_all(&work);

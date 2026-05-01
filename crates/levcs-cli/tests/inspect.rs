@@ -106,16 +106,28 @@ fn inspect_lists_branches_authority_and_tree() {
     let (code, stdout, _e) = run(&["inspect", &repo_id_hex], &probe, &xdg);
     assert_eq!(code, 0, "inspect at root must succeed");
     assert!(stdout.contains("repo_id"), "must show repo_id: {stdout}");
-    assert!(stdout.contains("current authority"), "must show authority: {stdout}");
+    assert!(
+        stdout.contains("current authority"),
+        "must show authority: {stdout}"
+    );
     assert!(stdout.contains("branches:"), "must list branches: {stdout}");
     assert!(stdout.contains("main"), "must show main branch: {stdout}");
-    assert!(stdout.contains("README"), "must list README at root: {stdout}");
-    assert!(stdout.contains("nested"), "must list nested subtree at root: {stdout}");
+    assert!(
+        stdout.contains("README"),
+        "must list README at root: {stdout}"
+    );
+    assert!(
+        stdout.contains("nested"),
+        "must list nested subtree at root: {stdout}"
+    );
 
     // Path inspect: drill into the `nested/` subtree.
     let (code, stdout, _e) = run(&["inspect", &repo_id_hex, "nested"], &probe, &xdg);
     assert_eq!(code, 0, "inspect at nested/ must succeed");
-    assert!(stdout.contains("file.txt"), "must list nested/file.txt: {stdout}");
+    assert!(
+        stdout.contains("file.txt"),
+        "must list nested/file.txt: {stdout}"
+    );
 
     task.abort();
     let _ = std::fs::remove_dir_all(&instance_root);

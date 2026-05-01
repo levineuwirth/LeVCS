@@ -15,7 +15,9 @@ pub struct JsonHandler;
 pub struct TomlHandler;
 
 impl MergeHandler for JsonHandler {
-    fn name(&self) -> &str { "json" }
+    fn name(&self) -> &str {
+        "json"
+    }
     fn applicable(&self, path: &Path, _b: &[u8], _o: &[u8], _t: &[u8]) -> bool {
         path.extension().and_then(|e| e.to_str()) == Some("json")
     }
@@ -35,17 +37,27 @@ impl MergeHandler for JsonHandler {
         let status = if conflicts.is_empty() {
             MergeStatus::Merged {
                 content: bytes,
-                notes: vec![MergeNote { message: "structural JSON three-way merge".into() }],
+                notes: vec![MergeNote {
+                    message: "structural JSON three-way merge".into(),
+                }],
             }
         } else {
-            MergeStatus::Conflict { regions: conflicts, partial: bytes }
+            MergeStatus::Conflict {
+                regions: conflicts,
+                partial: bytes,
+            }
         };
-        MergeResult { handler: self.name().into(), status }
+        MergeResult {
+            handler: self.name().into(),
+            status,
+        }
     }
 }
 
 impl MergeHandler for TomlHandler {
-    fn name(&self) -> &str { "toml" }
+    fn name(&self) -> &str {
+        "toml"
+    }
     fn applicable(&self, path: &Path, _b: &[u8], _o: &[u8], _t: &[u8]) -> bool {
         path.extension().and_then(|e| e.to_str()) == Some("toml")
     }
@@ -71,12 +83,20 @@ impl MergeHandler for TomlHandler {
         let status = if conflicts.is_empty() {
             MergeStatus::Merged {
                 content: bytes,
-                notes: vec![MergeNote { message: "structural TOML three-way merge".into() }],
+                notes: vec![MergeNote {
+                    message: "structural TOML three-way merge".into(),
+                }],
             }
         } else {
-            MergeStatus::Conflict { regions: conflicts, partial: bytes }
+            MergeStatus::Conflict {
+                regions: conflicts,
+                partial: bytes,
+            }
         };
-        MergeResult { handler: self.name().into(), status }
+        MergeResult {
+            handler: self.name().into(),
+            status,
+        }
     }
 }
 
@@ -158,8 +178,12 @@ pub fn merge_value(
                 };
                 match (bv, ov, tv) {
                     (None, None, None) => {}
-                    (None, Some(o), None) => { merged.insert(k.clone(), o.clone()); }
-                    (None, None, Some(t)) => { merged.insert(k.clone(), t.clone()); }
+                    (None, Some(o), None) => {
+                        merged.insert(k.clone(), o.clone());
+                    }
+                    (None, None, Some(t)) => {
+                        merged.insert(k.clone(), t.clone());
+                    }
                     (Some(b), Some(o), None) => {
                         if b == o {
                             // theirs deleted; ours unchanged → delete.
@@ -167,8 +191,12 @@ pub fn merge_value(
                             // ours modified, theirs deleted → conflict (keep ours).
                             merged.insert(k.clone(), o.clone());
                             conflicts.push(ConflictRegion {
-                                description: format!("{sub_path}: modified by ours, deleted by theirs"),
-                                base: 0..0, ours: 0..0, theirs: 0..0,
+                                description: format!(
+                                    "{sub_path}: modified by ours, deleted by theirs"
+                                ),
+                                base: 0..0,
+                                ours: 0..0,
+                                theirs: 0..0,
                             });
                         }
                     }
@@ -178,8 +206,12 @@ pub fn merge_value(
                         } else {
                             merged.insert(k.clone(), t.clone());
                             conflicts.push(ConflictRegion {
-                                description: format!("{sub_path}: deleted by ours, modified by theirs"),
-                                base: 0..0, ours: 0..0, theirs: 0..0,
+                                description: format!(
+                                    "{sub_path}: deleted by ours, modified by theirs"
+                                ),
+                                base: 0..0,
+                                ours: 0..0,
+                                theirs: 0..0,
                             });
                         }
                     }
@@ -194,8 +226,12 @@ pub fn merge_value(
                         } else {
                             merged.insert(k.clone(), o.clone());
                             conflicts.push(ConflictRegion {
-                                description: format!("{sub_path}: independently added with different values"),
-                                base: 0..0, ours: 0..0, theirs: 0..0,
+                                description: format!(
+                                    "{sub_path}: independently added with different values"
+                                ),
+                                base: 0..0,
+                                ours: 0..0,
+                                theirs: 0..0,
                             });
                         }
                     }
@@ -220,7 +256,9 @@ pub fn merge_value(
             // Scalar conflict.
             let conflict = ConflictRegion {
                 description: format!("{path}: divergent scalar modifications"),
-                base: 0..0, ours: 0..0, theirs: 0..0,
+                base: 0..0,
+                ours: 0..0,
+                theirs: 0..0,
             };
             (ours.clone(), vec![conflict])
         }

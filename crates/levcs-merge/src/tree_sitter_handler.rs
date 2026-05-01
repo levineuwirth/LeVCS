@@ -145,7 +145,9 @@ pub struct TreeSitterHandler {
 }
 
 impl TreeSitterHandler {
-    pub fn new(lang: Lang) -> Self { Self { lang } }
+    pub fn new(lang: Lang) -> Self {
+        Self { lang }
+    }
 
     fn parse(&self, src: &[u8]) -> Option<Tree> {
         let mut p = Parser::new();
@@ -240,7 +242,12 @@ fn block_from_node(node: Node, src: &[u8]) -> Block {
         Some(n) => BlockKey::Named(kind.clone(), n),
         None => BlockKey::Anon(kind.clone(), *blake3::hash(&text).as_bytes()),
     };
-    Block { kind, key, range, text }
+    Block {
+        kind,
+        key,
+        range,
+        text,
+    }
 }
 
 fn top_level_blocks(tree: &Tree, src: &[u8]) -> Vec<Block> {
@@ -379,7 +386,13 @@ fn merge_blocks_inner(
                     output.push(o.text.clone());
                 } else {
                     had_conflict = true;
-                    conflicts.push(make_region(&o.kind, "concurrent additions diverge", None, Some(o), Some(tb)));
+                    conflicts.push(make_region(
+                        &o.kind,
+                        "concurrent additions diverge",
+                        None,
+                        Some(o),
+                        Some(tb),
+                    ));
                     output.push(conflict_marker_block(&o.text, &tb.text));
                 }
             }
@@ -388,7 +401,13 @@ fn merge_blocks_inner(
                     // ours unchanged, theirs deleted → honour deletion
                 } else {
                     had_conflict = true;
-                    conflicts.push(make_region(&o.kind, "modify-vs-delete", Some(bb), Some(o), None));
+                    conflicts.push(make_region(
+                        &o.kind,
+                        "modify-vs-delete",
+                        Some(bb),
+                        Some(o),
+                        None,
+                    ));
                     output.push(conflict_marker_block(&o.text, &[]));
                     notes.push(MergeNote {
                         message: format!("{}: modified by ours, deleted by theirs", o.kind),
@@ -450,7 +469,13 @@ fn merge_blocks_inner(
                     // theirs unchanged, ours deleted → honour deletion
                 } else {
                     had_conflict = true;
-                    conflicts.push(make_region(&t.kind, "delete-vs-modify", Some(bb), None, Some(t)));
+                    conflicts.push(make_region(
+                        &t.kind,
+                        "delete-vs-modify",
+                        Some(bb),
+                        None,
+                        Some(t),
+                    ));
                     output.push(conflict_marker_block(&[], &t.text));
                     notes.push(MergeNote {
                         message: format!("{}: deleted by ours, modified by theirs", t.kind),
@@ -460,7 +485,12 @@ fn merge_blocks_inner(
         }
     }
 
-    InnerMerge { blocks: output, conflicts, notes, had_conflict }
+    InnerMerge {
+        blocks: output,
+        conflicts,
+        notes,
+        had_conflict,
+    }
 }
 
 /// Try to merge a single conflicted block by descending into its body and
@@ -525,7 +555,12 @@ fn try_recursive_clean(
     // Recursion only buys something when at least one of the inner blocks
     // has a recoverable identity. If everything is anonymous, body diffs
     // collapse to text-level and we'd match arbitrary content together.
-    if bc.iter().chain(&oc).chain(&tc).all(|b| matches!(b.key, BlockKey::Anon(..))) {
+    if bc
+        .iter()
+        .chain(&oc)
+        .chain(&tc)
+        .all(|b| matches!(b.key, BlockKey::Anon(..)))
+    {
         return None;
     }
 
@@ -571,11 +606,7 @@ fn body_prefix_suffix<'a>(
     (&body_text[..first_rel], &body_text[last_rel..])
 }
 
-fn inter_child_separator(
-    body_text: &[u8],
-    children: &[Block],
-    body_start_abs: usize,
-) -> Vec<u8> {
+fn inter_child_separator(body_text: &[u8], children: &[Block], body_start_abs: usize) -> Vec<u8> {
     if children.len() < 2 {
         return b"\n\n".to_vec();
     }
@@ -593,7 +624,9 @@ fn strip_trailing_newline(b: &[u8]) -> Vec<u8> {
 }
 
 impl MergeHandler for TreeSitterHandler {
-    fn name(&self) -> &str { self.lang.handler_name() }
+    fn name(&self) -> &str {
+        self.lang.handler_name()
+    }
 
     fn applicable(&self, _path: &Path, _base: &[u8], _ours: &[u8], _theirs: &[u8]) -> bool {
         // Applicability is decided in `merge`; if any input fails to parse
@@ -660,7 +693,12 @@ mod tests {
 
     fn run(lang: Lang, base: &str, ours: &str, theirs: &str) -> MergeResult {
         let h = TreeSitterHandler::new(lang);
-        h.merge(Path::new("file"), base.as_bytes(), ours.as_bytes(), theirs.as_bytes())
+        h.merge(
+            Path::new("file"),
+            base.as_bytes(),
+            ours.as_bytes(),
+            theirs.as_bytes(),
+        )
     }
 
     #[test]
@@ -776,7 +814,9 @@ mod tests {
         let result = run(Lang::Rust, base, ours, theirs);
         match result.status {
             MergeStatus::Conflict { regions, .. } => {
-                assert!(regions.iter().any(|r| r.description.contains("modify-vs-delete")));
+                assert!(regions
+                    .iter()
+                    .any(|r| r.description.contains("modify-vs-delete")));
             }
             other => panic!("expected Conflict, got {other:?}"),
         }
@@ -801,7 +841,9 @@ mod tests {
                 assert!(s.contains("fn c("), "must keep theirs-side addition: {s}");
                 assert!(s.contains("impl Foo"), "must preserve outer header");
                 assert!(
-                    notes.iter().any(|n| n.message.contains("recursive descent")),
+                    notes
+                        .iter()
+                        .any(|n| n.message.contains("recursive descent")),
                     "merge note must record that recursion fired: {notes:?}"
                 );
             }

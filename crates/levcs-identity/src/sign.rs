@@ -22,7 +22,10 @@ pub fn sign_commit(commit: Commit, sk: &SecretKey) -> Result<SignedObject> {
     let mut signed = commit.into_signed().map_err(IdentityError::from)?;
     let h = signed.signing_hash();
     let signature = sk.sign(h.as_bytes());
-    signed.signatures.push(SignatureEntry { public_key: sk.public().0, signature });
+    signed.signatures.push(SignatureEntry {
+        public_key: sk.public().0,
+        signature,
+    });
     Ok(signed)
 }
 
@@ -37,7 +40,10 @@ pub fn sign_release(release: Release, sk: &SecretKey) -> Result<SignedObject> {
     let mut signed = release.into_signed().map_err(IdentityError::from)?;
     let h = signed.signing_hash();
     let signature = sk.sign(h.as_bytes());
-    signed.signatures.push(SignatureEntry { public_key: sk.public().0, signature });
+    signed.signatures.push(SignatureEntry {
+        public_key: sk.public().0,
+        signature,
+    });
     Ok(signed)
 }
 
@@ -47,7 +53,10 @@ pub fn sign_authority(body: &AuthorityBody, sk: &SecretKey) -> Result<SignedObje
     debug_assert_eq!(signed.object_type, ObjectType::Authority);
     let h = signed.signing_hash();
     let signature = sk.sign(h.as_bytes());
-    signed.signatures.push(SignatureEntry { public_key: sk.public().0, signature });
+    signed.signatures.push(SignatureEntry {
+        public_key: sk.public().0,
+        signature,
+    });
     Ok(signed)
 }
 
@@ -56,5 +65,8 @@ pub fn sign_authority(body: &AuthorityBody, sk: &SecretKey) -> Result<SignedObje
 pub fn add_cosigner_signature(signed: &mut SignedObject, sk: &SecretKey) {
     let h = signed.signing_hash();
     let signature = sk.sign(h.as_bytes());
-    signed.signatures.push(SignatureEntry { public_key: sk.public().0, signature });
+    signed.signatures.push(SignatureEntry {
+        public_key: sk.public().0,
+        signature,
+    });
 }

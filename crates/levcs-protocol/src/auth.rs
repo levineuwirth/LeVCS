@@ -108,12 +108,13 @@ pub fn verify_request(
     skew_seconds: i64,
 ) -> Result<AuthHeaders, AuthError> {
     let pk = PublicKey::parse_levcs(key_header).map_err(AuthError::Identity)?;
-    let timestamp_micros: i64 = timestamp_header
-        .parse()
-        .map_err(|e: std::num::ParseIntError| AuthError::InvalidHeader {
-            name: "LeVCS-Timestamp",
-            detail: e.to_string(),
-        })?;
+    let timestamp_micros: i64 =
+        timestamp_header
+            .parse()
+            .map_err(|e: std::num::ParseIntError| AuthError::InvalidHeader {
+                name: "LeVCS-Timestamp",
+                detail: e.to_string(),
+            })?;
     let skew = (now_micros - timestamp_micros) / 1_000_000;
     if skew.abs() > skew_seconds {
         return Err(AuthError::Skew(skew));
@@ -161,8 +162,10 @@ pub fn verify_request(
 }
 
 fn getrandom_bytes(buf: &mut [u8]) -> Result<(), AuthError> {
-    getrandom::getrandom(buf)
-        .map_err(|e| AuthError::InvalidHeader { name: "LeVCS-Nonce", detail: e.to_string() })
+    getrandom::getrandom(buf).map_err(|e| AuthError::InvalidHeader {
+        name: "LeVCS-Nonce",
+        detail: e.to_string(),
+    })
 }
 
 pub fn current_micros() -> i64 {
@@ -202,7 +205,11 @@ mod tests {
             body,
         };
         let (key, ts, nonce, sig) = sign_request(&sk, &req).unwrap();
-        let req2 = AuthRequest { method: "POST", path_with_query: "/levcs/v1/repos/abc/push", body: b"bogus" };
+        let req2 = AuthRequest {
+            method: "POST",
+            path_with_query: "/levcs/v1/repos/abc/push",
+            body: b"bogus",
+        };
         let now = current_micros();
         assert!(verify_request(&req2, &key, &ts, &nonce, &sig, now, DEFAULT_CLOCK_SKEW).is_err());
     }

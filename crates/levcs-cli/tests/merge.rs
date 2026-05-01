@@ -59,8 +59,14 @@ fn fast_forward_merge_advances_branch() {
     assert_eq!(run(&["branch", "--switch", "main"], &work, &xdg).0, 0);
     let (code, _, e) = run(&["merge", "feature"], &work, &xdg);
     assert_eq!(code, 0, "fast-forward merge: {e}");
-    assert!(e.contains("fast-forward"), "expected fast-forward message; got {e}");
-    assert!(work.join("b.txt").is_file(), "feature file should be present");
+    assert!(
+        e.contains("fast-forward"),
+        "expected fast-forward message; got {e}"
+    );
+    assert!(
+        work.join("b.txt").is_file(),
+        "feature file should be present"
+    );
 }
 
 #[test]
@@ -88,7 +94,10 @@ fn clean_three_way_merge_then_commit_produces_two_parents() {
     assert_eq!(run(&["branch", "--switch", "main"], &work, &xdg).0, 0);
     let (code, o, e) = run(&["merge", "feat"], &work, &xdg);
     assert_eq!(code, 0, "merge: {e}");
-    assert!(o.contains("auto-resolved: 1") || o.contains("auto-resolved: 2"), "summary missing: {o}");
+    assert!(
+        o.contains("auto-resolved: 1") || o.contains("auto-resolved: 2"),
+        "summary missing: {o}"
+    );
 
     // Both files should be in the working tree now.
     assert!(work.join("b.txt").is_file());
@@ -96,12 +105,18 @@ fn clean_three_way_merge_then_commit_produces_two_parents() {
 
     // MERGE_HEAD should exist before commit, then disappear after.
     let merge_head = work.join(".levcs/MERGE_HEAD");
-    assert!(merge_head.exists(), "MERGE_HEAD should be set before commit");
+    assert!(
+        merge_head.exists(),
+        "MERGE_HEAD should be set before commit"
+    );
 
     // Finalize.
     let (code, _, e) = run(&["commit", "-m", "merge feat"], &work, &xdg);
     assert_eq!(code, 0, "commit (merge): {e}");
-    assert!(!merge_head.exists(), "MERGE_HEAD should be cleared after commit");
+    assert!(
+        !merge_head.exists(),
+        "MERGE_HEAD should be cleared after commit"
+    );
 
     // Log should show the merge as the most recent commit.
     let (code, log, _) = run(&["log"], &work, &xdg);
@@ -131,7 +146,10 @@ fn conflicting_merge_writes_state_and_blocks_commit_until_resolved() {
     assert_eq!(run(&["branch", "--switch", "main"], &work, &xdg).0, 0);
     let (code, _o, e) = run(&["merge", "feat"], &work, &xdg);
     assert_ne!(code, 0, "conflict should produce non-zero exit");
-    assert!(e.contains("CONFLICT") || e.contains("conflict"), "conflict report missing: {e}");
+    assert!(
+        e.contains("CONFLICT") || e.contains("conflict"),
+        "conflict report missing: {e}"
+    );
 
     // Merge state files exist.
     assert!(work.join(".levcs/MERGE_HEAD").exists());
@@ -147,7 +165,10 @@ fn conflicting_merge_writes_state_and_blocks_commit_until_resolved() {
     // commit must refuse while conflict markers remain.
     let (code, _, e) = run(&["commit", "-m", "premature"], &work, &xdg);
     assert_ne!(code, 0, "commit should refuse: {e}");
-    assert!(e.contains("conflict markers"), "marker check should mention markers: {e}");
+    assert!(
+        e.contains("conflict markers"),
+        "marker check should mention markers: {e}"
+    );
 
     // Resolve manually and commit.
     std::fs::write(work.join("a.txt"), b"resolved\n").unwrap();
@@ -225,7 +246,10 @@ fn commit_refuses_merge_record_with_handler_outside_repo_policy() {
 
     let (code, _, e) = run(&["commit", "-m", "merge feat"], &work, &xdg);
     assert_ne!(code, 0, "commit must refuse a record outside policy");
-    assert!(e.contains("tree-sitter:protobuf"), "error must name the bad handler: {e}");
+    assert!(
+        e.contains("tree-sitter:protobuf"),
+        "error must name the bad handler: {e}"
+    );
 }
 
 #[test]
@@ -293,10 +317,7 @@ fn merge_format_json_reports_conflicts_and_exits_nonzero() {
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("parse JSON");
     assert!(v["conflicts"].as_u64().unwrap() >= 1);
     let files = v["files"].as_array().unwrap();
-    let conflicted: Vec<_> = files
-        .iter()
-        .filter(|f| f["status"] == "conflict")
-        .collect();
+    let conflicted: Vec<_> = files.iter().filter(|f| f["status"] == "conflict").collect();
     assert!(!conflicted.is_empty(), "must report at least one conflict");
     // Conflict regions array is present for conflicted files.
     let f = conflicted[0];
@@ -359,7 +380,10 @@ fn merge_local_toml_can_demote_handler() {
         .iter()
         .find(|f| f["path"] == "note.txt")
         .expect("note.txt in report");
-    assert_eq!(txt["handler"], "textual", "demoted handler must be in effect");
+    assert_eq!(
+        txt["handler"], "textual",
+        "demoted handler must be in effect"
+    );
 }
 
 #[test]
@@ -386,7 +410,10 @@ fn merge_local_toml_promotion_is_rejected() {
     .unwrap();
     let (code, _, e) = run(&["merge", "f"], &work, &xdg);
     assert_ne!(code, 0, "promotion must error out");
-    assert!(e.contains("merge.local.toml"), "error must name the offending file: {e}");
+    assert!(
+        e.contains("merge.local.toml"),
+        "error must name the offending file: {e}"
+    );
     assert!(e.contains("promote"), "error must say 'promote': {e}");
 }
 

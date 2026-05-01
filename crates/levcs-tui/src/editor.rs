@@ -79,10 +79,7 @@ pub fn run_editor_on(initial: &[u8], path_hint: &Path) -> Result<EditOutcome, Ed
     let tmp = make_tempfile(path_hint)?;
     std::fs::write(&tmp, initial)?;
 
-    let status = Command::new(prog)
-        .args(&leading)
-        .arg(&tmp)
-        .status()?;
+    let status = Command::new(prog).args(&leading).arg(&tmp).status()?;
     if !status.success() {
         let _ = std::fs::remove_file(&tmp);
         return Err(EditError::EditorFailed(status.code().unwrap_or(-1)));
@@ -109,7 +106,10 @@ fn make_tempfile(hint: &Path) -> std::io::Result<PathBuf> {
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("buffer");
-    p.push(format!("levcs-review-{}-{nanos}-{base}", std::process::id()));
+    p.push(format!(
+        "levcs-review-{}-{nanos}-{base}",
+        std::process::id()
+    ));
     Ok(p)
 }
 

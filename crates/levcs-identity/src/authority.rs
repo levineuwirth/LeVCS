@@ -32,7 +32,11 @@ impl Role {
             2 => Self::Contributor,
             3 => Self::Maintainer,
             4 => Self::Owner,
-            n => return Err(IdentityError::MalformedAuthority(format!("unknown role: {n}"))),
+            n => {
+                return Err(IdentityError::MalformedAuthority(format!(
+                    "unknown role: {n}"
+                )))
+            }
         })
     }
 
@@ -51,7 +55,11 @@ impl Role {
             "contributor" => Self::Contributor,
             "maintainer" => Self::Maintainer,
             "owner" => Self::Owner,
-            other => return Err(IdentityError::MalformedAuthority(format!("unknown role: {other}"))),
+            other => {
+                return Err(IdentityError::MalformedAuthority(format!(
+                    "unknown role: {other}"
+                )))
+            }
         })
     }
 }
@@ -85,14 +93,19 @@ pub struct AuthorityBody {
 }
 
 impl AuthorityBody {
-    pub fn is_genesis(&self) -> bool { self.previous_authority.is_zero() }
+    pub fn is_genesis(&self) -> bool {
+        self.previous_authority.is_zero()
+    }
 
     pub fn find_member(&self, key: &PublicKey) -> Option<&MemberEntry> {
         self.members.iter().find(|m| m.key == *key)
     }
 
     pub fn policy_value(&self, key: &str) -> Option<&[u8]> {
-        self.policy.iter().find(|p| p.key == key).map(|p| p.value.as_slice())
+        self.policy
+            .iter()
+            .find(|p| p.key == key)
+            .map(|p| p.value.as_slice())
     }
 
     pub fn public_read(&self) -> bool {
@@ -106,7 +119,12 @@ impl AuthorityBody {
     pub fn protected_branches(&self) -> Vec<String> {
         self.policy_value("protected_branches")
             .and_then(|v| std::str::from_utf8(v).ok())
-            .map(|s| s.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect())
+            .map(|s| {
+                s.split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -116,7 +134,8 @@ impl AuthorityBody {
         for m in &self.members {
             if m.handle.len() > 64 {
                 return Err(IdentityError::MalformedAuthority(format!(
-                    "handle too long: {} bytes", m.handle.len()
+                    "handle too long: {} bytes",
+                    m.handle.len()
                 )));
             }
         }
@@ -124,22 +143,29 @@ impl AuthorityBody {
         for w in self.members.windows(2) {
             if w[0].key == w[1].key {
                 return Err(IdentityError::MalformedAuthority(format!(
-                    "duplicate member: {}", w[0].key
+                    "duplicate member: {}",
+                    w[0].key
                 )));
             }
         }
-        self.policy.sort_by(|a, b| a.key.as_bytes().cmp(b.key.as_bytes()));
+        self.policy
+            .sort_by(|a, b| a.key.as_bytes().cmp(b.key.as_bytes()));
         for w in self.policy.windows(2) {
             if w[0].key == w[1].key {
                 return Err(IdentityError::MalformedAuthority(format!(
-                    "duplicate policy key: {}", w[0].key
+                    "duplicate policy key: {}",
+                    w[0].key
                 )));
             }
             if w[0].key.len() > 255 {
-                return Err(IdentityError::MalformedAuthority("policy key too long".into()));
+                return Err(IdentityError::MalformedAuthority(
+                    "policy key too long".into(),
+                ));
             }
             if w[0].value.len() > u16::MAX as usize {
-                return Err(IdentityError::MalformedAuthority("policy value too large".into()));
+                return Err(IdentityError::MalformedAuthority(
+                    "policy value too large".into(),
+                ));
             }
         }
         Ok(())
@@ -222,7 +248,9 @@ fn encode_body(b: &AuthorityBody) -> Result<Vec<u8>> {
         out.extend_from_slice(m.added_by.as_bytes());
     }
     if b.policy.len() > u16::MAX as usize {
-        return Err(IdentityError::MalformedAuthority("too many policy entries".into()));
+        return Err(IdentityError::MalformedAuthority(
+            "too many policy entries".into(),
+        ));
     }
     let mut pc = [0u8; 2];
     LittleEndian::write_u16(&mut pc, b.policy.len() as u16);
@@ -240,7 +268,9 @@ fn encode_body(b: &AuthorityBody) -> Result<Vec<u8>> {
 
 fn decode_body(bytes: &[u8]) -> Result<AuthorityBody> {
     if bytes.len() < 2 + 32 + 32 + 4 + 8 + 2 {
-        return Err(IdentityError::MalformedAuthority("authority body too short".into()));
+        return Err(IdentityError::MalformedAuthority(
+            "authority body too short".into(),
+        ));
     }
     let mut p = 0usize;
     let schema_version = LittleEndian::read_u16(&bytes[p..p + 2]);
@@ -265,7 +295,9 @@ fn decode_body(bytes: &[u8]) -> Result<AuthorityBody> {
     let mut members = Vec::with_capacity(member_count);
     for _ in 0..member_count {
         if bytes.len() < p + 32 + 2 {
-            return Err(IdentityError::MalformedAuthority("member entry truncated".into()));
+            return Err(IdentityError::MalformedAuthority(
+                "member entry truncated".into(),
+            ));
         }
         let mut k = [0u8; 32];
         k.copy_from_slice(&bytes[p..p + 32]);
@@ -273,7 +305,9 @@ fn decode_body(bytes: &[u8]) -> Result<AuthorityBody> {
         let hl = LittleEndian::read_u16(&bytes[p..p + 2]) as usize;
         p += 2;
         if bytes.len() < p + hl + 1 + 8 + 32 {
-            return Err(IdentityError::MalformedAuthority("member entry truncated".into()));
+            return Err(IdentityError::MalformedAuthority(
+                "member entry truncated".into(),
+            ));
         }
         let handle = std::str::from_utf8(&bytes[p..p + hl])
             .map_err(|_| IdentityError::MalformedAuthority("handle not UTF-8".into()))?
@@ -295,19 +329,25 @@ fn decode_body(bytes: &[u8]) -> Result<AuthorityBody> {
         });
     }
     if bytes.len() < p + 2 {
-        return Err(IdentityError::MalformedAuthority("policy_count truncated".into()));
+        return Err(IdentityError::MalformedAuthority(
+            "policy_count truncated".into(),
+        ));
     }
     let policy_count = LittleEndian::read_u16(&bytes[p..p + 2]) as usize;
     p += 2;
     let mut policy = Vec::with_capacity(policy_count);
     for _ in 0..policy_count {
         if bytes.len() < p + 1 {
-            return Err(IdentityError::MalformedAuthority("policy entry truncated".into()));
+            return Err(IdentityError::MalformedAuthority(
+                "policy entry truncated".into(),
+            ));
         }
         let kl = bytes[p] as usize;
         p += 1;
         if bytes.len() < p + kl + 2 {
-            return Err(IdentityError::MalformedAuthority("policy entry truncated".into()));
+            return Err(IdentityError::MalformedAuthority(
+                "policy entry truncated".into(),
+            ));
         }
         let key = std::str::from_utf8(&bytes[p..p + kl])
             .map_err(|_| IdentityError::MalformedAuthority("policy key not UTF-8".into()))?
@@ -316,7 +356,9 @@ fn decode_body(bytes: &[u8]) -> Result<AuthorityBody> {
         let vl = LittleEndian::read_u16(&bytes[p..p + 2]) as usize;
         p += 2;
         if bytes.len() < p + vl {
-            return Err(IdentityError::MalformedAuthority("policy value truncated".into()));
+            return Err(IdentityError::MalformedAuthority(
+                "policy value truncated".into(),
+            ));
         }
         let value = bytes[p..p + vl].to_vec();
         p += vl;
@@ -324,7 +366,8 @@ fn decode_body(bytes: &[u8]) -> Result<AuthorityBody> {
     }
     if p != bytes.len() {
         return Err(IdentityError::MalformedAuthority(format!(
-            "trailing {} byte(s) after authority body", bytes.len() - p
+            "trailing {} byte(s) after authority body",
+            bytes.len() - p
         )));
     }
     Ok(AuthorityBody {
@@ -386,7 +429,10 @@ pub fn parse_toml_authority(text: &str) -> Result<AuthorityBody> {
     }
     let mut policy = Vec::new();
     for (k, v) in t.policy {
-        policy.push(PolicyEntry { key: k, value: encode_policy_value(&v) });
+        policy.push(PolicyEntry {
+            key: k,
+            value: encode_policy_value(&v),
+        });
     }
     let mut body = AuthorityBody {
         schema_version: t.schema_version,
@@ -435,9 +481,9 @@ pub fn render_toml_authority(body: &AuthorityBody) -> Result<String> {
 }
 
 fn parse_blake3(s: &str) -> Result<ObjectId> {
-    let rest = s
-        .strip_prefix("blake3:")
-        .ok_or_else(|| IdentityError::MalformedAuthority(format!("missing blake3: prefix in {s}")))?;
+    let rest = s.strip_prefix("blake3:").ok_or_else(|| {
+        IdentityError::MalformedAuthority(format!("missing blake3: prefix in {s}"))
+    })?;
     Ok(ObjectId::from_hex(rest).map_err(|e| IdentityError::MalformedAuthority(e.to_string()))?)
 }
 
@@ -449,11 +495,19 @@ fn parse_rfc3339_micros(s: &str) -> Result<i64> {
         .ok_or_else(|| IdentityError::MalformedAuthority(format!("bad timestamp: {s}")))?;
     let dparts: Vec<&str> = date.split('-').collect();
     if dparts.len() != 3 {
-        return Err(IdentityError::MalformedAuthority(format!("bad date: {date}")));
+        return Err(IdentityError::MalformedAuthority(format!(
+            "bad date: {date}"
+        )));
     }
-    let y: i64 = dparts[0].parse().map_err(|_| IdentityError::MalformedAuthority(s.into()))?;
-    let mo: u32 = dparts[1].parse().map_err(|_| IdentityError::MalformedAuthority(s.into()))?;
-    let d: u32 = dparts[2].parse().map_err(|_| IdentityError::MalformedAuthority(s.into()))?;
+    let y: i64 = dparts[0]
+        .parse()
+        .map_err(|_| IdentityError::MalformedAuthority(s.into()))?;
+    let mo: u32 = dparts[1]
+        .parse()
+        .map_err(|_| IdentityError::MalformedAuthority(s.into()))?;
+    let d: u32 = dparts[2]
+        .parse()
+        .map_err(|_| IdentityError::MalformedAuthority(s.into()))?;
     let rest = rest.trim_end_matches('Z');
     let (time, frac) = match rest.split_once('.') {
         Some((t, f)) => (t, f),
@@ -461,11 +515,19 @@ fn parse_rfc3339_micros(s: &str) -> Result<i64> {
     };
     let tparts: Vec<&str> = time.split(':').collect();
     if tparts.len() != 3 {
-        return Err(IdentityError::MalformedAuthority(format!("bad time: {time}")));
+        return Err(IdentityError::MalformedAuthority(format!(
+            "bad time: {time}"
+        )));
     }
-    let h: i64 = tparts[0].parse().map_err(|_| IdentityError::MalformedAuthority(s.into()))?;
-    let mi: i64 = tparts[1].parse().map_err(|_| IdentityError::MalformedAuthority(s.into()))?;
-    let se: i64 = tparts[2].parse().map_err(|_| IdentityError::MalformedAuthority(s.into()))?;
+    let h: i64 = tparts[0]
+        .parse()
+        .map_err(|_| IdentityError::MalformedAuthority(s.into()))?;
+    let mi: i64 = tparts[1]
+        .parse()
+        .map_err(|_| IdentityError::MalformedAuthority(s.into()))?;
+    let se: i64 = tparts[2]
+        .parse()
+        .map_err(|_| IdentityError::MalformedAuthority(s.into()))?;
     let micros_frac: i64 = if frac.is_empty() {
         0
     } else {
@@ -474,7 +536,8 @@ fn parse_rfc3339_micros(s: &str) -> Result<i64> {
         while s6.len() < 6 {
             s6.push('0');
         }
-        s6.parse().map_err(|_| IdentityError::MalformedAuthority("bad fractional seconds".into()))?
+        s6.parse()
+            .map_err(|_| IdentityError::MalformedAuthority("bad fractional seconds".into()))?
     };
     let days = ymd_to_days(y, mo, d);
     let total_secs = days * 86400 + h * 3600 + mi * 60 + se;
@@ -579,8 +642,14 @@ mod tests {
                 added_by: pk,
             }],
             policy: vec![
-                PolicyEntry { key: "public_read".into(), value: vec![0x01] },
-                PolicyEntry { key: "allowed_handlers".into(), value: b"builtin".to_vec() },
+                PolicyEntry {
+                    key: "public_read".into(),
+                    value: vec![0x01],
+                },
+                PolicyEntry {
+                    key: "allowed_handlers".into(),
+                    value: b"builtin".to_vec(),
+                },
             ],
         };
         body.normalize().unwrap();
@@ -607,7 +676,10 @@ mod tests {
                 added_micros: 1_700_000_000_000_000,
                 added_by: pk,
             }],
-            policy: vec![PolicyEntry { key: "public_read".into(), value: vec![0x01] }],
+            policy: vec![PolicyEntry {
+                key: "public_read".into(),
+                value: vec![0x01],
+            }],
         };
         body.assign_genesis_repo_id().unwrap();
         let toml_text = render_toml_authority(&body).unwrap();

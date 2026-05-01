@@ -122,7 +122,10 @@ impl ReviewState {
     }
 
     pub fn next_region(&mut self) {
-        let n = self.current_file().map(|f| f.conflict_regions().len()).unwrap_or(0);
+        let n = self
+            .current_file()
+            .map(|f| f.conflict_regions().len())
+            .unwrap_or(0);
         if n > 0 && self.selected_region + 1 < n {
             self.selected_region += 1;
         }
@@ -154,11 +157,21 @@ impl ReviewState {
         }
     }
 
-    pub fn accept_ours(&mut self) { self.set_current_resolution(Resolution::AcceptOurs); }
-    pub fn accept_theirs(&mut self) { self.set_current_resolution(Resolution::AcceptTheirs); }
-    pub fn keep_current(&mut self) { self.set_current_resolution(Resolution::KeepCurrent); }
-    pub fn skip(&mut self) { self.set_current_resolution(Resolution::Skip); }
-    pub fn quit(&mut self) { self.quitting = true; }
+    pub fn accept_ours(&mut self) {
+        self.set_current_resolution(Resolution::AcceptOurs);
+    }
+    pub fn accept_theirs(&mut self) {
+        self.set_current_resolution(Resolution::AcceptTheirs);
+    }
+    pub fn keep_current(&mut self) {
+        self.set_current_resolution(Resolution::KeepCurrent);
+    }
+    pub fn skip(&mut self) {
+        self.set_current_resolution(Resolution::Skip);
+    }
+    pub fn quit(&mut self) {
+        self.quitting = true;
+    }
 
     /// Walk every file and write the chosen bytes. Returns
     /// `(written, skipped)`. Errors short-circuit — partial writes are
@@ -170,7 +183,10 @@ impl ReviewState {
         // count every file as skipped so the caller can still report
         // the totals it expects.
         if self.read_only {
-            return Ok(ApplyReport { written: 0, skipped: self.files.len() });
+            return Ok(ApplyReport {
+                written: 0,
+                skipped: self.files.len(),
+            });
         }
         let mut written = 0usize;
         let mut skipped = 0usize;
@@ -230,10 +246,12 @@ fn write_file(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
             t.set_file_name(name);
             t
         }
-        None => return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "target has no file name",
-        )),
+        None => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "target has no file name",
+            ))
+        }
     };
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, target)?;
@@ -249,15 +267,30 @@ mod tests {
         let conflict_regions: Vec<ConflictRegion> = (0..regions)
             .map(|i| ConflictRegion {
                 description: format!("region {i}"),
-                base: Range { start: i * 10, end: i * 10 + 5 },
-                ours: Range { start: i * 10, end: i * 10 + 7 },
-                theirs: Range { start: i * 10, end: i * 10 + 6 },
+                base: Range {
+                    start: i * 10,
+                    end: i * 10 + 5,
+                },
+                ours: Range {
+                    start: i * 10,
+                    end: i * 10 + 7,
+                },
+                theirs: Range {
+                    start: i * 10,
+                    end: i * 10 + 6,
+                },
             })
             .collect();
         let status = if regions == 0 {
-            MergeStatus::Merged { content: b"ok".to_vec(), notes: vec![] }
+            MergeStatus::Merged {
+                content: b"ok".to_vec(),
+                notes: vec![],
+            }
         } else {
-            MergeStatus::Conflict { regions: conflict_regions, partial: vec![] }
+            MergeStatus::Conflict {
+                regions: conflict_regions,
+                partial: vec![],
+            }
         };
         FileEntry {
             path: path.into(),
@@ -359,14 +392,8 @@ mod tests {
         assert_eq!(report.written, 2);
         assert_eq!(report.skipped, 1);
 
-        assert_eq!(
-            std::fs::read(dir.join("a.txt")).unwrap(),
-            b"OURS-a.txt"
-        );
-        assert_eq!(
-            std::fs::read(dir.join("b.txt")).unwrap(),
-            b"THEIRS-b.txt"
-        );
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"OURS-a.txt");
+        assert_eq!(std::fs::read(dir.join("b.txt")).unwrap(), b"THEIRS-b.txt");
         // Skipped file untouched.
         assert_eq!(std::fs::read(dir.join("c.txt")).unwrap(), b"original-c");
 
@@ -387,7 +414,9 @@ mod tests {
         std::fs::write(dir.join("a.txt"), b"original").unwrap();
 
         let mut s = ReviewState::new(vec![entry("a.txt", 1)]);
-        s.set_current_resolution(Resolution::Edit { bytes: b"hand-edited".to_vec() });
+        s.set_current_resolution(Resolution::Edit {
+            bytes: b"hand-edited".to_vec(),
+        });
         let report = s.apply(&dir).unwrap();
         assert_eq!(report.written, 1);
         assert_eq!(report.skipped, 0);

@@ -156,7 +156,10 @@ fn key_parsers_handle_almost_valid_inputs() {
                 1 => 'g',
                 2 => 'Z',
                 3 => ' ',
-                _ => "0123456789abcdef".chars().nth((lcg(&mut seed) % 16) as usize).unwrap(),
+                _ => "0123456789abcdef"
+                    .chars()
+                    .nth((lcg(&mut seed) % 16) as usize)
+                    .unwrap(),
             };
             hex_part.push(c);
         }

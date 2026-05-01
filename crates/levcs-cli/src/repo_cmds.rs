@@ -7,11 +7,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Result};
 
 use levcs_core::object::{ObjectType, SignedObject};
+use levcs_core::refs::Head;
 use levcs_core::{
     Blob, Commit, CommitFlags, Index, IndexEntry, IndexEntryFlags, ObjectId, Refs, Release,
     Repository, Tree, ZERO_ID,
 };
-use levcs_core::refs::Head;
 use levcs_identity::authority::{
     AuthorityBody, MemberEntry, PolicyEntry, Role, AUTHORITY_SCHEMA_VERSION,
 };
@@ -32,7 +32,11 @@ use crate::ctx::{load_keychain, load_secret, now_micros, open_repo, save_keychai
 
 pub fn init(args: InitArgs) -> Result<()> {
     let path = args.path.unwrap_or_else(|| PathBuf::from("."));
-    let path = if path.is_absolute() { path } else { std::env::current_dir()?.join(path) };
+    let path = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()?.join(path)
+    };
     fs::create_dir_all(&path)?;
     if path.join(".levcs").exists() {
         bail!("repository already exists at {:?}", path);
@@ -47,7 +51,10 @@ pub fn init(args: InitArgs) -> Result<()> {
         let sk = SecretKey::generate();
         kc.add_plaintext(&label, &sk)?;
         save_keychain(&kc)?;
-        eprintln!("generated new key '{label}' at {:?}", crate::ctx::keychain_path());
+        eprintln!(
+            "generated new key '{label}' at {:?}",
+            crate::ctx::keychain_path()
+        );
         sk
     };
     let pk = sk.public();
@@ -68,9 +75,18 @@ pub fn init(args: InitArgs) -> Result<()> {
             added_by: pk,
         }],
         policy: vec![
-            PolicyEntry { key: "public_read".into(), value: vec![0x01] },
-            PolicyEntry { key: "require_signed_releases".into(), value: vec![0x01] },
-            PolicyEntry { key: "allowed_handlers".into(), value: b"builtin".to_vec() },
+            PolicyEntry {
+                key: "public_read".into(),
+                value: vec![0x01],
+            },
+            PolicyEntry {
+                key: "require_signed_releases".into(),
+                value: vec![0x01],
+            },
+            PolicyEntry {
+                key: "allowed_handlers".into(),
+                value: b"builtin".to_vec(),
+            },
         ],
     };
     auth.normalize()?;
@@ -83,10 +99,13 @@ pub fn init(args: InitArgs) -> Result<()> {
     repo.set_genesis_authority(auth_id)?;
     repo.set_current_authority(auth_id)?;
     // Create empty `main` branch HEAD pointer.
-    repo.refs.write_head(&Head::Branch("refs/branches/main".into()))?;
+    repo.refs
+        .write_head(&Head::Branch("refs/branches/main".into()))?;
     eprintln!(
         "initialized levcs repository at {:?}\n  repo_id     = blake3:{}\n  authority   = {}",
-        path, auth.repo_id.to_hex(), auth_id
+        path,
+        auth.repo_id.to_hex(),
+        auth_id
     );
     Ok(())
 }
@@ -103,7 +122,11 @@ pub fn track(args: TrackArgs) -> Result<()> {
         targets.extend(repo.walk_workdir()?);
     } else {
         for p in args.paths {
-            let abs = if p.is_absolute() { p } else { repo.workdir.join(p) };
+            let abs = if p.is_absolute() {
+                p
+            } else {
+                repo.workdir.join(p)
+            };
             if abs.is_dir() {
                 walk_dir(&abs, &repo.workdir, &mut targets)?;
             } else if abs.is_file() {
@@ -114,7 +137,10 @@ pub fn track(args: TrackArgs) -> Result<()> {
         }
     }
     for path in targets {
-        let rel = path.strip_prefix(&repo.workdir)?.to_string_lossy().replace('\\', "/");
+        let rel = path
+            .strip_prefix(&repo.workdir)?
+            .to_string_lossy()
+            .replace('\\', "/");
         let bytes = fs::read(&path)?;
         let blob = Blob::new(bytes.clone());
         let id = repo.objects.write_raw(&blob.serialize())?;
@@ -139,8 +165,15 @@ pub fn forget(args: ForgetArgs) -> Result<()> {
     let repo = open_repo()?;
     let mut idx = repo.read_index()?;
     for p in args.paths {
-        let abs = if p.is_absolute() { p } else { repo.workdir.join(&p) };
-        let rel = abs.strip_prefix(&repo.workdir)?.to_string_lossy().replace('\\', "/");
+        let abs = if p.is_absolute() {
+            p
+        } else {
+            repo.workdir.join(&p)
+        };
+        let rel = abs
+            .strip_prefix(&repo.workdir)?
+            .to_string_lossy()
+            .replace('\\', "/");
         idx.remove(&rel);
         if !args.keep_file {
             let _ = fs::remove_file(&abs);
@@ -191,7 +224,10 @@ pub fn status() -> Result<()> {
     let mut modified = Vec::new();
     let mut untracked = Vec::new();
     for path in workdir_files {
-        let rel = path.strip_prefix(&repo.workdir)?.to_string_lossy().replace('\\', "/");
+        let rel = path
+            .strip_prefix(&repo.workdir)?
+            .to_string_lossy()
+            .replace('\\', "/");
         match tracked.get(&rel) {
             None => untracked.push(rel),
             Some(entry) => {
@@ -206,7 +242,12 @@ pub fn status() -> Result<()> {
     let work_set: HashSet<String> = repo
         .walk_workdir()?
         .iter()
-        .map(|p| p.strip_prefix(&repo.workdir).unwrap().to_string_lossy().replace('\\', "/"))
+        .map(|p| {
+            p.strip_prefix(&repo.workdir)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
         .collect();
     let mut deleted: Vec<String> = idx
         .entries
@@ -217,15 +258,21 @@ pub fn status() -> Result<()> {
     deleted.sort();
     if !modified.is_empty() {
         println!("\nmodified:");
-        for m in &modified { println!("  {m}"); }
+        for m in &modified {
+            println!("  {m}");
+        }
     }
     if !deleted.is_empty() {
         println!("\ndeleted:");
-        for d in &deleted { println!("  {d}"); }
+        for d in &deleted {
+            println!("  {d}");
+        }
     }
     if !untracked.is_empty() {
         println!("\nuntracked:");
-        for u in &untracked { println!("  {u}"); }
+        for u in &untracked {
+            println!("  {u}");
+        }
     }
     if modified.is_empty() && deleted.is_empty() && untracked.is_empty() {
         println!("\nworking tree clean.");
@@ -248,8 +295,12 @@ pub fn log(_args: LogArgs) -> Result<()> {
         println!("commit {}", id);
         println!("Author: {}", pk);
         println!("Date:   {} (us since epoch)", commit.timestamp_micros);
-        if commit.flags.modifies_authority() { println!("Flags:  authority-modifying"); }
-        if commit.flags.is_fork() { println!("Flags:  fork"); }
+        if commit.flags.modifies_authority() {
+            println!("Flags:  authority-modifying");
+        }
+        if commit.flags.is_fork() {
+            println!("Flags:  fork");
+        }
         println!();
         for line in commit.message.lines() {
             println!("    {line}");
@@ -308,7 +359,9 @@ pub fn commit(args: CommitArgs) -> Result<()> {
                     e.path
                 );
             }
-            let blob_id = repo.objects.write_raw(&Blob::new(bytes.clone()).serialize())?;
+            let blob_id = repo
+                .objects
+                .write_raw(&Blob::new(bytes.clone()).serialize())?;
             let meta = fs::metadata(&abs)?;
             new_entries.push(IndexEntry {
                 path: e.path.clone(),
@@ -379,7 +432,10 @@ pub fn commit(args: CommitArgs) -> Result<()> {
         .find_member(&pk)
         .ok_or_else(|| anyhow!("your key is not in the current authority"))?;
     if member.role < Role::Contributor {
-        bail!("your key has role '{}', need at least contributor", member.role.name());
+        bail!(
+            "your key has role '{}', need at least contributor",
+            member.role.name()
+        );
     }
 
     let default_message = match merge_head_id {
@@ -509,7 +565,11 @@ pub fn construct(args: ConstructArgs) -> Result<()> {
 
     // Path-restricted reconstruction.
     for p in paths {
-        let abs = if p.is_absolute() { p.clone() } else { repo.workdir.join(&p) };
+        let abs = if p.is_absolute() {
+            p.clone()
+        } else {
+            repo.workdir.join(&p)
+        };
         let rel = abs
             .strip_prefix(&repo.workdir)
             .map_err(|_| anyhow!("path {:?} is outside the repository", p))?;
@@ -603,7 +663,9 @@ pub fn diff(args: DiffArgs) -> Result<()> {
         if restrict.is_empty() {
             return true;
         }
-        restrict.iter().any(|r| p == r || p.starts_with(&format!("{r}/")))
+        restrict
+            .iter()
+            .any(|r| p == r || p.starts_with(&format!("{r}/")))
     };
 
     let baseline = collect_tree_files(&repo, baseline_tree, "")?;
@@ -611,7 +673,10 @@ pub fn diff(args: DiffArgs) -> Result<()> {
         .walk_workdir()?
         .into_iter()
         .map(|p| -> Result<_> {
-            let rel = p.strip_prefix(&repo.workdir)?.to_string_lossy().replace('\\', "/");
+            let rel = p
+                .strip_prefix(&repo.workdir)?
+                .to_string_lossy()
+                .replace('\\', "/");
             let bytes = fs::read(&p)?;
             Ok((rel, bytes))
         })
@@ -626,7 +691,9 @@ pub fn diff(args: DiffArgs) -> Result<()> {
         }
         let a = baseline.get(k).cloned().unwrap_or_default();
         let b = work.get(k).cloned().unwrap_or_default();
-        if a == b { continue; }
+        if a == b {
+            continue;
+        }
         println!("--- a/{k}\n+++ b/{k}");
         let a_s = String::from_utf8_lossy(&a);
         let b_s = String::from_utf8_lossy(&b);
@@ -655,7 +722,11 @@ fn collect_tree_files(
     let raw = repo.objects.read_typed(tree_id, ObjectType::Tree)?;
     let tree = Tree::parse_body(&raw.body)?;
     for e in tree.entries {
-        let path = if prefix.is_empty() { e.name.clone() } else { format!("{prefix}/{}", e.name) };
+        let path = if prefix.is_empty() {
+            e.name.clone()
+        } else {
+            format!("{prefix}/{}", e.name)
+        };
         match e.entry_type {
             levcs_core::EntryType::Blob => {
                 let blob = repo.objects.read_typed(e.hash, ObjectType::Blob)?;
@@ -679,7 +750,11 @@ pub fn branch(args: BranchArgs) -> Result<()> {
     if args.list || (args.create.is_none() && args.switch.is_none() && args.delete.is_none()) {
         let cur = repo.current_branch()?.unwrap_or_default();
         for (name, id) in repo.refs.list_branches()? {
-            let marker = if cur == format!("refs/branches/{name}") { "*" } else { " " };
+            let marker = if cur == format!("refs/branches/{name}") {
+                "*"
+            } else {
+                " "
+            };
             println!("{marker} {name}\t{id}");
         }
         return Ok(());
@@ -687,7 +762,10 @@ pub fn branch(args: BranchArgs) -> Result<()> {
     if let Some(name) = args.create {
         let from = match args.from {
             Some(s) => ObjectId::from_hex(&s)?,
-            None => repo.refs.resolve_head()?.ok_or_else(|| anyhow!("no HEAD"))?,
+            None => repo
+                .refs
+                .resolve_head()?
+                .ok_or_else(|| anyhow!("no HEAD"))?,
         };
         repo.refs.write(&format!("refs/branches/{name}"), from)?;
         eprintln!("created branch {name} at {from}");
@@ -697,7 +775,8 @@ pub fn branch(args: BranchArgs) -> Result<()> {
             .refs
             .read(&format!("refs/branches/{name}"))?
             .ok_or_else(|| anyhow!("no such branch: {name}"))?;
-        repo.refs.write_head(&Head::Branch(format!("refs/branches/{name}")))?;
+        repo.refs
+            .write_head(&Head::Branch(format!("refs/branches/{name}")))?;
         let raw = repo.read_raw_object(target)?;
         let tree_id = match raw.object_type {
             ObjectType::Commit => Commit::parse_body(&raw.body)?.tree,
@@ -787,7 +866,11 @@ fn merge_run(args: MergeArgs) -> Result<()> {
         files: Vec::new(),
     };
     let mut paths: BTreeSet<String> = BTreeSet::new();
-    for k in base_files.keys().chain(ours_files.keys()).chain(theirs_files.keys()) {
+    for k in base_files
+        .keys()
+        .chain(ours_files.keys())
+        .chain(theirs_files.keys())
+    {
         // .levcs/* synthetic tree entries (authority, merge-record) live in
         // commits but never on disk; skip them when reconciling files.
         if k.starts_with(".levcs/") || k == ".levcs" {
@@ -798,7 +881,10 @@ fn merge_run(args: MergeArgs) -> Result<()> {
 
     let json_mode = args.format == "json";
     if !json_mode && args.format != "text" {
-        bail!("unknown --format value: {} (allowed: text, json)", args.format);
+        bail!(
+            "unknown --format value: {} (allowed: text, json)",
+            args.format
+        );
     }
     let mut auto_resolved = 0usize;
     let mut conflict_count = 0usize;
@@ -900,7 +986,10 @@ fn merge_run(args: MergeArgs) -> Result<()> {
                 auto_resolved += 1;
                 merged_files.insert(path.clone(), content.clone());
             }
-            MergeStatus::Conflict { partial, regions: _ } => {
+            MergeStatus::Conflict {
+                partial,
+                regions: _,
+            } => {
                 conflict_count += 1;
                 merged_files.insert(path.clone(), partial.clone());
             }
@@ -930,7 +1019,9 @@ fn merge_run(args: MergeArgs) -> Result<()> {
     // without re-reading the working directory's view of every file.
     let mut idx = Index::new();
     for (path, bytes) in &merged_files {
-        let id = repo.objects.write_raw(&Blob::new(bytes.clone()).serialize())?;
+        let id = repo
+            .objects
+            .write_raw(&Blob::new(bytes.clone()).serialize())?;
         let mut flags = IndexEntryFlags::TRACKED;
         if let Some(fr) = record.files.iter().find(|fr| fr.path == *path) {
             if matches!(fr.status, FileStatus::Manual) {
@@ -999,7 +1090,9 @@ fn merge_run(args: MergeArgs) -> Result<()> {
     println!("  conflicts:     {conflict_count}");
     println!();
     if conflict_count > 0 {
-        println!("review with `levcs merge --review`, or edit conflicted files and run `levcs commit`.");
+        println!(
+            "review with `levcs merge --review`, or edit conflicted files and run `levcs commit`."
+        );
         std::process::exit(1);
     }
     println!("clean merge. run `levcs commit` to finalize.");
@@ -1030,10 +1123,10 @@ fn load_effective_merge_config(repo: &Repository) -> Result<MergeConfig> {
     if !local_path.exists() {
         return Ok(base);
     }
-    let local_raw = fs::read_to_string(&local_path)
-        .map_err(|e| anyhow!("read merge.local.toml: {e}"))?;
-    let local: MergeConfig = toml::from_str(&local_raw)
-        .map_err(|e| anyhow!("parse merge.local.toml: {e}"))?;
+    let local_raw =
+        fs::read_to_string(&local_path).map_err(|e| anyhow!("read merge.local.toml: {e}"))?;
+    let local: MergeConfig =
+        toml::from_str(&local_raw).map_err(|e| anyhow!("parse merge.local.toml: {e}"))?;
     levcs_merge::engine::layer_local_over(&base, &local)
         .map_err(|e| anyhow!("merge.local.toml: {e}"))
 }
@@ -1284,15 +1377,12 @@ fn merge_explain() -> Result<()> {
             .resolve_head()?
             .ok_or_else(|| anyhow!("no HEAD"))?;
         let head_commit = Commit::from_signed(&repo.read_signed(head_id)?)?;
-        let merge_head_id = ObjectId::from_hex(
-            fs::read_to_string(repo.levcs_dir.join("MERGE_HEAD"))?
-                .trim(),
-        )?;
+        let merge_head_id =
+            ObjectId::from_hex(fs::read_to_string(repo.levcs_dir.join("MERGE_HEAD"))?.trim())?;
         let merge_head_commit = Commit::from_signed(&repo.read_signed(merge_head_id)?)?;
         let base_tree = if repo.levcs_dir.join("MERGE_BASE").exists() {
-            let id = ObjectId::from_hex(
-                fs::read_to_string(repo.levcs_dir.join("MERGE_BASE"))?.trim(),
-            )?;
+            let id =
+                ObjectId::from_hex(fs::read_to_string(repo.levcs_dir.join("MERGE_BASE"))?.trim())?;
             Some(Commit::from_signed(&repo.read_signed(id)?)?.tree)
         } else {
             None
@@ -1314,8 +1404,8 @@ fn merge_explain() -> Result<()> {
             .lookup_path(head_commit.tree, ".levcs/merge-record")?
             .ok_or_else(|| anyhow!("no merge-record on HEAD or in progress"))?;
         let blob = repo.objects.read_typed(entry.1, ObjectType::Blob)?;
-        let text = String::from_utf8(blob.body)
-            .map_err(|_| anyhow!("merge-record is not UTF-8"))?;
+        let text =
+            String::from_utf8(blob.body).map_err(|_| anyhow!("merge-record is not UTF-8"))?;
         // For a committed merge, "ours" is HEAD's first parent and
         // "theirs" is HEAD's second parent. If the commit isn't a
         // merge, we have nothing to step through — fall back to text.
@@ -1360,7 +1450,9 @@ fn merge_explain() -> Result<()> {
         .map(|fr| {
             let ours = read_path(ours_tree, &fr.path);
             let theirs = read_path(theirs_tree, &fr.path);
-            let base = base_tree.map(|t| read_path(t, &fr.path)).unwrap_or_default();
+            let base = base_tree
+                .map(|t| read_path(t, &fr.path))
+                .unwrap_or_default();
             // For explain, the "current" pane shows the *result* of the
             // merge — i.e., what the engine produced for this file.
             // For an in-progress merge that's the working tree; for a
@@ -1381,7 +1473,9 @@ fn merge_explain() -> Result<()> {
                     notes: if fr.notes.is_empty() {
                         vec![]
                     } else {
-                        vec![levcs_merge::MergeNote { message: fr.notes.clone() }]
+                        vec![levcs_merge::MergeNote {
+                            message: fr.notes.clone(),
+                        }]
                     },
                 },
                 FileStatus::Manual => MergeStatus::Conflict {
@@ -1438,8 +1532,7 @@ fn merge_review() -> Result<()> {
         bail!("no merge in progress");
     }
     let s = fs::read_to_string(&merge_record_path)?;
-    let record = MergeRecord::from_toml(&s)
-        .map_err(|e| anyhow!("parse merge-record: {e}"))?;
+    let record = MergeRecord::from_toml(&s).map_err(|e| anyhow!("parse merge-record: {e}"))?;
 
     // Resolve the three side trees the review needs.
     //   * ours  — current HEAD's tree (what we had before the merge).
@@ -1452,10 +1545,8 @@ fn merge_review() -> Result<()> {
     let head_commit = Commit::from_signed(&repo.read_signed(head_id)?)?;
     let ours_tree = head_commit.tree;
 
-    let merge_head_id = ObjectId::from_hex(
-        fs::read_to_string(repo.levcs_dir.join("MERGE_HEAD"))?
-            .trim(),
-    )?;
+    let merge_head_id =
+        ObjectId::from_hex(fs::read_to_string(repo.levcs_dir.join("MERGE_HEAD"))?.trim())?;
     let merge_head_commit = Commit::from_signed(&repo.read_signed(merge_head_id)?)?;
     let theirs_tree = merge_head_commit.tree;
 
@@ -1492,16 +1583,16 @@ fn merge_review() -> Result<()> {
                 .map(|t| read_path(t, &fr.path))
                 .unwrap_or_default();
             let status = match fr.status {
-                FileStatus::Auto | FileStatus::Ours | FileStatus::Theirs => {
-                    MergeStatus::Merged {
-                        content: current.clone(),
-                        notes: if fr.notes.is_empty() {
-                            vec![]
-                        } else {
-                            vec![levcs_merge::MergeNote { message: fr.notes.clone() }]
-                        },
-                    }
-                }
+                FileStatus::Auto | FileStatus::Ours | FileStatus::Theirs => MergeStatus::Merged {
+                    content: current.clone(),
+                    notes: if fr.notes.is_empty() {
+                        vec![]
+                    } else {
+                        vec![levcs_merge::MergeNote {
+                            message: fr.notes.clone(),
+                        }]
+                    },
+                },
                 FileStatus::Manual => MergeStatus::Conflict {
                     regions: vec![levcs_merge::ConflictRegion {
                         description: if fr.notes.is_empty() {
@@ -1530,8 +1621,7 @@ fn merge_review() -> Result<()> {
         .collect();
 
     let total = files.len();
-    let final_state = levcs_tui::review(files)
-        .map_err(|e| anyhow!("review session: {e}"))?;
+    let final_state = levcs_tui::review(files).map_err(|e| anyhow!("review session: {e}"))?;
     let report = final_state
         .apply(&repo.workdir)
         .map_err(|e| anyhow!("apply resolutions: {e}"))?;
@@ -1546,7 +1636,9 @@ fn find_common_ancestor(repo: &Repository, a: ObjectId, b: ObjectId) -> Result<O
     let mut a_anc: HashSet<ObjectId> = HashSet::new();
     let mut stack = vec![a];
     while let Some(id) = stack.pop() {
-        if !a_anc.insert(id) { continue; }
+        if !a_anc.insert(id) {
+            continue;
+        }
         if let Ok(s) = repo.read_signed(id) {
             if let Ok(c) = Commit::from_signed(&s) {
                 stack.extend(c.parents);
@@ -1556,7 +1648,9 @@ fn find_common_ancestor(repo: &Repository, a: ObjectId, b: ObjectId) -> Result<O
     let mut stack = vec![b];
     let mut visited: HashSet<ObjectId> = HashSet::new();
     while let Some(id) = stack.pop() {
-        if !visited.insert(id) { continue; }
+        if !visited.insert(id) {
+            continue;
+        }
         if a_anc.contains(&id) {
             return Ok(Some(id));
         }
@@ -1573,16 +1667,24 @@ pub fn release(args: ReleaseArgs) -> Result<()> {
     let repo = open_repo()?;
     let (_label, sk) = load_secret(args.key.as_deref())?;
     let pk = sk.public();
-    let authority = repo.current_authority()?.ok_or_else(|| anyhow!("no current authority"))?;
+    let authority = repo
+        .current_authority()?
+        .ok_or_else(|| anyhow!("no current authority"))?;
     let auth_signed = repo.read_signed(authority)?;
     let auth_body = AuthorityBody::parse(&auth_signed.body)?;
     let m = auth_body
         .find_member(&pk)
         .ok_or_else(|| anyhow!("your key is not in the current authority"))?;
     if m.role < Role::Maintainer {
-        bail!("releases require maintainer role; your role is '{}'", m.role.name());
+        bail!(
+            "releases require maintainer role; your role is '{}'",
+            m.role.name()
+        );
     }
-    let head = repo.refs.resolve_head()?.ok_or_else(|| anyhow!("no HEAD"))?;
+    let head = repo
+        .refs
+        .resolve_head()?
+        .ok_or_else(|| anyhow!("no HEAD"))?;
     let head_commit = Commit::from_signed(&repo.read_signed(head)?)?;
     let parent_release = repo
         .refs
@@ -1600,7 +1702,8 @@ pub fn release(args: ReleaseArgs) -> Result<()> {
     };
     let signed = sign_release(release, &sk)?;
     let id = repo.write_signed(&signed)?;
-    repo.refs.write(&format!("refs/releases/{}", args.label), id)?;
+    repo.refs
+        .write(&format!("refs/releases/{}", args.label), id)?;
 
     // §4.4: warm the release cache and run LRU eviction so the
     // cache stays under its configured cap. The cap is 1 GiB by
@@ -1635,7 +1738,9 @@ pub fn cache(args: CacheArgs) -> Result<()> {
     }
     if let Some(id) = args.restore {
         let src = dir.join(&id);
-        if !src.is_dir() { bail!("no such cache: {id}"); }
+        if !src.is_dir() {
+            bail!("no such cache: {id}");
+        }
         copy_dir_recursive(&src, &repo.workdir)?;
         eprintln!("restored {id}");
         return Ok(());
@@ -1648,7 +1753,9 @@ pub fn cache(args: CacheArgs) -> Result<()> {
         for path in repo.walk_workdir()? {
             let rel = path.strip_prefix(&repo.workdir)?;
             let target = dest.join(rel);
-            if let Some(parent) = target.parent() { fs::create_dir_all(parent)?; }
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
             fs::copy(&path, &target)?;
         }
         if let Some(m) = args.message {
@@ -1671,7 +1778,9 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
             fs::create_dir_all(&t)?;
             copy_dir_recursive(&p, &t)?;
         } else {
-            if let Some(parent) = t.parent() { fs::create_dir_all(parent)?; }
+            if let Some(parent) = t.parent() {
+                fs::create_dir_all(parent)?;
+            }
             fs::copy(&p, &t)?;
         }
     }
@@ -1701,17 +1810,29 @@ pub fn gc(args: GcArgs) -> Result<()> {
     let repo = open_repo()?;
     let mut reachable: HashSet<ObjectId> = HashSet::new();
     let mut stack: Vec<ObjectId> = Vec::new();
-    if let Some(h) = repo.refs.resolve_head()? { stack.push(h); }
-    if let Some(c) = repo.current_authority()? { stack.push(c); }
-    if let Some(g) = repo.genesis_authority()? { stack.push(g); }
-    for (_, id) in repo.refs.list_all()? { stack.push(id); }
+    if let Some(h) = repo.refs.resolve_head()? {
+        stack.push(h);
+    }
+    if let Some(c) = repo.current_authority()? {
+        stack.push(c);
+    }
+    if let Some(g) = repo.genesis_authority()? {
+        stack.push(g);
+    }
+    for (_, id) in repo.refs.list_all()? {
+        stack.push(id);
+    }
     while let Some(id) = stack.pop() {
-        if !reachable.insert(id) { continue; }
+        if !reachable.insert(id) {
+            continue;
+        }
         if let Ok(raw) = repo.objects.read_object(id) {
             match raw.object_type {
                 ObjectType::Tree => {
                     if let Ok(t) = Tree::parse_body(&raw.body) {
-                        for e in t.entries { stack.push(e.hash); }
+                        for e in t.entries {
+                            stack.push(e.hash);
+                        }
                     }
                 }
                 ObjectType::Commit => {
@@ -1726,7 +1847,9 @@ pub fn gc(args: GcArgs) -> Result<()> {
                         stack.push(r.tree);
                         stack.push(r.predecessor);
                         stack.push(r.authority);
-                        if !r.parent_release.is_zero() { stack.push(r.parent_release); }
+                        if !r.parent_release.is_zero() {
+                            stack.push(r.parent_release);
+                        }
                     }
                 }
                 ObjectType::Authority => {
@@ -1786,7 +1909,9 @@ fn walk_dir(dir: &Path, base: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
         let ent = ent?;
         let path = ent.path();
         let rel = path.strip_prefix(base)?;
-        if levcs_core::ignore::always_ignored(rel) { continue; }
+        if levcs_core::ignore::always_ignored(rel) {
+            continue;
+        }
         let ft = ent.file_type()?;
         if ft.is_dir() {
             walk_dir(&path, base, out)?;
@@ -1809,11 +1934,17 @@ fn file_mtime_micros(meta: &fs::Metadata) -> i64 {
 fn file_mode_bits(meta: &fs::Metadata) -> u8 {
     use std::os::unix::fs::PermissionsExt;
     let m = meta.permissions().mode();
-    if m & 0o111 != 0 { 0o111 } else { 0 }
+    if m & 0o111 != 0 {
+        0o111
+    } else {
+        0
+    }
 }
 
 #[cfg(not(unix))]
-fn file_mode_bits(_meta: &fs::Metadata) -> u8 { 0 }
+fn file_mode_bits(_meta: &fs::Metadata) -> u8 {
+    0
+}
 
 #[allow(dead_code)]
 fn _refs_unused(_: Refs) {}

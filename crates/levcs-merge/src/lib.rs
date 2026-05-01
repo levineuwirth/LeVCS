@@ -5,16 +5,16 @@
 //! file path / extension, applies the highest-priority applicable handler,
 //! and falls through on `NotApplicable`.
 
-pub mod handler;
 pub mod engine;
-pub mod textual;
 pub mod format;
 pub mod format_extra;
+pub mod handler;
 pub mod plugin;
 pub mod record;
+pub mod textual;
 pub mod tree_sitter_handler;
 
-pub use handler::{ConflictRegion, MergeHandler, MergeResult, MergeNote, MergeStatus};
 pub use engine::{CascadeEngine, MergeConfig, MergeRule};
-pub use record::{MergeRecord, FileRecord, FileStatus};
+pub use handler::{ConflictRegion, MergeHandler, MergeNote, MergeResult, MergeStatus};
+pub use record::{FileRecord, FileStatus, MergeRecord};
 pub use tree_sitter_handler::{Lang, TreeSitterHandler};

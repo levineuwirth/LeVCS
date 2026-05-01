@@ -210,7 +210,7 @@ mod tests {
         let repo = Repository::init_skeleton(&work).unwrap();
         let dir = cache_dir(&repo);
         let paths = populate(&dir, 5, 100); // total 500
-        // Cap at 250 → must evict 3 oldest (250 left).
+                                            // Cap at 250 → must evict 3 oldest (250 left).
         let report = evict_to(&repo, 250).unwrap();
         assert_eq!(report.evicted_files, 3);
         assert!(report.remaining_bytes <= 250);

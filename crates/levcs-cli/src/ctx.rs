@@ -69,9 +69,7 @@ pub fn load_secret(label: Option<&str>) -> Result<(String, SecretKey)> {
                     keychain_path()
                 ));
             } else {
-                return Err(anyhow!(
-                    "multiple keys in keychain; pass --key <label>"
-                ));
+                return Err(anyhow!("multiple keys in keychain; pass --key <label>"));
             }
         }
     };

@@ -15,7 +15,9 @@ fn lcg_bytes(seed: u64, n: usize) -> Vec<u8> {
     let mut s = seed;
     (0..n)
         .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (s >> 33) as u8
         })
         .collect()
@@ -80,9 +82,11 @@ fn bench_decode(c: &mut Criterion) {
         let pk = random_pack(0xa5a5_a5a5, count, size);
         let bytes = pk.encode();
         g.throughput(Throughput::Bytes(bytes.len() as u64));
-        g.bench_with_input(BenchmarkId::new("incompressible", label), &bytes, |b, bytes| {
-            b.iter(|| black_box(Pack::decode(bytes).unwrap()))
-        });
+        g.bench_with_input(
+            BenchmarkId::new("incompressible", label),
+            &bytes,
+            |b, bytes| b.iter(|| black_box(Pack::decode(bytes).unwrap())),
+        );
     }
     {
         let pk = delta_friendly_pack(0x5a5a_5a5a, 100, 1024);

@@ -77,7 +77,10 @@ impl ObjectStore {
             if e.kind() == std::io::ErrorKind::NotFound {
                 Error::NotFound(id.to_hex())
             } else {
-                Error::Io { path: Some(path.clone()), source: e }
+                Error::Io {
+                    path: Some(path.clone()),
+                    source: e,
+                }
             }
         })?;
         let mut buf = Vec::new();
@@ -102,7 +105,9 @@ impl ObjectStore {
         let obj = self.read_object(id)?;
         if obj.object_type != expected {
             return Err(Error::MalformedObject(format!(
-                "expected {}, got {}", expected.name(), obj.object_type.name()
+                "expected {}, got {}",
+                expected.name(),
+                obj.object_type.name()
             )));
         }
         Ok(obj)
@@ -167,11 +172,13 @@ mod tests {
 
     fn tempdir() -> PathBuf {
         let mut p = std::env::temp_dir();
-        let n: u64 = blake3::hash(format!("{:?}-{}", std::time::SystemTime::now(), std::process::id()).as_bytes())
-            .as_bytes()
-            .iter()
-            .take(8)
-            .fold(0u64, |acc, b| (acc << 8) | *b as u64);
+        let n: u64 = blake3::hash(
+            format!("{:?}-{}", std::time::SystemTime::now(), std::process::id()).as_bytes(),
+        )
+        .as_bytes()
+        .iter()
+        .take(8)
+        .fold(0u64, |acc, b| (acc << 8) | *b as u64);
         p.push(format!("levcs-store-test-{n}"));
         std::fs::create_dir_all(&p).unwrap();
         p

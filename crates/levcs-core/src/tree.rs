@@ -41,8 +41,12 @@ impl FileMode {
     pub const EXECUTABLE: FileMode = FileMode(0b01);
     pub const SYMLINK: FileMode = FileMode(0b10);
 
-    pub fn is_executable(self) -> bool { self.0 & 0b01 != 0 }
-    pub fn is_symlink(self) -> bool { self.0 & 0b10 != 0 }
+    pub fn is_executable(self) -> bool {
+        self.0 & 0b01 != 0
+    }
+    pub fn is_symlink(self) -> bool {
+        self.0 & 0b10 != 0
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -59,7 +63,10 @@ impl TreeEntry {
             return Err(Error::InvalidPath("empty tree-entry name".into()));
         }
         if name.len() > 255 {
-            return Err(Error::InvalidPath(format!("name too long ({} bytes)", name.len())));
+            return Err(Error::InvalidPath(format!(
+                "name too long ({} bytes)",
+                name.len()
+            )));
         }
         if name == "." || name == ".." {
             return Err(Error::InvalidPath(format!("reserved name: {name}")));
@@ -80,7 +87,9 @@ pub struct Tree {
 }
 
 impl Tree {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// Sort entries by name (byte-wise) and validate; required for hash
     /// determinism.
@@ -88,12 +97,14 @@ impl Tree {
         for e in &self.entries {
             TreeEntry::validate_name(&e.name)?;
         }
-        self.entries.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
+        self.entries
+            .sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
         // detect duplicate names
         for w in self.entries.windows(2) {
             if w[0].name == w[1].name {
                 return Err(Error::MalformedObject(format!(
-                    "duplicate tree entry name: {}", w[0].name
+                    "duplicate tree entry name: {}",
+                    w[0].name
                 )));
             }
         }
@@ -128,7 +139,9 @@ impl Tree {
         let mut p = 0usize;
         while p < body.len() {
             if body.len() < p + 2 {
-                return Err(Error::MalformedObject("tree entry: short name length".into()));
+                return Err(Error::MalformedObject(
+                    "tree entry: short name length".into(),
+                ));
             }
             let n = LittleEndian::read_u16(&body[p..p + 2]) as usize;
             p += 2;
@@ -146,7 +159,12 @@ impl Tree {
             let mut h = [0u8; 32];
             h.copy_from_slice(&body[p..p + 32]);
             p += 32;
-            entries.push(TreeEntry { name, entry_type, mode, hash: ObjectId(h) });
+            entries.push(TreeEntry {
+                name,
+                entry_type,
+                mode,
+                hash: ObjectId(h),
+            });
         }
         Ok(Tree { entries })
     }

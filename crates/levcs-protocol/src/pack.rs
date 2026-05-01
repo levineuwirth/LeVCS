@@ -70,7 +70,9 @@ pub struct Pack {
 }
 
 impl Pack {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     pub fn push(&mut self, object_type: u8, bytes: Vec<u8>) {
         self.entries.push(PackEntry { object_type, bytes });
@@ -78,7 +80,11 @@ impl Pack {
 
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(
-            16 + self.entries.iter().map(|e| 10 + e.bytes.len()).sum::<usize>(),
+            16 + self
+                .entries
+                .iter()
+                .map(|e| 10 + e.bytes.len())
+                .sum::<usize>(),
         );
         out.extend_from_slice(&PACK_MAGIC);
         let mut v = [0u8; 4];
@@ -277,7 +283,10 @@ impl Pack {
             // is a valid base.
             let hash = *blake3::hash(&data).as_bytes();
             idx_by_hash.entry(hash).or_insert(entries.len());
-            entries.push(PackEntry { object_type, bytes: data });
+            entries.push(PackEntry {
+                object_type,
+                bytes: data,
+            });
         }
         Ok((Self { entries }, p))
     }
@@ -295,7 +304,9 @@ mod tests {
         let mut s = seed;
         (0..n)
             .map(|_| {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 (s >> 33) as u8
             })
             .collect()

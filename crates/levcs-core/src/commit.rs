@@ -26,15 +26,22 @@ impl CommitFlags {
     pub const MODIFIES_AUTHORITY: CommitFlags = CommitFlags(0b01);
     pub const FORK: CommitFlags = CommitFlags(0b10);
 
-    pub fn modifies_authority(self) -> bool { self.0 & 0b01 != 0 }
-    pub fn is_fork(self) -> bool { self.0 & 0b10 != 0 }
+    pub fn modifies_authority(self) -> bool {
+        self.0 & 0b01 != 0
+    }
+    pub fn is_fork(self) -> bool {
+        self.0 & 0b10 != 0
+    }
 
-    pub fn raw(self) -> u8 { self.0 }
+    pub fn raw(self) -> u8 {
+        self.0
+    }
 
     pub fn validate(self) -> Result<(), Error> {
         if self.0 & !0b11 != 0 {
             return Err(Error::MalformedObject(format!(
-                "commit flags has reserved bits set: {:#x}", self.0
+                "commit flags has reserved bits set: {:#x}",
+                self.0
             )));
         }
         Ok(())
@@ -85,7 +92,9 @@ impl Commit {
     pub fn parse_body(body: &[u8]) -> Result<Self, Error> {
         let need = 32 + 1;
         if body.len() < need {
-            return Err(Error::MalformedObject("commit body too short for tree+parent_count".into()));
+            return Err(Error::MalformedObject(
+                "commit body too short for tree+parent_count".into(),
+            ));
         }
         let mut tree = [0u8; 32];
         tree.copy_from_slice(&body[0..32]);
@@ -124,7 +133,8 @@ impl Commit {
         p += msg_len;
         if p != body.len() {
             return Err(Error::MalformedObject(format!(
-                "trailing {} byte(s) after commit message", body.len() - p
+                "trailing {} byte(s) after commit message",
+                body.len() - p
             )));
         }
         Ok(Self {
@@ -146,12 +156,14 @@ impl Commit {
     pub fn from_signed(s: &SignedObject) -> Result<Self, Error> {
         if s.object_type != ObjectType::Commit {
             return Err(Error::MalformedObject(format!(
-                "expected commit, got {}", s.object_type.name()
+                "expected commit, got {}",
+                s.object_type.name()
             )));
         }
         if s.signatures.len() != 1 {
             return Err(Error::MalformedObject(format!(
-                "commit must have exactly 1 signature, got {}", s.signatures.len()
+                "commit must have exactly 1 signature, got {}",
+                s.signatures.len()
             )));
         }
         let c = Commit::parse_body(&s.body)?;
@@ -166,7 +178,10 @@ impl Commit {
     /// Convenience: produce a partial signature entry with just the key set;
     /// callers fill in `signature` after computing the Ed25519 signature.
     pub fn signature_template(&self) -> SignatureEntry {
-        SignatureEntry { public_key: self.author_key, signature: [0u8; 64] }
+        SignatureEntry {
+            public_key: self.author_key,
+            signature: [0u8; 64],
+        }
     }
 }
 

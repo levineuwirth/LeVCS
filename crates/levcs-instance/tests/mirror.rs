@@ -12,9 +12,7 @@ use std::sync::Arc;
 use levcs_client::Client;
 use levcs_core::hash::blake3_hash;
 use levcs_core::object::ObjectType;
-use levcs_core::{
-    Blob, Commit, CommitFlags, EntryType, FileMode, Tree, TreeEntry, ZERO_ID,
-};
+use levcs_core::{Blob, Commit, CommitFlags, EntryType, FileMode, Tree, TreeEntry, ZERO_ID};
 use levcs_identity::authority::{AuthorityBody, MemberEntry, PolicyEntry, Role};
 use levcs_identity::keys::SecretKey;
 use levcs_identity::sign::{sign_authority, sign_commit};
@@ -82,7 +80,12 @@ fn build_genesis() -> Setup {
     let auth_bytes = signed.serialize();
     let auth_id = blake3_hash(&auth_bytes);
     let repo_id = auth.repo_id.to_hex();
-    Setup { sk, auth_id, repo_id, auth_bytes }
+    Setup {
+        sk,
+        auth_id,
+        repo_id,
+        auth_bytes,
+    }
 }
 
 fn build_simple_commit_pack(
@@ -231,7 +234,10 @@ async fn mirror_pulls_state_from_source() {
         "mirror's main must match source"
     );
     assert!(mirror_info.is_mirror, "/info must declare mirror status");
-    assert_eq!(mirror_info.mirror_source.as_deref(), Some(source_base.as_str()));
+    assert_eq!(
+        mirror_info.mirror_source.as_deref(),
+        Some(source_base.as_str())
+    );
     assert_eq!(mirror_info.mirror_mode.as_deref(), Some("full"));
 
     // Push to mirror must be refused (read-only by config).
@@ -243,8 +249,7 @@ async fn mirror_pulls_state_from_source() {
         move || {
             let sk = SecretKey::from_seed(seed);
             let client = Client::new(mb);
-            let (pack, commit_id) =
-                build_simple_commit_pack(&sk, auth_id, "x.txt", b"x\n", None);
+            let (pack, commit_id) = build_simple_commit_pack(&sk, auth_id, "x.txt", b"x\n", None);
             let manifest = PushManifest {
                 authority_hash: auth_id.to_hex(),
                 updates: vec![PushUpdate {
@@ -333,8 +338,7 @@ async fn migrate_replays_repo_to_fresh_instance() {
             let sk = SecretKey::from_seed(seed);
             let client = Client::new(base);
             client.init(&sk, &repo_id, &auth_bytes).unwrap();
-            let (pack, commit_id) =
-                build_simple_commit_pack(&sk, auth_id, "f.txt", b"v1\n", None);
+            let (pack, commit_id) = build_simple_commit_pack(&sk, auth_id, "f.txt", b"v1\n", None);
             let manifest = PushManifest {
                 authority_hash: auth_id.to_hex(),
                 updates: vec![PushUpdate {
@@ -364,8 +368,7 @@ async fn migrate_replays_repo_to_fresh_instance() {
             // §5.7 step 1: init with the authority object.
             client.init(&sk, &repo_id, &auth_bytes).unwrap();
             // §5.7 step 3: push history.
-            let (pack, commit_id) =
-                build_simple_commit_pack(&sk, auth_id, "f.txt", b"v1\n", None);
+            let (pack, commit_id) = build_simple_commit_pack(&sk, auth_id, "f.txt", b"v1\n", None);
             let manifest = PushManifest {
                 authority_hash: auth_id.to_hex(),
                 updates: vec![PushUpdate {

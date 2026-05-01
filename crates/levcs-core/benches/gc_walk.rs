@@ -17,7 +17,9 @@ use std::path::PathBuf;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use levcs_core::hash::blake3_hash;
 use levcs_core::object::ObjectType;
-use levcs_core::{Blob, Commit, EntryType, FileMode, ObjectId, ObjectStore, Release, Tree, TreeEntry};
+use levcs_core::{
+    Blob, Commit, EntryType, FileMode, ObjectId, ObjectStore, Release, Tree, TreeEntry,
+};
 
 fn tempdir(prefix: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
@@ -110,9 +112,11 @@ fn bench_walk(c: &mut Criterion) {
         store.ensure_dirs().unwrap();
         let root = populate(&store, n);
 
-        g.bench_with_input(BenchmarkId::from_parameter(format!("{n}_objects")), &(), |b, _| {
-            b.iter(|| black_box(walk_reachable(&store, root)))
-        });
+        g.bench_with_input(
+            BenchmarkId::from_parameter(format!("{n}_objects")),
+            &(),
+            |b, _| b.iter(|| black_box(walk_reachable(&store, root))),
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }

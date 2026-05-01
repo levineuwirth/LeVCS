@@ -69,10 +69,12 @@ impl ObjectSource for MemorySource {
 
 fn read_signed<S: ObjectSource>(src: &S, id: ObjectId) -> Verification<SignedObject> {
     let bytes = src.read_raw(id)?;
-    Ok(SignedObject::parse(&bytes).map_err(|e| VerifyError::Object {
-        hash: id.to_hex(),
-        kind: e.to_string(),
-    })?)
+    Ok(
+        SignedObject::parse(&bytes).map_err(|e| VerifyError::Object {
+            hash: id.to_hex(),
+            kind: e.to_string(),
+        })?,
+    )
 }
 
 /// Verify the signature(s) on a SignedObject. Each signature in the trailer
@@ -94,13 +96,16 @@ pub fn verify_signed_object(signed: &SignedObject) -> Verification<()> {
 pub fn verify_genesis(genesis: &SignedObject) -> Verification<AuthorityBody> {
     if genesis.object_type != ObjectType::Authority {
         return Err(VerifyError::Authority(format!(
-            "expected authority object, got {}", genesis.object_type.name()
+            "expected authority object, got {}",
+            genesis.object_type.name()
         )));
     }
-    let body = AuthorityBody::parse(&genesis.body)
-        .map_err(|e| VerifyError::Authority(e.to_string()))?;
+    let body =
+        AuthorityBody::parse(&genesis.body).map_err(|e| VerifyError::Authority(e.to_string()))?;
     if !body.previous_authority.is_zero() {
-        return Err(VerifyError::Authority("genesis must have zero previous_authority".into()));
+        return Err(VerifyError::Authority(
+            "genesis must have zero previous_authority".into(),
+        ));
     }
     if body.version != 1 {
         return Err(VerifyError::Authority("genesis version must be 1".into()));
@@ -148,7 +153,8 @@ fn verify_authority_step(
     }
     if new_body.version != prev_body.version + 1 {
         return Err(VerifyError::Authority(format!(
-            "version not sequential: prev {} -> next {}", prev_body.version, new_body.version
+            "version not sequential: prev {} -> next {}",
+            prev_body.version, new_body.version
         )));
     }
     if new_body.previous_authority != prev_id {
@@ -232,10 +238,7 @@ pub fn verify_successor(
             "signer must hold owner role in predecessor".into(),
         ));
     }
-    let found_in_new = a_new
-        .signatures
-        .iter()
-        .any(|s| s.public_key == signer.0);
+    let found_in_new = a_new.signatures.iter().any(|s| s.public_key == signer.0);
     if !found_in_new {
         return Err(VerifyError::Authority(
             "predecessor owner must also sign the new authority".into(),
@@ -260,11 +263,13 @@ pub fn verify_fork(
     if a_source_body.public_read() {
         return Ok(());
     }
-    let m = a_source_body
-        .find_member(&fork_author)
-        .ok_or_else(|| VerifyError::Authority("fork author not authorized to read source".into()))?;
+    let m = a_source_body.find_member(&fork_author).ok_or_else(|| {
+        VerifyError::Authority("fork author not authorized to read source".into())
+    })?;
     if m.role < Role::Reader {
-        return Err(VerifyError::Authority("fork author lacks reader role".into()));
+        return Err(VerifyError::Authority(
+            "fork author lacks reader role".into(),
+        ));
     }
     Ok(())
 }
@@ -324,7 +329,10 @@ pub fn verify_commit<S: ObjectSource>(
     if signed.signatures.len() != 1 {
         return Err(VerifyError::Commit {
             hash: commit_id.to_hex(),
-            reason: format!("commit must have 1 signature, got {}", signed.signatures.len()),
+            reason: format!(
+                "commit must have 1 signature, got {}",
+                signed.signatures.len()
+            ),
         });
     }
     let sig = signed.signatures[0];
@@ -360,7 +368,9 @@ pub fn verify_commit<S: ObjectSource>(
         return Err(VerifyError::Commit {
             hash: commit_id.to_hex(),
             reason: format!(
-                "insufficient role: have {}, need {}", member.role.name(), required.name()
+                "insufficient role: have {}, need {}",
+                member.role.name(),
+                required.name()
             ),
         });
     }
@@ -387,10 +397,12 @@ pub fn verify_commit<S: ObjectSource>(
                 });
             }
             let parent_signed = read_signed(src, commit.parents[0])?;
-            let parent_commit =
-                levcs_core::Commit::from_signed(&parent_signed).map_err(|e| {
-                    VerifyError::Commit { hash: commit_id.to_hex(), reason: e.to_string() }
-                })?;
+            let parent_commit = levcs_core::Commit::from_signed(&parent_signed).map_err(|e| {
+                VerifyError::Commit {
+                    hash: commit_id.to_hex(),
+                    reason: e.to_string(),
+                }
+            })?;
             let source_auth_signed = read_signed(src, parent_commit.authority)?;
             let source_auth_body = AuthorityBody::parse(&source_auth_signed.body)
                 .map_err(|e| VerifyError::Authority(e.to_string()))?;
@@ -438,9 +450,11 @@ pub fn verify_release<S: ObjectSource>(src: &S, release_id: ObjectId) -> Verific
         });
     }
     verify_signed_object(&signed)?;
-    let release = levcs_core::Release::parse_body(&signed.body).map_err(|e| {
-        VerifyError::Object { hash: release_id.to_hex(), kind: e.to_string() }
-    })?;
+    let release =
+        levcs_core::Release::parse_body(&signed.body).map_err(|e| VerifyError::Object {
+            hash: release_id.to_hex(),
+            kind: e.to_string(),
+        })?;
     let _ = verify_authority_chain(src, release.authority)?;
     let auth_signed = read_signed(src, release.authority)?;
     let auth_body = AuthorityBody::parse(&auth_signed.body)
@@ -653,7 +667,10 @@ mod tests {
         fork.assign_genesis_repo_id().unwrap();
         let fork_signed = crate::sign::sign_authority(&fork, &bob).unwrap();
         let res = verify_fork(bob_pk, &source, &fork_signed, &fork);
-        assert!(res.is_err(), "stranger should not be able to fork private source");
+        assert!(
+            res.is_err(),
+            "stranger should not be able to fork private source"
+        );
     }
 
     #[test]

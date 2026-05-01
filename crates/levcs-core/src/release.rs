@@ -38,7 +38,8 @@ impl Release {
         if self.notes.len() > u32::MAX as usize {
             return Err(Error::MalformedObject("release notes too large".into()));
         }
-        let mut out = Vec::with_capacity(32 * 4 + 32 + 8 + 2 + self.label.len() + 4 + self.notes.len());
+        let mut out =
+            Vec::with_capacity(32 * 4 + 32 + 8 + 2 + self.label.len() + 4 + self.notes.len());
         out.extend_from_slice(self.tree.as_bytes());
         out.extend_from_slice(self.parent_release.as_bytes());
         out.extend_from_slice(self.predecessor.as_bytes());
@@ -80,7 +81,9 @@ impl Release {
         let label_len = LittleEndian::read_u16(&body[p..p + 2]) as usize;
         p += 2;
         if body.len() < p + label_len + 4 {
-            return Err(Error::MalformedObject("release label/notes truncated".into()));
+            return Err(Error::MalformedObject(
+                "release label/notes truncated".into(),
+            ));
         }
         let label = std::str::from_utf8(&body[p..p + label_len])
             .map_err(|_| Error::MalformedObject("release label not UTF-8".into()))?
@@ -96,11 +99,19 @@ impl Release {
             .to_string();
         p += notes_len;
         if p != body.len() {
-            return Err(Error::MalformedObject("trailing bytes after release notes".into()));
+            return Err(Error::MalformedObject(
+                "trailing bytes after release notes".into(),
+            ));
         }
         Ok(Self {
-            tree, parent_release, predecessor, authority, declarer_key,
-            timestamp_micros, label, notes,
+            tree,
+            parent_release,
+            predecessor,
+            authority,
+            declarer_key,
+            timestamp_micros,
+            label,
+            notes,
         })
     }
 
@@ -111,11 +122,14 @@ impl Release {
     pub fn from_signed(s: &SignedObject) -> Result<Self, Error> {
         if s.object_type != ObjectType::Release {
             return Err(Error::MalformedObject(format!(
-                "expected release, got {}", s.object_type.name()
+                "expected release, got {}",
+                s.object_type.name()
             )));
         }
         if s.signatures.is_empty() {
-            return Err(Error::MalformedObject("release must have at least one signature".into()));
+            return Err(Error::MalformedObject(
+                "release must have at least one signature".into(),
+            ));
         }
         let r = Release::parse_body(&s.body)?;
         if r.declarer_key != s.signatures[0].public_key {

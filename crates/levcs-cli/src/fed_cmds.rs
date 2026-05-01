@@ -49,7 +49,8 @@ fn write_instance_url(repo: &Repository, url: &str) -> Result<()> {
     let path = repo.config_path();
     let s = fs::read_to_string(&path).unwrap_or_default();
     let mut cfg: RepoConfig = toml::from_str(&s).unwrap_or_default();
-    cfg.instance.insert("url".into(), toml::Value::String(url.to_string()));
+    cfg.instance
+        .insert("url".into(), toml::Value::String(url.to_string()));
     let out = toml::to_string_pretty(&cfg)?;
     fs::write(&path, out)?;
     Ok(())
@@ -59,7 +60,10 @@ fn user_config_path() -> PathBuf {
     if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
         PathBuf::from(xdg).join("levcs").join("config.toml")
     } else if let Some(home) = std::env::var_os("HOME") {
-        PathBuf::from(home).join(".config").join("levcs").join("config.toml")
+        PathBuf::from(home)
+            .join(".config")
+            .join("levcs")
+            .join("config.toml")
     } else {
         PathBuf::from(".levcs.toml")
     }
@@ -126,7 +130,11 @@ pub fn instance(args: InstanceArgs) -> Result<()> {
     if args.list {
         let cfg = read_user_cfg()?;
         for u in cfg.instances {
-            let star = if Some(u.clone()) == cfg.active { "*" } else { " " };
+            let star = if Some(u.clone()) == cfg.active {
+                "*"
+            } else {
+                " "
+            };
             println!("{star} {u}");
         }
         return Ok(());
@@ -151,7 +159,8 @@ fn active_instance() -> Result<String> {
         }
     }
     let cfg = read_user_cfg()?;
-    cfg.active.ok_or_else(|| anyhow!("no active instance; run `levcs instance --set <URL>`"))
+    cfg.active
+        .ok_or_else(|| anyhow!("no active instance; run `levcs instance --set <URL>`"))
 }
 
 pub fn push(args: PushArgs) -> Result<()> {
@@ -184,12 +193,16 @@ pub fn push(args: PushArgs) -> Result<()> {
         let mut stack = vec![new];
         let mut seen = std::collections::HashSet::<ObjectId>::new();
         while let Some(id) = stack.pop() {
-            if !seen.insert(id) { continue; }
+            if !seen.insert(id) {
+                continue;
+            }
             if let Ok(raw) = repo.objects.read_object(id) {
                 match raw.object_type {
                     ObjectType::Tree => {
                         if let Ok(t) = levcs_core::Tree::parse_body(&raw.body) {
-                            for e in t.entries { stack.push(e.hash); }
+                            for e in t.entries {
+                                stack.push(e.hash);
+                            }
                         }
                     }
                     ObjectType::Commit => {
@@ -204,7 +217,9 @@ pub fn push(args: PushArgs) -> Result<()> {
                             stack.push(rel.tree);
                             stack.push(rel.predecessor);
                             stack.push(rel.authority);
-                            if !rel.parent_release.is_zero() { stack.push(rel.parent_release); }
+                            if !rel.parent_release.is_zero() {
+                                stack.push(rel.parent_release);
+                            }
                         }
                     }
                     ObjectType::Authority => {
@@ -237,7 +252,9 @@ pub fn push(args: PushArgs) -> Result<()> {
     let mut pack = Pack::new();
     let mut deduped = std::collections::HashSet::new();
     for id in needed {
-        if !deduped.insert(id) { continue; }
+        if !deduped.insert(id) {
+            continue;
+        }
         if let Ok(bytes) = repo.objects.read_raw(id) {
             if bytes.len() >= 5 {
                 pack.push(bytes[4], bytes);
@@ -295,10 +312,15 @@ pub fn pull(args: PullArgs) -> Result<()> {
     for (r, h) in remote_refs.branches {
         if want_refs.contains(&r) {
             let id = ObjectId::from_hex(&h)?;
-            repo.refs.write(&format!("refs/remote/origin/branches/{r}"), id)?;
+            repo.refs
+                .write(&format!("refs/remote/origin/branches/{r}"), id)?;
         }
     }
-    eprintln!("pulled {} object(s) from {} ref(s)", pack.entries.len(), want_refs.len());
+    eprintln!(
+        "pulled {} object(s) from {} ref(s)",
+        pack.entries.len(),
+        want_refs.len()
+    );
     Ok(())
 }
 
@@ -382,9 +404,18 @@ pub fn fork(args: ForkArgs) -> Result<()> {
             added_by: pk,
         }],
         policy: vec![
-            PolicyEntry { key: "public_read".into(), value: vec![0x01] },
-            PolicyEntry { key: "require_signed_releases".into(), value: vec![0x01] },
-            PolicyEntry { key: "allowed_handlers".into(), value: b"builtin".to_vec() },
+            PolicyEntry {
+                key: "public_read".into(),
+                value: vec![0x01],
+            },
+            PolicyEntry {
+                key: "require_signed_releases".into(),
+                value: vec![0x01],
+            },
+            PolicyEntry {
+                key: "allowed_handlers".into(),
+                value: b"builtin".to_vec(),
+            },
         ],
     };
     new_auth_body.normalize()?;
@@ -397,9 +428,8 @@ pub fn fork(args: ForkArgs) -> Result<()> {
 
     // 8. Build the fork commit's tree: source's tree, with .levcs/authority
     //    pointing at the new genesis.
-    let new_tree_id = crate::tree_helpers::put_authority_in_tree(
-        &repo, source_commit.tree, new_auth_id,
-    )?;
+    let new_tree_id =
+        crate::tree_helpers::put_authority_in_tree(&repo, source_commit.tree, new_auth_id)?;
 
     // 9. Construct and sign the fork commit.
     let flags = CommitFlags(CommitFlags::MODIFIES_AUTHORITY.0 | CommitFlags::FORK.0);
@@ -558,8 +588,8 @@ pub fn deploy(args: DeployArgs) -> Result<()> {
     let (manifest, pack) = build_deploy_archive(&repo, args.release)?;
     let pack_bytes = pack.encode();
 
-    let listener = TcpListener::bind(&args.listen)
-        .with_context(|| format!("bind {}", args.listen))?;
+    let listener =
+        TcpListener::bind(&args.listen).with_context(|| format!("bind {}", args.listen))?;
     let local = listener.local_addr()?;
     eprintln!(
         "deploy listening on {local}\n  recipient = {}\n  send  {} branch(es), {} release(s), {} object(s) ({} bytes packed)",
@@ -581,11 +611,7 @@ pub fn deploy(args: DeployArgs) -> Result<()> {
     let (stream, peer_addr) = listener.accept()?;
     eprintln!("dialer connected from {peer_addr}");
 
-    let mut session = match levcs_protocol::p2p::handshake_listen(
-        stream,
-        &sk,
-        &recipient_pub,
-    ) {
+    let mut session = match levcs_protocol::p2p::handshake_listen(stream, &sk, &recipient_pub) {
         Ok(s) => s,
         Err(e) => bail!("handshake failed: {e}"),
     };
@@ -595,9 +621,7 @@ pub fn deploy(args: DeployArgs) -> Result<()> {
     session
         .send_pack(&pack_bytes)
         .map_err(|e| anyhow!("send pack: {e}"))?;
-    session
-        .send_done()
-        .map_err(|e| anyhow!("send done: {e}"))?;
+    session.send_done().map_err(|e| anyhow!("send done: {e}"))?;
     eprintln!("deploy complete");
     Ok(())
 }
@@ -627,7 +651,11 @@ fn build_deploy_archive(
     if branches.is_empty() && releases.is_empty() {
         bail!(
             "nothing to deploy: repository has no {}",
-            if release_only { "releases" } else { "branches or releases" }
+            if release_only {
+                "releases"
+            } else {
+                "branches or releases"
+            }
         );
     }
 
@@ -655,7 +683,11 @@ fn build_deploy_archive(
     }
     let manifest = levcs_protocol::p2p::DeployManifest {
         repo_id,
-        mode: if release_only { "release".into() } else { "all".into() },
+        mode: if release_only {
+            "release".into()
+        } else {
+            "all".into()
+        },
         branches: branch_map,
         releases: release_map,
         authority_hash: auth.to_hex(),
@@ -762,18 +794,17 @@ pub fn migrate(args: MigrateArgs) -> Result<()> {
         write_instance_url(&repo, &args.to)?;
         eprintln!("active instance for this repo set to {}", args.to);
     } else {
-        eprintln!("(run `levcs instance --set {}` to repoint future operations)", args.to);
+        eprintln!(
+            "(run `levcs instance --set {}` to repoint future operations)",
+            args.to
+        );
     }
     Ok(())
 }
 
 /// Reachability walk shared by push() and migrate(). Inserts every object
 /// transitively referenced from `start` into `out`, including blobs.
-fn walk_closure(
-    repo: &Repository,
-    start: ObjectId,
-    out: &mut std::collections::HashSet<ObjectId>,
-) {
+fn walk_closure(repo: &Repository, start: ObjectId, out: &mut std::collections::HashSet<ObjectId>) {
     let mut stack = vec![start];
     while let Some(id) = stack.pop() {
         if !out.insert(id) {
@@ -838,12 +869,8 @@ pub fn dial(args: DialArgs) -> Result<()> {
     let manifest = session
         .recv_manifest()
         .map_err(|e| anyhow!("recv manifest: {e}"))?;
-    let pack_bytes = session
-        .recv_pack()
-        .map_err(|e| anyhow!("recv pack: {e}"))?;
-    session
-        .recv_done()
-        .map_err(|e| anyhow!("recv done: {e}"))?;
+    let pack_bytes = session.recv_pack().map_err(|e| anyhow!("recv pack: {e}"))?;
+    session.recv_done().map_err(|e| anyhow!("recv done: {e}"))?;
     let pack = Pack::decode(&pack_bytes).map_err(|e| anyhow!("decode pack: {e}"))?;
     eprintln!(
         "received {} object(s); manifest reports {} branch(es), {} release(s)",
@@ -856,8 +883,10 @@ pub fn dial(args: DialArgs) -> Result<()> {
     // mirrors the convention `levcs fork` uses.
     let dest = match args.path {
         Some(p) => p,
-        None => std::env::current_dir()?
-            .join(format!("dial-{}", &manifest.repo_id[..8.min(manifest.repo_id.len())])),
+        None => std::env::current_dir()?.join(format!(
+            "dial-{}",
+            &manifest.repo_id[..8.min(manifest.repo_id.len())]
+        )),
     };
     if dest.exists() {
         bail!("destination already exists: {:?}", dest);
@@ -918,7 +947,10 @@ pub fn dial(args: DialArgs) -> Result<()> {
     // HEAD on main if present, otherwise any branch we got. Releases-only
     // archives leave HEAD detached at the latest release's predecessor —
     // there's no branch to point at.
-    if let Some((name, _)) = manifest.branches.iter().find(|(k, _)| k.as_str() == "main")
+    if let Some((name, _)) = manifest
+        .branches
+        .iter()
+        .find(|(k, _)| k.as_str() == "main")
         .or_else(|| manifest.branches.iter().next())
     {
         let r = format!("refs/branches/{name}");

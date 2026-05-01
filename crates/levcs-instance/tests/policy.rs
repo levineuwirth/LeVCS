@@ -11,9 +11,7 @@ use std::path::PathBuf;
 use levcs_client::Client;
 use levcs_core::hash::blake3_hash;
 use levcs_core::object::ObjectType;
-use levcs_core::{
-    Blob, Commit, CommitFlags, EntryType, FileMode, Tree, TreeEntry, ZERO_ID,
-};
+use levcs_core::{Blob, Commit, CommitFlags, EntryType, FileMode, Tree, TreeEntry, ZERO_ID};
 use levcs_identity::authority::{AuthorityBody, MemberEntry, PolicyEntry, Role};
 use levcs_identity::keys::SecretKey;
 use levcs_identity::sign::{sign_authority, sign_commit};
@@ -32,7 +30,9 @@ fn tempdir(prefix: &str) -> PathBuf {
     p
 }
 
-async fn start(allowed_handlers: Vec<String>) -> (SocketAddr, tokio::task::JoinHandle<()>, PathBuf) {
+async fn start(
+    allowed_handlers: Vec<String>,
+) -> (SocketAddr, tokio::task::JoinHandle<()>, PathBuf) {
     let root = tempdir("levcs-policy");
     let cfg = InstanceConfig {
         root: root.clone(),
@@ -77,7 +77,10 @@ fn build_genesis() -> Setup {
             added_micros: now,
             added_by: pk,
         }],
-        policy: vec![PolicyEntry { key: "public_read".into(), value: vec![0x01] }],
+        policy: vec![PolicyEntry {
+            key: "public_read".into(),
+            value: vec![0x01],
+        }],
     };
     auth.normalize().unwrap();
     auth.assign_genesis_repo_id().unwrap();
@@ -85,7 +88,12 @@ fn build_genesis() -> Setup {
     let auth_bytes = signed.serialize();
     let auth_id = blake3_hash(&auth_bytes);
     let repo_id = auth.repo_id.to_hex();
-    Setup { sk, auth_id, repo_id, auth_bytes }
+    Setup {
+        sk,
+        auth_id,
+        repo_id,
+        auth_bytes,
+    }
 }
 
 /// Build a commit whose tree has `path` -> blob(content) and (optionally) a
@@ -180,9 +188,8 @@ async fn builtin_only_policy_admits_clean_push() {
             let sk = SecretKey::from_seed(seed);
             let client = Client::new(base);
             client.init(&sk, &repo_id, &auth_bytes).unwrap();
-            let (pack, commit_id) = build_pack_with_optional_record(
-                &sk, auth_id, "a.txt", b"hello\n", None, None,
-            );
+            let (pack, commit_id) =
+                build_pack_with_optional_record(&sk, auth_id, "a.txt", b"hello\n", None, None);
             let manifest = PushManifest {
                 authority_hash: auth_id.to_hex(),
                 updates: vec![PushUpdate {
@@ -233,7 +240,12 @@ status = "auto"
             let client = Client::new(base);
             client.init(&sk, &repo_id, &auth_bytes).unwrap();
             let (pack, commit_id) = build_pack_with_optional_record(
-                &sk, auth_id, "a.txt", b"hello\n", Some(&toml), None,
+                &sk,
+                auth_id,
+                "a.txt",
+                b"hello\n",
+                Some(&toml),
+                None,
             );
             let manifest = PushManifest {
                 authority_hash: auth_id.to_hex(),
@@ -254,7 +266,10 @@ status = "auto"
     match result {
         Err(levcs_client::ClientError::Server { status, body }) => {
             assert_eq!(status, 403, "expected 403, got {status} {body}");
-            assert!(body.contains("tree-sitter:protobuf"), "error must name the rejected handler: {body}");
+            assert!(
+                body.contains("tree-sitter:protobuf"),
+                "error must name the rejected handler: {body}"
+            );
         }
         other => panic!("expected 403 server error, got {other:?}"),
     }
@@ -292,7 +307,12 @@ status = "auto"
             let client = Client::new(base);
             client.init(&sk, &repo_id, &auth_bytes).unwrap();
             let (pack, commit_id) = build_pack_with_optional_record(
-                &sk, auth_id, "a.txt", b"hello\n", Some(&toml), None,
+                &sk,
+                auth_id,
+                "a.txt",
+                b"hello\n",
+                Some(&toml),
+                None,
             );
             let manifest = PushManifest {
                 authority_hash: auth_id.to_hex(),
@@ -309,7 +329,10 @@ status = "auto"
     })
     .await
     .unwrap();
-    assert!(result.is_ok(), "permissive policy must accept any handler: {result:?}");
+    assert!(
+        result.is_ok(),
+        "permissive policy must accept any handler: {result:?}"
+    );
 
     task.abort();
     let _ = std::fs::remove_dir_all(root);

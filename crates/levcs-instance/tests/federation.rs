@@ -73,7 +73,10 @@ async fn instance_info_and_init_roundtrip() {
             added_micros: now,
             added_by: pk,
         }],
-        policy: vec![PolicyEntry { key: "public_read".into(), value: vec![0x01] }],
+        policy: vec![PolicyEntry {
+            key: "public_read".into(),
+            value: vec![0x01],
+        }],
     };
     body.normalize().unwrap();
     body.assign_genesis_repo_id().unwrap();
@@ -84,7 +87,11 @@ async fn instance_info_and_init_roundtrip() {
     // Sign request manually via levcs-protocol's sign_request.
     use levcs_protocol::auth::{sign_request, AuthRequest};
     let path = format!("/repos/{repo_id}/init");
-    let req = AuthRequest { method: "POST", path_with_query: &path, body: &bytes };
+    let req = AuthRequest {
+        method: "POST",
+        path_with_query: &path,
+        body: &bytes,
+    };
     let (key, ts, nonce, sig) = sign_request(&sk, &req).unwrap();
     let res = client
         .post(format!("{base}{path}"))
@@ -98,7 +105,12 @@ async fn instance_info_and_init_roundtrip() {
         .send()
         .await
         .unwrap();
-    assert!(res.status().is_success(), "init returned {}: {}", res.status(), res.text().await.unwrap());
+    assert!(
+        res.status().is_success(),
+        "init returned {}: {}",
+        res.status(),
+        res.text().await.unwrap()
+    );
 
     // /repos/{id}/info should now succeed
     let info: serde_json::Value = client

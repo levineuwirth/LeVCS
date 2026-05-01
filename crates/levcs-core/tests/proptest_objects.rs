@@ -6,9 +6,7 @@
 //! a property fails, proptest shrinks toward a minimal failing case.
 
 use levcs_core::object::RawObject;
-use levcs_core::{
-    Blob, Commit, CommitFlags, EntryType, FileMode, ObjectId, Tree, TreeEntry,
-};
+use levcs_core::{Blob, Commit, CommitFlags, EntryType, FileMode, ObjectId, Tree, TreeEntry};
 use proptest::collection::vec;
 use proptest::prelude::*;
 

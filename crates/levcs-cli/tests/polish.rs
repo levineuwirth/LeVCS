@@ -55,8 +55,14 @@ fn construct_restricted_to_paths_only_rewrites_those_files() {
     // Restore only a.txt from HEAD.
     let (code, _, e) = run(&["construct", "a.txt"], &work, &xdg);
     assert_eq!(code, 0, "construct a.txt: {e}");
-    assert_eq!(std::fs::read_to_string(work.join("a.txt")).unwrap(), "a v1\n");
-    assert_eq!(std::fs::read_to_string(work.join("b.txt")).unwrap(), "b dirty\n");
+    assert_eq!(
+        std::fs::read_to_string(work.join("a.txt")).unwrap(),
+        "a v1\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(work.join("b.txt")).unwrap(),
+        "b dirty\n"
+    );
 }
 
 #[test]

@@ -26,7 +26,9 @@ pub fn key(cmd: KeyCmd) -> Result<()> {
             if encrypt {
                 let pp = read_passphrase("new passphrase: ")?;
                 let pp2 = read_passphrase("confirm passphrase: ")?;
-                if pp != pp2 { bail!("passphrases do not match"); }
+                if pp != pp2 {
+                    bail!("passphrases do not match");
+                }
                 kc.add_encrypted(&label, &sk, pp.as_bytes())?;
             } else {
                 kc.add_plaintext(&label, &sk)?;
@@ -38,20 +40,29 @@ pub fn key(cmd: KeyCmd) -> Result<()> {
         KeyCmd::List => {
             let kc = load_keychain()?;
             for e in &kc.keys {
-                let kind = if e.private_encrypted.is_some() { "encrypted" } else { "plaintext" };
+                let kind = if e.private_encrypted.is_some() {
+                    "encrypted"
+                } else {
+                    "plaintext"
+                };
                 println!("{}\t{}\t{kind}", e.label, e.public);
             }
             Ok(())
         }
         KeyCmd::Show { label } => {
             let kc = load_keychain()?;
-            let e = kc.entry(&label).ok_or_else(|| anyhow!("no such key: {label}"))?;
+            let e = kc
+                .entry(&label)
+                .ok_or_else(|| anyhow!("no such key: {label}"))?;
             println!("{}", e.public);
             Ok(())
         }
         KeyCmd::Export { label, path } => {
             let kc = load_keychain()?;
-            let e = kc.entry(&label).ok_or_else(|| anyhow!("no such key: {label}"))?.clone();
+            let e = kc
+                .entry(&label)
+                .ok_or_else(|| anyhow!("no such key: {label}"))?
+                .clone();
             let mut single = Keychain::new();
             single.keys.push(e);
             single.save(&path)?;
@@ -111,7 +122,12 @@ pub fn authority(cmd: AuthorityCmd) -> Result<()> {
             }
             Ok(())
         }
-        AuthorityCmd::Add { key, role, handle, signing_key } => {
+        AuthorityCmd::Add {
+            key,
+            role,
+            handle,
+            signing_key,
+        } => {
             let pk = PublicKey::parse_levcs(&key)?;
             let role = Role::from_name(&role)?;
             let handle = handle.unwrap_or_default();
@@ -140,7 +156,11 @@ pub fn authority(cmd: AuthorityCmd) -> Result<()> {
                 Ok(())
             })
         }
-        AuthorityCmd::Promote { key, role, signing_key } => {
+        AuthorityCmd::Promote {
+            key,
+            role,
+            signing_key,
+        } => {
             let pk = PublicKey::parse_levcs(&key)?;
             let role = Role::from_name(&role)?;
             mutate_authority(signing_key.as_deref(), |new_body, _| {
@@ -168,17 +188,28 @@ where
     let label = match signing_key_label {
         Some(l) => Some(l.to_string()),
         None => {
-            let auth_id = repo.current_authority()?.ok_or_else(|| anyhow!("no current authority"))?;
+            let auth_id = repo
+                .current_authority()?
+                .ok_or_else(|| anyhow!("no current authority"))?;
             let signed = repo.read_signed(auth_id)?;
             let body = AuthorityBody::parse(&signed.body)?;
-            let owners: Vec<&MemberEntry> = body.members.iter().filter(|m| m.role == Role::Owner).collect();
+            let owners: Vec<&MemberEntry> = body
+                .members
+                .iter()
+                .filter(|m| m.role == Role::Owner)
+                .collect();
             if owners.len() == 1 {
                 let kc = crate::ctx::load_keychain()?;
                 let owner_key = owners[0].key;
-                kc.keys.iter().find(|e| {
-                    levcs_identity::keys::PublicKey::parse_levcs(&e.public)
-                        .ok().map(|p| p == owner_key).unwrap_or(false)
-                }).map(|e| e.label.clone())
+                kc.keys
+                    .iter()
+                    .find(|e| {
+                        levcs_identity::keys::PublicKey::parse_levcs(&e.public)
+                            .ok()
+                            .map(|p| p == owner_key)
+                            .unwrap_or(false)
+                    })
+                    .map(|e| e.label.clone())
             } else {
                 None
             }
@@ -200,7 +231,10 @@ where
     // Build successor body.
     let mut new_body = cur_body.clone();
     new_body.previous_authority = cur_id;
-    new_body.version = cur_body.version.checked_add(1).ok_or_else(|| anyhow!("version overflow"))?;
+    new_body.version = cur_body
+        .version
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("version overflow"))?;
     new_body.created_micros = now_micros();
     f(&mut new_body, pk)?;
     new_body.normalize()?;
@@ -216,7 +250,8 @@ where
     } else {
         ZERO_ID
     };
-    let new_tree_id = crate::tree_helpers::put_authority_in_tree(&repo, parent_tree_id, new_auth_id)?;
+    let new_tree_id =
+        crate::tree_helpers::put_authority_in_tree(&repo, parent_tree_id, new_auth_id)?;
     let commit_obj = Commit {
         tree: new_tree_id,
         parents,

@@ -12,7 +12,9 @@ fn lcg_bytes(seed: u64, n: usize) -> Vec<u8> {
     let mut s = seed;
     (0..n)
         .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (s >> 33) as u8
         })
         .collect()
@@ -67,9 +69,11 @@ fn bench_tree(c: &mut Criterion) {
     let mut g = c.benchmark_group("tree_serialize_hash");
     for &n in &[10usize, 100, 1000] {
         let t = make_tree(n);
-        g.bench_with_input(BenchmarkId::from_parameter(format!("{n}_entries")), &t, |b, t| {
-            b.iter(|| black_box(blake3_hash(&t.serialize())))
-        });
+        g.bench_with_input(
+            BenchmarkId::from_parameter(format!("{n}_entries")),
+            &t,
+            |b, t| b.iter(|| black_box(blake3_hash(&t.serialize()))),
+        );
     }
     g.finish();
 }

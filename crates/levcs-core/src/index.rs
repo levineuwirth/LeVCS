@@ -33,9 +33,15 @@ impl IndexEntryFlags {
     pub const CACHED: IndexEntryFlags = IndexEntryFlags(0b010);
     pub const CONFLICTED: IndexEntryFlags = IndexEntryFlags(0b100);
 
-    pub fn is_tracked(self) -> bool { self.0 & 0b001 != 0 }
-    pub fn is_cached(self) -> bool { self.0 & 0b010 != 0 }
-    pub fn is_conflicted(self) -> bool { self.0 & 0b100 != 0 }
+    pub fn is_tracked(self) -> bool {
+        self.0 & 0b001 != 0
+    }
+    pub fn is_cached(self) -> bool {
+        self.0 & 0b010 != 0
+    }
+    pub fn is_conflicted(self) -> bool {
+        self.0 & 0b100 != 0
+    }
 
     pub fn with(self, mask: IndexEntryFlags) -> IndexEntryFlags {
         IndexEntryFlags(self.0 | mask.0)
@@ -62,7 +68,9 @@ pub struct Index {
 }
 
 impl Index {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     pub fn find(&self, path: &str) -> Option<&IndexEntry> {
         self.entries.iter().find(|e| e.path == path)
@@ -127,7 +135,9 @@ impl Index {
         }
         let version = LittleEndian::read_u32(&bytes[4..8]);
         if version != INDEX_VERSION {
-            return Err(Error::InvalidIndex(format!("unsupported version {version}")));
+            return Err(Error::InvalidIndex(format!(
+                "unsupported version {version}"
+            )));
         }
         let count = LittleEndian::read_u32(&bytes[8..12]) as usize;
         let mut entries = Vec::with_capacity(count);
@@ -157,7 +167,12 @@ impl Index {
             let size = LittleEndian::read_u64(&bytes[p..p + 8]);
             p += 8;
             entries.push(IndexEntry {
-                path, blob_hash: ObjectId(h), mode, flags, mtime_micros, size,
+                path,
+                blob_hash: ObjectId(h),
+                mode,
+                flags,
+                mtime_micros,
+                size,
             });
         }
         if p != bytes.len() {
@@ -170,7 +185,10 @@ impl Index {
         match fs::read(path) {
             Ok(bytes) => Index::parse(&bytes),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Index::new()),
-            Err(e) => Err(Error::Io { path: Some(path.clone()), source: e }),
+            Err(e) => Err(Error::Io {
+                path: Some(path.clone()),
+                source: e,
+            }),
         }
     }
 

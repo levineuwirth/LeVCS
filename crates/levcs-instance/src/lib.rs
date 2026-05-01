@@ -34,7 +34,9 @@ use levcs_core::object::ObjectType;
 use levcs_core::{Commit, EntryType, ObjectId, ObjectStore, Tree};
 use levcs_identity::authority::AuthorityBody;
 use levcs_identity::keys::PublicKey;
-use levcs_identity::verify::{verify_authority_chain, verify_genesis, ObjectSource as VerifySource};
+use levcs_identity::verify::{
+    verify_authority_chain, verify_genesis, ObjectSource as VerifySource,
+};
 use levcs_merge::engine::check_handler_allowed;
 use levcs_merge::record::MergeRecord;
 use levcs_protocol::auth::{verify_request, AuthRequest, DEFAULT_CLOCK_SKEW};
@@ -82,7 +84,9 @@ pub struct MirrorConfig {
     pub writeback: bool,
 }
 
-fn default_mirror_mode() -> String { "full".into() }
+fn default_mirror_mode() -> String {
+    "full".into()
+}
 
 impl InstanceConfig {
     /// Look up a mirror declaration for `repo_id`. Returns `None` for
@@ -177,7 +181,10 @@ pub fn router(state: AppState) -> Router {
         .route("/levcs/v1/instance/peers", get(handle_instance_peers))
         .route("/levcs/v1/repos/:repo_id/info", get(handle_repo_info))
         .route("/levcs/v1/repos/:repo_id/refs", get(handle_repo_refs))
-        .route("/levcs/v1/repos/:repo_id/objects/:hash", get(handle_get_object))
+        .route(
+            "/levcs/v1/repos/:repo_id/objects/:hash",
+            get(handle_get_object),
+        )
         .route("/levcs/v1/repos/:repo_id/pack", get(handle_get_pack))
         .route("/levcs/v1/repos/:repo_id/push", post(handle_push))
         .route("/levcs/v1/repos/:repo_id/init", post(handle_init))
@@ -429,7 +436,11 @@ fn verify_request_against(
     let nonce = h("LeVCS-Nonce")?;
     let sig = h("LeVCS-Signature")?;
     let now = levcs_protocol::auth::current_micros();
-    let req = AuthRequest { method, path_with_query: path, body };
+    let req = AuthRequest {
+        method,
+        path_with_query: path,
+        body,
+    };
     let auth = verify_request(&req, key, ts, nonce, sig, now, DEFAULT_CLOCK_SKEW)
         .map_err(|e| err(StatusCode::UNAUTHORIZED, e.to_string()))?;
     let mut cache = s.nonce_cache.lock().unwrap();
@@ -449,10 +460,10 @@ async fn handle_init(
     let auth = verify_request_against(&s, &headers, "POST", &path, body.as_ref())?;
     // Body is the genesis authority object (signed).
     use levcs_core::object::SignedObject;
-    let signed = SignedObject::parse(&body)
-        .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
-    let body_parsed = verify_genesis(&signed)
-        .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let signed =
+        SignedObject::parse(&body).map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let body_parsed =
+        verify_genesis(&signed).map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
     if hex::encode(body_parsed.repo_id.as_bytes()) != repo_id {
         return Err(err(
             StatusCode::BAD_REQUEST,
@@ -532,7 +543,10 @@ async fn handle_push(
         return Err(err(StatusCode::BAD_REQUEST, "body truncated after pack"));
     }
     let manifest_len = u32::from_le_bytes([
-        body[pack_len], body[pack_len + 1], body[pack_len + 2], body[pack_len + 3],
+        body[pack_len],
+        body[pack_len + 1],
+        body[pack_len + 2],
+        body[pack_len + 3],
     ]) as usize;
     if body.len() != pack_len + 4 + manifest_len + 64 {
         return Err(err(StatusCode::BAD_REQUEST, "body length mismatch"));
@@ -616,7 +630,8 @@ async fn handle_push(
             let record = MergeRecord::from_toml(record_str)
                 .map_err(|e| err(StatusCode::BAD_REQUEST, format!("merge-record: {e}")))?;
             for fr in &record.files {
-                if !check_handler_allowed(&fr.handler, &fr.handler_hash, &s.config.allowed_handlers) {
+                if !check_handler_allowed(&fr.handler, &fr.handler_hash, &s.config.allowed_handlers)
+                {
                     return Err(err(
                         StatusCode::FORBIDDEN,
                         format!(
@@ -646,10 +661,7 @@ async fn handle_push(
         .find_member(&auth.key)
         .ok_or_else(|| err(StatusCode::FORBIDDEN, "pusher not in authority"))?;
     if member.role < levcs_identity::authority::Role::Contributor {
-        return Err(err(
-            StatusCode::FORBIDDEN,
-            "pusher lacks contributor role",
-        ));
+        return Err(err(StatusCode::FORBIDDEN, "pusher lacks contributor role"));
     }
 
     // Step 4: verify each new commit and compare-and-swap each ref.
@@ -661,9 +673,10 @@ async fn handle_push(
             .read(&u.r#ref)
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         let old_expected = match &u.old_hash {
-            Some(s) if !s.is_empty() => Some(ObjectId::from_hex(s).map_err(|e| {
-                err(StatusCode::BAD_REQUEST, format!("bad old_hash: {e}"))
-            })?),
+            Some(s) if !s.is_empty() => Some(
+                ObjectId::from_hex(s)
+                    .map_err(|e| err(StatusCode::BAD_REQUEST, format!("bad old_hash: {e}")))?,
+            ),
             _ => None,
         };
         if old_actual != old_expected {
@@ -690,7 +703,10 @@ async fn handle_push(
             other => {
                 return Err(err(
                     StatusCode::BAD_REQUEST,
-                    format!("ref tip is {} object, must be Commit or Release", other.name()),
+                    format!(
+                        "ref tip is {} object, must be Commit or Release",
+                        other.name()
+                    ),
                 ));
             }
         }

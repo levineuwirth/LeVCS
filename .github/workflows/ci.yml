@@ -35,13 +35,10 @@ jobs:
       - name: Compile-check benches
         run: cargo build --workspace --benches
 
-  # Informational: surfaces formatting drift without blocking merges.
-  # Flip continue-on-error to false (or remove the line) once the
-  # codebase is fmt-clean.
+  # Gate: codebase is fmt-clean as of v0.1.0; keep it that way.
   fmt:
-    name: fmt (informational)
+    name: fmt
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

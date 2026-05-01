@@ -155,7 +155,11 @@ fn merge_patches(
         let resolved = resolve_group(base_pos, end, base_lines, &group_o, &group_t);
         match resolved {
             Resolution::Applied(lines) => output.extend(lines),
-            Resolution::Conflict { ours_lines, theirs_lines, base_range } => {
+            Resolution::Conflict {
+                ours_lines,
+                theirs_lines,
+                base_range,
+            } => {
                 let ours_start = output.len();
                 output.extend(conflict_marker_ours());
                 output.extend(ours_lines.clone());
@@ -238,12 +242,24 @@ fn resolve_group(
     }
 }
 
-fn conflict_marker_ours() -> Vec<String> { vec!["<<<<<<< ours\n".to_string()] }
-fn conflict_marker_base() -> Vec<String> { vec!["||||||| base\n".to_string()] }
-fn conflict_marker_theirs() -> Vec<String> { vec!["=======\n".to_string()] }
-fn conflict_marker_end() -> Vec<String> { vec![">>>>>>> theirs\n".to_string()] }
+fn conflict_marker_ours() -> Vec<String> {
+    vec!["<<<<<<< ours\n".to_string()]
+}
+fn conflict_marker_base() -> Vec<String> {
+    vec!["||||||| base\n".to_string()]
+}
+fn conflict_marker_theirs() -> Vec<String> {
+    vec!["=======\n".to_string()]
+}
+fn conflict_marker_end() -> Vec<String> {
+    vec![">>>>>>> theirs\n".to_string()]
+}
 
-pub fn three_way_merge_lines(base: &str, ours: &str, theirs: &str) -> (String, Vec<ConflictRegion>) {
+pub fn three_way_merge_lines(
+    base: &str,
+    ours: &str,
+    theirs: &str,
+) -> (String, Vec<ConflictRegion>) {
     let base_lines = split_lines_keep(base);
     let ours_lines = split_lines_keep(ours);
     let theirs_lines = split_lines_keep(theirs);
@@ -267,13 +283,17 @@ trait MapFirst<A, B> {
 }
 
 impl<S: Into<String>, B> MapFirst<S, B> for (S, B) {
-    fn map_first(self) -> (String, B) { (self.0.into(), self.1) }
+    fn map_first(self) -> (String, B) {
+        (self.0.into(), self.1)
+    }
 }
 
 pub struct TextualHandler;
 
 impl MergeHandler for TextualHandler {
-    fn name(&self) -> &str { "textual" }
+    fn name(&self) -> &str {
+        "textual"
+    }
 
     fn applicable(&self, _path: &Path, base: &[u8], ours: &[u8], theirs: &[u8]) -> bool {
         // Only apply to anything that's valid UTF-8 — we refuse to do
@@ -301,7 +321,10 @@ impl MergeHandler for TextualHandler {
                 partial: merged.into_bytes(),
             }
         };
-        MergeResult { handler: self.name().into(), status }
+        MergeResult {
+            handler: self.name().into(),
+            status,
+        }
     }
 }
 

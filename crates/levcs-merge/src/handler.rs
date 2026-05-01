@@ -14,8 +14,14 @@ pub struct ConflictRegion {
 
 #[derive(Clone, Debug)]
 pub enum MergeStatus {
-    Merged { content: Vec<u8>, notes: Vec<MergeNote> },
-    Conflict { regions: Vec<ConflictRegion>, partial: Vec<u8> },
+    Merged {
+        content: Vec<u8>,
+        notes: Vec<MergeNote>,
+    },
+    Conflict {
+        regions: Vec<ConflictRegion>,
+        partial: Vec<u8>,
+    },
     NotApplicable,
 }
 

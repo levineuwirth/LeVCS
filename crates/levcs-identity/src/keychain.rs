@@ -63,14 +63,20 @@ impl Default for KdfParams {
 
 impl Keychain {
     pub fn new() -> Self {
-        Self { schema_version: KEYCHAIN_SCHEMA_VERSION, keys: Vec::new() }
+        Self {
+            schema_version: KEYCHAIN_SCHEMA_VERSION,
+            keys: Vec::new(),
+        }
     }
 
     pub fn default_path() -> PathBuf {
         if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
             PathBuf::from(xdg).join("levcs").join("keys.toml")
         } else if let Some(home) = std::env::var_os("HOME") {
-            PathBuf::from(home).join(".config").join("levcs").join("keys.toml")
+            PathBuf::from(home)
+                .join(".config")
+                .join("levcs")
+                .join("keys.toml")
         } else {
             PathBuf::from("/tmp").join("levcs").join("keys.toml")
         }
@@ -161,12 +167,7 @@ impl Keychain {
         Ok(())
     }
 
-    pub fn add_encrypted(
-        &mut self,
-        label: &str,
-        sk: &SecretKey,
-        passphrase: &[u8],
-    ) -> Result<()> {
+    pub fn add_encrypted(&mut self, label: &str, sk: &SecretKey, passphrase: &[u8]) -> Result<()> {
         if self.entry(label).is_some() {
             return Err(IdentityError::Other(format!("key already exists: {label}")));
         }
@@ -193,7 +194,9 @@ impl Keychain {
 
     pub fn rename(&mut self, old: &str, new: &str) -> Result<()> {
         if self.entry(new).is_some() {
-            return Err(IdentityError::Other(format!("destination already exists: {new}")));
+            return Err(IdentityError::Other(format!(
+                "destination already exists: {new}"
+            )));
         }
         let e = self
             .entry_mut(old)
@@ -205,7 +208,9 @@ impl Keychain {
 
 fn now_rfc3339() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let dur = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let dur = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     // crude RFC3339 (no tzdb dependency): seconds since epoch as Z time.
     let secs = dur.as_secs() as i64;
     // y/m/d via integer math.
@@ -267,7 +272,8 @@ fn decrypt_secret(enc: &EncryptedKey, passphrase: &[u8]) -> Result<SecretKey> {
     };
     if enc.algorithm != "xchacha20poly1305-argon2id" {
         return Err(IdentityError::Crypto(format!(
-            "unknown algorithm: {}", enc.algorithm
+            "unknown algorithm: {}",
+            enc.algorithm
         )));
     }
     let salt = B64
@@ -297,8 +303,13 @@ fn decrypt_secret(enc: &EncryptedKey, passphrase: &[u8]) -> Result<SecretKey> {
 
 fn derive_key(passphrase: &[u8], salt: &[u8], params: &KdfParams) -> Result<[u8; 32]> {
     use argon2::{Algorithm, Argon2, Params, Version};
-    let p = Params::new(params.memory, params.iterations, params.parallelism, Some(32))
-        .map_err(|e| IdentityError::Argon2(e.to_string()))?;
+    let p = Params::new(
+        params.memory,
+        params.iterations,
+        params.parallelism,
+        Some(32),
+    )
+    .map_err(|e| IdentityError::Argon2(e.to_string()))?;
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, p);
     let mut out = [0u8; 32];
     argon
@@ -326,7 +337,8 @@ mod tests {
     fn keychain_encryption_roundtrip() {
         let mut kc = Keychain::new();
         let sk = SecretKey::generate();
-        kc.add_encrypted("locked", &sk, b"correct horse battery staple").unwrap();
+        kc.add_encrypted("locked", &sk, b"correct horse battery staple")
+            .unwrap();
         let s = toml::to_string(&kc).unwrap();
         let kc2: Keychain = toml::from_str(&s).unwrap();
         let unlocked = kc2

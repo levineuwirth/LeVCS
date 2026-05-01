@@ -1,0 +1,41 @@
+# Spec drafts — kept private until published.
+/spec/
+
+# Build output and bench artifacts.
+/target
+/bench-results
+
+# LeVCS working state at the repo root, if the binaries are ever run
+# from here. Subdirectory `.levcs/` is part of every repo's metadata
+# and is excluded so committing this repo via git stays orthogonal
+# to dogfooding it via LeVCS itself.
+/levcs-data/
+/.levcs/
+
+# Profiling and perf output.
+flamegraph.svg
+perf.data
+perf.data.old
+*.profraw
+*.profdata
+
+# Editor and IDE.
+.vscode/
+.idea/
+*.iml
+
+# OS metadata.
+.DS_Store
+Thumbs.db
+
+# Backup and swap.
+*~
+*.swp
+*.swo
+*.bak
+
+# Local env files. Never commit secrets — keychain lives in
+# $XDG_CONFIG_HOME by design, but pattern-match anyway.
+.env
+.env.*
+!.env.example

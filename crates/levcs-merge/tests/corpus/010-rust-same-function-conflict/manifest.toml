@@ -1,0 +1,8 @@
+description = "Rust: divergent edits to the same function body surface as a single block-level conflict"
+path = "src/lib.rs"
+
+[expected]
+status = "conflict"
+handler = "tree-sitter:rust"
+conflict_count = 1
+region_descriptions_contain = ["concurrent edits"]

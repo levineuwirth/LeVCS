@@ -1,0 +1,8 @@
+description = "TOML: each side adds a new table at the top level — both must survive"
+path = "Cargo.toml"
+git_false_conflict = true
+
+[expected]
+status = "merged"
+handler = "toml"
+contains = ["[dependencies]", "[dev-dependencies]"]

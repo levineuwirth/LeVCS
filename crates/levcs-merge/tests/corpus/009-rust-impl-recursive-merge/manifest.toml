@@ -1,0 +1,9 @@
+description = "Rust: two engineers add different methods to the same impl block — recursive merge resolves cleanly"
+path = "src/lib.rs"
+git_false_conflict = true
+
+[expected]
+status = "merged"
+handler = "tree-sitter:rust"
+contains = ["fn render", "fn cache_key", "fn debug_dump", "impl Page"]
+notes_contain = ["recursive descent"]

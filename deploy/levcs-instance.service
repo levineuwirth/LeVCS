@@ -1,0 +1,41 @@
+[Unit]
+Description=LeVCS federation instance (§5.2)
+Documentation=https://github.com/lneuwirth/levcs
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=levcs
+Group=levcs
+ExecStart=/usr/local/bin/levcs-instance --config /etc/levcs/instance.toml
+Restart=on-failure
+RestartSec=5
+
+# tracing-subscriber respects RUST_LOG. info-level is reasonable for
+# production (one line per request via the TraceLayer); bump to debug
+# while diagnosing.
+Environment=RUST_LOG=info
+
+# Hardening. The instance reads its config and writes only to its
+# data root; everything else can be sealed off.
+ProtectSystem=strict
+ReadWritePaths=/var/lib/levcs
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+RestrictRealtime=true
+
+# File descriptor limits — pack/clone responses are streamed, but
+# enough headroom for hundreds of concurrent peers.
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

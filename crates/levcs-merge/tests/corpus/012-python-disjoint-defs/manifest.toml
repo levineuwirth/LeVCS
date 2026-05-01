@@ -1,0 +1,8 @@
+description = "Python: each side adds a different top-level def — both survive"
+path = "app.py"
+git_false_conflict = true
+
+[expected]
+status = "merged"
+handler = "tree-sitter:python"
+contains = ["def login", "def logout"]

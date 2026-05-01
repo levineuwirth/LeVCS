@@ -1,0 +1,7 @@
+description = "YAML: disjoint key additions merge cleanly via the JSON-bridged YAML handler"
+path = "values.yaml"
+
+[expected]
+status = "merged"
+handler = "yaml"
+contains = ["alice", "bob", "carol"]

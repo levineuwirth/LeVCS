@@ -1,0 +1,6 @@
+description = "JSON: divergent edits to the same key surface as a conflict"
+path = "config.json"
+
+[expected]
+status = "conflict"
+handler = "json"

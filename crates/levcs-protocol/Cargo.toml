@@ -1,0 +1,28 @@
+[package]
+name = "levcs-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+levcs-core = { workspace = true }
+levcs-identity = { workspace = true }
+blake3 = { workspace = true }
+ed25519-dalek = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+byteorder = { workspace = true }
+getrandom = { workspace = true }
+zstd = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "pack_codec"
+harness = false

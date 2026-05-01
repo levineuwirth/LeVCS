@@ -1,0 +1,1 @@
+fn router_init() {}

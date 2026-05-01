@@ -1,0 +1,30 @@
+[package]
+name = "levcs-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+levcs-core = { workspace = true }
+levcs-identity = { workspace = true }
+levcs-merge = { workspace = true }
+levcs-protocol = { workspace = true }
+levcs-client = { workspace = true }
+levcs-tui = { workspace = true }
+clap = { workspace = true }
+similar = { workspace = true }
+serde = { workspace = true }
+anyhow = { workspace = true }
+hex = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+
+[[bin]]
+name = "levcs"
+path = "src/main.rs"
+
+[dev-dependencies]
+levcs-instance = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }

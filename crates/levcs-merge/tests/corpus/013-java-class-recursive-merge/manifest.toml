@@ -1,0 +1,9 @@
+description = "Java: two engineers add different methods to the same class — recursive merge resolves cleanly"
+path = "src/Service.java"
+git_false_conflict = true
+
+[expected]
+status = "merged"
+handler = "tree-sitter:java"
+contains = ["void start", "void stop", "void reload"]
+notes_contain = ["recursive descent"]

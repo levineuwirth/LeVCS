@@ -1,0 +1,225 @@
+//! References. Stored under `.levcs/refs/` as small text files containing one
+//! hex hash and a trailing newline. `HEAD` is at the top level of `.levcs/`.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use crate::error::{Error, IoExt, Result};
+use crate::hash::ObjectId;
+
+#[derive(Clone, Debug)]
+pub struct Refs {
+    pub levcs_dir: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Head {
+    /// HEAD points at a branch (e.g., `refs/branches/main`).
+    Branch(String),
+    /// Detached HEAD pointing directly at a commit.
+    Detached(ObjectId),
+}
+
+impl Refs {
+    pub fn new(levcs_dir: impl Into<PathBuf>) -> Self {
+        Self { levcs_dir: levcs_dir.into() }
+    }
+
+    pub fn refs_dir(&self) -> PathBuf { self.levcs_dir.join("refs") }
+    pub fn head_path(&self) -> PathBuf { self.levcs_dir.join("HEAD") }
+
+    pub fn ref_path(&self, name: &str) -> Result<PathBuf> {
+        validate_ref_name(name)?;
+        Ok(self.levcs_dir.join(name))
+    }
+
+    pub fn read(&self, name: &str) -> Result<Option<ObjectId>> {
+        let path = self.ref_path(name)?;
+        match fs::read_to_string(&path) {
+            Ok(s) => Ok(Some(parse_ref_value(&s)?)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(Error::Io { path: Some(path), source: e }),
+        }
+    }
+
+    pub fn write(&self, name: &str, id: ObjectId) -> Result<()> {
+        let path = self.ref_path(name)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).ctx(parent.to_path_buf())?;
+        }
+        atomic_write(&path, format!("{}\n", id.to_hex()).as_bytes())
+    }
+
+    pub fn delete(&self, name: &str) -> Result<()> {
+        let path = self.ref_path(name)?;
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(Error::Io { path: Some(path), source: e }),
+        }
+    }
+
+    pub fn read_head(&self) -> Result<Option<Head>> {
+        let path = self.head_path();
+        match fs::read_to_string(&path) {
+            Ok(s) => Ok(Some(parse_head(&s)?)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(Error::Io { path: Some(path), source: e }),
+        }
+    }
+
+    pub fn write_head(&self, head: &Head) -> Result<()> {
+        let s = match head {
+            Head::Branch(name) => {
+                validate_ref_name(name)?;
+                format!("ref: {}\n", name)
+            }
+            Head::Detached(id) => format!("{}\n", id.to_hex()),
+        };
+        atomic_write(&self.head_path(), s.as_bytes())
+    }
+
+    /// Resolve HEAD to a commit hash, if any. None if HEAD points to a branch
+    /// that does not exist (i.e., empty repository).
+    pub fn resolve_head(&self) -> Result<Option<ObjectId>> {
+        match self.read_head()? {
+            None => Ok(None),
+            Some(Head::Detached(id)) => Ok(Some(id)),
+            Some(Head::Branch(name)) => self.read(&name),
+        }
+    }
+
+    /// List every ref under `refs/`. Returns `(name, id)` pairs.
+    pub fn list_all(&self) -> Result<Vec<(String, ObjectId)>> {
+        let mut out = Vec::new();
+        let dir = self.refs_dir();
+        if !dir.is_dir() {
+            return Ok(out);
+        }
+        walk(&dir, &dir, &mut out)?;
+        return Ok(out);
+
+        fn walk(base: &Path, dir: &Path, out: &mut Vec<(String, ObjectId)>) -> Result<()> {
+            for ent in fs::read_dir(dir).ctx(dir.to_path_buf())? {
+                let ent = ent.ctx(dir.to_path_buf())?;
+                let path = ent.path();
+                if path.is_dir() {
+                    walk(base, &path, out)?;
+                } else {
+                    let rel = path.strip_prefix(base.parent().unwrap()).unwrap();
+                    let name = rel.to_string_lossy().replace('\\', "/").to_string();
+                    let txt = fs::read_to_string(&path).ctx(path.clone())?;
+                    if let Ok(id) = parse_ref_value(&txt) {
+                        out.push((name, id));
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+
+    pub fn list_branches(&self) -> Result<Vec<(String, ObjectId)>> {
+        let dir = self.refs_dir().join("branches");
+        let mut out = Vec::new();
+        if !dir.is_dir() { return Ok(out); }
+        for ent in fs::read_dir(&dir).ctx(dir.clone())? {
+            let ent = ent.ctx(dir.clone())?;
+            let name = ent.file_name().to_string_lossy().to_string();
+            let txt = fs::read_to_string(ent.path()).ctx(ent.path())?;
+            if let Ok(id) = parse_ref_value(&txt) {
+                out.push((name, id));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
+
+    pub fn list_releases(&self) -> Result<Vec<(String, ObjectId)>> {
+        let dir = self.refs_dir().join("releases");
+        let mut out = Vec::new();
+        if !dir.is_dir() { return Ok(out); }
+        for ent in fs::read_dir(&dir).ctx(dir.clone())? {
+            let ent = ent.ctx(dir.clone())?;
+            let name = ent.file_name().to_string_lossy().to_string();
+            let txt = fs::read_to_string(ent.path()).ctx(ent.path())?;
+            if let Ok(id) = parse_ref_value(&txt) {
+                out.push((name, id));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
+}
+
+pub fn validate_ref_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(Error::InvalidReference("empty".into()));
+    }
+    for comp in name.split('/') {
+        if comp.is_empty() {
+            return Err(Error::InvalidReference(format!("empty component in {name}")));
+        }
+        if comp == "." || comp == ".." {
+            return Err(Error::InvalidReference(format!("reserved component: {comp}")));
+        }
+        if comp.contains('\0') {
+            return Err(Error::InvalidReference("null byte".into()));
+        }
+    }
+    if name.contains("//") || name.starts_with('/') || name.ends_with('/') {
+        return Err(Error::InvalidReference(format!("malformed path: {name}")));
+    }
+    Ok(())
+}
+
+fn parse_ref_value(s: &str) -> Result<ObjectId> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Err(Error::InvalidReference("empty ref body".into()));
+    }
+    ObjectId::from_hex(trimmed)
+}
+
+fn parse_head(s: &str) -> Result<Head> {
+    let trimmed = s.trim();
+    if let Some(rest) = trimmed.strip_prefix("ref:") {
+        let name = rest.trim();
+        validate_ref_name(name)?;
+        Ok(Head::Branch(name.to_string()))
+    } else {
+        Ok(Head::Detached(ObjectId::from_hex(trimmed)?))
+    }
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::Other(format!("ref path has no parent: {path:?}")))?;
+    fs::create_dir_all(parent).ctx(parent.to_path_buf())?;
+    let tmp = parent.join(format!(
+        ".tmp.{}",
+        path.file_name().unwrap().to_string_lossy()
+    ));
+    fs::write(&tmp, bytes).ctx(tmp.clone())?;
+    fs::rename(&tmp, path).ctx(path.to_path_buf())?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_names_rejected() {
+        for n in ["", ".", "..", "a/", "/a", "a//b", "a/.."] {
+            assert!(validate_ref_name(n).is_err(), "should reject: {n}");
+        }
+    }
+
+    #[test]
+    fn valid_names_accepted() {
+        for n in ["refs/branches/main", "refs/releases/v1.0", "refs/authority/current"] {
+            validate_ref_name(n).unwrap();
+        }
+    }
+}

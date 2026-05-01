@@ -1,0 +1,41 @@
+# Caddy reverse-proxy block for levcs-instance.
+#
+# Caddy is the recommended front-end: automatic TLS via Let's Encrypt,
+# zero ceremony. Replace `levcs.example.com` with your hostname and
+# drop this into /etc/caddy/Caddyfile (or import it from there).
+#
+# The instance terminates HTTP only — Caddy handles TLS and forwards
+# plaintext to 127.0.0.1:7117. Federation requests are signed at the
+# application layer (LeVCS-Signature header), so the proxy is solely
+# responsible for transport security and rate limiting.
+
+levcs.example.com {
+	# Forward everything under /levcs/v1 and /health. Anything else
+	# returns 404 from Caddy without ever touching the instance.
+	@levcs path /levcs/v1/* /health
+	handle @levcs {
+		reverse_proxy 127.0.0.1:7117 {
+			# Pack responses can be large on a fresh clone. Disable
+			# Caddy's default 30s read timeout so long pulls don't
+			# get cut off mid-stream.
+			transport http {
+				read_timeout 5m
+				write_timeout 5m
+			}
+		}
+	}
+
+	# Anything else: a clear 404. No web UI exists yet — be explicit
+	# rather than leaking a default Caddy page.
+	respond 404
+
+	# Modest log retention. The instance also logs each request via
+	# tower-http's TraceLayer, so this is a backstop.
+	log {
+		output file /var/log/caddy/levcs.log {
+			roll_size 50mb
+			roll_keep 5
+		}
+		format json
+	}
+}

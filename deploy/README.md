@@ -1,0 +1,300 @@
+# Hosting a LeVCS instance on a VPS
+
+This walkthrough takes you from "I have a VPS" to "the LeVCS source code
+lives on my LeVCS instance" using the artifacts in this directory.
+
+The instance terminates HTTP, not TLS, so you'll run it behind a reverse
+proxy (Caddy or nginx). Federation requests are signed at the
+application layer, so the proxy is just transport security + rate
+limiting — there's no auth handoff between layers.
+
+## Architecture (one-liner)
+
+```
+laptop  --HTTPS-->  Caddy/nginx (TLS)  --HTTP--> levcs-instance (127.0.0.1:7117)
+                                                       |
+                                                       v
+                                                 /var/lib/levcs
+```
+
+## What's in this directory
+
+| File | Purpose |
+|---|---|
+| `instance.toml.example` | Annotated config — copy to `/etc/levcs/instance.toml`. |
+| `levcs-instance.service` | systemd unit. Runs as a `levcs` user, hardened. |
+| `Caddyfile.example` | Caddy reverse-proxy block (auto-TLS via Let's Encrypt). |
+| `nginx.conf.example` | nginx alternative (use if you already run nginx). |
+
+---
+
+## VPS-side install
+
+### 1. Build the binary
+
+On a build host (the VPS itself or a beefier dev machine cross-compiled
+to its target), build a release binary:
+
+```sh
+cargo build --release -p levcs-instance --bin levcs-instance
+```
+
+The binary lands at `target/release/levcs-instance`. Copy it to
+`/usr/local/bin/levcs-instance` on the VPS.
+
+### 2. Create the service user and directories
+
+```sh
+sudo useradd --system --home /var/lib/levcs --shell /usr/sbin/nologin levcs
+sudo install -d -o levcs -g levcs -m 0755 /var/lib/levcs
+sudo install -d -o root -g root -m 0755 /etc/levcs
+```
+
+### 3. Drop the config in place
+
+```sh
+sudo cp deploy/instance.toml.example /etc/levcs/instance.toml
+sudo $EDITOR /etc/levcs/instance.toml
+```
+
+The defaults (full storage, builtin handlers only, no mirrors, listen
+on 127.0.0.1:7117) are correct for a single-VPS install. Change `root`
+only if `/var/lib/levcs` doesn't suit your filesystem layout.
+
+### 4. Install the systemd unit
+
+```sh
+sudo cp deploy/levcs-instance.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now levcs-instance
+sudo systemctl status levcs-instance
+```
+
+Verify it's listening:
+
+```sh
+curl -fsS http://127.0.0.1:7117/health
+# {"status":"ok"}
+```
+
+### 5. Reverse proxy
+
+#### Option A — Caddy (recommended)
+
+If Caddy isn't installed yet:
+
+```sh
+sudo apt install caddy        # or your distro's package
+```
+
+Edit `Caddyfile.example`, replace `levcs.example.com` with your real
+hostname, then either drop it in as `/etc/caddy/Caddyfile` or import it
+from your existing one. Reload Caddy:
+
+```sh
+sudo cp deploy/Caddyfile.example /etc/caddy/Caddyfile
+sudo $EDITOR /etc/caddy/Caddyfile
+sudo systemctl reload caddy
+```
+
+Caddy will fetch a Let's Encrypt cert automatically on the first
+request. Confirm:
+
+```sh
+curl -fsS https://levcs.example.com/health
+# {"status":"ok"}
+```
+
+#### Option B — nginx (if you already run it)
+
+If your VPS already runs nginx (e.g. fronting Forgejo), use a server
+block alongside the existing ones rather than introducing Caddy. Make
+sure you have a TLS cert for the new hostname (certbot:
+`sudo certbot --nginx -d levcs.example.com`).
+
+```sh
+sudo cp deploy/nginx.conf.example /etc/nginx/sites-available/levcs
+sudo $EDITOR /etc/nginx/sites-available/levcs
+sudo ln -s ../sites-available/levcs /etc/nginx/sites-enabled/
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+The example block handles both 80→443 redirect and the proxy itself.
+The location regex (`/levcs/v1` and `/health`) ensures everything else
+returns 404 — there is no web UI yet, and the instance shouldn't appear
+to host one.
+
+### 6. Firewall
+
+Open 80 and 443 on the VPS, keep 7117 closed from the public internet:
+
+```sh
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+# 7117 stays closed — only Caddy/nginx talk to it.
+```
+
+---
+
+## Laptop-side bootstrap
+
+Now make the LeVCS source code itself a LeVCS repository hosted on the
+new instance. This is the dogfood claim: you're running the protocol on
+your own code from this point on.
+
+### 1. Build the CLI locally
+
+```sh
+cargo build --release -p levcs-cli --bin levcs
+sudo install -m 0755 target/release/levcs /usr/local/bin/levcs
+```
+
+### 2. Generate or import an identity key
+
+If you don't already have a LeVCS key:
+
+```sh
+levcs key generate --label primary
+levcs key list
+```
+
+The label is yours to choose (`alice`, `primary`, your handle — anything).
+This key is your authority membership credential; it signs every
+authority object and every push.
+
+### 3. Init the repo locally
+
+From inside the LeVCS source tree:
+
+```sh
+levcs init --key primary
+levcs track --all
+levcs commit -m "initial import"
+```
+
+`init` writes a `.levcs/` directory next to your source, with a genesis
+authority object that names your key as the sole Owner. The repo_id is
+the BLAKE3 hash of that authority — globally unique by construction.
+
+### 4. Point the local repo at the VPS instance
+
+```sh
+levcs instance --set https://levcs.example.com/levcs/v1
+levcs instance --info
+```
+
+The `--set` value is what the federation client uses for every push and
+pull on this repo.
+
+### 5. First push (auto-init)
+
+```sh
+levcs push refs/branches/main
+```
+
+Behind the scenes the client tries `/push` first, gets a 404 (the repo
+doesn't exist on the instance yet), then falls back to `/init` with the
+genesis authority object and re-pushes. Output looks like:
+
+```
+repo not yet on instance; initialising
+pushed 1 ref(s)
+```
+
+That's it. The repo is now hosted on the VPS, available to anyone over
+HTTPS:
+
+```sh
+curl -fsS https://levcs.example.com/levcs/v1/repos/<repo_id>/info | jq
+```
+
+### 6. (Optional) Verify the server-side state
+
+SSH to the VPS and look at what got persisted:
+
+```sh
+sudo ls /var/lib/levcs/
+sudo ls /var/lib/levcs/<repo_id>/.levcs/refs/branches/
+sudo cat /var/lib/levcs/<repo_id>/.levcs/refs/authority/current
+```
+
+You should see your repo_id directory, a `main` ref pointing at your
+head commit hash, and a current-authority pointer matching the genesis.
+
+---
+
+## Operating notes
+
+### Logs
+
+```sh
+sudo journalctl -u levcs-instance -f         # live
+sudo journalctl -u levcs-instance -p warning # warnings + errors only
+```
+
+The `TraceLayer` middleware emits one line per HTTP request at
+`info` level — method, path, status, latency. Bump to `debug` via
+`Environment=RUST_LOG=debug` in the systemd unit when diagnosing.
+
+### Backups
+
+The instance is filesystem-only. A consistent backup is just a
+snapshot of `/var/lib/levcs`. Per-push atomicity is per-object plus a
+serializing per-repo mutex (see `crates/levcs-instance/src/lib.rs`),
+which means a snapshot taken at any moment is internally consistent
+even without quiescing the service. `rsync --link-dest` for incremental
+hardlink snapshots works well.
+
+### Storage growth
+
+There's no automatic GC on the instance. Run `levcs gc` from a client
+that has the repo locally; instance-side GC is a future feature. For
+now, "GC" on the VPS is "delete entire `<repo_id>/` directories of repos
+you no longer want."
+
+### Updating the binary
+
+```sh
+sudo systemctl stop levcs-instance
+sudo install -m 0755 target/release/levcs-instance /usr/local/bin/levcs-instance
+sudo systemctl start levcs-instance
+```
+
+The on-disk format is content-addressed and forward-compatible — there's
+no migration step between versions. If a future release introduces an
+incompatible change, the release notes will say so.
+
+### Mirrors
+
+To set up a read-only mirror of a repo from another instance, add a
+`[[mirrors]]` block to `/etc/levcs/instance.toml`:
+
+```toml
+[[mirrors]]
+repo_id = "abcd1234..."
+source = "https://other.example/levcs/v1"
+mode = "full"
+poll_interval = "5m"
+writeback = false
+```
+
+Then `sudo systemctl restart levcs-instance`. The background poller
+spawns at startup; `journalctl -u levcs-instance` will show the sync
+activity.
+
+---
+
+## What's missing (workflow honesty)
+
+The protocol surface this instance exposes is just refs + objects + auth.
+There is **no** web UI, issue tracker, PR/review surface, comment thread,
+notification hub, or branch-protection layer yet. If you're migrating
+from Forgejo for the LeVCS source, you'll lose:
+
+- The web frontend for browsing code, blame, and history.
+- Issues and PR discussions (and any Forgejo-specific automations).
+- CI integration (no webhooks yet — you'd need to poll the refs from
+  your CI).
+
+That's the spec gap that comes next. This deployment is the substrate
+the workflow layer will sit on top of.

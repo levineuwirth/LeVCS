@@ -1,0 +1,7 @@
+description = "Rust: ours modifies a function that theirs deleted — surfaces as a modify-vs-delete conflict"
+path = "src/lib.rs"
+
+[expected]
+status = "conflict"
+handler = "tree-sitter:rust"
+region_descriptions_contain = ["modify-vs-delete"]

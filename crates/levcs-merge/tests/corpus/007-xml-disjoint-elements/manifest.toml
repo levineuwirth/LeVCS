@@ -1,0 +1,9 @@
+description = "XML: each side edits a different child element under the same parent — both edits land"
+path = "config.xml"
+git_false_conflict = true
+
+[expected]
+status = "merged"
+handler = "xml"
+contains = ["<owner>bob</owner>", "<port>9090</port>"]
+not_contains = ["<owner>alice</owner>", "<port>8080</port>"]

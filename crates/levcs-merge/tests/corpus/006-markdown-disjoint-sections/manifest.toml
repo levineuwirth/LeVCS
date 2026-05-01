@@ -1,0 +1,8 @@
+description = "Markdown: each side appends a different new section — both survive, no conflict"
+path = "CHANGELOG.md"
+git_false_conflict = true
+
+[expected]
+status = "merged"
+handler = "markdown"
+contains = ["## Authentication", "## Caching"]

@@ -1,0 +1,6 @@
+description = "TOML: divergent edits to the same key surface as a structural conflict"
+path = "config.toml"
+
+[expected]
+status = "conflict"
+handler = "toml"

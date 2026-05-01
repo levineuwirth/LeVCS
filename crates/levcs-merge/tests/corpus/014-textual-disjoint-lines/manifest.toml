@@ -1,0 +1,9 @@
+description = "Textual: line additions in non-overlapping regions of the file merge cleanly via diff3"
+path = "audit.log"
+git_false_conflict = true
+
+[expected]
+status = "merged"
+handler = "textual"
+contains = ["ours-side event", "theirs-side event"]
+not_contains = ["<<<<<<<", "======="]

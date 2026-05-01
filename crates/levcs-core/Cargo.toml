@@ -1,0 +1,30 @@
+[package]
+name = "levcs-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+blake3 = { workspace = true }
+byteorder = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+glob = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "object_hash"
+harness = false
+
+[[bench]]
+name = "store_write"
+harness = false
+
+[[bench]]
+name = "gc_walk"
+harness = false

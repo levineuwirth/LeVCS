@@ -1,0 +1,8 @@
+description = "JSON: disjoint top-level key additions on each side merge cleanly"
+path = "config.json"
+
+[expected]
+status = "merged"
+handler = "json"
+contains = ["alice", "bob", "carol"]
+not_contains = ["<<<<<<<"]

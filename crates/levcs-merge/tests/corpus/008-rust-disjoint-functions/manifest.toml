@@ -1,0 +1,8 @@
+description = "Rust: each side appends a different top-level function — both survive"
+path = "src/lib.rs"
+git_false_conflict = true
+
+[expected]
+status = "merged"
+handler = "tree-sitter:rust"
+contains = ["fn handle_get", "fn handle_post"]

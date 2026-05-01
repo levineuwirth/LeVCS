@@ -1,0 +1,34 @@
+[package]
+name = "levcs-instance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+levcs-core = { workspace = true }
+levcs-identity = { workspace = true }
+levcs-merge = { workspace = true }
+levcs-protocol = { workspace = true }
+levcs-client = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+hex = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+reqwest = { workspace = true }
+levcs-protocol = { workspace = true }
+levcs-client = { workspace = true }
+tokio = { workspace = true }
+
+[[bin]]
+name = "levcs-instance"
+path = "src/main.rs"

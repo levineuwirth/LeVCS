@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use levcs_client::{Client, ClientError};
 use levcs_core::{ObjectId, ObjectStore, Refs, Repository};
-use levcs_identity::verify::{verify_authority_chain, verify_commit, verify_release};
+use levcs_identity::verify::ChainVerifier;
 use thiserror::Error;
 
 use crate::{InstanceConfig, MirrorConfig};
@@ -122,22 +122,25 @@ pub fn sync_mirror(
         store.write_raw(&ent.bytes)?;
     }
 
+    // Share one chain-verification cache across every per-tip check below.
+    // Without this, each tip independently walks its authority chain back
+    // to genesis — repeating identical work for every tip that cites the
+    // same authority. With the cache the second tip onwards is O(1).
+    let mut verifier = ChainVerifier::new();
+
     // Verify the authority chain on the announced current authority.
-    // Every commit / release we're about to advance to must chain back to
-    // a member that is rooted in `genesis_authority` — the chain walk
-    // checks that, so doing it once here covers all the per-tip checks
-    // below. (verify_commit re-walks the chain internally; that is
-    // redundant but cheap and keeps the per-tip checks self-contained.)
+    // This populates the cache with the entire chain so the per-tip
+    // checks below get cache hits.
     if !info.current_authority.is_empty() {
         let cur_auth = parse_hash(&info.current_authority)?;
-        verify_authority_chain(&store, cur_auth)?;
+        verifier.verify_chain(&store, cur_auth)?;
     }
 
     // Per-branch verification — fully checks signature, author membership,
     // and authority chain. If verification fails on any tip we abort
     // before touching local refs, so a bad source can never poison us.
     for (name, id) in &want_branches {
-        verify_commit(&store, *id, Some(&format!("refs/branches/{name}")))?;
+        verifier.verify_commit(&store, *id, Some(&format!("refs/branches/{name}")))?;
     }
     // Per-release verification: check the signed object itself and its
     // authority. The release object's full schema check (predecessor /
@@ -146,7 +149,7 @@ pub fn sync_mirror(
     // the signing key is actually a member of the chain rooted in our
     // local genesis.
     for (_, id) in &want_releases {
-        verify_release(&store, *id)?;
+        verifier.verify_release(&store, *id)?;
     }
 
     // All checks passed — advance local refs. We do branches first, then

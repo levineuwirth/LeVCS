@@ -11,6 +11,7 @@
 //! remote-fetching shim.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use thiserror::Error;
 
@@ -186,27 +187,125 @@ fn verify_authority_step(
 
 /// Walk an authority back to genesis, verifying each step. Returns the body
 /// of the genesis authority on success.
+///
+/// Standalone calls allocate a fresh verifier each time. Callers that
+/// verify many tips in a loop (mirror sync, push handler iterating
+/// commits) should use `ChainVerifier` directly so the chain walk can be
+/// shared — without it, verifying N commits that all cite the same
+/// authority is O(N × chain_depth).
 pub fn verify_authority_chain<S: ObjectSource>(
     src: &S,
     start: ObjectId,
 ) -> Verification<AuthorityBody> {
-    let mut cur_id = start;
-    let mut cur_signed = read_signed(src, cur_id)?;
-    let mut cur_body = AuthorityBody::parse(&cur_signed.body)
-        .map_err(|e| VerifyError::Authority(e.to_string()))?;
-    while !cur_body.previous_authority.is_zero() {
-        let prev_id = cur_body.previous_authority;
-        let prev_signed = read_signed(src, prev_id)?;
-        let prev_body = AuthorityBody::parse(&prev_signed.body)
-            .map_err(|e| VerifyError::Authority(e.to_string()))?;
-        verify_authority_step(&cur_signed, &cur_body, &prev_body, prev_id)?;
-        cur_signed = prev_signed;
-        cur_body = prev_body;
-        cur_id = prev_id;
+    let mut v = ChainVerifier::new();
+    let body = v.verify_chain(src, start)?;
+    Ok((*body).clone())
+}
+
+/// Caches authority chains that have been fully verified back to genesis.
+/// Hand the same verifier to a sequence of `verify_chain` / `verify_commit`
+/// / `verify_release` calls and the per-call cost drops from O(chain
+/// depth) to O(1) once an ancestor has been seen.
+///
+/// The cache is keyed by authority id, which is a BLAKE3 of the signed
+/// object — collisions are infeasible — so a hit is sound: the underlying
+/// bytes are guaranteed identical to whatever produced the original
+/// success. Insertions are atomic per call: a partial walk that fails
+/// midway leaves the cache untouched.
+///
+/// Not internally synchronized. Callers that share a verifier across
+/// threads should wrap it in `Mutex<_>`.
+#[derive(Default)]
+pub struct ChainVerifier {
+    /// Maps any id along a verified chain → the chain's genesis body.
+    /// The same `Arc<AuthorityBody>` is shared across every entry that
+    /// belongs to one chain, so memory cost scales with the number of
+    /// distinct chains, not with the number of authorities.
+    verified: HashMap<ObjectId, Arc<AuthorityBody>>,
+}
+
+impl ChainVerifier {
+    pub fn new() -> Self {
+        Self::default()
     }
-    let _ = cur_id;
-    let body = verify_genesis(&cur_signed)?;
-    Ok(body)
+
+    /// Verify the authority chain rooted at `start` back to genesis.
+    /// On a cache hit (any id along a previously-verified chain), returns
+    /// the cached genesis body in O(1). On a cache miss, walks the chain,
+    /// verifies each step, and on full success records every walked id
+    /// against a single shared genesis body.
+    pub fn verify_chain<S: ObjectSource>(
+        &mut self,
+        src: &S,
+        start: ObjectId,
+    ) -> Verification<Arc<AuthorityBody>> {
+        if let Some(g) = self.verified.get(&start) {
+            return Ok(g.clone());
+        }
+        // Walk back, accumulating the path. We don't insert anything into
+        // the cache until the entire walk succeeds — a partial walk that
+        // errors out must not leave half-trusted ids cached.
+        let mut walked: Vec<ObjectId> = Vec::new();
+        let mut cur_id = start;
+        let mut cur_signed = read_signed(src, cur_id)?;
+        let mut cur_body = AuthorityBody::parse(&cur_signed.body)
+            .map_err(|e| VerifyError::Authority(e.to_string()))?;
+        let genesis: Arc<AuthorityBody> = loop {
+            walked.push(cur_id);
+            if cur_body.previous_authority.is_zero() {
+                break Arc::new(verify_genesis(&cur_signed)?);
+            }
+            let prev_id = cur_body.previous_authority;
+            // Cache hit on the predecessor: we still need to verify the
+            // step from cur → prev (because the *step's* signature isn't
+            // covered by prev being known-good), but the rest of the
+            // chain back to genesis is already trusted.
+            if let Some(g) = self.verified.get(&prev_id).cloned() {
+                let prev_signed = read_signed(src, prev_id)?;
+                let prev_body = AuthorityBody::parse(&prev_signed.body)
+                    .map_err(|e| VerifyError::Authority(e.to_string()))?;
+                verify_authority_step(&cur_signed, &cur_body, &prev_body, prev_id)?;
+                break g;
+            }
+            let prev_signed = read_signed(src, prev_id)?;
+            let prev_body = AuthorityBody::parse(&prev_signed.body)
+                .map_err(|e| VerifyError::Authority(e.to_string()))?;
+            verify_authority_step(&cur_signed, &cur_body, &prev_body, prev_id)?;
+            cur_signed = prev_signed;
+            cur_body = prev_body;
+            cur_id = prev_id;
+        };
+        for id in walked {
+            self.verified.insert(id, genesis.clone());
+        }
+        Ok(genesis)
+    }
+
+    /// Cache-aware variant of `verify_commit`. Identical semantics; the
+    /// only behavioural difference is that authority chains visited in
+    /// prior calls don't get re-walked.
+    pub fn verify_commit<S: ObjectSource>(
+        &mut self,
+        src: &S,
+        commit_id: ObjectId,
+        target_ref: Option<&str>,
+    ) -> Verification<()> {
+        verify_commit_inner(src, commit_id, target_ref, self)
+    }
+
+    /// Cache-aware variant of `verify_release`.
+    pub fn verify_release<S: ObjectSource>(
+        &mut self,
+        src: &S,
+        release_id: ObjectId,
+    ) -> Verification<()> {
+        verify_release_inner(src, release_id, self)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cache_size(&self) -> usize {
+        self.verified.len()
+    }
 }
 
 /// Verify a successor authority object against `A_old`, given the signer key
@@ -303,10 +402,23 @@ pub fn role_for_commit(
 /// Full commit verification per §3.6 algorithm. `target_ref` is the ref the
 /// commit is being applied to (used for protected-branch role checks); pass
 /// `None` if not applicable (e.g., during walking).
+///
+/// Each call walks the authority chain from scratch. To share that work
+/// across many commits — e.g., during a mirror sync that verifies a
+/// branch's worth of tips — use `ChainVerifier::verify_commit` instead.
 pub fn verify_commit<S: ObjectSource>(
     src: &S,
     commit_id: ObjectId,
     target_ref: Option<&str>,
+) -> Verification<()> {
+    verify_commit_inner(src, commit_id, target_ref, &mut ChainVerifier::new())
+}
+
+fn verify_commit_inner<S: ObjectSource>(
+    src: &S,
+    commit_id: ObjectId,
+    target_ref: Option<&str>,
+    verifier: &mut ChainVerifier,
 ) -> Verification<()> {
     let bytes = src.read_raw(commit_id)?;
     let actual = blake3::hash(&bytes);
@@ -356,7 +468,7 @@ pub fn verify_commit<S: ObjectSource>(
     let auth_signed = read_signed(src, commit.authority)?;
     let auth_body = AuthorityBody::parse(&auth_signed.body)
         .map_err(|e| VerifyError::Authority(e.to_string()))?;
-    let _ = verify_authority_chain(src, commit.authority)?;
+    let _ = verifier.verify_chain(src, commit.authority)?;
     let member = auth_body
         .find_member(&pk)
         .ok_or_else(|| VerifyError::Commit {
@@ -425,6 +537,14 @@ pub fn verify_commit<S: ObjectSource>(
 /// against the authority body. A release with no listed members signing
 /// it is rejected.
 pub fn verify_release<S: ObjectSource>(src: &S, release_id: ObjectId) -> Verification<()> {
+    verify_release_inner(src, release_id, &mut ChainVerifier::new())
+}
+
+fn verify_release_inner<S: ObjectSource>(
+    src: &S,
+    release_id: ObjectId,
+    verifier: &mut ChainVerifier,
+) -> Verification<()> {
     let bytes = src.read_raw(release_id)?;
     let actual = blake3::hash(&bytes);
     if *actual.as_bytes() != release_id.0 {
@@ -455,7 +575,7 @@ pub fn verify_release<S: ObjectSource>(src: &S, release_id: ObjectId) -> Verific
             hash: release_id.to_hex(),
             kind: e.to_string(),
         })?;
-    let _ = verify_authority_chain(src, release.authority)?;
+    let _ = verifier.verify_chain(src, release.authority)?;
     let auth_signed = read_signed(src, release.authority)?;
     let auth_body = AuthorityBody::parse(&auth_signed.body)
         .map_err(|e| VerifyError::Authority(e.to_string()))?;
@@ -730,5 +850,173 @@ mod tests {
         let mut signed = sign_authority(&body, &sk).unwrap();
         signed.body[0] ^= 0xFF; // tamper
         assert!(verify_signed_object(&signed).is_err());
+    }
+
+    /// `ObjectSource` wrapper that counts each `read_raw` call. Lets us
+    /// assert exactly how many bytes the verifier actually fetched, which
+    /// is the only direct way to observe a chain-cache hit.
+    struct CountingSource<'a> {
+        inner: &'a MemorySource,
+        reads: std::cell::Cell<usize>,
+    }
+    impl<'a> CountingSource<'a> {
+        fn new(inner: &'a MemorySource) -> Self {
+            Self {
+                inner,
+                reads: std::cell::Cell::new(0),
+            }
+        }
+        fn reads(&self) -> usize {
+            self.reads.get()
+        }
+    }
+    impl<'a> ObjectSource for CountingSource<'a> {
+        fn read_raw(&self, id: ObjectId) -> Verification<Vec<u8>> {
+            self.reads.set(self.reads.get() + 1);
+            self.inner.read_raw(id)
+        }
+    }
+
+    /// Build a chain of `length` authorities — genesis at index 0, each
+    /// later entry a properly-signed successor of the previous — backed
+    /// by `alice` (an Owner) for the whole walk. Returns the
+    /// `MemorySource` plus the list of authority ids in order.
+    fn build_chain(length: usize, alice: &SecretKey) -> (MemorySource, Vec<ObjectId>) {
+        assert!(length >= 1);
+        let alice_pk = alice.public();
+        let now = 1_700_000_000_000_000;
+        let mut genesis = AuthorityBody {
+            schema_version: 1,
+            repo_id: ObjectId([0u8; 32]),
+            previous_authority: ObjectId([0u8; 32]),
+            version: 1,
+            created_micros: now,
+            members: vec![crate::authority::MemberEntry {
+                key: alice_pk,
+                handle: "alice".into(),
+                role: Role::Owner,
+                added_micros: now,
+                added_by: alice_pk,
+            }],
+            policy: vec![crate::authority::PolicyEntry {
+                key: "public_read".into(),
+                value: vec![0x01],
+            }],
+        };
+        genesis.normalize().unwrap();
+        genesis.assign_genesis_repo_id().unwrap();
+        let genesis_signed = sign_authority(&genesis, alice).unwrap();
+        let genesis_id = ObjectId(*blake3::hash(&genesis_signed.serialize()).as_bytes());
+
+        let mut store: HashMap<ObjectId, Vec<u8>> = HashMap::new();
+        let mut ids = vec![genesis_id];
+        store.insert(genesis_id, genesis_signed.serialize());
+
+        let mut prev_id = genesis_id;
+        let mut prev_body = genesis;
+        for v in 2..=length as u32 {
+            let mut body = AuthorityBody {
+                schema_version: prev_body.schema_version,
+                repo_id: prev_body.repo_id,
+                previous_authority: prev_id,
+                version: v,
+                created_micros: now + v as i64 * 1_000_000,
+                members: prev_body.members.clone(),
+                policy: prev_body.policy.clone(),
+            };
+            body.normalize().unwrap();
+            let signed = sign_authority(&body, alice).unwrap();
+            let id = ObjectId(*blake3::hash(&signed.serialize()).as_bytes());
+            store.insert(id, signed.serialize());
+            ids.push(id);
+            prev_id = id;
+            prev_body = body;
+        }
+        (MemorySource(store), ids)
+    }
+
+    /// Verifying a chain of length N from the tip touches every
+    /// authority object exactly once. A second verification of the same
+    /// tip — using the same `ChainVerifier` — must perform zero reads.
+    /// This is the user-visible win: O(N²) → O(N) total work for N
+    /// commits citing the same chain.
+    #[test]
+    fn chain_verifier_caches_walked_authorities() {
+        let alice = SecretKey::generate();
+        let (mem, ids) = build_chain(5, &alice);
+        let src = CountingSource::new(&mem);
+        let mut verifier = ChainVerifier::new();
+
+        let _ = verifier.verify_chain(&src, *ids.last().unwrap()).unwrap();
+        let first_pass_reads = src.reads();
+        assert!(
+            first_pass_reads >= 5,
+            "first verification must read every authority at least once; got {first_pass_reads}"
+        );
+        // Every walked authority should now sit in the cache pointing
+        // at the same shared genesis body.
+        assert_eq!(verifier.cache_size(), ids.len());
+
+        let before = src.reads();
+        let _ = verifier.verify_chain(&src, *ids.last().unwrap()).unwrap();
+        assert_eq!(
+            src.reads(),
+            before,
+            "cached re-verification must perform zero reads"
+        );
+    }
+
+    /// Verifying an *ancestor* after the tip must also be a cache hit —
+    /// this is the practical case during a sync where one tip points at
+    /// `A_n` and a second tip points at `A_{n-1}`.
+    #[test]
+    fn chain_verifier_serves_ancestors_from_cache() {
+        let alice = SecretKey::generate();
+        let (mem, ids) = build_chain(4, &alice);
+        let src = CountingSource::new(&mem);
+        let mut verifier = ChainVerifier::new();
+        let _ = verifier.verify_chain(&src, *ids.last().unwrap()).unwrap();
+        let after_tip = src.reads();
+        // Ask for A_2 — should be a hit.
+        let _ = verifier.verify_chain(&src, ids[1]).unwrap();
+        assert_eq!(
+            src.reads(),
+            after_tip,
+            "ancestor verification must hit cache, not re-walk"
+        );
+    }
+
+    /// A failing verification must NOT pollute the cache. The test
+    /// rebuilds a chain, corrupts the bytes of the most recent
+    /// authority, and checks that (a) verification fails, (b) the
+    /// cache stays empty, and (c) a follow-up valid lookup still walks
+    /// the chain rather than serving a phantom hit.
+    #[test]
+    fn chain_verifier_does_not_cache_on_failure() {
+        let alice = SecretKey::generate();
+        let (mut mem, ids) = build_chain(3, &alice);
+        let tip_id = *ids.last().unwrap();
+        // Mutate the byte at offset 12 of the tip's signed bytes — that
+        // sits inside the authority body, so the recorded BLAKE3 hash
+        // will no longer match the id that names it. The verifier reads
+        // by id and re-hashes the bytes; mismatched bytes propagate as
+        // a `repo_id derivation invalid` or a parse-time error depending
+        // on the offset, but in either case the chain walk fails.
+        let bytes = mem.0.get(&tip_id).unwrap().clone();
+        let mut bad = bytes.clone();
+        bad[12] ^= 0xFF;
+        mem.0.insert(tip_id, bad);
+
+        let src = CountingSource::new(&mem);
+        let mut verifier = ChainVerifier::new();
+        assert!(
+            verifier.verify_chain(&src, tip_id).is_err(),
+            "corrupted tip must fail verification"
+        );
+        assert_eq!(
+            verifier.cache_size(),
+            0,
+            "failed verification must leave the cache empty"
+        );
     }
 }

@@ -417,6 +417,102 @@ fn merge_local_toml_promotion_is_rejected() {
     assert!(e.contains("promote"), "error must say 'promote': {e}");
 }
 
+/// Regression test for the dirty-tree merge precondition. Before this
+/// guard, `levcs merge` would silently overwrite uncommitted edits to
+/// tracked files — clobbering work the user hadn't yet committed.
+#[test]
+fn merge_refuses_when_workdir_has_uncommitted_changes() {
+    let (work, xdg) = init_repo();
+    std::fs::write(work.join("a.txt"), b"original\n").unwrap();
+    assert_eq!(run(&["track", "--all"], &work, &xdg).0, 0);
+    assert_eq!(run(&["commit", "-m", "base"], &work, &xdg).0, 0);
+
+    // Create feat branch with a divergent change so a real merge would run.
+    assert_eq!(run(&["branch", "--create", "feat"], &work, &xdg).0, 0);
+    assert_eq!(run(&["branch", "--switch", "feat"], &work, &xdg).0, 0);
+    std::fs::write(work.join("b.txt"), b"feat side\n").unwrap();
+    assert_eq!(run(&["track", "--all"], &work, &xdg).0, 0);
+    assert_eq!(run(&["commit", "-m", "feat add"], &work, &xdg).0, 0);
+
+    // Back on main, dirty `a.txt` *without committing*.
+    assert_eq!(run(&["branch", "--switch", "main"], &work, &xdg).0, 0);
+    std::fs::write(work.join("a.txt"), b"local-uncommitted-edit\n").unwrap();
+
+    // Merge must refuse and name the dirty file in the error.
+    let (code, _o, e) = run(&["merge", "feat"], &work, &xdg);
+    assert_ne!(code, 0, "merge must refuse on dirty tree: stderr={e}");
+    assert!(
+        e.contains("uncommitted changes") && e.contains("a.txt"),
+        "error must explain refusal and name the file: {e}"
+    );
+
+    // Critically: the local edit must NOT have been overwritten, and no
+    // merge state should have been created.
+    let bytes = std::fs::read(work.join("a.txt")).unwrap();
+    assert_eq!(
+        bytes, b"local-uncommitted-edit\n",
+        "user's uncommitted edit must be preserved when merge is refused"
+    );
+    assert!(!work.join(".levcs/MERGE_HEAD").exists());
+    assert!(!work.join(".levcs/merge-record").exists());
+}
+
+/// When the merge engine produces a record that violates the repo's
+/// `[policy].allowed_handlers`, the merge must fail BEFORE touching the
+/// working tree. Previously the policy check ran after `fs::write`, so
+/// a rejected merge still left half-merged content on disk and stale
+/// blob hashes in the index.
+#[test]
+fn policy_violation_rejects_merge_before_writing_working_tree() {
+    let (work, xdg) = init_repo();
+    std::fs::write(work.join("a.txt"), b"original\n").unwrap();
+    assert_eq!(run(&["track", "--all"], &work, &xdg).0, 0);
+    assert_eq!(run(&["commit", "-m", "base"], &work, &xdg).0, 0);
+
+    assert_eq!(run(&["branch", "--create", "feat"], &work, &xdg).0, 0);
+    std::fs::write(work.join("a.txt"), b"main side\n").unwrap();
+    assert_eq!(run(&["commit", "-m", "main"], &work, &xdg).0, 0);
+    assert_eq!(run(&["branch", "--switch", "feat"], &work, &xdg).0, 0);
+    std::fs::write(work.join("a.txt"), b"feat side\n").unwrap();
+    assert_eq!(run(&["commit", "-m", "feat"], &work, &xdg).0, 0);
+
+    // Switch to main and write a policy that forbids EVERYTHING — every
+    // file the engine touches will be flagged. (An empty allow-list with
+    // a non-empty handlers field on every record entry guarantees a
+    // mismatch; we want to verify that even though the engine produced
+    // a complete merge plan, the writes never landed.)
+    assert_eq!(run(&["branch", "--switch", "main"], &work, &xdg).0, 0);
+    let main_a = std::fs::read(work.join("a.txt")).unwrap();
+    std::fs::write(
+        work.join(".levcs/merge.toml"),
+        b"[policy]\nallowed_handlers = [\"this-handler-does-not-exist\"]\n",
+    )
+    .unwrap();
+
+    let (code, _, e) = run(&["merge", "feat"], &work, &xdg);
+    assert_ne!(code, 0, "merge must fail under restrictive policy");
+    assert!(
+        e.contains("not in repository policy"),
+        "error must explain policy mismatch: {e}"
+    );
+
+    // Working tree must be untouched: `a.txt` still holds main's content,
+    // not a partial merge result. And no merge state was committed.
+    let after = std::fs::read(work.join("a.txt")).unwrap();
+    assert_eq!(
+        after, main_a,
+        "policy-rejected merge must not modify the working tree"
+    );
+    assert!(
+        !work.join(".levcs/MERGE_HEAD").exists(),
+        "policy-rejected merge must not leave MERGE_HEAD behind"
+    );
+    assert!(
+        !work.join(".levcs/merge-record").exists(),
+        "policy-rejected merge must not persist a merge-record"
+    );
+}
+
 #[test]
 fn explain_dumps_merge_record() {
     let (work, xdg) = init_repo();

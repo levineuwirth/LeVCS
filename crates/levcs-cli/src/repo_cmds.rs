@@ -783,6 +783,16 @@ pub fn branch(args: BranchArgs) -> Result<()> {
             _ => bail!("branch tip is not a commit"),
         };
         repo.checkout_tree(tree_id, &repo.workdir)?;
+        // Refresh the index from the new tree. Without this the index
+        // keeps the previous branch's blob hashes — invisible to most
+        // workflows because the next `commit` rebuilds the index from
+        // the working tree, but visible to anything that compares
+        // index-vs-workdir (e.g., the merge command's dirty-tree
+        // precondition, which would otherwise false-positive on every
+        // branch switch).
+        let mut idx = Index::new();
+        rebuild_index_from_tree(&repo, tree_id, "", &mut idx)?;
+        repo.write_index(&idx)?;
         eprintln!("switched to branch {name}");
     }
     if let Some(name) = args.delete {
@@ -806,6 +816,51 @@ pub fn merge(args: MergeArgs) -> Result<()> {
     merge_run(args)
 }
 
+/// Return the list of tracked paths whose working-tree contents differ from
+/// the index, including paths that are tracked but missing from disk. Used
+/// as a precondition for any operation that overwrites the working tree
+/// (currently: `merge`, both fast-forward and three-way). Callers should
+/// refuse to proceed when the returned list is non-empty so users don't
+/// silently lose uncommitted work.
+fn dirty_tracked_paths(repo: &Repository) -> Result<Vec<String>> {
+    let idx = repo.read_index()?;
+    let mut workdir_set: HashSet<String> = HashSet::new();
+    for path in repo.walk_workdir()? {
+        let rel = path
+            .strip_prefix(&repo.workdir)?
+            .to_string_lossy()
+            .replace('\\', "/");
+        workdir_set.insert(rel);
+    }
+    let mut dirty = Vec::new();
+    for entry in &idx.entries {
+        if !entry.flags.is_tracked() {
+            continue;
+        }
+        let abs = repo.workdir.join(&entry.path);
+        if !workdir_set.contains(&entry.path) {
+            // Tracked file removed from working tree without `levcs commit`
+            // — counts as dirty for merge purposes since the merge would
+            // resurrect it (or compute against stale on-disk state).
+            dirty.push(entry.path.clone());
+            continue;
+        }
+        let bytes = match fs::read(&abs) {
+            Ok(b) => b,
+            Err(_) => {
+                dirty.push(entry.path.clone());
+                continue;
+            }
+        };
+        let id = Blob::new(bytes).object_id();
+        if id != entry.blob_hash {
+            dirty.push(entry.path.clone());
+        }
+    }
+    dirty.sort();
+    Ok(dirty)
+}
+
 fn merge_run(args: MergeArgs) -> Result<()> {
     let branch_name = args
         .branch
@@ -814,6 +869,29 @@ fn merge_run(args: MergeArgs) -> Result<()> {
     let repo = open_repo()?;
     if repo.levcs_dir.join("MERGE_HEAD").exists() {
         bail!("a merge is already in progress; run `levcs merge --abort` to cancel");
+    }
+    // Refuse to start a merge when tracked files have uncommitted changes —
+    // both the fast-forward and three-way paths overwrite the working
+    // tree, and silently clobbering local edits is the kind of bug that
+    // costs users hours of work. Mirrors git's `Your local changes to
+    // the following files would be overwritten by merge` precondition.
+    let dirty = dirty_tracked_paths(&repo)?;
+    if !dirty.is_empty() {
+        let listing = dirty
+            .iter()
+            .take(10)
+            .map(|p| format!("  {p}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let more = if dirty.len() > 10 {
+            format!("\n  ... and {} more", dirty.len() - 10)
+        } else {
+            String::new()
+        };
+        bail!(
+            "uncommitted changes to tracked files would be overwritten by merge:\n{listing}{more}\n\
+             commit them (or revert to HEAD) before merging — see `levcs status`."
+        );
     }
     let head = repo
         .refs
@@ -1001,6 +1079,21 @@ fn merge_run(args: MergeArgs) -> Result<()> {
         record.files.push(fr);
     }
 
+    // Repo-side policy ceiling: every handler reference in the record must
+    // be permitted by `.levcs/merge.toml` (§6.6). This used to run *after*
+    // we applied the merge to the working tree, which left the user's
+    // files clobbered when the policy check then bailed. Validate up
+    // front, before any disk write, so a rejected merge leaves the
+    // working tree exactly as we found it.
+    let allowed = load_merge_policy_allowed(&repo);
+    let bad = validate_record_against_policy(&record, &allowed);
+    if !bad.is_empty() {
+        bail!(
+            "merge produced records referencing handlers not in repository policy: {}",
+            bad.join(", ")
+        );
+    }
+
     // Apply to working tree.
     for (path, bytes) in &merged_files {
         let abs = repo.workdir.join(path);
@@ -1038,19 +1131,6 @@ fn merge_run(args: MergeArgs) -> Result<()> {
         });
     }
     repo.write_index(&idx)?;
-
-    // Repo-side policy ceiling: every handler reference in the record must
-    // be permitted by `.levcs/merge.toml` (§6.6). Catch this before we
-    // touch the working tree's merge state so an aborted policy-violating
-    // merge leaves nothing to clean up.
-    let allowed = load_merge_policy_allowed(&repo);
-    let bad = validate_record_against_policy(&record, &allowed);
-    if !bad.is_empty() {
-        bail!(
-            "merge produced records referencing handlers not in repository policy: {}",
-            bad.join(", ")
-        );
-    }
 
     // Persist merge state and the in-progress merge-record.
     fs::write(repo.levcs_dir.join("MERGE_HEAD"), theirs_id.to_hex())?;

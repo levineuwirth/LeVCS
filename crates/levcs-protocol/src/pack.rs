@@ -52,6 +52,19 @@ pub const COMPRESSION_THRESHOLD: usize = 256;
 /// 3 is libzstd's default — a sensible balance of throughput and ratio.
 pub const COMPRESSION_LEVEL: i32 = 3;
 
+/// Default ceiling on a single object's *uncompressed* size when decoding
+/// a pack. The recorded `size` field is read straight off the wire and is
+/// otherwise used as the destination capacity for decompression — a
+/// hostile peer can declare `size = 1 TiB` against a tiny zstd frame and
+/// trigger a multi-gigabyte allocation before any data has been
+/// validated. Capping `size` at decode time short-circuits that.
+///
+/// 256 MiB is generous for normal repository content (source files, even
+/// large binaries) while remaining well below practical RAM limits on a
+/// modest VPS. Callers that genuinely need to move larger blobs should
+/// use `Pack::decode_prefix_with_limit` and pick their own ceiling.
+pub const DEFAULT_MAX_OBJECT_BYTES: usize = 256 * 1024 * 1024;
+
 #[derive(Debug, Error)]
 pub enum PackError {
     #[error("malformed pack: {0}")]
@@ -171,11 +184,22 @@ impl Pack {
         Ok(pack)
     }
 
-    /// Decode a pack from the start of `bytes`. Returns the pack and the
+    /// Decode a pack from the start of `bytes` using the default per-object
+    /// size ceiling (`DEFAULT_MAX_OBJECT_BYTES`). Returns the pack and the
     /// number of bytes consumed; trailing bytes are not an error. This is
     /// used by the push wire format, which appends a manifest after the
     /// pack.
     pub fn decode_prefix(bytes: &[u8]) -> Result<(Self, usize), PackError> {
+        Self::decode_prefix_with_limit(bytes, DEFAULT_MAX_OBJECT_BYTES)
+    }
+
+    /// Like `decode_prefix`, but lets the caller pick the per-object size
+    /// ceiling. Any entry whose recorded `size` exceeds `max_object_bytes`
+    /// is rejected before any allocation or decompression takes place.
+    pub fn decode_prefix_with_limit(
+        bytes: &[u8],
+        max_object_bytes: usize,
+    ) -> Result<(Self, usize), PackError> {
         if bytes.len() < 16 {
             return Err(PackError::Malformed("header truncated".into()));
         }
@@ -206,8 +230,20 @@ impl Pack {
             }
             let object_type = bytes[p];
             p += 1;
-            let size = LittleEndian::read_u64(&bytes[p..p + 8]) as usize;
+            let size_u64 = LittleEndian::read_u64(&bytes[p..p + 8]);
             p += 8;
+            // Reject implausibly-large `size` declarations *before* we
+            // touch the data. zstd's `decompress(_, size)` allocates the
+            // declared size up front, so leaving this unbounded is a
+            // memory-exhaustion vector. We also reject `size > usize::MAX`
+            // explicitly on 32-bit targets where the cast below would
+            // truncate.
+            if size_u64 > max_object_bytes as u64 {
+                return Err(PackError::Malformed(format!(
+                    "entry size {size_u64} exceeds limit {max_object_bytes}"
+                )));
+            }
+            let size = size_u64 as usize;
             let flags = bytes[p];
             p += 1;
             let unknown = flags & !(FLAG_ZSTD | FLAG_DELTA);
@@ -552,6 +588,50 @@ mod tests {
         let err = Pack::decode(&bytes).unwrap_err();
         match err {
             PackError::Malformed(s) => assert!(s.contains("delta base not in pack")),
+        }
+    }
+
+    #[test]
+    fn pack_rejects_oversized_object_declaration() {
+        // Hand-craft a pack whose single entry declares a uncompressed
+        // size of 1 TiB. The decoder must reject this before allocating
+        // anything, regardless of how much data actually follows on the
+        // wire — a hostile peer can pair this with a tiny zstd frame to
+        // trigger a multi-gigabyte allocation in `zstd::bulk::decompress`.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&PACK_MAGIC);
+        bytes.extend_from_slice(&PACK_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.push(1); // type
+        bytes.extend_from_slice(&(1u64 << 40).to_le_bytes()); // 1 TiB
+        bytes.push(0); // flags: raw
+                       // (no body needed — the size check should fire before we look)
+        let err = Pack::decode(&bytes).unwrap_err();
+        match err {
+            PackError::Malformed(s) => assert!(
+                s.contains("exceeds limit"),
+                "error must mention size limit: {s}"
+            ),
+        }
+    }
+
+    #[test]
+    fn pack_decode_with_limit_admits_objects_under_caller_ceiling() {
+        // The custom-limit decoder should accept any entry up to its
+        // configured ceiling, even when smaller than the default. Build
+        // a 1 KiB raw entry, then decode with a 4 KiB limit.
+        let payload = vec![0xABu8; 1024];
+        let mut pk = Pack::new();
+        pk.push(1, payload.clone());
+        let encoded = pk.encode();
+        let (pk2, _) = Pack::decode_prefix_with_limit(&encoded, 4096).unwrap();
+        assert_eq!(pk2.entries.len(), 1);
+        assert_eq!(pk2.entries[0].bytes, payload);
+
+        // Same encoded pack, decoded with a 512-byte limit, must reject.
+        let err = Pack::decode_prefix_with_limit(&encoded, 512).unwrap_err();
+        match err {
+            PackError::Malformed(s) => assert!(s.contains("exceeds limit")),
         }
     }
 

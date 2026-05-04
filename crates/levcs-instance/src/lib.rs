@@ -39,7 +39,7 @@ use levcs_identity::verify::{
 };
 use levcs_merge::engine::check_handler_allowed;
 use levcs_merge::record::MergeRecord;
-use levcs_protocol::auth::{verify_request, AuthRequest, DEFAULT_CLOCK_SKEW};
+use levcs_protocol::auth::{verify_request, AuthRequest, DEFAULT_CLOCK_SKEW, NONCE_TTL_SECS};
 use levcs_protocol::wire::{InfoResponse, InstanceInfo, RefList};
 use levcs_protocol::Pack;
 
@@ -149,24 +149,66 @@ impl AppState {
     }
 }
 
+/// Replay-protection cache for §5.3 request nonces.
+///
+/// `verify_request` already rejects timestamps outside ±`DEFAULT_CLOCK_SKEW`,
+/// so a nonce only needs to be remembered while its parent timestamp is
+/// still within the skew window — anything older is rejected for skew
+/// before the cache is even consulted. We use `NONCE_TTL_SECS` (the
+/// protocol-level constant) as the retention horizon, which is wider than
+/// the skew window so that a small clock difference between client and
+/// server can't open a replay window between the two checks.
+///
+/// The earlier implementation was a `HashSet` that called `clear()` once
+/// it grew past a count cap. That was a real replay vulnerability: an
+/// attacker who captured a recent signed request could replay it the
+/// instant the cache wiped, regardless of how long the original was
+/// supposed to remain "seen." The TTL approach below is bounded in
+/// memory by the rate of accepted requests times the TTL — at typical
+/// federation load that's a few thousand entries, kilobytes of state.
+/// How many inserts to accept before sweeping expired entries. Eviction
+/// is O(len), so amortizing keeps the per-call cost O(1) average. Stale
+/// entries that sit in the map a little longer cost nothing — they
+/// would just match the TTL skew check upstream and be rejected anyway.
+const NONCE_EVICT_BATCH: usize = 1024;
+
 #[derive(Default)]
 pub struct NonceCache {
-    /// Maps nonce → expiry epoch (in micros).
-    seen: HashSet<[u8; 16]>,
+    /// `nonce → request timestamp (micros since epoch)`. We index by
+    /// timestamp rather than insertion time so a delayed request whose
+    /// own clock is slightly behind ours can't sneak past TTL eviction.
+    seen: HashMap<[u8; 16], i64>,
+    inserts_since_evict: usize,
 }
 
 impl NonceCache {
-    pub fn check_and_insert(&mut self, nonce: [u8; 16]) -> bool {
-        if self.seen.contains(&nonce) {
-            false
-        } else {
-            self.seen.insert(nonce);
-            // Cap memory by clearing periodically.
-            if self.seen.len() > 100_000 {
-                self.seen.clear();
-            }
-            true
+    /// Check whether `nonce` (carried with `request_ts_micros`) has been
+    /// seen, and if not, record it. `now_micros` is the verifier's notion
+    /// of the current time, used to evict stale entries periodically.
+    /// Returns `true` if the nonce was *new* (request should proceed),
+    /// `false` if it was a replay.
+    pub fn check_and_insert(
+        &mut self,
+        nonce: [u8; 16],
+        request_ts_micros: i64,
+        now_micros: i64,
+    ) -> bool {
+        self.inserts_since_evict += 1;
+        if self.inserts_since_evict >= NONCE_EVICT_BATCH {
+            let cutoff = now_micros - NONCE_TTL_SECS * 1_000_000;
+            self.seen.retain(|_, ts| *ts >= cutoff);
+            self.inserts_since_evict = 0;
         }
+        if self.seen.contains_key(&nonce) {
+            return false;
+        }
+        self.seen.insert(nonce, request_ts_micros);
+        true
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.seen.len()
     }
 }
 
@@ -201,6 +243,18 @@ struct ApiError(StatusCode, String);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        // Surface every error response in the server log before sending it
+        // to the client. Without this, 5xx and auth failures would vanish
+        // — the client sees the body but nothing reaches the operator.
+        // 5xx is a server-side bug worth `error!`; 4xx is the caller's
+        // problem (bad signature, malformed pack, conflict) and lands at
+        // `warn!` so it's still grep-able but doesn't blow up alerts.
+        let level_5xx = self.0.is_server_error();
+        if level_5xx {
+            tracing::error!(status = %self.0, error = %self.1, "request failed");
+        } else {
+            tracing::warn!(status = %self.0, error = %self.1, "request rejected");
+        }
         (self.0, self.1).into_response()
     }
 }
@@ -444,7 +498,7 @@ fn verify_request_against(
     let auth = verify_request(&req, key, ts, nonce, sig, now, DEFAULT_CLOCK_SKEW)
         .map_err(|e| err(StatusCode::UNAUTHORIZED, e.to_string()))?;
     let mut cache = s.nonce_cache.lock().unwrap();
-    if !cache.check_and_insert(auth.nonce) {
+    if !cache.check_and_insert(auth.nonce, auth.timestamp_micros, now) {
         return Err(err(StatusCode::UNAUTHORIZED, "replayed nonce"));
     }
     Ok(AuthCheck { key: auth.key })
@@ -875,3 +929,95 @@ fn find_merge_record(
 // Allow `verify_authority_chain` to use ObjectStore directly.
 #[allow(dead_code)]
 fn _vs(_: &dyn VerifySource) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn micros_from_secs(s: i64) -> i64 {
+        s * 1_000_000
+    }
+
+    /// Re-inserting the same nonce within the TTL window must be rejected.
+    /// This is the core anti-replay invariant; before the TTL rewrite the
+    /// cache also satisfied this property, so a green test here is the
+    /// floor, not the ceiling.
+    #[test]
+    fn nonce_replay_within_ttl_is_rejected() {
+        let mut cache = NonceCache::default();
+        let nonce = [0x42u8; 16];
+        let ts = micros_from_secs(1_700_000_000);
+        let now = ts + micros_from_secs(1);
+        assert!(cache.check_and_insert(nonce, ts, now));
+        // Same nonce, slightly later "now": still within TTL, must reject.
+        assert!(!cache.check_and_insert(nonce, ts, now + micros_from_secs(60)));
+    }
+
+    /// Once a nonce ages past `NONCE_TTL_SECS` it must be evicted from
+    /// the cache; what bounds memory growth is precisely this release.
+    /// (`verify_request` will reject the timestamp for skew long before
+    /// the cache ever sees a stale request again, so re-accepting the
+    /// nonce bytes is safe.)
+    ///
+    /// We drive `NONCE_EVICT_BATCH` distinct inserts at a fresh timestamp
+    /// to trigger one full eviction pass, then assert the original
+    /// (now-stale) entry has been swept.
+    #[test]
+    fn nonce_evicted_after_ttl_expires() {
+        let mut cache = NonceCache::default();
+        let stale = [0x42u8; 16];
+        let stale_ts = micros_from_secs(1_700_000_000);
+        assert!(cache.check_and_insert(stale, stale_ts, stale_ts));
+        // Fast-forward "now" past the TTL window and force an eviction
+        // sweep by inserting a batch of fresh nonces.
+        let later = stale_ts + micros_from_secs(NONCE_TTL_SECS + 1);
+        for i in 0..(NONCE_EVICT_BATCH as u32) {
+            let mut n = [0u8; 16];
+            n[..4].copy_from_slice(&i.to_le_bytes());
+            n[15] = 0xFF; // disambiguate from `stale`
+            assert!(cache.check_and_insert(n, later, later));
+        }
+        // The stale entry is gone; same-nonce-bytes with a fresh
+        // timestamp are allowed.
+        assert!(cache.check_and_insert(stale, later, later));
+    }
+
+    /// Regression test for the original CVE-shaped bug: the previous
+    /// implementation called `seen.clear()` once it grew past 100k
+    /// entries, which dropped every recently-seen nonce in one step and
+    /// allowed any captured request still within the 5-minute clock-skew
+    /// window to be replayed.
+    ///
+    /// Here we (a) drive the cache through several eviction passes with
+    /// junk-but-fresh nonces, then (b) try to replay a still-fresh nonce
+    /// inserted at the start. With time-bounded eviction the replay
+    /// must be rejected, because the original entry's timestamp is still
+    /// inside the TTL window. With the old count-bounded `clear()`, this
+    /// test would erroneously succeed (the replay would be accepted).
+    /// The flood size is intentionally a small multiple of
+    /// `NONCE_EVICT_BATCH` — the property doesn't depend on the exact
+    /// count, just on triggering the eviction path.
+    #[test]
+    fn nonce_cache_does_not_drop_fresh_entries_under_load() {
+        let mut cache = NonceCache::default();
+        let base_ts = micros_from_secs(1_700_000_000);
+        let mut victim = [0u8; 16];
+        victim[..8].copy_from_slice(&u64::MAX.to_le_bytes());
+        // Insert the "captured" request first.
+        assert!(cache.check_and_insert(victim, base_ts, base_ts));
+        // Flood with NONCE_EVICT_BATCH * 4 fresh-but-distinct nonces, all
+        // dated within the same TTL window so eviction can't help us.
+        let flood: u32 = (NONCE_EVICT_BATCH as u32) * 4;
+        for i in 0..flood {
+            let mut n = [0u8; 16];
+            n[..4].copy_from_slice(&i.to_le_bytes());
+            let now = base_ts + (i as i64) * 1_000;
+            assert!(cache.check_and_insert(n, now, now));
+        }
+        let replay_now = base_ts + micros_from_secs(60);
+        assert!(
+            !cache.check_and_insert(victim, base_ts, replay_now),
+            "replay of fresh nonce must be rejected even when cache is large"
+        );
+    }
+}

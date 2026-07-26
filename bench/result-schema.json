@@ -1,0 +1,1173 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://levcs.dev/schemas/instance-benchmark-result-v1.json",
+  "title": "LeVCS instance benchmark result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "gate",
+    "run_id",
+    "attestation",
+    "source",
+    "artifacts",
+    "workload",
+    "hardware",
+    "deployment",
+    "measurement",
+    "counts",
+    "bytes",
+    "latency_micros",
+    "resources",
+    "durability",
+    "verification",
+    "verdicts",
+    "promotable",
+    "outcome",
+    "storage"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "gate": {
+      "enum": [
+        "storage_primitive",
+        "in_process_protocol",
+        "deployed_30k",
+        "deployed_60k",
+        "recovery",
+        "overload",
+        "compaction",
+        "federation",
+        "release"
+      ]
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "attestation": {
+      "$ref": "#/$defs/attestation"
+    },
+    "source": {
+      "$ref": "#/$defs/source"
+    },
+    "artifacts": {
+      "$ref": "#/$defs/artifacts"
+    },
+    "workload": {
+      "$ref": "#/$defs/workload"
+    },
+    "hardware": {
+      "$ref": "#/$defs/hardware"
+    },
+    "deployment": {
+      "$ref": "#/$defs/deployment"
+    },
+    "measurement": {
+      "$ref": "#/$defs/measurement"
+    },
+    "counts": {
+      "$ref": "#/$defs/counts"
+    },
+    "bytes": {
+      "$ref": "#/$defs/bytes"
+    },
+    "latency_micros": {
+      "$ref": "#/$defs/latency"
+    },
+    "resources": {
+      "$ref": "#/$defs/resources"
+    },
+    "durability": {
+      "$ref": "#/$defs/durability"
+    },
+    "verification": {
+      "$ref": "#/$defs/verification"
+    },
+    "verdicts": {
+      "type": "object",
+      "additionalProperties": {
+        "enum": [
+          "pass",
+          "fail",
+          "not-applicable"
+        ]
+      },
+      "required": [
+        "storage_primitive",
+        "in_process_protocol",
+        "deployed_30k",
+        "deployed_60k",
+        "recovery",
+        "overload",
+        "compaction",
+        "federation",
+        "release"
+      ]
+    },
+    "promotable": {
+      "type": "boolean",
+      "description": "Whether this result may be promoted to an instance throughput claim. False exactly for storage_primitive: plan section 3 states a storage primitive result can never be promoted."
+    },
+    "outcome": {
+      "enum": [
+        "pass",
+        "fail",
+        "preliminary"
+      ],
+      "description": "Whether this run met its gate. Only \"pass\" asserts the section 3 window rule; \"fail\" and \"preliminary\" keep a run archivable instead of unrepresentable."
+    },
+    "storage": {
+      "$ref": "#/$defs/storage"
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "nonnegative": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "positive": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "attestation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "signer",
+        "key_epoch",
+        "content_digest",
+        "signature"
+      ],
+      "properties": {
+        "signer": {
+          "type": "string",
+          "pattern": "^ed25519:[0-9a-f]{64}$"
+        },
+        "key_epoch": {
+          "$ref": "#/$defs/nonnegative"
+        },
+        "content_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "signature": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{128}$"
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "revision",
+        "dirty_tree_digest",
+        "cargo_lock_digest",
+        "rustc",
+        "rustflags"
+      ],
+      "properties": {
+        "revision": {
+          "type": "string",
+          "minLength": 7
+        },
+        "dirty_tree_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "cargo_lock_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "rustc": {
+          "type": "string",
+          "minLength": 1
+        },
+        "rustflags": {
+          "type": "string"
+        }
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "binary_digest",
+        "config_digest",
+        "workload_digest",
+        "corpus_digest",
+        "raw_metrics_digest",
+        "telemetry_versions"
+      ],
+      "properties": {
+        "binary_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "config_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "workload_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "corpus_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "raw_metrics_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "telemetry_versions": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "workload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "seed",
+        "topology",
+        "selection",
+        "client_batch_commits",
+        "writer_group_limit",
+        "persistent_clients",
+        "validation_flags",
+        "generator"
+      ],
+      "properties": {
+        "name": {
+          "const": "canonical-small-commit"
+        },
+        "seed": {
+          "type": "integer"
+        },
+        "topology": {
+          "enum": [
+            "many-ref",
+            "many-repo",
+            "hot-ref"
+          ]
+        },
+        "selection": {
+          "enum": [
+            "uniform",
+            "zipf-0.9"
+          ]
+        },
+        "client_batch_commits": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64
+        },
+        "writer_group_limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 512
+        },
+        "persistent_clients": {
+          "$ref": "#/$defs/positive"
+        },
+        "validation_flags": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "request_signature",
+            "replay",
+            "pack_hash_and_framing",
+            "outer_embedded_type_match",
+            "complete_graph",
+            "authority_and_role",
+            "instance_policy",
+            "repository_policy",
+            "typed_ref_cas",
+            "fast_forward",
+            "durability_fence_before_response"
+          ],
+          "properties": {
+            "request_signature": {
+              "type": "boolean"
+            },
+            "replay": {
+              "type": "boolean"
+            },
+            "pack_hash_and_framing": {
+              "type": "boolean"
+            },
+            "outer_embedded_type_match": {
+              "type": "boolean"
+            },
+            "complete_graph": {
+              "type": "boolean"
+            },
+            "authority_and_role": {
+              "type": "boolean"
+            },
+            "instance_policy": {
+              "type": "boolean"
+            },
+            "repository_policy": {
+              "type": "boolean"
+            },
+            "typed_ref_cas": {
+              "type": "boolean"
+            },
+            "fast_forward": {
+              "type": "boolean"
+            },
+            "durability_fence_before_response": {
+              "type": "boolean"
+            }
+          },
+          "description": "Which checks the measured system actually performed. Pinned per gate by the conditional rules in allOf: all true for every instance gate, and per-flag for storage_primitive, whose measured system is the store alone (contract review 2026-07-24-B)."
+        },
+        "generator": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Must equal the frozen generator in bench/workloads/small-commit.toml."
+        }
+      }
+    },
+    "hardware": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profile",
+        "cpu",
+        "numa",
+        "governor",
+        "microcode",
+        "ram_bytes",
+        "swap_events",
+        "filesystem",
+        "mount_options",
+        "nvme",
+        "firmware",
+        "write_cache",
+        "barriers",
+        "scheduler",
+        "temperature_celsius",
+        "nic",
+        "driver",
+        "link_mbps",
+        "mtu",
+        "kernel"
+      ],
+      "properties": {
+        "profile": {
+          "enum": [
+            "minimum-30k",
+            "release-60k",
+            "diagnostic"
+          ]
+        },
+        "cpu": {
+          "type": "string",
+          "minLength": 1
+        },
+        "numa": {
+          "type": "string",
+          "minLength": 1
+        },
+        "governor": {
+          "type": "string",
+          "minLength": 1
+        },
+        "microcode": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ram_bytes": {
+          "$ref": "#/$defs/positive"
+        },
+        "swap_events": {
+          "const": 0
+        },
+        "filesystem": {
+          "type": "string",
+          "minLength": 1
+        },
+        "mount_options": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string"
+          }
+        },
+        "nvme": {
+          "type": "string",
+          "minLength": 1
+        },
+        "firmware": {
+          "type": "string",
+          "minLength": 1
+        },
+        "write_cache": {
+          "type": "string",
+          "minLength": 1
+        },
+        "barriers": {
+          "type": "string",
+          "minLength": 1,
+          "enum": [
+            "enabled"
+          ]
+        },
+        "scheduler": {
+          "type": "string",
+          "minLength": 1
+        },
+        "temperature_celsius": {
+          "type": "number"
+        },
+        "nic": {
+          "type": "string",
+          "minLength": 1
+        },
+        "driver": {
+          "type": "string",
+          "minLength": 1
+        },
+        "link_mbps": {
+          "$ref": "#/$defs/positive"
+        },
+        "mtu": {
+          "$ref": "#/$defs/positive"
+        },
+        "kernel": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "deployment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "persistent_data_mount",
+        "tmpfs",
+        "overlay",
+        "remote_storage",
+        "durability_enabled",
+        "systemd",
+        "cgroup",
+        "proxy",
+        "tls",
+        "store_directory_attributes"
+      ],
+      "properties": {
+        "persistent_data_mount": {
+          "const": true
+        },
+        "tmpfs": {
+          "const": false
+        },
+        "overlay": {
+          "const": false
+        },
+        "remote_storage": {
+          "const": false
+        },
+        "durability_enabled": {
+          "const": true
+        },
+        "systemd": {
+          "type": "string",
+          "minLength": 1
+        },
+        "cgroup": {
+          "type": "string",
+          "minLength": 1
+        },
+        "proxy": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tls": {
+          "type": "string",
+          "minLength": 1
+        },
+        "store_directory_attributes": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Effective attributes for the journal and segment directories, read back at startup and compared against the reference profile. Recording without verifying would let a silently copy-on-write-mounted run claim nodatacow."
+        }
+      }
+    },
+    "measurement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "warmup_seconds",
+        "measured_seconds",
+        "repetition",
+        "started_at",
+        "ended_at",
+        "one_minute_windows",
+        "histogram_format",
+        "coordinated_omission_corrected",
+        "windows_meeting_target_percent",
+        "windows_below_floor_count"
+      ],
+      "properties": {
+        "warmup_seconds": {
+          "$ref": "#/$defs/nonnegative"
+        },
+        "measured_seconds": {
+          "$ref": "#/$defs/positive"
+        },
+        "repetition": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 3
+        },
+        "started_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "ended_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "one_minute_windows": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "number",
+            "minimum": 0
+          }
+        },
+        "histogram_format": {
+          "type": "string",
+          "minLength": 1
+        },
+        "coordinated_omission_corrected": {
+          "type": "boolean",
+          "description": "Latency corrected for coordinated omission. Applicable at every gate. A closed-loop driver that cannot correct for it must report false, not omit it: the measurement was applicable and was not performed."
+        },
+        "windows_meeting_target_percent": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100,
+          "description": "Pinned to >=95 only when outcome is \"pass\"; a failed or preliminary run must be recordable."
+        },
+        "windows_below_floor_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Pinned to 0 only when outcome is \"pass\"."
+        }
+      }
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "offered_requests",
+        "accepted_requests",
+        "rejected_requests",
+        "duplicate_requests",
+        "acknowledged_requests",
+        "counted_commits",
+        "objects_new"
+      ],
+      "properties": {
+        "offered_requests": {
+          "$ref": "#/$defs/nonnegative"
+        },
+        "accepted_requests": {
+          "$ref": "#/$defs/nonnegative"
+        },
+        "rejected_requests": {
+          "$ref": "#/$defs/nonnegative"
+        },
+        "duplicate_requests": {
+          "$ref": "#/$defs/nonnegative"
+        },
+        "acknowledged_requests": {
+          "$ref": "#/$defs/nonnegative"
+        },
+        "counted_commits": {
+          "$ref": "#/$defs/nonnegative"
+        },
+        "objects_new": {
+          "$ref": "#/$defs/nonnegative"
+        }
+      }
+    },
+    "bytes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "raw",
+        "pack_compressed",
+        "application",
+        "wire"
+      ],
+      "properties": {
+        "raw": {
+          "$ref": "#/$defs/nonnegative"
+        },
+        "pack_compressed": {
+          "$ref": "#/$defs/nonnegative"
+        },
+        "application": {
+          "$ref": "#/$defs/nonnegative"
+        },
+        "wire": {
+          "$ref": "#/$defs/nonnegative"
+        }
+      }
+    },
+    "latency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "p50",
+        "p95",
+        "p99",
+        "max",
+        "histogram_digest"
+      ],
+      "properties": {
+        "p50": {
+          "$ref": "#/$defs/nonnegative"
+        },
+        "p95": {
+          "$ref": "#/$defs/nonnegative"
+        },
+        "p99": {
+          "$ref": "#/$defs/nonnegative"
+        },
+        "max": {
+          "$ref": "#/$defs/nonnegative"
+        },
+        "histogram_digest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "configured_ceilings",
+        "observed_peaks",
+        "time_series_digest",
+        "cpu_percent",
+        "storage_utilization_percent",
+        "memory_current_bytes",
+        "open_fds",
+        "compaction_debt_returned_low",
+        "no_growth_passed"
+      ],
+      "properties": {
+        "configured_ceilings": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": "number",
+            "minimum": 0
+          }
+        },
+        "observed_peaks": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": "number",
+            "minimum": 0
+          }
+        },
+        "time_series_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "cpu_percent": {
+          "type": "number",
+          "minimum": 0
+        },
+        "storage_utilization_percent": {
+          "type": "number",
+          "minimum": 0
+        },
+        "memory_current_bytes": {
+          "$ref": "#/$defs/nonnegative"
+        },
+        "open_fds": {
+          "$ref": "#/$defs/nonnegative"
+        },
+        "compaction_debt_returned_low": {
+          "type": "boolean"
+        },
+        "no_growth_passed": {
+          "type": "boolean"
+        }
+      }
+    },
+    "durability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "external_ack_journal_digest",
+        "ack_journal_fenced_before_count",
+        "recovery_reconciled",
+        "acknowledged_loss",
+        "torn_transactions"
+      ],
+      "properties": {
+        "external_ack_journal_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "ack_journal_fenced_before_count": {
+          "const": true
+        },
+        "recovery_reconciled": {
+          "type": "boolean"
+        },
+        "acknowledged_loss": {
+          "const": 0
+        },
+        "torn_transactions": {
+          "const": 0
+        }
+      }
+    },
+    "verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "setup_traffic_excluded",
+        "commits_in_recovered_closure",
+        "acknowledged_sequences_reconciled"
+      ],
+      "properties": {
+        "setup_traffic_excluded": {
+          "const": true
+        },
+        "unique_blob_tree_commit_ids": {
+          "const": true,
+          "description": "Not applicable at storage_primitive, where no object graph exists; omitted there rather than falsified, since false would claim the check was applicable and failed."
+        },
+        "objects_new_equals_three_per_commit": {
+          "const": true,
+          "description": "Counted independently of the transaction total, not derived from it. A harness that computes objects_new as transactions * 3 and then asserts this flag has written a tautology, not a check. Absent at storage_primitive, which creates no objects."
+        },
+        "blobs_recomputed": {
+          "const": true,
+          "description": "Not applicable at storage_primitive, where no object graph exists; omitted there rather than falsified, since false would claim the check was applicable and failed."
+        },
+        "commits_in_recovered_closure": {
+          "type": "boolean",
+          "description": "Every counted commit proved present in the recovered closure of its acknowledged ref. Requires graph traversal, so false at storage_primitive, where acknowledged_sequences_reconciled is the storage-layer proof instead."
+        },
+        "operation_receipts_reconciled": {
+          "const": true,
+          "description": "Not applicable at storage_primitive, where no object graph exists; omitted there rather than falsified, since false would claim the check was applicable and failed."
+        },
+        "metadata_complete": {
+          "const": true,
+          "description": "Not applicable at storage_primitive, where no object graph exists; omitted there rather than falsified, since false would claim the check was applicable and failed."
+        },
+        "acknowledged_sequences_reconciled": {
+          "const": true,
+          "description": "Every externally acknowledged shard_sequence present in what production recovery adopted, reconciled against the external ACK journal. Required at every gate; at storage_primitive it is the proof that replaces commits_in_recovered_closure."
+        }
+      }
+    },
+    "storage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "index_bytes_per_object",
+        "checkpoint_lookup_fanout",
+        "evidence_signing_micros_p50",
+        "fences",
+        "transactions"
+      ],
+      "properties": {
+        "index_bytes_per_object": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Section 13 stop condition: index cost per object."
+        },
+        "checkpoint_lookup_fanout": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Section 13 stop condition: index runs searched per lookup."
+        },
+        "evidence_signing_micros_p50": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Section 5.2 requires P2 to measure signing cost separately."
+        },
+        "fences": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Durability fences performed. With transactions, this is the mechanical form of 'no per-object fsync'."
+        },
+        "transactions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "trim_settle_seconds": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Idle/trim interval between repetitions, so repetition 3 is not measured against a differently garbage-collected device than repetition 1 (scope 8.2)."
+        },
+        "store_directory_attributes_verified": {
+          "const": true
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "gate": {
+            "const": "storage_primitive"
+          },
+          "outcome": {
+            "const": "pass"
+          }
+        },
+        "required": [
+          "gate",
+          "outcome"
+        ]
+      },
+      "then": {
+        "properties": {
+          "latency_micros": {
+            "properties": {
+              "p99": {
+                "maximum": 50000
+              }
+            }
+          }
+        }
+      },
+      "title": "a passing storage_primitive run must meet its latency ceiling"
+    },
+    {
+      "if": {
+        "properties": {
+          "gate": {
+            "const": "in_process_protocol"
+          },
+          "outcome": {
+            "const": "pass"
+          }
+        },
+        "required": [
+          "gate",
+          "outcome"
+        ]
+      },
+      "then": {
+        "properties": {
+          "latency_micros": {
+            "properties": {
+              "p50": {
+                "maximum": 20000
+              },
+              "p95": {
+                "maximum": 50000
+              },
+              "p99": {
+                "maximum": 100000
+              }
+            }
+          }
+        }
+      },
+      "title": "a passing in_process_protocol run must meet its latency ceiling"
+    },
+    {
+      "if": {
+        "properties": {
+          "gate": {
+            "const": "deployed_30k"
+          },
+          "outcome": {
+            "const": "pass"
+          }
+        },
+        "required": [
+          "gate",
+          "outcome"
+        ]
+      },
+      "then": {
+        "properties": {
+          "latency_micros": {
+            "properties": {
+              "p50": {
+                "maximum": 20000
+              },
+              "p95": {
+                "maximum": 50000
+              },
+              "p99": {
+                "maximum": 100000
+              }
+            }
+          }
+        }
+      },
+      "title": "a passing deployed_30k run must meet its latency ceiling"
+    },
+    {
+      "if": {
+        "properties": {
+          "gate": {
+            "const": "deployed_60k"
+          },
+          "outcome": {
+            "const": "pass"
+          }
+        },
+        "required": [
+          "gate",
+          "outcome"
+        ]
+      },
+      "then": {
+        "properties": {
+          "latency_micros": {
+            "properties": {
+              "p50": {
+                "maximum": 20000
+              },
+              "p95": {
+                "maximum": 50000
+              },
+              "p99": {
+                "maximum": 100000
+              }
+            }
+          }
+        }
+      },
+      "title": "a passing deployed_60k run must meet its latency ceiling"
+    },
+    {
+      "title": "validation flags and promotability are pinned per gate",
+      "if": {
+        "properties": {
+          "gate": {
+            "const": "storage_primitive"
+          }
+        },
+        "required": [
+          "gate"
+        ]
+      },
+      "then": {
+        "properties": {
+          "promotable": {
+            "const": false
+          },
+          "workload": {
+            "properties": {
+              "validation_flags": {
+                "properties": {
+                  "request_signature": {
+                    "const": false
+                  },
+                  "replay": {
+                    "const": false
+                  },
+                  "pack_hash_and_framing": {
+                    "const": false
+                  },
+                  "outer_embedded_type_match": {
+                    "const": false
+                  },
+                  "complete_graph": {
+                    "const": false
+                  },
+                  "authority_and_role": {
+                    "const": false
+                  },
+                  "instance_policy": {
+                    "const": false
+                  },
+                  "repository_policy": {
+                    "const": false
+                  },
+                  "typed_ref_cas": {
+                    "const": true
+                  },
+                  "fast_forward": {
+                    "const": false
+                  },
+                  "durability_fence_before_response": {
+                    "const": true
+                  }
+                }
+              }
+            }
+          },
+          "verification": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "unique_blob_tree_commit_ids"
+                  ]
+                },
+                {
+                  "required": [
+                    "objects_new_equals_three_per_commit"
+                  ]
+                },
+                {
+                  "required": [
+                    "blobs_recomputed"
+                  ]
+                },
+                {
+                  "required": [
+                    "operation_receipts_reconciled"
+                  ]
+                },
+                {
+                  "required": [
+                    "metadata_complete"
+                  ]
+                }
+              ]
+            },
+            "properties": {
+              "commits_in_recovered_closure": {
+                "const": false
+              }
+            },
+            "required": [
+              "commits_in_recovered_closure"
+            ]
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "promotable": {
+            "const": true
+          },
+          "workload": {
+            "properties": {
+              "validation_flags": {
+                "properties": {
+                  "request_signature": {
+                    "const": true
+                  },
+                  "replay": {
+                    "const": true
+                  },
+                  "pack_hash_and_framing": {
+                    "const": true
+                  },
+                  "outer_embedded_type_match": {
+                    "const": true
+                  },
+                  "complete_graph": {
+                    "const": true
+                  },
+                  "authority_and_role": {
+                    "const": true
+                  },
+                  "instance_policy": {
+                    "const": true
+                  },
+                  "repository_policy": {
+                    "const": true
+                  },
+                  "typed_ref_cas": {
+                    "const": true
+                  },
+                  "fast_forward": {
+                    "const": true
+                  },
+                  "durability_fence_before_response": {
+                    "const": true
+                  }
+                }
+              }
+            }
+          },
+          "verification": {
+            "properties": {
+              "unique_blob_tree_commit_ids": {
+                "const": true
+              },
+              "objects_new_equals_three_per_commit": {
+                "const": true
+              },
+              "blobs_recomputed": {
+                "const": true
+              },
+              "operation_receipts_reconciled": {
+                "const": true
+              },
+              "metadata_complete": {
+                "const": true
+              },
+              "commits_in_recovered_closure": {
+                "const": true
+              }
+            },
+            "required": [
+              "unique_blob_tree_commit_ids",
+              "objects_new_equals_three_per_commit",
+              "blobs_recomputed",
+              "operation_receipts_reconciled",
+              "metadata_complete",
+              "commits_in_recovered_closure"
+            ]
+          },
+          "measurement": {
+            "properties": {
+              "coordinated_omission_corrected": {
+                "const": true
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "title": "a passing run must meet the section 3 one-minute-window rule",
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "pass"
+          }
+        },
+        "required": [
+          "outcome"
+        ]
+      },
+      "then": {
+        "properties": {
+          "measurement": {
+            "properties": {
+              "windows_meeting_target_percent": {
+                "minimum": 95
+              },
+              "windows_below_floor_count": {
+                "const": 0
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

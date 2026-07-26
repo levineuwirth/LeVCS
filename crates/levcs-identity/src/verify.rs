@@ -10,7 +10,7 @@
 //! the same logic works against an `ObjectStore`, an in-memory map, or a
 //! remote-fetching shim.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use thiserror::Error;
@@ -570,16 +570,24 @@ fn verify_release_inner<S: ObjectSource>(
         });
     }
     verify_signed_object(&signed)?;
-    let release =
-        levcs_core::Release::parse_body(&signed.body).map_err(|e| VerifyError::Object {
-            hash: release_id.to_hex(),
-            kind: e.to_string(),
-        })?;
+    // `Release::from_signed` enforces the contract used by `sign_release`:
+    // the first trailer signature is the declared release signer.
+    let release = levcs_core::Release::from_signed(&signed).map_err(|e| VerifyError::Object {
+        hash: release_id.to_hex(),
+        kind: e.to_string(),
+    })?;
     let _ = verifier.verify_chain(src, release.authority)?;
     let auth_signed = read_signed(src, release.authority)?;
     let auth_body = AuthorityBody::parse(&auth_signed.body)
         .map_err(|e| VerifyError::Authority(e.to_string()))?;
+    let mut signers = HashSet::with_capacity(signed.signatures.len());
     for s in &signed.signatures {
+        if !signers.insert(s.public_key) {
+            return Err(VerifyError::Object {
+                hash: release_id.to_hex(),
+                kind: "release contains a duplicate signer".into(),
+            });
+        }
         let pk = PublicKey(s.public_key);
         if auth_body.find_member(&pk).is_none() {
             return Err(VerifyError::Object {

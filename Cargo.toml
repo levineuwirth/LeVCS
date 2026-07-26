@@ -5,6 +5,7 @@ members = [
     "crates/levcs-identity",
     "crates/levcs-merge",
     "crates/levcs-protocol",
+    "crates/levcs-store",
     "crates/levcs-client",
     "crates/levcs-instance",
     "crates/levcs-cli",
@@ -23,6 +24,7 @@ levcs-core = { path = "crates/levcs-core" }
 levcs-identity = { path = "crates/levcs-identity" }
 levcs-merge = { path = "crates/levcs-merge" }
 levcs-protocol = { path = "crates/levcs-protocol" }
+levcs-store = { path = "crates/levcs-store" }
 levcs-client = { path = "crates/levcs-client" }
 levcs-instance = { path = "crates/levcs-instance" }
 levcs-tui = { path = "crates/levcs-tui" }
@@ -71,8 +73,18 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1.0"
+# levcs-store (Phase 1 storage spine). See doc/phase1-storage-spine-scope.md 2.4
+# for why each of these is taken and what was rejected in its place.
+arc-swap = "1.7"
+crossbeam-channel = "0.5"
+rustix = { version = "1.1", features = ["fs"] }
+libc = "0.2"
+memmap2 = "0.9"
+hdrhistogram = "7.5"
+
 proptest = "1.5"
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+tempfile = "3"
 
 [profile.release]
 opt-level = 3

@@ -1,0 +1,16 @@
+schema_version = 1
+name = "canonical-federation"
+source_workload = "small-commit.toml"
+projections = ["full", "release", "metadata"]
+round_trip_milliseconds = [1, 20, 80]
+packet_loss_percent = [0, 1, 5]
+partition_seconds = 600
+same_rack_ref_lag_p99_seconds = 5
+wan_ref_lag_p99_seconds = 30
+partition_catchup_seconds = 120
+maximum_source_degradation_percent = 10
+require_source_restart = true
+require_mirror_restart_during_apply = true
+require_exact_projection_digest = true
+require_atomic_destination_generation = true
+

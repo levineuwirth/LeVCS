@@ -1,0 +1,95 @@
+schema_version = 1
+name = "canonical-small-commit"
+description = "The only workload whose commits may contribute to the instance throughput headline."
+seed = 126394451485337
+generator = "blake3-xof(seed || repo_ordinal_le || ref_ordinal_le || commit_ordinal_le)"
+blob_bytes = 1024
+files_per_tree = 1
+unique_blob_per_commit = true
+unique_tree_per_commit = true
+unique_commit_per_commit = true
+client_batch_sizes = [1, 8, 32, 64]
+max_client_batch_commits = 64
+max_writer_group_transactions = 512
+
+[identity]
+signed_commit = true
+real_ed25519 = true
+required_role = "Contributor"
+authority_chain = "repository-current"
+
+[validation]
+request_signature = true
+replay = true
+pack_hash_and_framing = true
+outer_embedded_type_match = true
+complete_graph = true
+authority_and_role = true
+instance_policy = true
+repository_policy = true
+typed_ref_cas = true
+fast_forward = true
+durability_fence_before_response = true
+
+[counting]
+unit = "new-valid-durably-acknowledged-commit"
+exclude_offered = true
+exclude_rejected = true
+exclude_duplicate = true
+exclude_unacknowledged = true
+expected_objects_new_per_commit = 3
+external_ack_journal_required = true
+recovered_closure_reconciliation_required = true
+
+[[topology]]
+name = "many-ref-uniform"
+repositories = 1
+refs_per_repository = 1024
+persistent_clients = 64
+selection = "uniform"
+
+[[topology]]
+name = "many-ref-zipf"
+repositories = 1
+refs_per_repository = 1024
+persistent_clients = 64
+selection = "zipf"
+zipf_exponent = 0.9
+
+[[topology]]
+name = "many-repo-uniform"
+repositories = 256
+refs_per_repository = 16
+persistent_clients = 64
+selection = "uniform"
+
+[[topology]]
+name = "many-repo-zipf"
+repositories = 256
+refs_per_repository = 16
+persistent_clients = 64
+selection = "zipf"
+zipf_exponent = 0.9
+
+[measurement]
+p2_p3_warmup_seconds = 300
+p2_p3_measured_seconds = 900
+p4_warmup_seconds = 600
+p4_measured_seconds = 1800
+repetitions = 3
+correct_coordinated_omission = true
+record_raw_pack_application_wire_bytes = true
+# Per plan §3: >=95% of one-minute windows must meet the throughput target
+# and no window may fall below 90% of it.
+one_minute_window_target_met_percent_min = 95
+one_minute_window_floor_percent = 90
+
+[measurement.latency_micros]
+p2_p99_max = 50_000
+p3_p50_max = 20_000
+p3_p95_max = 50_000
+p3_p99_max = 100_000
+p4_p50_max = 20_000
+p4_p95_max = 50_000
+p4_p99_max = 100_000
+

@@ -22,6 +22,8 @@ zstd = { workspace = true }
 [dev-dependencies]
 proptest = { workspace = true }
 criterion = { workspace = true }
+tempfile = { workspace = true }
+toml = { workspace = true }
 
 [[bench]]
 name = "pack_codec"

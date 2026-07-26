@@ -1,0 +1,96 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "name": "foreign-valid-authority-chain",
+      "class": "foreign_authority",
+      "legacy_observation": "accept",
+      "v2_expected": "reject",
+      "reason": "authority chain does not terminate at the destination repository genesis"
+    },
+    {
+      "name": "stale-valid-authority-ancestor",
+      "class": "stale_authority",
+      "legacy_observation": "accept",
+      "v2_expected": "reject",
+      "reason": "ordinary transaction authority is not the pinned current authority"
+    },
+    {
+      "name": "same-transaction-successor-object",
+      "class": "same_transaction_successor",
+      "legacy_observation": "not-applicable",
+      "v2_expected": "reject",
+      "reason": "successor-authority commits and releases wait for the next transaction"
+    },
+    {
+      "name": "successor-object-in-later-transaction",
+      "class": "same_transaction_successor",
+      "legacy_observation": "not-applicable",
+      "v2_expected": "accept",
+      "reason": "the later transaction pins the already-published successor"
+    },
+    {
+      "name": "invalid-ed25519-signature",
+      "class": "signature",
+      "legacy_observation": "reject",
+      "v2_expected": "reject",
+      "reason": "object signature is invalid"
+    },
+    {
+      "name": "malformed-extra-commit-signature",
+      "class": "signature",
+      "legacy_observation": "reject",
+      "v2_expected": "reject",
+      "reason": "an extra all-zero signature entry is invalid and must not be tolerated"
+    },
+    {
+      "name": "release-first-signer-is-not-declarer",
+      "class": "release_declarer",
+      "legacy_observation": "reject",
+      "v2_expected": "reject",
+      "reason": "the first release signature must match declarer_key"
+    },
+    {
+      "name": "release-duplicate-cosigner",
+      "class": "release_declarer",
+      "legacy_observation": "reject",
+      "v2_expected": "reject",
+      "reason": "extra release signatures must be valid, authorized, and unique"
+    },
+    {
+      "name": "missing-ordinary-tree-closure",
+      "class": "closure",
+      "legacy_observation": "accept",
+      "v2_expected": "reject",
+      "reason": "every newly reachable typed edge must resolve"
+    },
+    {
+      "name": "wrong-embedded-edge-type",
+      "class": "closure",
+      "legacy_observation": "not-exercised",
+      "v2_expected": "reject",
+      "reason": "outer and embedded types and expected graph edge types must match; not-exercised because levcs-identity has no closure-walking code path today, so there is nothing for this fixture to call yet -- this is Phase 2 IdentitySession/ProjectionCore work, not a Phase 0 test gap"
+    },
+    {
+      "name": "repository-policy-read-failure",
+      "class": "policy",
+      "legacy_observation": "not-exercised",
+      "v2_expected": "reject",
+      "reason": "policy evaluation is fail-closed; not-exercised because repository policy is instance-level I/O and this crate only sees policy already embedded in AuthorityBody, so a read failure cannot be constructed here -- exercised in levcs-instance/Phase 2 AdmissionAuth instead"
+    },
+    {
+      "name": "repository-policy-parse-failure",
+      "class": "policy",
+      "legacy_observation": "not-exercised",
+      "v2_expected": "reject",
+      "reason": "malformed policy is not equivalent to no policy; not-exercised for the same reason -- levcs-identity has no separate policy-parse step to feed malformed bytes into"
+    },
+    {
+      "name": "protected-branch-contributor",
+      "class": "policy",
+      "legacy_observation": "reject",
+      "v2_expected": "reject",
+      "reason": "protected branch requires maintainer role"
+    }
+  ]
+}

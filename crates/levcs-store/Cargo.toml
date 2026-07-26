@@ -1,0 +1,67 @@
+[package]
+name = "levcs-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Durable transaction spine for LeVCS instances: journal, recovery, index, and snapshots."
+
+[features]
+default = []
+
+# Deterministic crash-injection points. Compiled out entirely in release; see
+# `failpoints.rs`. Required by the crash matrix (scope 4-A3).
+failpoints = []
+
+# Journal-level drive API (`drive.rs`) used by the crash driver and the
+# P1-micro benchmark before `StoreEngine::submit` exists. Test/bench seam only;
+# never enabled in a release binary. See scope 2.1.
+store-internals = []
+
+# Gates construction of `ValidatedTransaction`. Enabled only by validated
+# ingest (`levcs-instance`), this crate's own recovery path, and the Phase 2
+# migrator. Deliberately NOT reachable from `&StoreEngine`; see scope 2.2.
+store-privileged = []
+
+# Long-run benchmark harness dependencies.
+bench-harness = ["dep:hdrhistogram", "dep:ed25519-dalek", "dep:rand_core"]
+
+[dependencies]
+levcs-core = { workspace = true }
+levcs-protocol = { workspace = true }
+blake3 = { workspace = true }
+thiserror = { workspace = true }
+hex = { workspace = true }
+arc-swap = { workspace = true }
+crossbeam-channel = { workspace = true }
+rustix = { workspace = true }
+libc = { workspace = true }
+memmap2 = { workspace = true }
+hdrhistogram = { workspace = true, optional = true }
+# Benchmark-only. The P2 bundle needs a real Ed25519 attestation and section 5.2
+# requires P2 to measure real signing cost, but the store may not call into
+# levcs-identity. The harness therefore implements CommitEvidenceSigner itself;
+# the library never sees these.
+ed25519-dalek = { workspace = true, optional = true }
+rand_core = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+serde_json = { workspace = true }
+proptest = { workspace = true }
+criterion = { workspace = true }
+
+[[bin]]
+name = "store-crash-driver"
+path = "src/bin/store-crash-driver.rs"
+required-features = ["failpoints", "store-internals", "store-privileged"]
+
+[[bin]]
+name = "store-bench"
+path = "src/bin/store-bench.rs"
+required-features = ["bench-harness", "store-internals", "store-privileged"]
+
+[[bench]]
+name = "durable_ingest"
+harness = false
+required-features = ["store-internals"]

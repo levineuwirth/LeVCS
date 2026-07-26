@@ -9,11 +9,18 @@
 //!
 //! All of these must accept malformed input without panicking.
 
+mod support;
+
 use std::io::Cursor;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use levcs_protocol::p2p::{read_frame, DeployManifest};
-use levcs_protocol::{InfoResponse, Pack, PushManifest, RefList, RefsResponse};
+use levcs_protocol::v2::{
+    CursorExpiredV1, MissingObjectsRequestV1, ProjectionStageChunkV1, ProjectionStageManifestV1,
+    ProjectionStageSessionV1, SignedClientOperationV2, SignedReadRequestV2, SignedRepoSnapshotV1,
+    TransactionEvidenceV1, TransactionStatusV1,
+};
+use levcs_protocol::{CanonicalCodec, InfoResponse, Pack, PushManifest, RefList, RefsResponse};
 
 const ITERS: u32 = 5_000;
 
@@ -231,6 +238,80 @@ fn pack_decode_survives_mutation_of_valid_pack() {
         }
         assert_no_panic("Pack::decode(mut)", seed, &buf, |b| {
             let _ = Pack::decode(b);
+        });
+    }
+}
+
+#[test]
+fn every_phase0_v2_decoder_rejects_hostile_bytes_without_panicking() {
+    let mut seed = 0x20_26_07_24_f0_f0_f0_f0u64;
+    for _ in 0..ITERS {
+        let n = rand_size(&mut seed).min(16 * 1024);
+        let bytes = rand_bytes(&mut seed, n);
+        assert_no_panic("SignedClientOperationV2", seed, &bytes, |b| {
+            let _ = SignedClientOperationV2::decode_canonical(b);
+        });
+        assert_no_panic("SignedReadRequestV2", seed, &bytes, |b| {
+            let _ = SignedReadRequestV2::decode_canonical(b);
+        });
+        assert_no_panic("MissingObjectsRequestV1", seed, &bytes, |b| {
+            let _ = MissingObjectsRequestV1::decode_canonical(b);
+        });
+        assert_no_panic("SignedRepoSnapshotV1", seed, &bytes, |b| {
+            let _ = SignedRepoSnapshotV1::decode_canonical(b);
+        });
+        assert_no_panic("TransactionEvidenceV1", seed, &bytes, |b| {
+            let _ = TransactionEvidenceV1::decode_canonical(b);
+        });
+        assert_no_panic("TransactionStatusV1", seed, &bytes, |b| {
+            let _ = TransactionStatusV1::decode_canonical(b);
+        });
+        assert_no_panic("CursorExpiredV1", seed, &bytes, |b| {
+            let _ = CursorExpiredV1::decode_canonical(b);
+        });
+        assert_no_panic("ProjectionStageSessionV1", seed, &bytes, |b| {
+            let _ = ProjectionStageSessionV1::decode_canonical(b);
+        });
+        assert_no_panic("ProjectionStageChunkV1", seed, &bytes, |b| {
+            let _ = ProjectionStageChunkV1::decode_canonical(b);
+        });
+        assert_no_panic("ProjectionStageManifestV1", seed, &bytes, |b| {
+            let _ = ProjectionStageManifestV1::decode_canonical(b);
+        });
+    }
+}
+
+#[test]
+fn valid_v2_envelope_mutations_never_panic_or_verify_as_original() {
+    let valid = SignedClientOperationV2::Push(support::signed_normal_push())
+        .encode_canonical()
+        .unwrap();
+    let mut seed = 0x55_aa_55_aa_20_26_07_24u64;
+    for _ in 0..ITERS {
+        let mut bytes = valid.clone();
+        match lcg(&mut seed) % 3 {
+            0 => {
+                let index = (lcg(&mut seed) as usize) % bytes.len();
+                bytes[index] ^= 1 << (lcg(&mut seed) % 8);
+            }
+            1 => {
+                let length = (lcg(&mut seed) as usize) % bytes.len();
+                bytes.truncate(length);
+            }
+            _ => {
+                let extra = (lcg(&mut seed) % 32) as usize;
+                bytes.extend(rand_bytes(&mut seed, extra));
+            }
+        }
+        let is_real_mutation = bytes != valid;
+        assert_no_panic("mutated v2 envelope", seed, &bytes, |b| {
+            if let Ok(decoded) = SignedClientOperationV2::decode_canonical(b) {
+                let verified = decoded.verify().is_ok();
+                assert!(
+                    !(is_real_mutation && verified),
+                    "mutated bytes decoded and verified as valid at seed {seed:#x}"
+                );
+            }
         });
     }
 }

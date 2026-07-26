@@ -1,0 +1,218 @@
+{
+  "schema_version": 1,
+  "owner": "A3 StoreHarness",
+  "scope": "doc/phase1-storage-spine-scope.md 4-A3 deliverable 2",
+  "notes": [
+    "One row per levcs_store::failpoints::Failpoint. The row set, its order, and each row's wave are asserted against Failpoint::ALL and Failpoint::wave(); the wave partition is pinned by name in failpoints.rs and is never restated as a count here.",
+    "Each row carries two independent derivations of the same answer: physical_state_class -> required_outcome through the class table in tests/support/group_model.rs, and levcs_protocol::oracle::append_publication_expectation(point).recovery_outcome through the frozen Phase 0 oracle. crash_matrix.rs asserts the observed outcome equals both. Two derivations that must agree is the point; a single one would only restate itself.",
+    "No catch-all match arm exists in crash_matrix.rs or in the class table. Contract review 2026-07-24-A shipped an unsound recovery classification because a catch-all left most outcomes unasserted."
+  ],
+  "wave_a_assertion_scope": {
+    "asserted": [
+      "physical_state_class",
+      "recovery_outcome"
+    ],
+    "unasserted": [
+      "shard_poisoned",
+      "immediate_status",
+      "acknowledgment_allowed",
+      "later_append_allowed_before_recovery"
+    ],
+    "reason": "drive.rs has no engine, status root, sequencer, or signer, so there is no status to observe, no acknowledgment to permit or refuse, and no later-append admission control. These four fields are equally unassertable for every Wave A row, so they do not distinguish any row from another. Wave B re-asserts every row's complete FailpointExpectation through StoreEngine::submit."
+  },
+  "wave_b_exit_conditions": [
+    "The pending set is empty: no row carries wave = pending-wave-b.",
+    "Every row asserts its complete FailpointExpectation through submit, not only the two halves above.",
+    "The Panic action is exercised on DuringCommittedRootBuild, BeforeRootCas, and DuringRootCasRetry, so the panic-in-publication coverage vacated by ruling WriterPanicAfterFence into Wave A is not lost. The failpoint enum names a location; the driver chooses the action; the two axes are independent."
+  ],
+  "rows": [
+    {
+      "failpoint": "BeforeAppend",
+      "wave": "A",
+      "physical_state_class": "NoBytes",
+      "required_outcome": "AbsentRetriable",
+      "victim_placement": "first",
+      "drive": {
+        "action": "hard-exit",
+        "fault": "none"
+      },
+      "rationale": "The fault precedes the first byte of the group. Nothing is written, so the contiguous adopted prefix is pinned at p = 0."
+    },
+    {
+      "failpoint": "AfterMarkedResolving",
+      "wave": "pending-wave-b",
+      "physical_state_class": "NoBytes",
+      "required_outcome": "AbsentRetriable",
+      "victim_placement": "first",
+      "drive": null,
+      "pending_reason": "Requires the status root. Marking an operation Resolving is step 3 of the append ordering and lives in engine.rs; drive.rs has no status root, so the location does not exist to fire.",
+      "rationale": "Marking Resolving writes no journal byte, so the physical state is identical to BeforeAppend. The row is distinguished only by immediate_status and shard_poisoned, which is exactly why it is Wave B."
+    },
+    {
+      "failpoint": "DuringFrameWriteTorn",
+      "wave": "A",
+      "physical_state_class": "PartialFrame",
+      "required_outcome": "AbsentRetriable",
+      "victim_placement": "last",
+      "drive": {
+        "action": "hard-exit",
+        "fault": "short-write-tears-victim"
+      },
+      "rationale": "A short write is not an error; it leaves a durable prefix. The tear removes the 48-byte trailer of the victim, so the frame fails completeness condition 4 and can never be adopted. Frames before it are whole but unfenced, so p ranges over 0..=victim."
+    },
+    {
+      "failpoint": "AfterFrameWrite",
+      "wave": "A",
+      "physical_state_class": "WholeFrameUnfenced",
+      "required_outcome": "EitherWhole",
+      "victim_placement": "group-wide",
+      "drive": {
+        "action": "hard-exit",
+        "fault": "none"
+      },
+      "rationale": "Every frame's bytes are complete and no fence has returned. Whether any of them reached durable storage is exactly what recovery must decide by re-reading the device."
+    },
+    {
+      "failpoint": "EvidenceHandoffFailure",
+      "wave": "pending-wave-b",
+      "physical_state_class": "NoBytes",
+      "required_outcome": "AbsentRetriable",
+      "victim_placement": "first",
+      "drive": null,
+      "pending_reason": "Requires the sequencer's CommitEvidenceSigner handoff, which happens before append and lives in engine.rs. drive.rs has no signer, so the location does not exist to fire.",
+      "rationale": "Signer failure occurs before journal append and therefore writes nothing; it cannot produce an unsigned committed frame."
+    },
+    {
+      "failpoint": "BeforeFence",
+      "wave": "A",
+      "physical_state_class": "WholeFrameUnfenced",
+      "required_outcome": "EitherWhole",
+      "victim_placement": "group-wide",
+      "drive": {
+        "action": "hard-exit",
+        "fault": "none"
+      },
+      "rationale": "Identical physical state to AfterFrameWrite; the two rows differ only in where in the code the process died, and both must resolve through the device, never deterministically."
+    },
+    {
+      "failpoint": "FenceFailed",
+      "wave": "A",
+      "physical_state_class": "WholeFrameUnfenced",
+      "required_outcome": "EitherWhole",
+      "victim_placement": "group-wide",
+      "drive": {
+        "action": "fail",
+        "fault": "fence-eio"
+      },
+      "rationale": "On Linux an fdatasync error may be reported exactly once, after which the kernel has already dropped the dirty pages, so a retry can return success while the data is permanently gone. A failed fence therefore proves nothing about durability in either direction, which is why contract review 2026-07-24-A moved this row to EitherWhole. The shard poisons and never retries the fence."
+    },
+    {
+      "failpoint": "FenceAmbiguous",
+      "wave": "A",
+      "physical_state_class": "WholeFrameUnfenced",
+      "required_outcome": "EitherWhole",
+      "victim_placement": "group-wide",
+      "drive": {
+        "action": "hard-exit",
+        "fault": "none"
+      },
+      "rationale": "The process dies inside the fence call with no return value at all. Recovery must reopen with a fresh descriptor and re-read from the device before classifying; this row and FenceFailed are what scope 5 charter item 4 directs a reviewer to attack."
+    },
+    {
+      "failpoint": "AfterSuccessfulFence",
+      "wave": "A",
+      "physical_state_class": "WholeFrameFenced",
+      "required_outcome": "Committed",
+      "victim_placement": "group-wide",
+      "drive": {
+        "action": "hard-exit",
+        "fault": "none"
+      },
+      "rationale": "fdatasync returned success over the whole group, so p is pinned at group_len. Recovery must publish the complete durable prefix; a shorter prefix here is acknowledged loss, not a tolerable outcome."
+    },
+    {
+      "failpoint": "DuringCommittedRootBuild",
+      "wave": "pending-wave-b",
+      "physical_state_class": "WholeFrameFenced",
+      "required_outcome": "Committed",
+      "victim_placement": "group-wide",
+      "drive": null,
+      "pending_reason": "Requires the immutable shard subtree build of engine.rs. Wave B must exercise this row with the Panic action as well as Fail.",
+      "rationale": "The fence already succeeded, so the frames are durable regardless of what the in-memory build does. The shard poisons and recovery publishes the prefix exactly once."
+    },
+    {
+      "failpoint": "AllocationFailureBeforePublication",
+      "wave": "pending-wave-b",
+      "physical_state_class": "WholeFrameFenced",
+      "required_outcome": "Committed",
+      "victim_placement": "group-wide",
+      "drive": null,
+      "pending_reason": "Requires the publication path of engine.rs.",
+      "rationale": "Same durable state as AfterSuccessfulFence; the differential is entirely in the poison and status halves."
+    },
+    {
+      "failpoint": "BeforeRootCas",
+      "wave": "pending-wave-b",
+      "physical_state_class": "WholeFrameFenced",
+      "required_outcome": "Committed",
+      "victim_placement": "group-wide",
+      "drive": null,
+      "pending_reason": "Requires the ArcSwap committed-root CAS of engine.rs. Wave B must exercise this row with the Panic action as well as Fail.",
+      "rationale": "The committed-root swap is the visibility boundary, and it has not happened; the journal bytes are nonetheless durable."
+    },
+    {
+      "failpoint": "DuringRootCasRetry",
+      "wave": "pending-wave-b",
+      "physical_state_class": "WholeFrameFenced",
+      "required_outcome": "Committed",
+      "victim_placement": "group-wide",
+      "drive": null,
+      "pending_reason": "Requires the CAS merge loop under concurrent shard publication, which only exists in engine.rs. Wave B must exercise this row with the Panic action as well as Fail.",
+      "rationale": "A contended CAS re-merges against the newer root; dying inside the retry changes nothing about the durable prefix."
+    },
+    {
+      "failpoint": "WriterPanicBeforeFence",
+      "wave": "A",
+      "physical_state_class": "WholeFrameUnfenced",
+      "required_outcome": "EitherWhole",
+      "victim_placement": "group-wide",
+      "drive": {
+        "action": "panic",
+        "fault": "none"
+      },
+      "rationale": "Unwind rather than a clean error return, so destructors run. A Drop impl that truncates, rewinds the cursor, or flushes a buffer would show up here and nowhere else."
+    },
+    {
+      "failpoint": "WriterPanicAfterFence",
+      "wave": "A",
+      "physical_state_class": "WholeFrameFenced",
+      "required_outcome": "Committed",
+      "victim_placement": "group-wide",
+      "drive": {
+        "action": "panic",
+        "fault": "none"
+      },
+      "rationale": "Ruled into Wave A: the claim it certifies, that a fenced frame survives a panic-unwind death of the writer, is a journal-layer claim and drive.rs contains the panic site. Its whole differential against AfterSuccessfulFence is unwind versus clean error return, and the driver's HardExit path deliberately cannot catch a destructor bug because _exit(3) runs no destructors."
+    },
+    {
+      "failpoint": "AfterRootCasBeforeWaiterWake",
+      "wave": "pending-wave-b",
+      "physical_state_class": "WholeFrameFencedAndPublished",
+      "required_outcome": "Committed",
+      "victim_placement": "group-wide",
+      "drive": null,
+      "pending_reason": "Requires a published committed root and a receipt to be retrievable, both of which are engine.rs.",
+      "rationale": "The receipt is already visible, so acknowledgment is permitted and failing to wake a waiter cannot hide it. This is one of only two rows whose class is fenced-and-published."
+    },
+    {
+      "failpoint": "BeforeResponse",
+      "wave": "pending-wave-b",
+      "physical_state_class": "WholeFrameFencedAndPublished",
+      "required_outcome": "Committed",
+      "victim_placement": "group-wide",
+      "drive": null,
+      "pending_reason": "Requires a published receipt and a response path, both of which are engine.rs.",
+      "rationale": "Post-publication and pre-response: the receipt is already durable and idempotently retrievable by status or retry, and no reappend is required."
+    }
+  ]
+}

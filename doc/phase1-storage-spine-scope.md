@@ -920,6 +920,23 @@ above; `store-bench` produces a full P2 bundle over `submit`.
 
 ## 5. Wave A freeze gate and adversarial review charter
 
+> **Wave A is frozen at commit `5ee9c6b78b6e5f77f988e99e477656cfdc7db352`** (2026-07-26).
+> That commit is the frozen state: the `levcs-store` public API, the frame format and golden
+> corpus, the durability ordering, the failpoint registry, and the crash/fault fixtures.
+> Changing any of them now requires a contract review recorded in
+> `doc/instance-throughput-rewrite-plan.md`, not an edit.
+>
+> Verified at that commit: `check-phase1.sh` `GATE_EXIT=0` across all four feature
+> configurations, 124 test binaries, zero failures; `verify-store-recovery.sh --cycles 100`
+> with `recovery_failures=0`, `acknowledged_loss=0`, `torn_transactions=0`,
+> `repeated_adoptions=0`, `bundle=schema-valid`; `recovery_eio` 40/40 at four test threads;
+> golden corpus byte-stable.
+>
+> Two carry-forwards are explicitly **not** covered by the freeze and are B-wave work: the
+> crash-matrix extension and `GroupBuilder`'s production wiring, both below.
+> `doc/swarm-fabric-roadmap-exploration.md` (commit `e6a058d`) is deliberately outside this
+> freeze and remains non-binding.
+
 Per §12 as amended: **Wave B starts only after Wave A's interfaces, golden frame vectors,
 crash/fault fixtures, and durability ordering have passed review and are frozen.
 Compilation alone is not the dependency gate.**

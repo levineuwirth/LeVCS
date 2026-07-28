@@ -6,18 +6,20 @@ use support::*;
 
 fn destination_event_for(evidence: &TransactionEvidenceV1) -> CommittedTransactionV1 {
     let repo_id = id(3);
-    let (actor, operation_id) = match evidence {
+    // The actor is read off the evidence rather than recomputed here. A helper
+    // that derived it a second way could agree with `validate_mirror_application`
+    // by coincidence while every production sequencer disagreed, which is the
+    // defect this accessor exists to remove.
+    let actor = evidence.actor();
+    let operation_id = match evidence {
         TransactionEvidenceV1::MirrorEventV1 {
             source_instance,
             source_event,
             ..
-        } => (
+        } => mirror_event_operation_id(
             *source_instance,
-            mirror_event_operation_id(
-                *source_instance,
-                repo_id,
-                source_event.transaction.repo_sequence,
-            ),
+            repo_id,
+            source_event.transaction.repo_sequence,
         ),
         TransactionEvidenceV1::MirrorSnapshotV1 {
             source_instance,
@@ -25,17 +27,21 @@ fn destination_event_for(evidence: &TransactionEvidenceV1) -> CommittedTransacti
             destination_projection,
             projected_manifest_digest,
             ..
-        } => (
+        } => mirror_snapshot_operation_id(
             *source_instance,
-            mirror_snapshot_operation_id(
-                *source_instance,
-                repo_id,
-                source_snapshot.snapshot.generation_digest().unwrap(),
-                *destination_projection,
-                *projected_manifest_digest,
-            ),
+            repo_id,
+            source_snapshot.snapshot.generation_digest().unwrap(),
+            *destination_projection,
+            *projected_manifest_digest,
         ),
-        _ => (key(8).public().0, [0x71; 16]),
+        // Named individually: these four are not mirror applications, so they
+        // have no derived operation ID. A catch-all here would silently give a
+        // newly added mirror variant a constant operation ID and a passing
+        // test.
+        TransactionEvidenceV1::ClientV2 { .. }
+        | TransactionEvidenceV1::LegacyMigrationV1 { .. }
+        | TransactionEvidenceV1::ProjectionAdminV1 { .. }
+        | TransactionEvidenceV1::AdministrativeV1 { .. } => [0x71; 16],
     };
     CommittedTransactionV1 {
         repo_id,
@@ -157,6 +163,58 @@ fn mirror_event_consumer_distinguishes_projected_from_cursor_only() {
         MirrorApplicationKindV1::ProjectedEvent,
         &evidence,
         &cursor_only,
+        None
+    )
+    .is_err());
+}
+
+#[test]
+fn evidence_actor_is_the_binding_a_destination_event_must_restate() {
+    // One expected principal per `all_evidence()` entry, in order: the two
+    // client pushes are signed by keys 1 and 2, both mirror variants name
+    // instance key 7, and the three administrative variants are signed by the
+    // admin key 8. Written out rather than derived, so a variant that starts
+    // reporting a different principal fails here instead of agreeing with a
+    // second copy of the same mistake.
+    let expected = [
+        key(1).public().0,
+        key(2).public().0,
+        key(7).public().0,
+        key(7).public().0,
+        key(8).public().0,
+        key(8).public().0,
+        key(8).public().0,
+    ];
+    let evidence = all_evidence();
+    assert_eq!(evidence.len(), expected.len());
+    for (value, expected_actor) in evidence.iter().zip(expected) {
+        assert_eq!(value.actor(), expected_actor);
+    }
+
+    // The failure this accessor exists to prevent. Filling `actor` from the
+    // destination instance's own signing key produces an event that signs,
+    // fences, and becomes durable, and only then fails mirror verification —
+    // at which point no caller can withdraw it.
+    let snapshot_evidence = evidence
+        .iter()
+        .find(|value| matches!(value, TransactionEvidenceV1::MirrorSnapshotV1 { .. }))
+        .unwrap();
+    let event = destination_event_for(snapshot_evidence);
+    validate_mirror_application(
+        MirrorApplicationKindV1::SnapshotInline,
+        snapshot_evidence,
+        &event,
+        None,
+    )
+    .unwrap();
+    let destination_signed_actor = CommittedTransactionV1 {
+        actor: key(9).public().0,
+        ..event
+    };
+    assert!(validate_mirror_application(
+        MirrorApplicationKindV1::SnapshotInline,
+        snapshot_evidence,
+        &destination_signed_actor,
         None
     )
     .is_err());

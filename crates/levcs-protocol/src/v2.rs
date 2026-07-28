@@ -2361,6 +2361,35 @@ impl TransactionEvidenceV1 {
         }
     }
 
+    /// The principal a committed event's `actor` field must carry.
+    ///
+    /// This is not a convenience projection. `validate_mirror_application`
+    /// requires `destination_event.actor == source_instance` for all four
+    /// mirror kinds, and the administrative signing digests bind `actor`
+    /// directly, so `actor` is a property *of the evidence* that the
+    /// destination event restates. A sequencer that fills it from its own
+    /// signing key instead produces an event that signs, fences, and becomes
+    /// durable, and only then fails evidence verification — at the mirror, on
+    /// another instance, with no way to withdraw it. Reading it off the
+    /// evidence is the only construction that cannot drift.
+    pub fn actor(&self) -> PublicKeyBytes {
+        match self {
+            Self::ClientV2 { signed_envelope } => match signed_envelope {
+                SignedClientOperationV2::Init(signed) => signed.signer,
+                SignedClientOperationV2::Push(signed) => signed.signer,
+            },
+            Self::MirrorEventV1 {
+                source_instance, ..
+            } => *source_instance,
+            Self::MirrorSnapshotV1 {
+                source_instance, ..
+            } => *source_instance,
+            Self::LegacyMigrationV1 { actor, .. } => *actor,
+            Self::ProjectionAdminV1 { actor, .. } => *actor,
+            Self::AdministrativeV1 { actor, .. } => *actor,
+        }
+    }
+
     fn validate_structure(&self) -> CodecResult<()> {
         match self {
             Self::MirrorEventV1 {

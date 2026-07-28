@@ -1227,7 +1227,16 @@ mod wire {
 
 use wire::{R, W};
 
-fn object_type_code(value: ObjectType) -> u8 {
+/// The single in-crate statement of the store's object-type codes.
+///
+/// `pub(crate)` rather than private because `recovery.rs` and the engine both
+/// have to write the same code into an index entry, and a private mapping does
+/// not prevent a second table — it only guarantees the second table is written
+/// somewhere else and compared to this one by review. The recovered index entry
+/// and the submitted object are compared end to end by reopening a store, and
+/// that comparison is only meaningful while there is one table to disagree
+/// with.
+pub(crate) fn object_type_code(value: ObjectType) -> u8 {
     // Exhaustive on purpose: a new object type must break this build rather
     // than acquire an undocumented on-disk code.
     match value {

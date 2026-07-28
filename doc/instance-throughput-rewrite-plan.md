@@ -978,6 +978,130 @@ captured read cannot race reclamation.
 `GATE_EXIT=0`. B1 NamespaceTxn, B3 StagingSessions, and B4 StoreHarnessB may now dispatch
 against that surface; changes to it require another contract review here.
 
+##### Contract review 2026-07-28-A
+
+B2's adversarial review of the B1/B3 slice returned five interface requests against frozen
+surfaces. All five are granted, one with a tightened bound, and they land as a single
+reviewed change before either package's fix pass — so that B1 and B3 consume a contract
+rather than negotiate with it. Four of the five exist to delete a restated frozen table,
+which is the Wave A finding in its interface form: a package that cannot reach a mapping
+does not stop needing it, it writes a second copy that agrees today.
+
+**1. `CommitEvidenceSigner::sign_event` signs the signing digest, and now says so.** The
+parameter was named `event_digest`. What a correct implementation must sign is
+`SignedCommittedTransactionV1::signing_digest(transaction, source_key_epoch,
+durability_result)`, because that is the value the frozen `verify` recomputes. The two are
+not interchangeable: the signing digest commits to the key epoch and the durability result
+in addition to the canonical transaction, while the event digest is the chain identity that
+`previous_event_digest` links. B1 inferred this correctly and passes the signing digest;
+the interface, read literally, told it to do something else.
+
+The weaker fix — a doc line on the trait, leaving the parameter named `event_digest` — was
+rejected because of where the error surfaces. A signature over the wrong message is
+produced by the signer, accepted by the store, fenced, and made durable, and is first
+detected by a *verifier*, which may be a mirror on another instance. There is no point
+between those two events at which anything can decline the transaction. An interface whose
+misuse is undetectable until after durability has to state the requirement in the name a
+caller types, not in prose beside it.
+
+Amended: `types.rs`, and scope §2.2 where the frozen signature is printed. No
+implementation changed; `engine.rs` already passed the correct value.
+
+**2. `TransactionEvidenceV1::actor()`, which closes a P1 rather than adding a
+convenience.** `validate_mirror_application` requires `destination_event.actor ==
+source_instance` for all four mirror kinds, and the administrative signing digests bind
+`actor` directly, so `actor` is a property of the evidence that the committed event
+restates. B1 filled it from the destination signer's public key — the only value it could
+reach — which is a durable event that signs, fences, and publishes and *then* fails
+evidence verification at the mirror. That is the worst available failure ordering: the
+transaction is committed and unwithdrawable before anything says it is malformed.
+
+The accessor is exhaustive over the six variants and reads the client principal off the
+signed envelope's signer. Deriving it in the store instead was rejected on the grounds that
+a second derivation is precisely what produced the defect: whatever the store computes,
+`validate_mirror_application` is the authority, and only the protocol crate can be wrong
+about it in one place.
+
+Amended: `v2.rs`. `phase0_consumers.rs`'s `destination_event_for` helper now takes the
+actor from the accessor instead of its own match, and its `_` catch-all — which had been
+supplying both the actor and a constant operation ID to four named variants — is replaced
+with those four named arms. The same edit adds a test asserting the actor of every evidence
+variant and proving that substituting the destination instance's own key makes mirror
+validation fail. Charter item 8: the accessor's first consumer is a test that would have
+caught the P1, not a helper beside it.
+
+**3. One object-type table in the crate.** `format::object_type_code` and an identical
+private copy in `recovery.rs` both existed, so `engine.rs` wrote a third. `format`'s is now
+`pub(crate)` and `recovery.rs`'s twin is deleted; `recovery.rs` calls the shared one. The
+half-measure — exposing `format`'s and leaving recovery's in place — would have left the
+crate with two tables and a new way to reach a third, which is worse than either, because
+the exposure makes it look resolved.
+
+**4. Typed `RefRecord` conversion.** `checkpoint::RefRecord` carried `ref_kind: u8` with no
+way to interpret it, so `engine.rs` restated the branch/release codes to read a record
+`checkpoint.rs` had written. `RefRecord::from_target` and `RefRecord::target` now own that
+conversion, with the code table stated once per direction in `checkpoint.rs` and
+`read_applied_refs` rewired onto the decode half. `recovery.rs`'s replay map is keyed by
+`RefTarget` rather than by the physical `(kind, name)` pair, which removes its copy too.
+
+An unknown code is refused as `CheckpointError::RefKind(u8)`, carrying the byte. Neither a
+default to `Branch` nor a skip is acceptable: a ref table is derived state that the next
+checkpoint writes back, so a silently reclassified ref is laundered into the record within
+one checkpoint interval and is indistinguishable from a ref that was always there. Naming
+the byte is the difference between a torn write and a reader that predates a kind a newer
+writer emits.
+
+The refusal is at interpretation, not at checkpoint decode. Rejecting an unknown kind while
+decoding the body would be stronger — it would let checkpoint fallback try another
+generation instead of failing at first use — but it changes which generations are loadable,
+which is a durability-visible change to a frozen reader and beyond what these five rulings
+grant. It deserves its own ruling; it does not deserve to ride along beside four table
+deletions.
+
+`format.rs` keeps its own ref-kind table for the *frame* encoding, deliberately. That is
+not the duplicate that mattered: the frame and the checkpoint are independently versioned
+physical formats, each self-consistent, and a frame code is only ever compared to a frame
+code. The copies worth removing were the ones interpreting a `RefRecord` produced
+elsewhere.
+
+**5. Projection ceilings, approved with a tightened bound.** `max_projection_objects`
+defaulted to 100,000,000 while `ProjectionStageManifestV1.objects` is a flat canonical
+vector capped at `MAX_CANONICAL_ITEMS` (1,000,000). The ceiling is now that cap and the
+default is lowered to it; `max_projection_chunks` is capped identically against
+`chunk_digests`; and `max_projection_bytes` is capped at `max_projection_chunks *
+MAX_CANONICAL_BYTES`, since object bytes travel in per-chunk canonical encodings. The byte
+bound is necessary and not sufficient — a chunk also pays framing — and it is stated that
+way in the code, because a bound advertised as exact and enforced as approximate is worse
+than one that admits what it is.
+
+**The reasoning that belongs on the record: supporting a hundred million objects requires a
+versioned chunked/indexed manifest design, not a larger hostile-decode ceiling.** Raising
+`MAX_CANONICAL_ITEMS` would buy the object count by giving up the property the ceiling
+exists for — that a reader can bound its work before it materializes an attacker-declared
+vector. The right shape is a manifest a reader can traverse in pieces, and that is a
+Phase 2+ format with its own version, not a constant edit.
+
+Refusing at startup rather than at seal is the other half. The old configuration did not
+fail early; it admitted sessions, pinned a principal's whole staging budget, accepted hours
+of transfer at the supported floor, and refused at manifest encode. `options.rs` now
+refuses the configuration, which is the only point where the operator learns this from the
+configuration instead of from a stuck mirror.
+
+Amended: `options.rs`, with tests asserting the boundary in both directions, that the
+default *is* the format ceiling, and that the byte bound tracks the chunk allowance rather
+than a fixed number. `staging.rs`'s per-session `MAX_CANONICAL_ITEMS` checks are now
+redundant with startup validation; they are B3's to remove or to keep as a belt, and either
+is defensible now that no admitted configuration can reach them.
+
+**Expected collateral.** The tightened ceilings break exactly one test,
+`staging_sessions.rs::a_declared_projection_over_a_configured_ceiling_is_refused_before_pinning`,
+which sets `max_projection_chunks = 1` while leaving `max_projection_bytes` at the 1 TiB
+default — now an unsatisfiable configuration that `StoreOptions::validate` refuses before
+the store opens. The test's intent survives; its fixture has to vary the two together. It
+is B3's file and folds into B3's fix pass. The gate is transiently red between the two
+passes, which is accepted: landing the contract first is what keeps both packages from
+implementing against a surface that is about to move.
+
 ### Phase 1 — storage engine spine
 
 Lead first defines sealed transaction/frame/snapshot interfaces and file ownership. That deliverable (D0) landed on 2026-07-24 as `crates/levcs-store`: the frozen public API compiling against `StoreError::NotImplemented`, the file-ownership split, strict configuration validation, the single durability syscall funnel with its counters and fault hooks, the failpoint registry in enforced one-to-one correspondence with `oracle::AppendFailpoint`, and the journal-level drive seam that lets the crash harness run in Wave A. The enforced gate is `scripts/check-phase1.sh`, which runs `check-phase0.sh` first so the Phase 0 freeze stays enforced. That work is scoped in `doc/phase1-storage-spine-scope.md`, which realizes this section as a file-ownership matrix, a frozen `levcs-store` API, a physical format and durability/recovery specification, per-package deliverables and acceptance criteria, the Wave A adversarial review charter, and the capacity analysis for P2 on the frozen reference hardware. This plan remains authoritative; that document is the Phase 1 realization of it and lists the decisions that must be resolved before Wave A starts.

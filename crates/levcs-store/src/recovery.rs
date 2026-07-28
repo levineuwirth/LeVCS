@@ -81,14 +81,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use im::Vector;
-use levcs_core::{ObjectId, ObjectType};
+use levcs_core::ObjectId;
 use levcs_protocol::oracle::{self, RecoveredTailFact, RecoveryOutcome};
 use levcs_protocol::v2::{RefMutation, RefTarget, StagedProjectionInstallV1, TypedRefCas};
 
 use crate::checkpoint::{Checkpoint, CheckpointError, CheckpointLoad, ReceiptRecord, RefRecord};
 use crate::format::{
-    CurrentPointer, Frame, FrameError, FrameHeader, FrameObjectsV1, JournalHeader, Manifest,
-    TailRange, TransactionFramePayloadV1, JOURNAL_HEADER_LEN,
+    object_type_code, CurrentPointer, Frame, FrameError, FrameHeader, FrameObjectsV1,
+    JournalHeader, Manifest, TailRange, TransactionFramePayloadV1, JOURNAL_HEADER_LEN,
 };
 use crate::index::{IndexDelta, IndexKey, IndexLocation, IndexRun, NamespaceCatalog};
 use crate::journal::{Journal, QuarantinedTail, ScannedFrame, TailScan, TailStop};
@@ -1079,18 +1079,6 @@ impl PayloadFacts for CanonicalPayloadFacts {
             }
         }
         Ok(recovered)
-    }
-}
-
-fn object_type_code(value: ObjectType) -> u8 {
-    // Exhaustive so a new logical object type cannot acquire an accidental
-    // recovered-index representation.
-    match value {
-        ObjectType::Blob => 1,
-        ObjectType::Tree => 2,
-        ObjectType::Commit => 3,
-        ObjectType::Release => 4,
-        ObjectType::Authority => 5,
     }
 }
 
@@ -2530,24 +2518,20 @@ fn apply_recovered_refs(
     refs: &mut Vec<RefRecord>,
     replayed: &[ReplayedFrame],
 ) -> Result<(), StoreError> {
-    let mut state: BTreeMap<(NamespaceId, u8, Vec<u8>), ObjectId> = refs
+    // Keyed by the typed target, not by the physical `(ref_kind, name)` pair.
+    // Replay compares a checkpointed record against a frame's `RefTarget`, so
+    // whichever side is converted, one of them is being interpreted — and doing
+    // it here meant restating the checkpoint's code table in a module that has
+    // no way to notice when the two drift.
+    let mut state: BTreeMap<(NamespaceId, RefTarget), ObjectId> = refs
         .iter()
-        .map(|record| {
-            (
-                (record.namespace, record.ref_kind, record.name.clone()),
-                record.target,
-            )
-        })
-        .collect();
+        .map(|record| Ok(((record.namespace, record.target()?), record.target)))
+        .collect::<Result<_, CheckpointError>>()?;
 
     for frame in replayed {
         let facts = &frame.facts;
         for update in &frame.payload.ref_updates {
-            let (kind, name) = match &update.target {
-                RefTarget::Branch(name) => (1u8, name.as_bytes().to_vec()),
-                RefTarget::Release(name) => (2u8, name.as_bytes().to_vec()),
-            };
-            let key = (facts.namespace, kind, name);
+            let key = (facts.namespace, update.target.clone());
             let observed = state.get(&key).copied();
             if observed != update.expected {
                 return Err(StoreError::Corruption(format!(
@@ -2568,12 +2552,7 @@ fn apply_recovered_refs(
 
     *refs = state
         .into_iter()
-        .map(|((namespace, ref_kind, name), target)| RefRecord {
-            namespace,
-            ref_kind,
-            name,
-            target,
-        })
+        .map(|((namespace, target), object)| RefRecord::from_target(namespace, &target, object))
         .collect();
     Ok(())
 }

@@ -238,7 +238,8 @@ Also frozen in D0:
 pub trait CommitEvidenceSigner: Send + Sync {
     fn key_epoch(&self) -> u64;
     fn public_key(&self) -> [u8; 32];
-    fn sign_event(&self, event_digest: &ObjectId) -> Result<[u8; 64], SignerError>;
+    /// `SignedCommittedTransactionV1::signing_digest`, not the event digest.
+    fn sign_event(&self, signing_digest: &ObjectId) -> Result<[u8; 64], SignerError>;
 }
 
 /// Privileged construction. Sealed so instance validation, recovery, and
@@ -249,6 +250,15 @@ impl ValidatedTransaction {
 }
 pub struct PrivilegedConstruction(());
 ```
+
+The parameter name is normative, and contract review 2026-07-28-A amended it from
+`event_digest`. What the signature must cover is
+`SignedCommittedTransactionV1::signing_digest(transaction, source_key_epoch,
+durability_result)`, because that is what the frozen `verify` recomputes. A signature over
+the bare event digest omits the key epoch and the durability result and verifies nowhere —
+including at a mirror on another instance, after the transaction is already durable. The
+event digest is the chain identity `previous_event_digest` links; it is not the signature
+message.
 
 `PrivilegedConstruction` must **not** be obtainable from a `&StoreEngine`. A
 `StoreEngine::privileged()` method would make the seal decorative: anything holding an
@@ -1193,6 +1203,16 @@ contract review in `doc/instance-throughput-rewrite-plan.md`. D0-B already exerc
 nine of its eleven items amend a frozen or signature-frozen file, and each is a recorded
 amendment rather than an edit.
 
+**Contract review 2026-07-28-A** is the second exercise of that rule, this time driven by
+B2's findings against the B1/B3 slice rather than by the lead's own integration. Five
+interface requests were granted and landed on the frozen surfaces ahead of the packages'
+fix passes: `CommitEvidenceSigner::sign_event`'s parameter renamed to `signing_digest`
+(§2.2); a protocol-owned `TransactionEvidenceV1::actor()`; `format::object_type_code` made
+`pub(crate)` with `recovery.rs`'s twin removed; typed `RefRecord::target()`/`from_target()`
+on the checkpoint record; and the projection ceilings above. Four of the five exist to
+delete a restated frozen table — B1 filed each of them instead of quietly restating it a
+third time, which is exactly what §6.0 asks for and what Wave A did not get.
+
 The frozen surface is the **library**. Wave A's harness — `src/bin/store-crash-driver.rs`,
 `src/bin/store-bench.rs`, `tests/crash_matrix.rs`, and `scripts/verify-store-recovery.sh` —
 is not frozen; ownership transfers to B4, whose whole purpose is to extend it (§6.6). Test
@@ -1541,7 +1561,9 @@ criteria.
    middle, and last position of a forming group, in each case with later signer results
    already available.** Prove the failed transaction appends nothing, and that every retained
    suffix transaction is re-sequenced, re-chained, and re-signed as necessary, leaving no
-   sequence gap. Signing covers the event digest, which chains `previous_event_digest`, so
+   sequence gap. Signing covers `SignedCommittedTransactionV1::signing_digest`, which commits
+   to the whole committed transaction and therefore to the chained
+   `previous_event_digest`, so
    dropping a member from the middle of a group invalidates every signature after it — the
    already-returned results for the suffix are now signatures over a chain that no longer
    exists. A partial repair here produces a durable, correctly-fenced frame carrying a
@@ -1600,6 +1622,15 @@ B3's deliverables:
    minimum supported transfer rate must make one complete transfer possible, or creation
    rejects *before* pinning anything. A session that cannot finish is a session that only
    consumes budget.
+
+   Contract review 2026-07-28-A adds the representability half of the same argument.
+   `max_projection_objects` and `max_projection_chunks` are capped at
+   `codec::MAX_CANONICAL_ITEMS`, and `max_projection_bytes` at
+   `max_projection_chunks * codec::MAX_CANONICAL_BYTES`, because the sealed manifest is one
+   flat canonical vector and the chunks are one canonical encoding each. Startup refuses a
+   configuration above those caps rather than admitting sessions whose manifest could never
+   encode. `max_projection_objects` now defaults to `MAX_CANONICAL_ITEMS`; the previous
+   default of 100,000,000 advertised a capacity the format does not have.
 5. **Artifacts are written by maintenance workers, synced, uniquely named, and
    unreferenced.** They never enter namespace membership, object-existence answers,
    snapshots, refs, receipts, event feeds, dedupe state, or `CURRENT`.
@@ -1683,6 +1714,36 @@ a silently dropped pin is a leaked session that no expiry will collect.
 
 Both packages write a test driving the full lifecycle — pin, adopt, publish, unpin — and B2
 checks the two agree. A seam with tests on only one side is the Wave A finding restated.
+
+#### Carry-forwards after the first B3 slice — recorded, not closed
+
+Two properties are implemented and not operated. Both are recorded here rather than only in
+an ignored test, because a carry-forward that lives in a test attribute is invisible to
+anyone reading the scope to decide whether a deliverable is met, which is the mechanism by
+which Wave A's `GroupBuilder` gap nearly shipped as satisfied.
+
+1. **Production staging use is incomplete.** The *ownership* seam is closed — `StoreEngine::open`
+   constructs the single `ProjectionStaging` under the held `RecoverySession` and passes it as
+   recovery's `ProjectionRecoveryResolver` — but the *use* seam is not. No production path
+   calls `begin`, `finalize`, or `adopt_projection`; they are reachable only from B3's own
+   tests. Deliverable 5's security acceptance — sealed objects invisible to
+   `RepoSnapshot::locate` until a `submit` adopts them — therefore remains unasserted, and its
+   test stays ignored with both blockers named. Having a production caller for construction is
+   not the same as having one for the mechanism, and only the second discharges charter item 8.
+
+2. **`ProjectionStaging::expire` has no scheduler.** Expiry is implemented and unit-tested, and
+   nothing in production drives it. Session age is therefore a bound that is enforced when
+   asked and never asked — a limit no deployment currently applies. The bound is not met until
+   something operates it.
+
+**The `StoreEngine` staging accessor B3 requested is a pending interface amendment, and it must
+not be a bare `Arc<ProjectionStaging>`.** A cloned `Arc` can outlive `EngineShared`, survive the
+release of the root `LOCK`, and keep serving staging operations against a root this process no
+longer holds — which reintroduces the exact defect the root-lock-proof constructor was added to
+make inexpressible, and reintroduces it from the reader side where the constructor cannot see
+it. The eventual façade or handle must retain engine and root-lock authority for the lifetime
+of every session it creates. Until that is designed and frozen, the accessor does not exist and
+the acceptance test above stays blocked.
 
 ### 6.6 B4 — StoreHarnessB
 

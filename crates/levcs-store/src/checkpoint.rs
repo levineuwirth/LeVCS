@@ -99,6 +99,12 @@ pub enum CheckpointError {
     CountCeiling(&'static str),
     #[error("checkpoint body is malformed: {0}")]
     Body(&'static str),
+    /// Named separately from [`CheckpointError::Body`] because the offending
+    /// value is the whole diagnosis: a ref kind is one byte, and "which byte"
+    /// is the difference between a torn write and a reader that never learned
+    /// about a kind a newer writer emits.
+    #[error("checkpoint carries unknown ref kind {0}")]
+    RefKind(u8),
     #[error("checkpoint has trailing bytes after its declared body")]
     TrailingBytes,
     #[error("checkpoint file name is not <shard_sequence>.checkpoint")]
@@ -118,12 +124,47 @@ impl From<CheckpointError> for StoreError {
 // ---------------------------------------------------------------------------
 
 /// One typed ref binding, as of the checkpoint's `shard_committed_sequence`.
+///
+/// The physical `(ref_kind, name)` pair stays public because the checkpoint
+/// body encodes it directly, but nothing outside this module should ever
+/// interpret it: use [`RefRecord::from_target`] and [`RefRecord::target`].
+/// Every consumer that decodes `ref_kind` itself is restating a table this
+/// module owns, and the copy is only ever discovered when the two disagree —
+/// which, for a derived-but-authoritative ref table, means a reopened store
+/// silently resolving a branch as a release.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RefRecord {
     pub namespace: NamespaceId,
     pub ref_kind: u8,
     pub name: Vec<u8>,
     pub target: ObjectId,
+}
+
+impl RefRecord {
+    /// Builds the physical record for a typed ref binding.
+    pub fn from_target(namespace: NamespaceId, target: &RefTarget, object: ObjectId) -> Self {
+        let (ref_kind, name) = ref_target_parts(target);
+        Self {
+            namespace,
+            ref_kind,
+            name: name.as_bytes().to_vec(),
+            target: object,
+        }
+    }
+
+    /// The typed binding this record encodes.
+    ///
+    /// Fallible on purpose. A checkpoint is derived state read back from disk,
+    /// so `ref_kind` and `name` are attacker-adjacent in exactly the sense the
+    /// rest of this module's readers are: an unknown kind is refused by name,
+    /// never defaulted to `Branch` and never dropped. Defaulting would turn a
+    /// corrupt byte into a plausible ref that the next checkpoint would then
+    /// write back as if it had always been there.
+    pub fn target(&self) -> Result<RefTarget, CheckpointError> {
+        let name = std::str::from_utf8(&self.name)
+            .map_err(|_| CheckpointError::Body("ref record name utf-8"))?;
+        ref_target_from_kind_code(self.ref_kind, name)
+    }
 }
 
 /// A retained operation/receipt row.
@@ -330,10 +371,38 @@ fn read_optional_object_id(
     }
 }
 
+/// The checkpoint body's ref-kind codes, encode side.
+///
+/// Paired with [`ref_target_from_kind_code`], and the only place in the crate
+/// that assigns these two codes. `format.rs` has its own table for the *frame*
+/// encoding; that is not a duplicate, because the two physical formats are
+/// versioned independently and each is self-consistent — a frame code is only
+/// ever compared to a frame code. The copies that mattered were the ones that
+/// decoded a `RefRecord` this module produced, and those are now gone.
 fn ref_target_parts(target: &RefTarget) -> (u8, &str) {
     match target {
         RefTarget::Branch(name) => (1, name),
         RefTarget::Release(name) => (2, name),
+    }
+}
+
+/// The checkpoint body's ref-kind codes, decode side.
+///
+/// Rejects an unknown code by value rather than defaulting: a ref table is
+/// derived state, and a silently reclassified ref would be written back into
+/// the next checkpoint as though it were authoritative.
+fn ref_target_from_kind_code(kind: u8, name: &str) -> Result<RefTarget, CheckpointError> {
+    if name.is_empty()
+        || name.len() > MAX_REF_NAME_LEN as usize
+        || name.as_bytes().contains(&0)
+        || levcs_core::refs::validate_ref_name(name).is_err()
+    {
+        return Err(CheckpointError::Body("ref target name"));
+    }
+    match kind {
+        1 => Ok(RefTarget::Branch(name.to_owned())),
+        2 => Ok(RefTarget::Release(name.to_owned())),
+        unknown => Err(CheckpointError::RefKind(unknown)),
     }
 }
 
@@ -411,16 +480,8 @@ fn read_applied_refs(r: &mut Reader<'_>) -> Result<Vec<AppliedRef>, CheckpointEr
             return Err(CheckpointError::Body("receipt ref target name length"));
         }
         let name = std::str::from_utf8(r.take(name_len as usize, "receipt ref target name")?)
-            .map_err(|_| CheckpointError::Body("receipt ref target name utf-8"))?
-            .to_owned();
-        if name.as_bytes().contains(&0) || levcs_core::refs::validate_ref_name(&name).is_err() {
-            return Err(CheckpointError::Body("receipt ref target name"));
-        }
-        let target = match kind {
-            1 => RefTarget::Branch(name),
-            2 => RefTarget::Release(name),
-            _ => return Err(CheckpointError::Body("receipt ref target kind")),
-        };
+            .map_err(|_| CheckpointError::Body("receipt ref target name utf-8"))?;
+        let target = ref_target_from_kind_code(kind, name)?;
         if !targets.insert(target.clone()) {
             return Err(CheckpointError::Body(
                 "duplicate receipt applied-ref target",
@@ -1056,6 +1117,35 @@ mod tests {
             decoded.receipts[0].refs, checkpoint.receipts[0].refs,
             "old/new values, deletion, force, target kind, and order are receipt data"
         );
+    }
+
+    #[test]
+    fn a_ref_record_round_trips_through_its_typed_target() {
+        for target in [
+            RefTarget::Branch("refs/heads/main".into()),
+            RefTarget::Release("refs/releases/v1".into()),
+        ] {
+            let record = RefRecord::from_target(ns(1), &target, oid(0x40));
+            assert_eq!(record.target().expect("a record we built decodes"), target);
+        }
+    }
+
+    #[test]
+    fn an_unknown_ref_kind_is_refused_by_value_and_never_defaulted() {
+        let mut record = RefRecord::from_target(
+            ns(1),
+            &RefTarget::Branch("refs/heads/main".into()),
+            oid(0x40),
+        );
+        for kind in [0u8, 3, 255] {
+            record.ref_kind = kind;
+            assert_eq!(
+                record.target().unwrap_err(),
+                CheckpointError::RefKind(kind),
+                "an unreadable ref must not resolve as a branch: the next checkpoint would \
+                 write the guess back as though it were recovered state"
+            );
+        }
     }
 
     #[test]

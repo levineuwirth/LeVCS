@@ -132,7 +132,9 @@ impl Default for StoreOptions {
             max_replay_bytes: 8 * 1024 * 1024 * 1024,
             max_objects_per_transaction: 65_536,
             max_refs_per_transaction: 4_096,
-            max_projection_objects: 100_000_000,
+            // The manifest is a flat canonical vector, so this is the codec's
+            // item ceiling and not a tuning choice. See `validate`.
+            max_projection_objects: 1_000_000,
             max_projection_bytes: 1024 * 1024 * 1024 * 1024,
             max_projection_chunks: 1_000_000,
             max_status_entries: 1_000_000,
@@ -227,17 +229,62 @@ impl StoreOptions {
             self.max_objects_per_transaction >= 1,
             "max_objects_per_transaction must be nonzero"
         );
+        // The projection ceilings are bounded by what a manifest can actually
+        // represent, not only by what an operator would like to allow.
+        //
+        // `ProjectionStageManifestV1` carries `objects` and `chunk_digests` as
+        // flat canonical vectors, each capped at `MAX_CANONICAL_ITEMS`, and the
+        // whole encoding is capped at `MAX_CANONICAL_BYTES`. A configuration
+        // above those caps does not fail at seal after a long transfer — it
+        // *cannot* succeed, and every session admitted under it burns a
+        // principal's whole staging budget on a transfer guaranteed to be
+        // refused when its manifest is encoded. Refusing at startup is the only
+        // point where the operator learns this from the configuration rather
+        // than from a stuck mirror.
+        //
+        // The old 100,000,000 default asserted a capability the format does not
+        // have. Restoring it is not a matter of raising a decode ceiling:
+        // supporting a hundred million objects requires a versioned
+        // chunked/indexed manifest, so that a reader can bound its work without
+        // materializing the whole membership set. A larger hostile-decode
+        // ceiling would buy the object count by giving up the property that
+        // makes the ceiling worth having.
+        let canonical_items = levcs_protocol::codec::MAX_CANONICAL_ITEMS as u64;
+        let canonical_bytes = levcs_protocol::codec::MAX_CANONICAL_BYTES as u64;
         require!(
-            self.max_projection_objects >= 1,
-            "max_projection_objects must be nonzero"
+            self.max_projection_objects >= 1 && self.max_projection_objects <= canonical_items,
+            "max_projection_objects must be in 1..={canonical_items} while the staging \
+             manifest is one flat canonical vector, got {}",
+            self.max_projection_objects
         );
         require!(
-            self.max_projection_bytes >= 1,
-            "max_projection_bytes must be nonzero"
+            self.max_projection_chunks >= 1
+                && u64::from(self.max_projection_chunks) <= canonical_items,
+            "max_projection_chunks must be in 1..={canonical_items}: the manifest's \
+             chunk_digests vector is bounded by the same item ceiling, got {}",
+            self.max_projection_chunks
         );
+        // Bytes are bounded transitively rather than directly: object bytes
+        // travel in `ProjectionStageChunkV1`s, one canonical encoding each, so
+        // no projection can carry more than its chunk allowance times the
+        // canonical byte ceiling. This is a necessary condition and not a
+        // sufficient one — a chunk also pays framing and descriptor overhead,
+        // so a configuration passing here can still refuse an individual chunk.
+        // A configuration failing here is unsatisfiable for every projection at
+        // the declared maximum, which is the case worth refusing at startup.
+        let representable_projection_bytes = u64::from(self.max_projection_chunks)
+            .checked_mul(canonical_bytes)
+            .ok_or_else(|| {
+                StoreError::InvalidConfiguration(
+                    "max_projection_chunks times the canonical byte ceiling overflows u64".into(),
+                )
+            })?;
         require!(
-            self.max_projection_chunks >= 1,
-            "max_projection_chunks must be nonzero"
+            self.max_projection_bytes >= 1
+                && self.max_projection_bytes <= representable_projection_bytes,
+            "max_projection_bytes must be in 1..={representable_projection_bytes} \
+             (max_projection_chunks * {canonical_bytes}), got {}",
+            self.max_projection_bytes
         );
         require!(
             self.max_status_entries >= 1,
@@ -469,6 +516,52 @@ mod tests {
         assert!(
             o.validate().is_err(),
             "a session too short for one maximal transfer must be refused"
+        );
+    }
+
+    #[test]
+    fn projection_ceilings_above_what_a_manifest_can_encode_are_refused() {
+        let items = levcs_protocol::codec::MAX_CANONICAL_ITEMS as u64;
+
+        let mut o = valid();
+        o.max_projection_objects = items;
+        o.validate()
+            .expect("exactly the canonical item ceiling is representable");
+        o.max_projection_objects = items + 1;
+        assert!(
+            o.validate().is_err(),
+            "a projection larger than one canonical vector can never seal a manifest"
+        );
+
+        let mut o = valid();
+        o.max_projection_chunks = u32::try_from(items + 1).expect("ceiling fits u32");
+        o.staging_max_files_per_session = u64::from(o.max_projection_chunks) + 2;
+        o.staging_max_files_per_principal = o.staging_max_files_per_session * 2;
+        o.staging_max_files_global = o.staging_max_files_per_session * 8;
+        assert!(
+            o.validate().is_err(),
+            "chunk_digests is bounded by the same item ceiling as the object vector"
+        );
+
+        // Bytes are refused only where the chunk allowance cannot carry them,
+        // so this asserts the transitive bound rather than a fixed number.
+        let mut o = valid();
+        o.max_projection_chunks = 1;
+        o.max_projection_bytes = levcs_protocol::codec::MAX_CANONICAL_BYTES as u64 + 1;
+        assert!(
+            o.validate().is_err(),
+            "one chunk cannot carry more than one canonical encoding's worth of bytes"
+        );
+    }
+
+    #[test]
+    fn the_default_projection_ceilings_are_the_ones_the_format_can_represent() {
+        let o = valid();
+        assert_eq!(
+            o.max_projection_objects,
+            levcs_protocol::codec::MAX_CANONICAL_ITEMS as u64,
+            "the default is the manifest ceiling; raising it needs a versioned \
+             chunked manifest, not a larger decode ceiling"
         );
     }
 

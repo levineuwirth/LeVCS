@@ -220,7 +220,7 @@ impl From<std::io::Error> for StoreError {
     }
 }
 
-/// Signs `CommittedTransactionV1` event digests on behalf of the instance.
+/// Signs committed-transaction evidence on behalf of the instance.
 ///
 /// Registered by instance composition (plan §5.2). The store calls it before
 /// append and never decides who may sign — that is a federation trust
@@ -228,7 +228,21 @@ impl From<std::io::Error> for StoreError {
 pub trait CommitEvidenceSigner: Send + Sync {
     fn key_epoch(&self) -> u64;
     fn public_key(&self) -> [u8; 32];
-    fn sign_event(&self, event_digest: &ObjectId) -> Result<[u8; 64], SignerError>;
+
+    /// Signs `SignedCommittedTransactionV1::signing_digest`, **not** the bare
+    /// event digest.
+    ///
+    /// The parameter is named for the value a correct caller must pass because
+    /// nothing downstream can detect the substitution until verification
+    /// fails. The frozen `SignedCommittedTransactionV1::verify` recomputes
+    /// `signing_digest(transaction, source_key_epoch, durability_result)` and
+    /// checks `source_signature` against it, so a signature over the event
+    /// digest alone would omit the key epoch and the durability result and
+    /// would be rejected by every verifier — including the mirror path in
+    /// another instance, after the transaction is already durable. The event
+    /// digest is the chain identity that `previous_event_digest` links; it is
+    /// not the signature message.
+    fn sign_event(&self, signing_digest: &ObjectId) -> Result<[u8; 64], SignerError>;
 }
 
 /// Capability token for constructing a `ValidatedTransaction`.

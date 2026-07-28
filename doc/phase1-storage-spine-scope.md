@@ -5,8 +5,11 @@ The rewrite plan remains authoritative. Where this document is more specific, it
 lead's Phase 1 realization of the plan; where it appears to contradict the plan, the plan
 wins and this document is defective.
 
-Status: **D0 landed; Wave A unblocked.** Section 9's decisions were all resolved on
-2026-07-24 and are recorded there with their conditions. Contract review 2026-07-24-B
+Status: **Wave A frozen 2026-07-26 at `5ee9c6b`; Wave B scoped, D0-B not yet started.**
+Sections 9.1-9.6 were resolved on 2026-07-24 and are recorded there with their conditions;
+9.7 and 9.8 were ruled on 2026-07-26 and are recorded in §6.9, and contract review
+2026-07-26-A resolved the `EvidenceHandoffFailure` classification (§6.3). D0-B is unblocked;
+no open decision remains. Contract review 2026-07-24-B
 (sections 9.1 and 9.2) has been applied to `bench/result-schema.json` and
 `bench/reference-hardware.toml` and recorded in the plan document. `crates/levcs-store`
 exists with the frozen API, the ownership split, the durability funnel, the failpoint
@@ -160,7 +163,8 @@ file files a lead-arbitrated interface change request; it does not edit.
 | `crates/levcs-store/src/engine.rs` | **B1 NamespaceTxn** | Wave B |
 | `crates/levcs-store/src/transaction.rs` | **B1 NamespaceTxn** | Wave B |
 | `crates/levcs-store/src/snapshot.rs` | **B1 NamespaceTxn** | Wave B |
-| `crates/levcs-store/src/staging.rs` | **B1 NamespaceTxn** | Wave B |
+| `crates/levcs-store/src/staging.rs` | **B3 StagingSessions** | Wave B |
+| `crates/levcs-store/src/roots.rs`, `completion.rs` | Lead | D0-B |
 | `scripts/verify-store-recovery.sh` | **A3** | Wave A |
 | `scripts/check-phase1.sh` | Lead | Wave A freeze gate |
 | `Cargo.toml`, `Cargo.lock` | Lead | D0 |
@@ -1152,41 +1156,581 @@ expressible as a failure.
 
 ## 6. Wave B work packages
 
-### B1 — NamespaceTxn
+### 6.0 Preconditions
 
-Owns `engine.rs`, `transaction.rs`, `snapshot.rs`, `staging.rs`.
+Wave A is frozen at `5ee9c6b78b6e5f77f988e99e477656cfdc7db352`. Every file it owns is a
+frozen surface: `format.rs`, `journal.rs`, `segment.rs`, `index.rs`, `checkpoint.rs`,
+`recovery.rs`, `drive.rs`, `sys.rs`, `failpoints.rs`, `types.rs`, `options.rs`, and the
+golden corpus. **No Wave B package may edit any of them.** A change any package believes it
+needs is an interface request to the lead, arbitrated and — if granted — recorded as a
+contract review in `doc/instance-throughput-rewrite-plan.md`. D0-B already exercises this:
+seven of its nine items amend a frozen or signature-frozen file, and each is a recorded
+amendment rather than an edit.
 
-1. `StoreEngine::open` with the four startup states, per-shard threads, and readiness.
-2. Repository creation binding `repo_id` and genesis authority permanently in the catalog.
-3. `ValidatedTransaction` and its sealed builder; privileged constructors for recovery
-   (and, later, migration).
-4. The shard sequencer: speculative state containing every earlier accepted transaction in
-   the pending group; checks only mutable preconditions (operation ID/digest, repository
-   lifecycle, snapshot/config/policy epoch, typed ref CAS, expected authority, precomputed
-   force/ancestry facts); never re-parses, re-hashes, or re-verifies.
-5. Independent `shard_sequence` and `repo_sequence` assignment, `previous_event_digest`
-   chaining, `sequenced_at_micros`, event/state digest computation, and the
-   `CommitEvidenceSigner` handoff **before** append, on its own bounded pool, returning in
-   repository-sequence order.
-6. `ArcSwap<CommittedRoot>` + bounded `ArcSwap<OperationStatusRoot>`, the CAS merge loop,
-   and the linearizable A → status → B read of §5.1, asserted against
-   `oracle::two_root_status_read`.
-7. Receipts, idempotency, coalescing, and terminal retention: same-ID/same-digest attaches,
-   same-ID/different-digest rejects, asserted against `oracle::coalescing_decision`;
-   `receipt_visible_until` and `status_tombstone_until` from the frozen protocol functions.
-8. `RepoSnapshot` sharing persistent substructures — a snapshot must not clone the index.
-9. Bounded projection staging: begin, idempotent chunk-put, read-only resolver, seal to
-   `StagedProjectionInstallV1`, abort, expiry, cleanup. Sealing cannot publish membership;
-   only `submit` adopts. Validated against `validate_projection_stage_binding` and
-   `validate_projection_stage_finalize`.
+The frozen surface is the **library**. Wave A's harness — `src/bin/store-crash-driver.rs`,
+`src/bin/store-bench.rs`, `tests/crash_matrix.rs`, and `scripts/verify-store-recovery.sh` —
+is not frozen; ownership transfers to B4, whose whole purpose is to extend it (§6.6). Test
+files belonging to a frozen library module stay with that module and are amended the same
+way it is. Wave A shipped one blocker
+because a package quietly reimplemented a neighbour's logic instead of asking; the cost of
+asking is a message, and the cost of not asking was three findings.
 
-### B2 — StorageReviewer
+What Wave A already delivers, so no package rebuilds it:
+
+| Need | Provided by | Note |
+| --- | --- | --- |
+| Transaction frame payload codec | `format::TransactionFramePayloadV1` | Carries create, objects, ref CAS, both authorities, evidence, the signed `CommittedTransactionV1`, and receipt fields. |
+| Group formation | `journal::GroupBuilder` | Bounded by transactions, bytes, and idle delay. **Has no production caller** — carry-forward, B1 deliverable 4. |
+| Append + fence | `journal::append_group_and_fence` | Returns assigned `shard_sequence`es. One fence per group. |
+| Object index | `index::{IndexDelta, IndexRunBuilder, IndexRun}` | Namespace-scoped keys, Bloom-filtered sealed runs. |
+| Namespace catalog | `index::NamespaceCatalog` | `bind`, `advance`, `set_lifecycle`. |
+| Durable ref/receipt tables | `checkpoint::{RefRecord, ReceiptRecord, Checkpoint}` | Install and prune have production callers as of the freeze. |
+| Recovery | `recovery::*` | The algorithms are complete. The production **entry point** returning a `RecoveredShard` does not exist yet and is D0-B item 5; `ShardDrive::reopen_through_recovery` is a `store-internals` test seam, not it. |
+| Retention arithmetic | `oracle::{retained_terminal_status, recovered_receipt_visibility}` | Frozen; compute from these, never restate. |
+
+### 6.1 Ownership matrix
+
+| File | Owner | State at Wave B start |
+| --- | --- | --- |
+| `roots.rs` *(new)* | **Lead (D0-B)** | Created and frozen before any package starts. |
+| `completion.rs` *(new)* | **Lead (D0-B)** | Created and frozen before any package starts. |
+| `engine.rs`, `transaction.rs`, `snapshot.rs` | **B1 NamespaceTxn** | D0 signatures frozen; bodies are B1's. |
+| `staging.rs` | **B3 StagingSessions** | Empty. |
+| `src/bin/store-crash-driver.rs`, `src/bin/store-bench.rs`, `tests/crash_matrix.rs`, `scripts/verify-store-recovery.sh` | **B4 StoreHarnessB** | Wave A versions; B4 extends. |
+| Everything else | Frozen (Wave A) | Read-only to all packages. |
+| `bench/result-schema.json`, `bench/reference-hardware.toml` | **Lead** | Amendment requires a contract review. |
+
+B2 StorageReviewer owns no file. Its output is findings, not edits — the property that made
+the Wave A review able to contradict the packages it reviewed.
+
+### 6.2 D0-B — the sealed publication interfaces
+
+The lead defines and freezes D0-B before B1, B3, and B4 begin. This is the same D0 pattern
+Wave A used, for the same reason: `CommittedRoot` and `OperationStatusRoot` are named in plan
+§5.1 and §5.3 as the visibility boundary and the linearizable-read substrate, they are
+consumed later by Phase 2 `SnapshotReads` and Phase 4 `MirrorFeed`, and B2 has to review
+them. A structure invented by the package that also implements against it has no independent
+contract to review, which is precisely the arrangement charter item 8 warns about.
+
+**D0-B is not two new files.** The first draft of this section said `roots.rs` and
+`completion.rs` and was wrong: that set does not produce a compiling frozen interface,
+because the modules are undeclared, the dependencies are absent, two of the decisions below
+require configuration and error variants that do not exist, and the B1/B3 seam names a
+builder method that was never frozen. The complete amendment set is below. Every row is lead
+work, and every row touching a frozen Wave A file is a **contract amendment recorded in
+`doc/instance-throughput-rewrite-plan.md`**, not an edit.
+
+| # | Change | File | Frozen? |
+| --- | --- | --- | --- |
+| 1 | `CommittedRoot`, `RepoState`, `ShardSubtree`, `OperationStatusRoot`, `StatusEntry`, `merge` | `roots.rs` *(new)* | no |
+| 2 | The completion primitive behind `async fn submit` | `completion.rs` *(new)* | no |
+| 3 | `pub mod roots;` and `pub mod completion;` plus re-exports | `lib.rs` | **yes** |
+| 4 | `im` dependency (decision 9.7). **No dependency for item 2** — see below | `Cargo.toml`, workspace `Cargo.toml`, `Cargo.lock` | **yes** |
+| 5 | `RecoveredShard` and a non-feature-gated production recovery entry point | `recovery.rs` | **yes** |
+| 6 | `ShardDrive::reopen_through_recovery` re-pointed onto item 5 | `drive.rs` | **yes** |
+| 7 | Staging and status-root limits (§6.5, decision 9.8) | `options.rs` | **yes** |
+| 8 | `StoreError::Overloaded { limit, retry_after_micros }` | `types.rs` | **yes** |
+| 9 | The adoption seam: `ProjectionAdoption` handle (resolve, pin, three-way outcome, reference proof) and `ValidatedTransactionBuilder::adopt_projection(StagedProjectionInstallV1, ProjectionAdoption)` | `transaction.rs`, `staging.rs` | signature frozen |
+
+**Item 5 is a blocker discovered in review and is the reason this section was rewritten.**
+The first draft required `StoreEngine::open` to recover through
+`ShardDrive::reopen_through_recovery`. It cannot: `drive.rs` is compiled only under the
+`store-internals` feature, its own header states that B1 does not build on it, and
+`DriveRecovery` returns diagnostics and an adopted sequence set — not the catalog, refs,
+receipts, and index the engine needs to construct a `CommittedRoot`. Requiring the engine to
+call it would have forced B1 to write a second recovery path, which is exactly the defect
+that produced two of Wave A's three blockers.
+
+The fix keeps one path with two callers. `recovery.rs` gains a production entry point
+returning a `RecoveredShard`, and `drive.rs`'s seam is re-pointed onto it so the harness and
+the engine recover identically by construction rather than by review. If the two ever diverge
+again, it must be because somebody changed the shared function, not because a caller quietly
+grew its own.
+
+**`RecoveredShard` must carry everything `CommittedRoot` needs, which is more than the
+replayed tail.** A first draft listed "an index delta" and that is a defect: an object whose
+only index entry lives in a sealed `IndexRun` or a checkpointed generation would be present
+before the crash and absent after `open`, and the segments holding its bytes would not be
+pinned against reclamation. The contents are therefore:
+
+- the namespace catalog, ref state, and receipt table;
+- the **complete layered index** — the replayed delta *over* the ordered set of sealed
+  `IndexRun` references the selected manifest and checkpoint generation retain, in the
+  lookup order `CommittedRoot` will use, not the delta alone;
+- **every retained generation reference** — segments, index runs, and checkpoint
+  generations — so constructing the root transfers ownership of the things that keep those
+  files alive rather than merely naming them;
+- per-shard and per-repository sequences, and the `ShardRecoveryReport`.
+
+Ownership is the subtle half: recovery opens these artifacts, and if `RecoveredShard` hands
+over names instead of live references there is a window in which nothing holds them and
+reclamation is legal.
+
+**The drive seam keeps the recovered state, not just a projection of it.** `DriveRecovery` is
+diagnostic-only, and projecting `RecoveredShard` straight back down to it would make the
+engine/drive equivalence test impossible — the test could compare only the adopted sequence
+set, which is precisely the weakness that let Wave A's double-adoption hide. `DriveRecovery`
+therefore gains the `RecoveredShard` alongside its existing summary fields, exactly as it
+gained `report` after the Wave A review, and for the same reason. The equivalence test
+compares the recovered state itself: catalog, refs, receipts, index layering, and sequences.
+
+**`roots.rs` (lead-owned).**
+
+- `CommittedRoot` — immutable, `Arc`-shared, published only through `ArcSwap`. Holds
+  per-namespace `RepoState`, the layered object index (newest delta layers over sealed
+  `IndexRun` references), the receipt table, per-shard committed sequences, and the
+  generation/tail references that keep segments alive. Every read API captures exactly one
+  of these (plan §5.3).
+- `RepoState` — `repo_sequence`, `current_authority`, `genesis_authority`, the typed ref
+  map, lifecycle, and `previous_event_digest`. Per-repository and `Arc`-shared, so a group
+  touching three repositories replaces three of these and shares the rest.
+- `ShardSubtree` — what one fenced group produces, before merge: its index delta, its
+  affected `RepoState`s, its receipts, its shard committed sequence, and its generation
+  references. Plan §5.3 requires this be built as one immutable value and then merged;
+  building it incrementally into the live root is the defect this type exists to prevent.
+- `CommittedRoot::merge(&self, subtree: &ShardSubtree) -> CommittedRoot` — pure, allocating
+  a new root sharing all untouched substructure. The CAS loop calls this again against the
+  newer root on contention, so it must be **idempotent in effect and free of interior
+  mutation**: a merge that mutated anything reachable from `self` would corrupt the root a
+  concurrent reader already captured.
+- `OperationStatusRoot` — bounded map of in-flight `(NamespaceId, OperationId)` to
+  `StatusEntry { operation_digest, retry_until_micros, phase, shard_sequence }`. See
+  decision 9.8 for what "bounded" does at the bound.
+
+**`completion.rs` (lead-owned).** The runtime-agnostic completion primitive behind
+`async fn submit`. `levcs-store` takes no runtime dependency — plan §5.1 confines the crate
+to storage decisions, and §7 reserves Tokio for socket and timer work that performs no
+filesystem calls.
+
+**It is one-to-many, not one-to-one.** A first draft specified a single `Mutex<Option<Waker>>`
+and was wrong: deliverable 7 coalesces same-ID/same-digest callers onto one leader, so several
+futures await one outcome. A cloned `crossbeam` receiver does not fix this — a channel
+distributes each value to exactly one receiver, which is work distribution, not broadcast, and
+would deliver the receipt to one arbitrary waiter and hang the rest.
+
+`StoreError` is not `Clone`, so the shape is a real type decision and D0-B freezes it:
+**shared result state holding one outcome, with a collection of registered wakers.** The
+alternative — one slot per waiter with fan-out from the in-flight entry — was rejected
+because the fan-out has to duplicate the error anyway, so it does not avoid the problem, it
+relocates it.
+
+**"Read by reference or by a cloneable projection" was not a decision and is replaced.**
+Every `submit` caller must receive an owned `Result<CommitReceipt, StoreError>` — that
+signature is frozen in D0 and printed in plan §5.1 — so the stored outcome must be
+convertible into an owned result once per waiter, losslessly. D0-B makes `StoreError` itself
+`Clone`, and stores the outcome as exactly `Result<CommitReceipt, StoreError>`.
+
+That is a one-variant change. `CommitReceipt` already derives `Clone`, and every `StoreError`
+variant is already cloneable except one: `Io(std::io::Error)`. D0-B amends it to
+`Io(Arc<std::io::Error>)` (`types.rs`, already amended for item 8), with a hand-written
+`From<std::io::Error>` so `?` keeps working at the several hundred existing call sites.
+
+This is lossless **by construction rather than by reconstruction**, which is why it is
+preferred to the obvious alternative. A cloneable mirror error — capturing
+`(ErrorKind, String, raw_os_error)` and rebuilding an `io::Error` per waiter — is lossy in a
+way that is easy to miss and impossible to detect later: the rebuilt error is a different
+object, and any downstream `source()` chain or downcast is gone. Sharing the original
+through an `Arc` gives every waiter the same error, which is also the truth — one transaction
+failed once, for one reason.
+
+The conversion must be total. B2 checks that nothing in the completion path introduces a
+`_ =>` arm mapping unexpected variants onto a generic failure; a waiter receiving a
+different, vaguer error than the leader is a silent divergence between callers that the
+coalescing contract says are indistinguishable.
+
+**The synchronization algorithm is part of the frozen contract**, because the obvious
+implementation is racy. Receiving on a channel and *then* independently storing a waker has
+the classic lost-wakeup window: the sender can complete between the check and the
+registration, so the waker is stored after the only wake that would ever fire. Registration
+and the post-registration recheck must therefore share one synchronization point with the
+sender — one mutex covering `{outcome, wakers}`, where `poll` locks once, checks the outcome,
+and registers only while still holding the lock, and completion locks once, stores the
+outcome, and takes the waker list to wake after releasing. A waker registered under the lock
+is either seen by a completion that has not yet run, or made unnecessary by an outcome already
+present when it checked.
+
+That single mutex is why no dependency is needed and why `AtomicWaker` would not have helped:
+`AtomicWaker` solves single-waiter registration, not the multi-waiter set, and the state this
+guards is shared anyway. It is contended by a handful of parties, held for the duration of a
+move, and sits on a path dominated by an `fdatasync` several orders of magnitude larger.
+
+Hand-rolled futures fail by losing wakeups, and a lost wakeup here hangs a request that has
+already been durably committed — indistinguishable from a store that never returns. The
+contract is therefore stated as explicit traces, and is B2 charter material:
+
+1. **Completion after first poll.** `poll` returns `Pending` and registers a waker under the
+   lock; completion occurs; the waker is woken; the next `poll` returns `Ready`.
+2. **Completion before first poll.** Completion occurs with no waker registered; the first
+   `poll` returns `Ready` immediately. The value must not be lost for want of a waiter, and
+   no wake is required for a poll that has not happened yet.
+3. **Exactly-once delivery per waiter.** Each waiter observes `Ready` exactly once. A future
+   must not be polled again after `Ready`; the implementation makes that a clean panic or a
+   documented `unreachable`, never a second half-formed value.
+4. **Multiple attached waiters.** Every waiter attached to one in-flight entry observes the
+   same outcome. Not "an equivalent outcome" — the same one, since only one transaction was
+   sequenced.
+5. **A waiter dropping.** One waiter dropping mid-flight must not disturb the others: the
+   remaining waiters still observe the outcome, and the dropped waker is removed rather than
+   woken.
+6. **Dropped receiver, all of them.** Every waiter dropping must not leak the state and must
+   not panic the shard thread when it later signals. A disconnected receiver is a dropped
+   request, not a publication failure — plan §7 stage 11 makes a fenced transaction committed
+   regardless of whether anyone is still waiting for the receipt.
+7. **Exactly one execution.** N attached waiters cause exactly one signer handoff and exactly
+   one append. This is the property coalescing exists to provide, and it is asserted by
+   counting executions, not by observing that the receipts match — identical receipts are
+   what a double execution would produce if it were idempotent, and it is not.
+
+### 6.3 Publication ordering (normative)
+
+Extends §3's durability ordering across the publication half. Wave A's poison window ended at
+the fence. **The full poison window is steps 4 through 8 below** — from marking `Resolving`
+through committed-root publication, inclusive (plan §7 stages 10–11). Steps 1–3 are
+pre-append and definitively absent on failure; steps 9–10 are post-publication and cannot
+poison, because the transaction is already committed.
+
+1. Sequencer checks mutable preconditions against speculative state containing every earlier
+   accepted transaction in the pending group. Rejection here is a 409 and commits nothing.
+2. Assign `shard_sequence` and `repo_sequence`, chain `previous_event_digest`, compute event
+   and state digests, and hand off to `CommitEvidenceSigner` on its own bounded pool,
+   **returning in repository-sequence order**. *(`EvidenceHandoffFailure` — reclassified by
+   contract review 2026-07-26-A; see below.)*
+3. Re-check the signed deadline immediately before marking `Resolving`. Plan §7 stage 9: no
+   operation may first append after its signed deadline.
+4. Mark every operation in the group `Resolving` in the status root. *(`AfterMarkedResolving`)*
+5. `journal::append_group_and_fence` — exact reserved frames, one fence.
+6. Build the `ShardSubtree` from the fenced group. *(`DuringCommittedRootBuild`,
+   `AllocationFailureBeforePublication`)*
+7. CAS-publish: load the current root, `merge`, compare-and-swap; on contention reload and
+   merge again against the newer root. *(`BeforeRootCas`, `DuringRootCasRetry`)*
+8. Remove the group's status-root entries, with release/acquire ordering that makes the
+   step-7 publication visible to any subsequent mandatory B load.
+9. Wake waiters. *(`AfterRootCasBeforeWaiterWake`)*
+10. Return receipts. *(`BeforeResponse`)*
+
+Two orderings are load-bearing and must be asserted, not assumed:
+
+- **Step 8 after step 7, never before.** Removing a status entry before the receipt is
+  visible manufactures `Unknown` for a committed transaction — the exact race the mandatory
+  committed-root B read exists to close, reintroduced from the write side where no read can
+  fix it.
+- **Failure at step 9 or 10 is not a failure.** A fence that succeeded and a root that
+  published is committed. `AfterRootCasBeforeWaiterWake` and `BeforeResponse` must both leave
+  a queryable receipt; a waiter that never wakes is a hung request, not an absent
+  transaction. Plan §5.1: "failure to wake a waiter afterward cannot hide the receipt." The
+  frozen oracle agrees — both rows are `shard_poisoned: false`,
+  `immediate_status: Committed`.
+
+#### `EvidenceHandoffFailure` — resolved by contract review 2026-07-26-A
+
+The frozen oracle classified this failpoint as poisoning the shard with
+`immediate_status: Resolving`, alongside `AfterMarkedResolving`. It fires at step 2, before
+the group is marked `Resolving` and before any byte is written, so the physical state is
+`NoBytes` and the outcome is unambiguous. The store-side crash-matrix fixture already said as
+much in its own rationale, which is how the disagreement surfaced: the fixture and the oracle
+described the same row differently.
+
+**Ruled and applied.** `EvidenceHandoffFailure` takes the exact `BeforeAppend` shape —
+`shard_poisoned: false`, `immediate_status: DefinitiveAbsent`,
+`recovery_outcome: AbsentRetriable`, `acknowledgment_allowed: false`,
+`later_append_allowed_before_recovery: true`. The physical state class remains `NoBytes` and
+the fixture is unchanged. The failpoint stays in **Wave B**, because only B1's sequencer can
+exercise a signer handoff at all.
+
+The deciding argument was operational rather than formal. Under the old classification a
+routine `SignerError::Unavailable` — a restarting signer, no storage fault — would poison the
+shard and admit no mutation until recovery ran, trading a real availability property for a
+safety property that was never at risk.
+
+Recorded in `doc/instance-throughput-rewrite-plan.md`. The same edit replaced the `_`
+catch-all in `phase0_oracles.rs` with an exhaustive list of the thirteen poisoning
+failpoints: a catch-all in a test that pins a frozen classification silently absorbs any
+newly added row into "poisoned", which is the mechanism by which a wrong classification ships
+past its own test.
+
+### 6.4 B1 — NamespaceTxn
+
+Owns `engine.rs`, `transaction.rs`, `snapshot.rs`. Deliverables 1–8, with acceptance
+criteria.
+
+1. **`StoreEngine::open`** with plan §5.2's four startup states handled explicitly and in
+   order, no inference: absent-or-empty initializes; a valid `FORMAT` opens **through the
+   D0-B production recovery entry point** (§6.2 item 5) — the same function the drive seam
+   calls, never a second path; a recognized non-empty legacy layout without `FORMAT` returns
+   `LegacyLayout` carrying the exact `migrate-store` command; every other non-empty
+   unrecognized layout is refused without modification. Per-shard threads and readiness.
+   *Accept:* a test per startup state, including that an unrecognized layout is
+   byte-identical after the refusal, and a test that the engine and the drive seam produce
+   the same recovered state from one crash image.
+2. **Repository creation** binding `repo_id` and genesis authority permanently in the
+   catalog (plan §4 identity invariant 2). *Accept:* a second bind of the same `repo_id`
+   with a different genesis is refused, and the refusal survives reopen.
+3. **`ValidatedTransaction` and its sealed builder**, plus the privileged constructors for
+   recovery, plus `adopt_projection` (§6.2 item 9). *Accept:* the D0 contract test already
+   asserts the seal; extend it to prove the builder rejects an incomplete transaction rather
+   than producing a partial one.
+4. **The shard sequencer**, wiring `GroupBuilder` — this closes the Wave A carry-forward.
+   Speculative state contains every earlier accepted transaction in the pending group. It
+   checks **only** mutable preconditions: operation ID/digest, repository lifecycle,
+   snapshot/config/policy epoch, typed ref CAS, expected authority, and precomputed
+   force/ancestry facts. It never re-parses, re-hashes, re-verifies signatures, or
+   re-evaluates policy while holding the mutation lane. Includes releasing or revalidating
+   the speculative suffix when a member of a forming group fails before append. *Accept:*
+   group formation bounded by transactions, bytes, and idle delay asserted **against the
+   sequencer**, not against `GroupBuilder` in isolation — the carry-forward is closed by the
+   caller existing, not by the unit tests that already pass.
+5. **Sequence assignment and the signer handoff** per §6.3 step 2, on its own bounded pool,
+   returning in repository-sequence order. *Accept:* out-of-order signer completion still
+   produces repository-sequence-ordered frames, and `EvidenceHandoffFailure` matches the
+   amended oracle — definitively absent, shard not poisoned, later append allowed.
+
+   Plus the suffix-repair case, which is where this gets hard: **fail signing at the first,
+   middle, and last position of a forming group, in each case with later signer results
+   already available.** Prove the failed transaction appends nothing, and that every retained
+   suffix transaction is re-sequenced, re-chained, and re-signed as necessary, leaving no
+   sequence gap. Signing covers the event digest, which chains `previous_event_digest`, so
+   dropping a member from the middle of a group invalidates every signature after it — the
+   already-returned results for the suffix are now signatures over a chain that no longer
+   exists. A partial repair here produces a durable, correctly-fenced frame carrying a
+   signature that verifies against nothing, which no amount of recovery can detect later.
+6. **The two roots and the CAS merge loop**, with the linearizable A → status → B read.
+   *Accept:* asserted against `oracle::two_root_status_read` over every input combination; a
+   concurrent-publication test proving contention causes a re-merge against the newer root
+   and never a lost update; and a **duplicate-subtree test** proving `merge` is idempotent in
+   effect — merging the same `ShardSubtree` twice must not double-count receipts, sequences,
+   or index entries. Concurrency coverage alone does not test idempotence, and the CAS retry
+   path depends on it.
+7. **Receipts, idempotency, coalescing, terminal retention.** Same-ID/same-digest attaches;
+   same-ID/different-digest rejects. *Accept:* asserted against `oracle::coalescing_decision`
+   and `oracle::retained_terminal_status`; `receipt_visible_until` and
+   `status_tombstone_until` computed from the frozen protocol functions, never restated.
+   Ordering against the 9.8 capacity check is normative — see the ruling.
+8. **`RepoSnapshot`** sharing persistent substructures. *Accept:* a measured assertion that
+   taking a snapshot allocates no index copy — a count or a byte figure, not a comment. §5.3
+   makes this a correctness property, so it needs a test that fails if someone clones.
+
+**B1 must not** touch the crash harness (B4), staging (B3), or any frozen Wave A file.
+
+### 6.5 B3 — StagingSessions
+
+Owns `staging.rs`. Deliverable 9: bounded invisible projection staging.
+
+**The store/instance split, stated first because the first draft of this section got the
+size wrong by ignoring it.** Plan §8's staging contract is long, but most of it is not the
+store's. §5.1 forbids `levcs-store` from making identity-role, merge-policy, or federation
+decisions, so `ProjectionCore` validation, identity and authority proofs, policy evaluation,
+source-snapshot and `ForkProofV2` checks, authenticated source-kind and actor/key-epoch
+binding, session authentication, the v2 HTTP routes, and the remote source's export lease
+all belong to Phase 2's `levcs-instance/staging.rs` and `ProjectionCore`. B3 owns the
+**storage mechanism and its bounds**: what a session is on disk, what it costs, when it dies,
+and the guarantee that none of it is visible until a transaction adopts it. B3 must make
+every one of the instance-layer checks *possible* — by binding and exposing the fields they
+key on — without performing any of them.
+
+B3's deliverables:
+
+1. **Session lifecycle** — begin, idempotent numbered chunk-put, read-only resolver, seal to
+   `StagedProjectionInstallV1`, abort, expiry, cleanup. Restartable by session ID and chunk
+   digest; no renewal beyond the advertised maximum.
+2. **Canonical session binding.** Creation binds the session ID to destination
+   repo/genesis and expected state, projection mode, total object/byte/chunk counts, ordered
+   manifest digest, final operation ID/stable digest, and expiry. B3 stores and enforces the
+   binding; it does not evaluate the identity or policy fields it carries.
+3. **Same-device validation.** `<root>/staging` and the target shard must be on the same
+   `st_dev`, checked at session creation. Cross-device adoption and copy fallback are
+   forbidden, because adoption is a link, and a link across devices is not a rename — the
+   same physical constraint as scope 3.4's seal.
+4. **Bounds, all configured and all enforced before pinning** (§6.2 item 7): per-session,
+   per-principal, and global session counts; staged bytes, objects, and files; session age;
+   and compaction debt, accounted independently of ordinary receive spools. Plus the
+   **feasibility check**: configured maximum projection size, maximum session age, and
+   minimum supported transfer rate must make one complete transfer possible, or creation
+   rejects *before* pinning anything. A session that cannot finish is a session that only
+   consumes budget.
+5. **Artifacts are written by maintenance workers, synced, uniquely named, and
+   unreferenced.** They never enter namespace membership, object-existence answers,
+   snapshots, refs, receipts, event feeds, dedupe state, or `CURRENT`.
+6. **Finalize and the adoption pin.** `Open → Finalizing` moves atomically for the sole
+   bound operation/digest; identical concurrent finalizers coalesce onto one, and every
+   different operation/digest rejects. Expiry prevents a *new* finalizer but must not delete
+   artifacts held by an already-admitted one — the expiry/finalize race is a named acceptance
+   case, not an incidental detail. A definitive pre-append failure releases the pin and
+   returns the session to `Open` only if it is still live; otherwise cleanup aborts it.
+7. **Cleanup proves absence of reference.** It removes only artifacts carrying a valid
+   session marker, and only after proving no committed manifest references them, then syncs
+   the affected directories. *Accept:* a test that cleanup declines to remove an artifact a
+   committed manifest still references.
+8. **Recovery treats synced-but-unreferenced artifacts as invisible garbage**, and a complete
+   final frame as authoritative adoption. It can never expose a partial chunk set.
+
+The security property is the whole point of the package: **sealing cannot publish
+membership.** Only `submit` may adopt a sealed descriptor, so possession of a session ID
+never authorizes publication (plan §4 identity invariant 7, §8). *Accept:* a test that seals
+a session and then proves the objects are invisible to `RepoSnapshot::locate` until a
+`submit` adopts the descriptor — asserted through the reader API, not by inspecting staging's
+own state.
+
+Validated against `validate_projection_stage_binding` and
+`validate_projection_stage_finalize` from the frozen protocol.
+
+**The B1/B3 seam is a lifecycle, and D0-B freezes all of it.** An earlier draft called it
+"exactly one call" — `adopt_projection(StagedProjectionInstallV1)` — and that is not
+expressible. A bare wire descriptor cannot hold an adoption pin, cannot give B1 access to
+session and artifact state for the revalidation deliverable 6 requires, cannot tell B3 that a
+definitive pre-append failure released the session, and cannot let cleanup prove the committed
+root does not reference an artifact. With only the descriptor, either expiry may reclaim
+artifacts while a `submit` is already admitted, or B1 must read B3's private on-disk
+representation directly — and a package reading another's internals is how Wave A's first
+blocker happened.
+
+D0-B therefore freezes an **opaque adoption handle** obtained from B3 and consumed by
+`submit` together with the wire descriptor. The handle is the pin: holding it is what keeps
+expiry and cleanup off the artifacts, so the pin cannot be forgotten separately from the
+adoption. Its interface covers exactly four things, and no more, so it does not become a
+general back door into staging:
+
+1. **Resolution** — read-only access to the sealed manifest, chunk digests, and artifact
+   paths that B1 needs in order to recheck session, operation, digest, manifest, and artifact
+   hashes. Read-only is load-bearing: the adopting side revalidates, and a handle that could
+   mutate would let adoption repair what it was meant to reject.
+2. **Pin lifetime** — held from admission through committed-root publication. Compaction and
+   GC may not reclaim a pinned session, and expiry may not abort it (plan §8).
+3. **Outcome notification, all three ways** — adopted, definitively failed before append, or
+   **transferred to recovery**. On definitive pre-append failure the session returns to
+   `Open` if it is still live, and is otherwise aborted by cleanup.
+
+   The third outcome is the one an earlier draft missed, and its absence was a leak. A
+   failure anywhere in §6.3 steps 4–8 poisons the shard and leaves the outcome unresolved
+   until recovery runs — the transaction is neither adopted nor definitively absent, and
+   nothing in-process can say which. Without a terminal outcome for that case, closing the
+   poisoned engine either drops the handle without an outcome, which §6.5 declares a bug, or
+   strands a `Finalizing` session that no expiry may collect, because expiry must not touch
+   a pinned session. `TransferredToRecovery` is therefore a legitimate terminal state for the
+   handle, and the pin outlives the process.
+
+   **The durable authority for the transferred pin is the frame itself, not a separate pin
+   record.** Once the final frame is appended it binds the manifest and membership root, and
+   B3 deliverable 8 already makes a complete final frame authoritative adoption. So the
+   window analysis closes cleanly: a crash *before* append leaves no frame, the artifacts are
+   unreferenced, and cleanup reclaiming them is correct because the transaction is absent; a
+   crash *after* append leaves a frame that recovery resolves. Recovery then notifies staging
+   of the resolution — committed, so the artifacts are referenced and the session completes;
+   or proved absent, so the session returns to `Open` if still live and is otherwise aborted.
+   That notification is part of this seam, not an internal detail of recovery.
+
+   The ordering constraint this creates is worth stating plainly: cleanup may not reclaim
+   artifacts for a session whose adoption frame might be durable, so it must run **after**
+   recovery has resolved the shard, never against a store that is still poisoned.
+4. **Reference proof for cleanup** — the query by which B3 establishes that no committed
+   manifest references an artifact, answered against a `CommittedRoot`, not against B3's own
+   bookkeeping. Cleanup asking itself whether something is referenced is not a proof.
+
+Dropping the handle without an outcome is a bug, not a state: it must be observable, because
+a silently dropped pin is a leaked session that no expiry will collect.
+
+Both packages write a test driving the full lifecycle — pin, adopt, publish, unpin — and B2
+checks the two agree. A seam with tests on only one side is the Wave A finding restated.
+
+### 6.6 B4 — StoreHarnessB
+
+Owns the crash driver, the benchmark, the matrix, and the recovery script.
+
+1. **The Wave A matrix carry-forward.** Add fault generators for sealed-segment frame
+   corruption and cross-shard journal movement. The Wave A record states plainly that the
+   matrix could not have caught its own first blocker; until these exist, that is still true.
+   *Accept:* both generators produce a crash image that the production recovery path
+   rejects, demonstrated by the matrix failing when A1's validation is reverted.
+2. **The eight Wave B failpoint rows** — `AfterMarkedResolving`, `EvidenceHandoffFailure`,
+   `DuringCommittedRootBuild`, `AllocationFailureBeforePublication`, `BeforeRootCas`,
+   `DuringRootCasRetry`, `AfterRootCasBeforeWaiterWake`, `BeforeResponse` — each with its
+   expected outcome asserted against `oracle::append_publication_expectation`, and `Panic`
+   coverage for the three publication-side rows. The `pending-wave-b` rows must be gone from
+   the matrix at Phase 1 exit; `check-phase1.sh` already enforces that.
+3. **P2 against a real `StoreEngine::submit`.** The Wave A benchmark drove the journal seam.
+   Re-point it, and emit the bundle with the gate's honest `outcome`. Expect different
+   numbers; a change is the measurement working.
+4. **The `storage_primitive` verification claims may now be earnable.** With a real engine,
+   `commits_in_recovered_closure` and the object-graph flags forbidden at this gate should be
+   re-examined. If any becomes genuinely earnable, that is a schema amendment and a contract
+   review — **request it, do not emit it.** `bench/result-schema.json` is lead-owned.
+
+### 6.7 B2 — StorageReviewer
 
 Read-only durability, concurrency, and security review of the whole crate. Same charter as
-section 5, extended to the publication half: the eight `pending-wave-b` failpoint rows
-named in 4-A3, the `Panic`-action coverage required of the three publication-side rows, the
-status-root/committed-root race, the CAS merge loop under concurrent shard publication,
-staging-session isolation, and the `ValidatedTransaction` seal.
+§5, extended to the publication half: the status-root/committed-root race, the CAS merge
+loop under concurrent shard publication, the `completion.rs` wakeup contract in §6.2, the
+step-7/step-8 ordering, staging-session isolation, and the `ValidatedTransaction` seal.
+
+Charter items 8 and 9 apply in full. Item 9 is now a **required field in every package's
+report, asked at dispatch rather than after completion** — every disclosure it produced in
+Wave A arrived only because the question was asked late, and each one was a defect the gate
+had already reported green.
+
+### 6.8 Wave B freeze gate
+
+`scripts/check-phase1.sh` unchanged, plus: no `pending-wave-b` rows, all seventeen failpoints
+exercised, and the §7 exit criteria measured rather than asserted. The gate is necessary and
+not sufficient — Wave A's gate was fully green while three blockers stood, and nothing about
+Wave B makes that less likely. The adversarial review, not the gate, is the freeze condition.
+
+### 6.9 Decisions 9.7 and 9.8 — ruled 2026-07-26
+
+**9.7 — the persistent-map mechanism. Ruled: take the `im` dependency; no hand-rolled HAMT.**
+
+`Arc<BTreeMap>` with clone-on-write is O(entries) per group commit and fails §5.3's no-clone
+requirement at scale. A hand-rolled HAMT is a correctness risk in the one structure every
+read captures. `im` provides a HAMT-based `HashMap` and a structurally shared B-tree
+`OrdMap`, and its structures are `Arc`-backed and thread-safe, which is what publishing
+through `ArcSwap` requires.
+
+**Scope: every hot publication map, not only the namespace map.** Fixing the namespace map
+alone still permits O(receipts), O(status entries), or O(refs-per-repository) cloning on the
+publication path, and any one of those defeats the requirement by itself. The choice applies
+to:
+
+- per-namespace `RepoState` in `CommittedRoot`
+- the receipt table and its tombstones
+- the typed ref map inside each `RepoState`
+- `OperationStatusRoot`
+
+Use `OrdMap` **only where canonical iteration order is required** — checkpoint encoding,
+manifest construction, and anywhere a digest is computed over an iteration — and `HashMap`
+everywhere else. An ordered map used by default costs comparison work on every lookup on the
+hottest path in the crate; an unordered map used where a digest is computed produces a
+digest that depends on insertion history, which is a correctness bug that only appears under
+rehashing.
+
+B2's charter covers the dependency explicitly.
+
+**9.8 — status-root overflow. Ruled: reject with a typed overload error; never evict.**
+
+Eviction silently converts a `Pending` operation into `Unknown`, which is a correctness
+change wearing a capacity policy's clothes. The bound is enforced by refusal.
+
+The ordering is normative, because a capacity check placed too early breaks idempotency
+guarantees that have nothing to do with capacity. **Before** the capacity check, in order:
+
+1. the durable lookup (a committed or expired operation answers from the committed root and
+   never touches the status root);
+2. same-ID/same-digest attachment to an existing entry (attaching adds no entry, so it
+   cannot exceed a bound);
+3. same-ID/different-digest detection, which must still return `OperationIdMismatch` rather
+   than an overload error — a client sending a conflicting digest gets the same answer under
+   load as it does idle.
+
+Only a **new distinct reservation** may receive the overload error. Insertion must enforce
+the bound atomically with the insert; a check-then-insert race admits entries past the
+ceiling under exactly the concurrency the ceiling exists for.
+
+`Resolving` entries are never subject to the bound once created: they remain until
+publication or recovery resolves them. Discarding a `Resolving` entry would discard the only
+record that an append is in flight.
+
+Requires, in D0-B: a configured `max_status_entries` (§6.2 item 7), observable occupancy and
+rejection counters, and `StoreError::Overloaded { limit, retry_after_micros }` carrying retry
+guidance (§6.2 item 8). Plan §5.1 reserves `StoreError` for inability to answer, and a store
+at capacity genuinely cannot answer — this is the one overload condition the store itself
+originates, so it must be typed rather than folded into `Conflict` or `NotReady`.
 
 ## 7. Phase 1 exit criteria and evidence
 
@@ -1281,11 +1825,17 @@ and any per-transaction signature beyond the one `CommittedTransactionV1` signat
 consume it. The bundle must report signing cost separately (§5.2: "P2/P3 measure this
 ordering, signing cost, and backpressure").
 
-## 9. Decisions — all resolved 2026-07-24
+## 9. Decisions — 9.1-9.6 resolved 2026-07-24 (Wave A)
 
 Every item in this section was ruled on before D0. Each subsection states the question, the
 recommendation as originally written, and the **ruling** with any conditions attached to it.
-Nothing here is open; the subsections are retained because the reasoning is the record.
+Nothing in 9.1-9.6 is open; the subsections are retained because the reasoning is the record.
+
+**Two Wave B decisions are stated in §6.9**, not here, because they gate D0-B rather than
+D0: the persistent-map mechanism for `CommittedRoot` (9.7) and the status-root
+overflow behaviour (9.8). **Both were ruled on 2026-07-26** and are recorded there with their
+scope and conditions, on the same rule §11 applied to Wave A — a package must not discover a
+decision of this size while implementing against it.
 
 9.1 and 9.2 together constitute **contract review 2026-07-24-B**, amending two frozen
 Phase 0 benchmark artifacts (`bench/result-schema.json` and `bench/reference-hardware.toml`).
@@ -1503,19 +2053,43 @@ D0  lead skeleton, frozen API, sys/failpoint shims, deps, decisions 9.1-9.5
      +-- A2 RecoveryIndex  ---+--> Wave A freeze gate: check-phase1.sh + adversarial review
      +-- A3 StoreHarness   ---+          |
                                          v
-                              B1 NamespaceTxn  ||  B2 StorageReviewer
+                              Wave A frozen 2026-07-26 at 5ee9c6b
                                          |
-                                         v
+D0-B  lead: roots.rs, completion.rs, RecoveredShard entry point, adoption handle,
+      lib/deps/options/error amendments (9 items, 7 touching frozen files)
+                                         |
+     +-- B1 NamespaceTxn   ---+
+     +-- B3 StagingSessions ---+--> Wave B freeze gate + adversarial review
+     +-- B4 StoreHarnessB  ---+          |
+              B2 StorageReviewer ||      v
                               Phase 1 exit: P2 x3, full crash matrix, section 7 table
 ```
 
-Section 9 is resolved, so Wave A is unblocked once D0 lands. One item remains sequenced
-ahead of A3: **contract review 2026-07-24-B** — the `result-schema.json` per-flag
+**Wave B sequencing.** D0-B gates everything, exactly as D0 gated Wave A, and for the reason
+the Wave A review demonstrated: `CommittedRoot` is the structure B1 publishes, B3 becomes
+visible through, B4 measures, and B2 reviews. Whoever defines it first defines it for all
+four, and if that is a package rather than the lead then there is no independent contract to
+review.
+
+The three implementing packages are not equally unblocked. B1's committed-root publication path and
+`StoreEngine::submit` gate B4's re-pointed benchmark and all eight Wave B failpoint rows, so
+B1 should land the publication path before receipts and snapshots. B3 is the most
+independent — it needs the adoption seam from D0-B, meaning the `ProjectionAdoption` handle
+with its three-way outcome and reference-proof query, not merely a call signature — and once
+that is frozen it should start immediately rather than waiting on B1. B4's first deliverable, the two missing crash-matrix
+fault generators, depends on nothing in Wave B at all: it is Wave A work that Wave A did not
+do, and it should be finished before B1 has anything to test, so that B1 is tested by a
+matrix that can express the class of defect Wave A shipped.
+
+Sections 9.1-9.6 are resolved, so Wave A was unblocked once D0 landed; 9.7 and 9.8 were ruled
+on 2026-07-26 in §6.9, and contract review 2026-07-26-A closed the `EvidenceHandoffFailure`
+conflict, so D0-B is unblocked. The item that was sequenced ahead of A3 —
+**contract review 2026-07-24-B**, the `result-schema.json` per-flag
 conditional with its re-pin requirement and the top-level `promotable`, the added
 `workload.generator` field, and `reference-hardware.toml`'s `store_directory_attributes` —
-must be applied and recorded in `doc/instance-throughput-rewrite-plan.md` the way
-2026-07-24-A was before A3 writes the bundle emitter. It is not a Wave A deliverable; it is
-lead work that runs alongside D0.
+**was applied and recorded** in `doc/instance-throughput-rewrite-plan.md` before A3 wrote the
+bundle emitter, and was amended twice more during Wave A. It was never a Wave A deliverable;
+it was lead work alongside D0. Nothing is now sequenced ahead of any package.
 
 Within Wave A the three packages are not equally unblocked. A1's `format.rs` and `drive.rs`
 bodies gate A3's crash driver and benchmark, and A1's frame codec gates A2's recovery

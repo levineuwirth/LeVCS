@@ -47,7 +47,12 @@ fn every_append_through_publication_boundary_has_a_deterministic_oracle() {
             "{point:?} recovery outcome"
         );
         match point {
-            AppendFailpoint::BeforeAppend => {
+            // `EvidenceHandoffFailure` sits here, not with the poisoning
+            // rows, as of contract review 2026-07-26-A: it fires before the
+            // group is marked `Resolving` and before any byte is written, so
+            // the outcome is definitively absent and the shard stays in
+            // service. See the rationale in `oracle.rs`.
+            AppendFailpoint::BeforeAppend | AppendFailpoint::EvidenceHandoffFailure => {
                 assert!(!expectation.shard_poisoned);
                 assert_eq!(
                     expectation.immediate_status,
@@ -62,7 +67,24 @@ fn every_append_through_publication_boundary_has_a_deterministic_oracle() {
                 assert!(expectation.acknowledgment_allowed);
                 assert!(expectation.later_append_allowed_before_recovery);
             }
-            _ => {
+            // Listed exhaustively rather than by a catch-all arm. This test
+            // pins a frozen classification, and a `_` arm silently absorbs a
+            // newly added failpoint into "poisoned" — which is exactly how a
+            // wrong classification ships past its own test. Adding a row must
+            // fail to compile until someone classifies it.
+            AppendFailpoint::AfterMarkedResolving
+            | AppendFailpoint::DuringFrameWriteTorn
+            | AppendFailpoint::AfterFrameWrite
+            | AppendFailpoint::BeforeFence
+            | AppendFailpoint::FenceFailed
+            | AppendFailpoint::FenceAmbiguous
+            | AppendFailpoint::WriterPanicBeforeFence
+            | AppendFailpoint::AfterSuccessfulFence
+            | AppendFailpoint::DuringCommittedRootBuild
+            | AppendFailpoint::AllocationFailureBeforePublication
+            | AppendFailpoint::BeforeRootCas
+            | AppendFailpoint::DuringRootCasRetry
+            | AppendFailpoint::WriterPanicAfterFence => {
                 assert!(expectation.shard_poisoned);
                 assert_eq!(expectation.immediate_status, ImmediateStatus::Resolving);
                 assert!(!expectation.later_append_allowed_before_recovery);

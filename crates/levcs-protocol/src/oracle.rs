@@ -143,22 +143,31 @@ pub struct FailpointExpectation {
 pub fn append_publication_expectation(point: AppendFailpoint) -> FailpointExpectation {
     use AppendFailpoint::*;
     match point {
-        BeforeAppend => FailpointExpectation {
+        // `EvidenceHandoffFailure` joined this row in contract review
+        // 2026-07-26-A. It fires while the sequencer is handing a transaction
+        // to the evidence signer — before the group is marked `Resolving` and
+        // before any byte is written — so the physical state is `NoBytes` and
+        // nothing about the outcome is ambiguous. The original grouping with
+        // `AfterMarkedResolving` made a routine `SignerError::Unavailable`
+        // poison the shard, taking a whole shard out of service until recovery
+        // for a restarting signer and no storage fault at all. Plan §7 governs:
+        // a failure before append removes the transient reservation, releases
+        // or revalidates the speculative suffix, and wakes every waiter with
+        // the error; no durable status reservation is created.
+        BeforeAppend | EvidenceHandoffFailure => FailpointExpectation {
             shard_poisoned: false,
             immediate_status: ImmediateStatus::DefinitiveAbsent,
             recovery_outcome: RecoveryOutcome::AbsentRetriable,
             acknowledgment_allowed: false,
             later_append_allowed_before_recovery: true,
         },
-        AfterMarkedResolving | DuringFrameWriteTorn | EvidenceHandoffFailure => {
-            FailpointExpectation {
-                shard_poisoned: true,
-                immediate_status: ImmediateStatus::Resolving,
-                recovery_outcome: RecoveryOutcome::AbsentRetriable,
-                acknowledgment_allowed: false,
-                later_append_allowed_before_recovery: false,
-            }
-        }
+        AfterMarkedResolving | DuringFrameWriteTorn => FailpointExpectation {
+            shard_poisoned: true,
+            immediate_status: ImmediateStatus::Resolving,
+            recovery_outcome: RecoveryOutcome::AbsentRetriable,
+            acknowledgment_allowed: false,
+            later_append_allowed_before_recovery: false,
+        },
         // These four all leave a complete, checksum-valid frame written to
         // the device with the fence outcome undetermined (unfenced, failed,
         // ambiguous, or a panic racing the fence call): whether it actually

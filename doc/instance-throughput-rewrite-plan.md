@@ -850,6 +850,46 @@ The `else`-branch re-pin rule from the first amendment applies unchanged, and th
 
 Under `nodatacow` a torn block reads back as garbage rather than as `EIO`; under copy-on-write an ordinary crash leaves zeros or stale preallocated content. Both, plus `EIO` from a device that lost an acknowledged write — live here because the profile has `write_cache = enabled` and `power_loss_protection = false` — must be handled as end-of-tail rather than as a fatal store error. Treating `EIO` that way can silently drop a frame that was fenced and then lost by the device; nothing on the device distinguishes that from an unfenced tail, so the external ACK-journal reconciliation is the detector, and a non-zero `acknowledged_loss` there is a hardware finding that invalidates the run.
 
+##### Contract review 2026-07-26-A
+
+Wave B scoping found that `oracle::append_publication_expectation` classified
+`EvidenceHandoffFailure` as poisoning the shard, alongside `AfterMarkedResolving`, with
+`immediate_status: Resolving`. That is physically wrong and operationally harmful.
+
+The failpoint fires while the sequencer hands a transaction to the `CommitEvidenceSigner` —
+§7 stage 9, before the group is marked `Resolving` and before any byte is written. The
+physical state is `NoBytes` and nothing about the outcome is ambiguous. The frozen store-side
+fixture already said so in its own rationale ("signer failure occurs before journal append
+and therefore writes nothing"), which is how the disagreement was found: the fixture and the
+oracle described the same row differently.
+
+The operational cost of the old classification is the decisive part. A routine
+`SignerError::Unavailable` — a restarting or briefly overloaded signer, with no storage fault
+of any kind — would poison the shard and admit no mutation until recovery ran. That trades a
+real availability property for a safety property that was never at risk.
+
+§7 is authoritative and says the opposite: a failure before append "removes the transient
+in-flight entry, releases or revalidates its speculative suffix, and wakes every waiter with
+the same error; no durable status reservation is created."
+
+`EvidenceHandoffFailure` therefore takes the exact `BeforeAppend` shape: `shard_poisoned:
+false`, `immediate_status: DefinitiveAbsent`, `recovery_outcome: AbsentRetriable`,
+`acknowledgment_allowed: false`, `later_append_allowed_before_recovery: true`. The physical
+state class remains `NoBytes` and the crash-matrix fixture is unchanged. The failpoint stays
+assigned to **Wave B**, because only B1's sequencer can exercise a signer handoff at all.
+
+Amended: `crates/levcs-protocol/src/oracle.rs`, and
+`crates/levcs-protocol/tests/phase0_oracles.rs`, where the row moves beside `BeforeAppend`.
+The same edit replaced that test's `_` catch-all arm with an exhaustive list of the thirteen
+poisoning failpoints. A catch-all in a test that pins a frozen classification silently
+absorbs any newly added row into "poisoned" — which is the mechanism by which a wrong
+classification ships past its own test, the same defect as contract review 2026-07-24-A.
+Adding a failpoint must now fail to compile until someone classifies it.
+
+This is the second frozen Phase 0 classification found to be physically wrong. Both were
+found by asking what state the device is actually in, rather than by checking the model
+against itself.
+
 ### Phase 1 — storage engine spine
 
 Lead first defines sealed transaction/frame/snapshot interfaces and file ownership. That deliverable (D0) landed on 2026-07-24 as `crates/levcs-store`: the frozen public API compiling against `StoreError::NotImplemented`, the file-ownership split, strict configuration validation, the single durability syscall funnel with its counters and fault hooks, the failpoint registry in enforced one-to-one correspondence with `oracle::AppendFailpoint`, and the journal-level drive seam that lets the crash harness run in Wave A. The enforced gate is `scripts/check-phase1.sh`, which runs `check-phase0.sh` first so the Phase 0 freeze stays enforced. That work is scoped in `doc/phase1-storage-spine-scope.md`, which realizes this section as a file-ownership matrix, a frozen `levcs-store` API, a physical format and durability/recovery specification, per-package deliverables and acceptance criteria, the Wave A adversarial review charter, and the capacity analysis for P2 on the frozen reference hardware. This plan remains authoritative; that document is the Phase 1 realization of it and lists the decisions that must be resolved before Wave A starts.

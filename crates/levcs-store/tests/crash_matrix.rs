@@ -715,6 +715,186 @@ fn seed_committed_group(root: &std::path::Path, ack: &std::path::Path, seed: u64
     run.sequences("appended_sequences")
 }
 
+fn generate_damage(root: &std::path::Path, arguments: &[&str]) -> std::process::Output {
+    std::process::Command::new(harness::DRIVER)
+        .arg("damage")
+        .arg("--root")
+        .arg(root)
+        .args(arguments)
+        .output()
+        .expect("spawning physical crash-image generator")
+}
+
+/// Wave A review finding 1, physical image 1: a manifest-referenced segment
+/// whose footer remains valid while one of its frames no longer does.
+///
+/// This is generated from a segment the drive actually sealed and installed,
+/// and the assertion is against the same `reconcile` command the matrix and
+/// recovery script use. There is no harness-only validator in between. The
+/// pre-fix Wave A reopen accepted this exact class by trusting only footer
+/// offsets, so reverting that validation makes this test fail.
+#[test]
+fn production_recovery_rejects_a_corrupt_frame_in_a_sealed_segment() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let root = directory.path().join("root");
+    let ack = directory.path().join("ack.journal");
+
+    let seed = std::process::Command::new(harness::DRIVER)
+        .args(["append", "--root"])
+        .arg(&root)
+        .args([
+            "--shard",
+            "0",
+            "--shard-count",
+            "1",
+            "--create",
+            "--seed",
+            "49374",
+            "--group-len",
+            "2",
+            "--point",
+            "BeforeAppend",
+            "--action",
+            "continue",
+            "--fault",
+            "none",
+        ])
+        .arg("--ack-journal")
+        .arg(&ack)
+        .arg("--seal")
+        .output()
+        .expect("seeding sealed segment");
+    assert!(
+        seed.status.success(),
+        "the source must be a production-sealed segment.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&seed.stdout),
+        String::from_utf8_lossy(&seed.stderr)
+    );
+
+    let damage = generate_damage(
+        &root,
+        &["--kind", "sealed-frame-corruption", "--shard", "0"],
+    );
+    assert!(
+        damage.status.success(),
+        "the sealed-frame generator must produce its image.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&damage.stdout),
+        String::from_utf8_lossy(&damage.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&damage.stdout).contains("damage_phase=complete"),
+        "the generator must affirm that it fenced the mutation"
+    );
+
+    let reconcile = harness::run_reconcile(&root, 0, &ack);
+    assert_eq!(
+        reconcile.exit_code,
+        Some(65),
+        "production recovery must refuse the corrupt authority, not panic or \
+         publish it. stderr:\n{}",
+        reconcile.stderr
+    );
+    assert_eq!(reconcile.get("recovery_ok"), Some("false"));
+    assert!(
+        reconcile
+            .get("recovery_error")
+            .is_some_and(|error| error.contains("frame digest does not recompute")),
+        "the refusal must come from frame validation, not an unrelated setup \
+         failure: {:?}",
+        reconcile.get("recovery_error")
+    );
+    assert_eq!(
+        reconcile.get("adopted_sequences"),
+        None,
+        "a rejected recovery must publish no partial adoption result"
+    );
+}
+
+/// Wave A review finding 1, physical image 2: a valid journal from shard 1
+/// moved beneath shard 0 of the same root.
+///
+/// Root UUID validation alone cannot catch this. Production recovery must bind
+/// the journal header's shard index to the directory being recovered. The
+/// pre-fix Wave A reopen adopted the moved journal whole, so this is the second
+/// generator needed for the matrix to catch that original blocker.
+#[test]
+fn production_recovery_rejects_a_journal_moved_between_shards() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let root = directory.path().join("root");
+    let ack = directory.path().join("ack.journal");
+
+    let seed = std::process::Command::new(harness::DRIVER)
+        .args(["append", "--root"])
+        .arg(&root)
+        .args([
+            "--shard",
+            "1",
+            "--shard-count",
+            "2",
+            "--create",
+            "--seed",
+            "49375",
+            "--group-len",
+            "2",
+            "--point",
+            "BeforeAppend",
+            "--action",
+            "continue",
+            "--fault",
+            "none",
+        ])
+        .arg("--ack-journal")
+        .arg(&ack)
+        .output()
+        .expect("seeding shard-1 journal");
+    assert!(
+        seed.status.success(),
+        "the source must be a production-written shard-1 journal.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&seed.stdout),
+        String::from_utf8_lossy(&seed.stderr)
+    );
+
+    let damage = generate_damage(
+        &root,
+        &[
+            "--kind",
+            "cross-shard-journal-movement",
+            "--source-shard",
+            "1",
+            "--destination-shard",
+            "0",
+        ],
+    );
+    assert!(
+        damage.status.success(),
+        "the cross-shard generator must produce its image.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&damage.stdout),
+        String::from_utf8_lossy(&damage.stderr)
+    );
+
+    let reconcile = harness::run_reconcile(&root, 0, &ack);
+    assert_eq!(
+        reconcile.exit_code,
+        Some(65),
+        "production recovery must refuse the moved journal, not panic or adopt \
+         it. stderr:\n{}",
+        reconcile.stderr
+    );
+    assert_eq!(reconcile.get("recovery_ok"), Some("false"));
+    assert!(
+        reconcile
+            .get("recovery_error")
+            .is_some_and(|error| error.contains("journal belongs to shard 1, not shard 0")),
+        "the refusal must be the cross-shard binding check: {:?}",
+        reconcile.get("recovery_error")
+    );
+    assert_eq!(
+        reconcile.get("adopted_sequences"),
+        None,
+        "a rejected recovery must publish no partial adoption result"
+    );
+}
+
 #[test]
 fn enospc_during_append_is_refused_and_leaves_an_openable_store() {
     let directory = tempfile::tempdir().expect("tempdir");

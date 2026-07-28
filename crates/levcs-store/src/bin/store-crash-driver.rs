@@ -37,6 +37,8 @@
 //! | 70 | harness-internal error |
 //! | 101 | Rust panic (the `Panic` action, unwinding with destructors) |
 
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -45,7 +47,7 @@ use levcs_protocol::oracle::{AckRecord, ExternalAckJournal};
 use levcs_store::drive::faults::Fault;
 use levcs_store::drive::points::{Failpoint, FailpointAction};
 use levcs_store::drive::{DriveRecovery, ShardDrive, DRIVE_PREALLOCATE_BYTES};
-use levcs_store::format::{frame_total_len, JOURNAL_HEADER_LEN};
+use levcs_store::format::{frame_total_len, FRAME_HEADER_LEN, JOURNAL_HEADER_LEN};
 use levcs_store::types::NamespaceId;
 
 /// The adopted-sequence property, shared with `store-bench` and with
@@ -430,6 +432,193 @@ fn journal_acks(
 }
 
 // ---------------------------------------------------------------------------
+// Subcommand: damage — deterministic physical crash-image generators
+// ---------------------------------------------------------------------------
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum DamageKind {
+    SealedFrameCorruption,
+    CrossShardJournalMovement,
+}
+
+impl DamageKind {
+    fn parse(value: &str) -> Option<Self> {
+        if value == "sealed-frame-corruption" {
+            Some(Self::SealedFrameCorruption)
+        } else if value == "cross-shard-journal-movement" {
+            Some(Self::CrossShardJournalMovement)
+        } else {
+            None
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::SealedFrameCorruption => "sealed-frame-corruption",
+            Self::CrossShardJournalMovement => "cross-shard-journal-movement",
+        }
+    }
+}
+
+struct DamageArgs {
+    root: PathBuf,
+    kind: DamageKind,
+    shard: u16,
+    source_shard: u16,
+    destination_shard: u16,
+}
+
+/// Return the only file with `extension` under `directory`.
+///
+/// These generators deliberately require an unambiguous source image. Picking
+/// an arbitrary segment or journal from a larger store would make a passing
+/// campaign depend on directory iteration order and could mutate an
+/// unreferenced artifact instead of the production authority.
+fn only_file_with_extension(directory: &Path, extension: &str) -> Result<PathBuf, String> {
+    let mut matches = Vec::new();
+    let entries =
+        fs::read_dir(directory).map_err(|e| format!("reading {}: {e}", directory.display()))?;
+    for entry in entries {
+        let path = entry
+            .map_err(|e| format!("reading an entry under {}: {e}", directory.display()))?
+            .path();
+        if path
+            .extension()
+            .is_some_and(|candidate| candidate == extension)
+        {
+            matches.push(path);
+        }
+    }
+    matches.sort();
+    if matches.len() != 1 {
+        return Err(format!(
+            "{} must contain exactly one .{extension} file, found {}",
+            directory.display(),
+            matches.len()
+        ));
+    }
+    Ok(matches.pop().expect("length checked"))
+}
+
+fn sync_directory(path: &Path) -> Result<(), String> {
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|e| format!("syncing directory {}: {e}", path.display()))
+}
+
+fn run_damage(args: DamageArgs) -> ExitCode {
+    println!("damage_schema=1");
+    println!("damage_kind={}", args.kind.name());
+
+    let result = match args.kind {
+        DamageKind::SealedFrameCorruption => damage_sealed_frame(&args.root, args.shard),
+        DamageKind::CrossShardJournalMovement => {
+            damage_cross_shard_journal(&args.root, args.source_shard, args.destination_shard)
+        }
+    };
+
+    match result {
+        Ok(path) => {
+            println!("damage_phase=complete");
+            println!("damaged_path={}", path.display());
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            println!("damage_phase=failed");
+            eprintln!("store-crash-driver: damage: {error}");
+            ExitCode::from(EX_DATAERR)
+        }
+    }
+}
+
+/// Flip one byte in the first sealed frame's payload and fence the mutation.
+///
+/// The source must be a real segment created by `ShardDrive::seal_and_install`;
+/// the generator does not synthesize a footer, frame, manifest, or checksum.
+/// The changed byte lies after both the journal and frame headers, so the
+/// segment footer remains structurally valid while production frame
+/// verification must reject the referenced authority.
+fn damage_sealed_frame(root: &Path, shard: u16) -> Result<PathBuf, String> {
+    let segments = root
+        .join("shards")
+        .join(format!("{shard:02}"))
+        .join("segments");
+    let segment = only_file_with_extension(&segments, "seg")?;
+    let offset = (JOURNAL_HEADER_LEN + FRAME_HEADER_LEN) as u64;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&segment)
+        .map_err(|e| format!("opening {}: {e}", segment.display()))?;
+    if file
+        .metadata()
+        .map_err(|e| format!("stat {}: {e}", segment.display()))?
+        .len()
+        <= offset
+    {
+        return Err(format!(
+            "{} has no first-frame payload byte at offset {offset}",
+            segment.display()
+        ));
+    }
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|e| format!("seeking {}: {e}", segment.display()))?;
+    let mut byte = [0u8; 1];
+    file.read_exact(&mut byte)
+        .map_err(|e| format!("reading {}: {e}", segment.display()))?;
+    byte[0] ^= 0x80;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|e| format!("seeking {}: {e}", segment.display()))?;
+    file.write_all(&byte)
+        .map_err(|e| format!("writing {}: {e}", segment.display()))?;
+    file.sync_data()
+        .map_err(|e| format!("fencing {}: {e}", segment.display()))?;
+    sync_directory(&segments)?;
+    Ok(segment)
+}
+
+/// Move the only active journal from one shard directory into another.
+///
+/// This reproduces the Wave A review's same-root cross-shard image. A footer
+/// cannot detect it: the journal header's `shard_index` is the authority, and
+/// production recovery must bind that value to the directory it is opening.
+fn damage_cross_shard_journal(
+    root: &Path,
+    source_shard: u16,
+    destination_shard: u16,
+) -> Result<PathBuf, String> {
+    if source_shard == destination_shard {
+        return Err("source and destination shards must differ".to_string());
+    }
+    let shards = root.join("shards");
+    let source_dir = shards.join(format!("{source_shard:02}")).join("active");
+    let destination_dir = shards
+        .join(format!("{destination_shard:02}"))
+        .join("active");
+    let source = only_file_with_extension(&source_dir, "journal")?;
+    let name = source
+        .file_name()
+        .ok_or_else(|| format!("{} has no file name", source.display()))?;
+    let destination = destination_dir.join(name);
+    if destination.exists() {
+        return Err(format!(
+            "destination {} is already occupied",
+            destination.display()
+        ));
+    }
+    fs::rename(&source, &destination).map_err(|e| {
+        format!(
+            "moving {} to {}: {e}",
+            source.display(),
+            destination.display()
+        )
+    })?;
+    sync_directory(&source_dir)?;
+    sync_directory(&destination_dir)?;
+    Ok(destination)
+}
+
+// ---------------------------------------------------------------------------
 // Subcommand: soak
 // ---------------------------------------------------------------------------
 
@@ -719,12 +908,15 @@ impl Args {
 }
 
 const USAGE: &str = "\
-store-crash-driver <append|soak|reconcile> [flags]
+store-crash-driver <append|damage|soak|reconcile> [flags]
 
   append     --root P --shard N [--shard-count N] [--create] --seed U64
              --group-len N [--victim N] [--point NAME] [--action ACTION]
              [--fault FAULT] [--ack-journal P] [--path drive|submit]
              [--seal] [--seal-fault FAULT]
+  damage     --root P --kind sealed-frame-corruption [--shard N]
+  damage     --root P --kind cross-shard-journal-movement
+             [--source-shard N] [--destination-shard N]
   soak       --root P --shard N [--shard-count N] --seed U64 --group-len N
              --ack-journal P [--max-groups N] [--path drive|submit]
   reconcile  --root P --shard N [--ack-journal P] [--fault FAULT]
@@ -800,6 +992,19 @@ fn dispatch(args: &Args) -> Result<ExitCode, String> {
             ack_journal: PathBuf::from(args.required("ack-journal")?),
             max_groups: args.parsed::<u64>("max-groups", u64::MAX)?,
             path,
+        }));
+    }
+
+    if args.subcommand == "damage" {
+        let kind_name = args.required("kind")?;
+        let kind = DamageKind::parse(kind_name)
+            .ok_or_else(|| format!("unknown damage kind {kind_name:?}"))?;
+        return Ok(run_damage(DamageArgs {
+            root: PathBuf::from(args.required("root")?),
+            kind,
+            shard: args.parsed::<u16>("shard", 0)?,
+            source_shard: args.parsed::<u16>("source-shard", 1)?,
+            destination_shard: args.parsed::<u16>("destination-shard", 0)?,
         }));
     }
 

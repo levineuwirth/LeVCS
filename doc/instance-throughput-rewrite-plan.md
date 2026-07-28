@@ -973,6 +973,11 @@ and every waiter receives one owned clone of the same result. The committed root
 idempotent subtree merge and carries addressable live pins for every retained artifact so a
 captured read cannot race reclamation.
 
+**D0-B was frozen on 2026-07-27 at commit
+`5111d655da7689c73b3ad3189d9ecb3cd207f888`** after the complete Phase 1 gate returned
+`GATE_EXIT=0`. B1 NamespaceTxn, B3 StagingSessions, and B4 StoreHarnessB may now dispatch
+against that surface; changes to it require another contract review here.
+
 ### Phase 1 — storage engine spine
 
 Lead first defines sealed transaction/frame/snapshot interfaces and file ownership. That deliverable (D0) landed on 2026-07-24 as `crates/levcs-store`: the frozen public API compiling against `StoreError::NotImplemented`, the file-ownership split, strict configuration validation, the single durability syscall funnel with its counters and fault hooks, the failpoint registry in enforced one-to-one correspondence with `oracle::AppendFailpoint`, and the journal-level drive seam that lets the crash harness run in Wave A. The enforced gate is `scripts/check-phase1.sh`, which runs `check-phase0.sh` first so the Phase 0 freeze stays enforced. That work is scoped in `doc/phase1-storage-spine-scope.md`, which realizes this section as a file-ownership matrix, a frozen `levcs-store` API, a physical format and durability/recovery specification, per-package deliverables and acceptance criteria, the Wave A adversarial review charter, and the capacity analysis for P2 on the frozen reference hardware. This plan remains authoritative; that document is the Phase 1 realization of it and lists the decisions that must be resolved before Wave A starts.

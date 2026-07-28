@@ -5,13 +5,14 @@ The rewrite plan remains authoritative. Where this document is more specific, it
 lead's Phase 1 realization of the plan; where it appears to contradict the plan, the plan
 wins and this document is defective.
 
-Status: **Wave A frozen 2026-07-26 at `5ee9c6b`; Wave B scoped, D0-B implemented and
-gate-green 2026-07-27.**
+Status: **Wave A frozen 2026-07-26 at `5ee9c6b`; Wave B scoped, D0-B frozen
+2026-07-27 at `5111d65`.**
 Sections 9.1-9.6 were resolved on 2026-07-24 and are recorded there with their conditions;
 9.7 and 9.8 were ruled on 2026-07-26 and are recorded in §6.9, and contract review
-2026-07-26-A resolved the `EvidenceHandoffFailure` classification (§6.3). D0-B is complete,
-its frozen-surface implementation amendments are recorded by contract review 2026-07-27-A,
-and B1/B3/B4 dispatch is unblocked; no open decision remains. Contract review 2026-07-24-B
+2026-07-26-A resolved the `EvidenceHandoffFailure` classification (§6.3). D0-B is frozen at
+`5111d65`, its frozen-surface implementation amendments are recorded by contract review
+2026-07-27-A, and B1/B3/B4 dispatch is unblocked; no open decision remains. Contract review
+2026-07-24-B
 (sections 9.1 and 9.2) has been applied to `bench/result-schema.json` and
 `bench/reference-hardware.toml` and recorded in the plan document. `crates/levcs-store`
 exists with the frozen API, the ownership split, the durability funnel, the failpoint
@@ -2110,6 +2111,8 @@ D0  lead skeleton, frozen API, sys/failpoint shims, deps, decisions 9.1-9.5
 D0-B  lead: roots.rs, completion.rs, RecoveredShard entry point, adoption handle,
       lib/deps/options/error/recovery amendments (11 items, 9 touching frozen files)
                                          |
+                              D0-B frozen 2026-07-27 at 5111d65
+                                         |
      +-- B1 NamespaceTxn   ---+
      +-- B3 StagingSessions ---+--> Wave B freeze gate + adversarial review
      +-- B4 StoreHarnessB  ---+          |
@@ -2135,8 +2138,8 @@ matrix that can express the class of defect Wave A shipped.
 
 Sections 9.1-9.6 are resolved, so Wave A was unblocked once D0 landed; 9.7 and 9.8 were ruled
 on 2026-07-26 in §6.9, and contract review 2026-07-26-A closed the `EvidenceHandoffFailure`
-conflict. D0-B is implemented and gate-green, so B1, B3, and B4 dispatch is unblocked. The
-item that was sequenced ahead of A3 —
+conflict. D0-B is frozen at `5111d65` after a `GATE_EXIT=0` run, so B1, B3, and B4 dispatch
+is unblocked. The item that was sequenced ahead of A3 —
 **contract review 2026-07-24-B**, the `result-schema.json` per-flag
 conditional with its re-pin requirement and the top-level `promotable`, the added
 `workload.generator` field, and `reference-hardware.toml`'s `store_directory_attributes` —

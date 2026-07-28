@@ -76,6 +76,7 @@ mod faults {
                 repo_sequence: sequence,
                 shard_sequence: sequence,
                 current_authority: oid(0xB1),
+                refs: Vec::new(),
                 objects_new: 1,
                 retry_until_micros: 1_700_000_900_000_000,
                 first_receipt_visibility_micros: Some(1_700_000_000_100_000),

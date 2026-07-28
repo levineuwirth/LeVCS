@@ -77,6 +77,7 @@ anyhow = "1.0"
 # for why each of these is taken and what was rejected in its place.
 arc-swap = "1.7"
 crossbeam-channel = "0.5"
+im = "15.1"
 rustix = { version = "1.1", features = ["fs"] }
 libc = "0.2"
 memmap2 = "0.9"

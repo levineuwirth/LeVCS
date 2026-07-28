@@ -34,6 +34,7 @@ thiserror = { workspace = true }
 hex = { workspace = true }
 arc-swap = { workspace = true }
 crossbeam-channel = { workspace = true }
+im = { workspace = true }
 rustix = { workspace = true }
 libc = { workspace = true }
 memmap2 = { workspace = true }

@@ -33,6 +33,7 @@
 //! snapshots and events, never to these bytes.
 
 pub mod checkpoint;
+pub mod completion;
 pub mod engine;
 pub mod failpoints;
 pub mod format;
@@ -40,6 +41,7 @@ pub mod index;
 pub mod journal;
 pub mod options;
 pub mod recovery;
+pub mod roots;
 pub mod segment;
 pub mod snapshot;
 pub mod staging;
@@ -57,9 +59,21 @@ mod sys;
 #[cfg(feature = "store-internals")]
 pub mod drive;
 
+pub use completion::{CompletionWaiter, SharedCompletion};
 pub use engine::{CheckpointLease, StoreEngine};
 pub use options::{StoreDirectoryAttributes, StoreOptions};
+pub use roots::{
+    CommittedRoot, GenerationId, IndexDeltaLayer, LayeredObjectIndex, OperationKey,
+    OperationStatusMetricSnapshot, OperationStatusMetrics, OperationStatusRoot, PinnedFile,
+    ProjectionArtifactFormat, ReceiptTombstone, RepoState, RetainedGeneration, RetainedIndexRun,
+    RetainedObjectSource, RetainedProjectionArtifact, RetainedReceipt, RetainedSegment,
+    RetainedTail, ShardSubtree, StatusEntry, StatusPhase, StatusReservation, TerminalStatusEntry,
+};
 pub use snapshot::RepoSnapshot;
+pub use staging::{
+    ProjectionAdoption, ProjectionAdoptionOutcome, ProjectionAdoptionResolution,
+    ProjectionArtifact, RecoveredProjectionOutcome, RecoveredProjectionResolution,
+};
 pub use transaction::{StagedObject, ValidatedTransaction, ValidatedTransactionBuilder};
 pub use types::{
     AppliedRef, CommitEvidenceSigner, CommitReceipt, DurabilityCounterSnapshot, DurabilityCounters,

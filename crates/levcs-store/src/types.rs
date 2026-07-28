@@ -6,6 +6,7 @@
 //! The whole file is the Phase 1 realization of plan §5.1's frozen public API.
 
 use std::fmt;
+use std::sync::Arc;
 
 use levcs_core::ObjectId;
 
@@ -140,7 +141,7 @@ pub enum TransactionStatus {
 
 /// Inability to answer. Corruption, unavailable recovery state, refusal to
 /// open, or a definitive rejection — never a lifecycle state.
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("not implemented: {0}")]
     NotImplemented(&'static str),
@@ -174,7 +175,7 @@ pub enum StoreError {
     AlreadyLocked,
 
     #[error("io: {0}")]
-    Io(#[from] std::io::Error),
+    Io(#[source] Arc<std::io::Error>),
 
     #[error("no space left on the store device")]
     NoSpace,
@@ -184,6 +185,12 @@ pub enum StoreError {
         limit: &'static str,
         observed: u64,
         allowed: u64,
+    },
+
+    #[error("store overloaded at {limit}; retry after {retry_after_micros} microseconds")]
+    Overloaded {
+        limit: &'static str,
+        retry_after_micros: u64,
     },
 
     #[error("mutable-state conflict: {0}")]
@@ -199,12 +206,18 @@ pub enum StoreError {
     InvalidConfiguration(String),
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum SignerError {
     #[error("signer unavailable")]
     Unavailable,
     #[error("signer rejected the request: {0}")]
     Rejected(String),
+}
+
+impl From<std::io::Error> for StoreError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(Arc::new(error))
+    }
 }
 
 /// Signs `CommittedTransactionV1` event digests on behalf of the instance.
@@ -277,4 +290,45 @@ pub struct DurabilityCounterSnapshot {
     pub write_vectored: u64,
     pub short_writes: u64,
     pub bytes_written: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cloned_io_error_shares_the_original_error_losslessly() {
+        use std::error::Error;
+
+        let error = StoreError::from(std::io::Error::from_raw_os_error(libc::EIO));
+        let clone = error.clone();
+
+        let (StoreError::Io(original), StoreError::Io(cloned)) = (&error, &clone) else {
+            panic!("expected two shared I/O errors");
+        };
+        assert!(Arc::ptr_eq(original, cloned));
+        assert_eq!(cloned.raw_os_error(), Some(libc::EIO));
+        let source = clone.source().expect("I/O source remains available");
+        let shared = source
+            .downcast_ref::<Arc<std::io::Error>>()
+            .expect("shared I/O source remains downcastable without reconstruction");
+        assert!(Arc::ptr_eq(original, shared));
+    }
+
+    #[test]
+    fn overloaded_error_is_cloneable_and_preserves_retry_guidance() {
+        let error = StoreError::Overloaded {
+            limit: "max_status_entries",
+            retry_after_micros: 1_000,
+        };
+        let StoreError::Overloaded {
+            limit,
+            retry_after_micros,
+        } = error.clone()
+        else {
+            panic!("clone changed the error variant");
+        };
+        assert_eq!(limit, "max_status_entries");
+        assert_eq!(retry_after_micros, 1_000);
+    }
 }

@@ -36,14 +36,11 @@ use std::sync::Arc;
 
 use levcs_core::ObjectId;
 
-use crate::format::{
-    Frame, FrameHeader, JournalHeader, TransactionFramePayloadV1, JOURNAL_HEADER_LEN,
-};
+use crate::format::{Frame, FrameHeader, TransactionFramePayloadV1};
 use crate::index::{NamespaceCatalog, NamespaceLifecycle, NamespaceRecord, NamespaceStorageMode};
-use crate::journal::{Journal, TailStop};
-use crate::recovery::{self, ActiveJournalDisposition, FrameFacts, PayloadFacts};
+use crate::journal::Journal;
+use crate::recovery::{self, FrameFacts, PayloadFacts};
 use crate::segment::{self, RootLayout, ShardPaths};
-use crate::sys;
 use crate::types::{DurabilityCounterSnapshot, DurabilityCounters, NamespaceId, StoreError};
 
 /// A single shard's journal, opened directly.
@@ -90,8 +87,14 @@ const DRIVE_MANIFEST_CANDIDATES: usize = 8;
 const DRIVE_TERMINAL_STATUS_GRACE_MICROS: i64 = 900_000_000;
 
 /// What recovery concluded about a driven shard after reopening.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct DriveRecovery {
+    /// The full recovered state retained by the production entry point.
+    ///
+    /// The summary fields below are projections only. Keeping this value is
+    /// what lets the Wave B equivalence test compare the engine and drive
+    /// roots rather than merely comparing a sequence list.
+    pub recovered: recovery::RecoveredShard,
     /// Frames recovery adopted, in `shard_sequence` order. Always a contiguous
     /// prefix of what was appended — recovery stops at the first incomplete
     /// frame and discards everything after it, even a syntactically complete
@@ -106,7 +109,7 @@ pub struct DriveRecovery {
     /// The full report recovery produced, verbatim.
     ///
     /// The four fields above are a convenience projection of it and nothing
-    /// more; [`DriveRecovery::from_report`] is the only thing that builds
+    /// more; [`DriveRecovery::from_recovered`] is the only thing that builds
     /// them, so they cannot disagree with this.
     ///
     /// Added after the Wave A review (record 2026-07-24-D). The seam
@@ -121,6 +124,21 @@ pub struct DriveRecovery {
     pub report: recovery::ShardRecoveryReport,
 }
 
+// Preserve the Wave A comparison contract for the diagnostic projection. The
+// newly retained `RecoveredShard` contains mmap/file ownership whose identity
+// is deliberately not value-comparable.
+impl PartialEq for DriveRecovery {
+    fn eq(&self, other: &Self) -> bool {
+        self.adopted_shard_sequences == other.adopted_shard_sequences
+            && self.tail_stop_offset == other.tail_stop_offset
+            && self.quarantined_bytes == other.quarantined_bytes
+            && self.used_manifest_fallback == other.used_manifest_fallback
+            && self.report == other.report
+    }
+}
+
+impl Eq for DriveRecovery {}
+
 impl DriveRecovery {
     /// Project a recovery report into the seam's shape.
     ///
@@ -133,16 +151,18 @@ impl DriveRecovery {
     /// records *why* the scan stopped; whether that stop discarded anything is
     /// a separate judgment (a clean journal always stops at its first unwritten
     /// byte), and only the scan site holds both halves.
-    fn from_report(report: recovery::ShardRecoveryReport, tail_stop_offset: Option<u64>) -> Self {
+    fn from_recovered(recovered: recovery::RecoveredShard) -> Self {
+        let report = &recovered.report;
         Self {
             adopted_shard_sequences: report.adopted_shard_sequences.clone(),
-            tail_stop_offset,
+            tail_stop_offset: recovered.tail_stop_offset,
             quarantined_bytes: report.quarantined_bytes,
             used_manifest_fallback: matches!(
                 report.manifest_source,
                 Some(recovery::ManifestSource::Fallback { .. })
             ),
-            report,
+            report: report.clone(),
+            recovered,
         }
     }
 
@@ -423,11 +443,16 @@ impl ShardDrive {
     /// supplies the real ref state.
     pub fn checkpoint(&mut self) -> Result<PathBuf, StoreError> {
         let facts = self.durable_facts()?;
+        if facts.is_empty() {
+            return Err(StoreError::Conflict(
+                "an empty Phase 1 shard has no manifest and cannot install a checkpoint".into(),
+            ));
+        }
         let created_at_micros = now_micros();
 
         let mut catalog = NamespaceCatalog::new();
         let mut receipts = Vec::with_capacity(facts.len());
-        for fact in &facts {
+        for (fact, recovered) in &facts {
             if catalog.get(&fact.namespace).is_none() {
                 catalog.bind(NamespaceRecord {
                     namespace: fact.namespace,
@@ -446,13 +471,16 @@ impl ShardDrive {
                     fact.event_digest,
                 )?;
             }
-            receipts.push(receipt_for(fact, created_at_micros)?);
+            receipts.push(receipt_for(fact, recovered, created_at_micros)?);
         }
 
         let checkpoint = crate::checkpoint::Checkpoint {
             root_uuid: self.root_uuid,
             shard_index: self.shard,
-            shard_committed_sequence: facts.last().map(|f| f.shard_sequence).unwrap_or(0),
+            shard_committed_sequence: facts
+                .last()
+                .map(|(facts, _)| facts.shard_sequence)
+                .unwrap_or(0),
             // The resume point of scope 3.6: `journal_id` accompanies the
             // offset because an offset alone is meaningless once the journal
             // has rotated, and recovery checks the identity before it trusts
@@ -467,8 +495,92 @@ impl ShardDrive {
 
         let path =
             crate::checkpoint::install(&self.paths.checkpoints(), &checkpoint, &self.counters)?;
-        // Only after a successful install, so the store is never below its
-        // retention floor at an instant a crash could observe.
+
+        // A checkpoint file is derived state, not authority by directory
+        // presence. Seal the active frames and publish both the new tail range
+        // and this checkpoint row in one manifest generation. Installing an
+        // intermediate seal-only generation here would let manifest_retain=2
+        // evict the predecessor checkpoint manifest between two checkpoints.
+        let previous = segment::load_manifest_with_fallback(&self.paths, &self.root_uuid)?
+            .map(|(manifest, _)| manifest);
+        let generation = previous
+            .as_ref()
+            .map(|manifest| manifest.generation.saturating_add(1))
+            .unwrap_or(1);
+        let mut retained_tail_ranges = previous
+            .as_ref()
+            .map(|manifest| manifest.retained_tail_ranges.clone())
+            .unwrap_or_default();
+        let active_path = self.journal.path().to_path_buf();
+        let sealed_active = if let Some(last) = self.journal.last_appended_shard_sequence() {
+            let first = self.journal.header().first_shard_sequence;
+            let destination =
+                segment::seal_journal(&mut self.journal, &self.paths, generation, &self.counters)?;
+            let filename = destination
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| StoreError::Corruption("segment name is not UTF-8".into()))?
+                .to_string();
+            retained_tail_ranges.push(crate::format::TailRange {
+                generation,
+                first_shard_sequence: first,
+                last_shard_sequence: last,
+                filename,
+            });
+            true
+        } else {
+            false
+        };
+
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| StoreError::Corruption("checkpoint name is not UTF-8".into()))?
+            .to_string();
+        let mut checkpoint_rows = previous
+            .as_ref()
+            .map(|manifest| manifest.checkpoints.clone())
+            .unwrap_or_default();
+        checkpoint_rows.retain(|(sequence, _)| *sequence != checkpoint.shard_committed_sequence);
+        checkpoint_rows.push((checkpoint.shard_committed_sequence, filename));
+        let retain = self.checkpoint_retain.max(2) as usize;
+        if checkpoint_rows.len() > retain {
+            let drop_count = checkpoint_rows.len() - retain;
+            checkpoint_rows.drain(..drop_count);
+        }
+        let manifest = crate::format::Manifest {
+            root_uuid: self.root_uuid,
+            generation,
+            base_generation: previous
+                .as_ref()
+                .map(|manifest| manifest.base_generation)
+                .unwrap_or(0),
+            retained_tail_ranges,
+            index_runs: previous
+                .as_ref()
+                .map(|manifest| manifest.index_runs.clone())
+                .unwrap_or_default(),
+            checkpoints: checkpoint_rows,
+            committed_shard_sequence: checkpoint.shard_committed_sequence,
+        };
+        segment::install_manifest(&self.paths, &manifest, self.manifest_retain, &self.counters)?;
+
+        if sealed_active {
+            segment::unlink_sealed_journal(&active_path, &self.paths, &self.counters)?;
+            self.journal = Journal::create(
+                &self.paths.active(),
+                fresh_id(b"journal"),
+                checkpoint.shard_committed_sequence.saturating_add(1),
+                self.shard,
+                self.root_uuid,
+                self.preallocate_bytes,
+                now_micros(),
+                Arc::clone(&self.counters),
+            )?;
+        }
+
+        // Only after both the checkpoint and its authoritative manifest are
+        // fenced, so every retained manifest keeps a retained referent.
         crate::checkpoint::prune(
             &self.paths.checkpoints(),
             self.checkpoint_retain,
@@ -480,7 +592,9 @@ impl ShardDrive {
     /// Every frame durably reachable in this shard right now, in
     /// `shard_sequence` order, each proved complete by the same readers
     /// recovery uses.
-    fn durable_facts(&self) -> Result<Vec<FrameFacts>, StoreError> {
+    fn durable_facts(
+        &self,
+    ) -> Result<Vec<(FrameFacts, recovery::RecoveredPayloadFacts)>, StoreError> {
         let mut facts = Vec::new();
         if let Some((manifest, _)) =
             segment::load_manifest_with_fallback(&self.paths, &self.root_uuid)?
@@ -572,331 +686,31 @@ impl ShardDrive {
     ///   prevent. A crash between the manifest install and the active-name
     ///   unlink produced `0,1,2,3,0,1,2,3`.
     ///
-    /// The rule this function now follows is structural: every production
-    /// entry point in `recovery.rs` that belongs at this layer is called, and
-    /// the two that do not are named below with the reason.
-    ///
-    /// | `recovery.rs` entry point | here |
-    /// |---|---|
-    /// | `resolve_manifest` | step 2, with `SegmentFooterValidator` |
-    /// | `load_checkpoint` / `checkpoint_for_recovery` | step 3 |
-    /// | `validate_journal_binding` | every segment and the active journal |
-    /// | `classify_active_journal` / `complete_interrupted_seal` | scope 3.4 |
-    /// | `recover_journal_tail` | steps 5 to 7 (`journal::scan_journal` + `journal::quarantine_tail`) |
-    /// | `verify_shard_sequence` / `verify_repo_chain` | step 9 |
-    /// | `promote_receipt_visibility` | step 10 |
-    /// | `tail_outcome` | **not applicable.** It maps a scan to the frozen `RecoveryOutcome`; this seam returns the raw adoption set and A3's matrix does the oracle comparison itself. Calling it here would compute a verdict nothing reads. |
-    /// | `index_adopted_frames` | **not applicable.** The drive publishes no index — that is B1's `engine.rs`. Over scripted payloads `FrameFacts::objects` is empty, so the call would insert nothing and assert nothing. |
-    ///
-    /// What this function adds is the ordering between them and the
-    /// `DriveRecovery` projection, and nothing else.
+    /// The rule is now stronger and simpler: this function makes exactly one
+    /// call to [`recovery::recover_shard`], the same non-feature-gated entry
+    /// point the engine uses. It adds only the scripted-payload extractor and
+    /// the `DriveRecovery` summary projection. Manifest/checkpoint selection,
+    /// journal classification, replay, sequence verification, receipts,
+    /// index layering, and retained generation ownership have no drive-local
+    /// implementation to drift.
     pub fn reopen_through_recovery(root: &Path, shard: u16) -> Result<DriveRecovery, StoreError> {
-        let layout = RootLayout::new(root);
-        // Step 1: FORMAT, then the lock. Read first so an unopenable root is
-        // refused before a lock file is created inside it.
-        let marker = segment::read_format(&layout)?;
-        if shard >= marker.shard_count {
-            return Err(StoreError::FormatMismatch(format!(
-                "shard {shard} is outside the root's frozen topology of {} shards",
-                marker.shard_count
-            )));
-        }
-        let root_uuid = marker.root_uuid;
-        let _lock = segment::lock_root(&layout)?;
-        let paths = layout.shard(shard);
-        let counters = Arc::new(DurabilityCounters::default());
-        let mut report = recovery::ShardRecoveryReport::new(shard);
-
-        // --- step 2: CURRENT, then the manifest fallback --------------------
-        //
-        // Through `recovery::resolve_manifest` rather than
-        // `segment::load_manifest_with_fallback`: the two answer the same
-        // selection question, but only the former validates a referenced
-        // segment *beyond existence*, and only the former distinguishes "the
-        // pointer does not validate" from "the pointer validates and its
-        // referent does not". `recovery_manifest.rs` asserts the two agree.
-        let selection = recovery::resolve_manifest(
-            &paths,
-            &root_uuid,
-            &recovery::SegmentFooterValidator::new(root_uuid),
-            DRIVE_MANIFEST_CANDIDATES,
-        )?;
-        let manifest = match selection {
-            Some(selection) => {
-                report.manifest_generation = Some(selection.generation);
-                report.manifest_source = Some(selection.source.clone());
-                Some(selection)
-            }
-            // No generation validated. Emptiness and total corruption are
-            // different facts and are never collapsed: a shard that has never
-            // sealed has no manifests and is healthy, while one whose every
-            // generation fails validation must refuse to open rather than
-            // silently behave like a fresh shard.
-            None if segment::list_manifest_generations(&paths)?.is_empty() => None,
-            None => {
-                return Err(StoreError::Corruption(format!(
-                    "shard {shard} has manifest generations but none of the newest \
-                     {DRIVE_MANIFEST_CANDIDATES} validate; refusing to open rather \
-                     than treating a corrupt shard as an empty one"
-                )))
-            }
+        let payload_facts = DrivePayloadFacts;
+        let config = recovery::RecoveryConfig {
+            max_manifest_candidates: DRIVE_MANIFEST_CANDIDATES,
+            manifest_retain: 2,
+            checkpoint_retain: DRIVE_CHECKPOINT_RETAIN,
+            journal_preallocate_bytes: DRIVE_PREALLOCATE_BYTES,
+            terminal_status_grace_micros: DRIVE_TERMINAL_STATUS_GRACE_MICROS,
+            max_active_index_entries: 4_000_000,
+            max_active_index_bytes: 512 * 1024 * 1024,
+            max_index_runs: 64,
+            max_open_index_runs: 32,
+            max_replay_frames: u64::MAX,
+            max_replay_bytes: u64::MAX,
+            payload_facts: &payload_facts,
+            projection_recovery_resolver: None,
         };
-        let used_manifest_fallback = matches!(
-            report.manifest_source,
-            Some(recovery::ManifestSource::Fallback { .. })
-        );
-
-        // --- step 3: the checkpoint -----------------------------------------
-        //
-        // Three outcomes, kept distinct by the type: no generations at all is
-        // a shard that has not checkpointed yet and replays from the start;
-        // at least one validates and bounds the replay; every generation
-        // failing is an explicit offline-rebuild refusal and never an
-        // unbounded scan.
-        let load = recovery::load_checkpoint(
-            &paths.checkpoints(),
-            &root_uuid,
-            shard,
-            DRIVE_CHECKPOINT_RETAIN,
-        )?;
-        let checkpoint =
-            match recovery::checkpoint_for_recovery(load, &root_uuid, shard, &mut report) {
-                Some(checkpoint) => checkpoint,
-                None => {
-                    debug_assert!(report.offline_rebuild_required);
-                    return Err(StoreError::RecoveryRequired);
-                }
-            };
-        // `Checkpoint::empty` also reports sequence 0, and sequence 0 is a
-        // legitimate committed sequence, so "was a checkpoint loaded" is read
-        // off the report — which only the `Loaded` branch sets — and never
-        // off the sequence number.
-        let checkpointed = report.checkpoint_sequence.is_some();
-        let committed = checkpoint.shard_committed_sequence;
-
-        let mut adopted_shard_sequences: Vec<u64> = Vec::new();
-        // Only the frames actually replayed are re-verified. What a durable
-        // checkpoint already accounts for was verified when it was adopted;
-        // re-deriving it is what makes replay unbounded, which plan section
-        // 5.3 forbids.
-        let mut replayed: Vec<FrameFacts> = Vec::new();
-        if checkpointed {
-            let mut accounted: Vec<u64> = checkpoint
-                .receipts
-                .iter()
-                .map(|receipt| receipt.shard_sequence)
-                .filter(|sequence| *sequence <= committed)
-                .collect();
-            accounted.sort_unstable();
-            adopted_shard_sequences.extend(accounted);
-        }
-
-        // --- step 4: sealed segments named by the manifest, in order --------
-        if let Some(selection) = &manifest {
-            for range in &selection.manifest.retained_tail_ranges {
-                let path = paths.segments().join(&range.filename);
-                let reader = segment::SegmentReader::open(&path, &root_uuid)?;
-                // The footer proves the *offset table* is intact. It says
-                // nothing about the frames, and nothing at all about which
-                // shard the file belongs to — so both are established here,
-                // from the journal header the sealed file still carries.
-                recovery::validate_journal_binding(
-                    &reader.journal_header()?,
-                    &root_uuid,
-                    shard,
-                    Some(&reader.footer().journal_id),
-                    None,
-                )
-                .map_err(StoreError::from)?;
-
-                // A segment wholly at or below the checkpoint is already
-                // accounted for by it; step 4 replays segments *above* the
-                // checkpoint.
-                if checkpointed && range.last_shard_sequence <= committed {
-                    continue;
-                }
-
-                let sequences: Vec<u64> = reader
-                    .footer()
-                    .offsets
-                    .iter()
-                    .map(|(sequence, _, _)| *sequence)
-                    .collect();
-                for sequence in sequences {
-                    if checkpointed && sequence <= committed {
-                        continue;
-                    }
-                    // `SegmentReader::read_frame` re-reads the bytes and
-                    // decodes them through `format::verify_complete` against
-                    // this file's `journal_id`. Presence in the offset table
-                    // is not evidence of anything.
-                    let frame = reader.read_frame(sequence)?;
-                    adopted_shard_sequences.push(sequence);
-                    replayed.push(drive_frame_facts(&frame)?);
-                }
-            }
-        }
-
-        // --- steps 5 to 7: the active journal -------------------------------
-        //
-        // A shard with no active journal is not an error — a crash between
-        // sealing and opening the next journal leaves exactly that.
-        let mut tail_stop_offset = None;
-        let mut quarantined_bytes = 0;
-        if let Some(path) = active_journal_path(&paths)? {
-            let file = File::open(&path)?;
-            let mut header_bytes = [0u8; JOURNAL_HEADER_LEN];
-            sys::pread_exact(&file, 0, &mut header_bytes)?;
-            let header = JournalHeader::decode(&header_bytes)?;
-            // `root_uuid` catches a file copied in from another instance;
-            // `shard_index` catches one moved between shards of this root,
-            // which no digest in the file can detect on its own. The sequence
-            // bound is what is covered *so far* — the checkpoint or the
-            // segments above it — not the checkpoint alone, because a journal
-            // opened after a rotation legitimately starts above the
-            // checkpoint's committed sequence.
-            let covered_through = adopted_shard_sequences
-                .last()
-                .copied()
-                .or(checkpointed.then_some(committed));
-            recovery::validate_journal_binding(&header, &root_uuid, shard, None, covered_through)
-                .map_err(StoreError::from)?;
-
-            // Scope 3.4: is this a live journal, or the residue of a seal that
-            // completed through the manifest install and lost only its final
-            // unlink? The two are opposite errors — replaying a sealed journal
-            // duplicates every frame in it, and treating a live one as sealed
-            // drops every frame the manifest does not yet name — so the
-            // decision is A2's `classify_active_journal` and never an
-            // ordering assumption here.
-            let disposition = match &manifest {
-                Some(selection) => recovery::classify_active_journal(
-                    &paths,
-                    &selection.manifest,
-                    &header.journal_id,
-                    &root_uuid,
-                )?,
-                // No manifest generation validated, so nothing can prove a
-                // seal completed. The journal is the only authority there is.
-                None => ActiveJournalDisposition::Replay,
-            };
-            report.active_journal = Some(disposition.clone());
-
-            match disposition {
-                ActiveJournalDisposition::AlreadySealed { .. } => {
-                    // The frames are already in the adopted set, taken from
-                    // the manifest above. Finish the seal and do not scan.
-                    drop(file);
-                    recovery::complete_interrupted_seal(&path, &paths, &counters)?;
-                }
-                ActiveJournalDisposition::Replay => {
-                    // Step 5 resumes at the checkpoint offset, and only when
-                    // the checkpoint names *this* journal: an offset into a
-                    // journal that has since rotated is meaningless, which is
-                    // why the checkpoint records the identity alongside it.
-                    let from = if checkpointed && checkpoint.active_journal_id == header.journal_id
-                    {
-                        checkpoint
-                            .active_journal_offset
-                            .max(JOURNAL_HEADER_LEN as u64)
-                    } else {
-                        JOURNAL_HEADER_LEN as u64
-                    };
-                    let (scan, record) = recovery::recover_journal_tail(
-                        &layout.quarantine_dir(),
-                        &file,
-                        &header,
-                        from,
-                        &counters,
-                    )?;
-                    // Both halves of the record, from the one call that wrote
-                    // it. The byte count without the path is evidence nobody
-                    // can find, which is what `report.quarantined` being
-                    // unsettable amounted to.
-                    quarantined_bytes = record.as_ref().map(|r| r.bytes).unwrap_or(0);
-                    report.quarantined = record.map(|r| r.path);
-                    for scanned in &scan.frames {
-                        let mut frame_bytes = vec![
-                            0u8;
-                            usize::try_from(scanned.len).map_err(|_| {
-                                StoreError::from(crate::format::FrameError::Length)
-                            })?
-                        ];
-                        sys::pread_exact(&file, scanned.offset, &mut frame_bytes)?;
-                        let frame = Frame::decode(&frame_bytes, &header.journal_id)?;
-                        adopted_shard_sequences.push(scanned.shard_sequence);
-                        replayed.push(drive_frame_facts(&frame)?);
-                    }
-                    // A stop is only a *tail* when something was actually
-                    // discarded: a clean journal always stops at the first
-                    // unwritten byte, and reporting that as a torn tail would
-                    // make every ordinary crash look like a torn one. Each
-                    // stop reason is matched explicitly — no catch-all, per
-                    // the scope 5 charter.
-                    tail_stop_offset = match scan.stop {
-                        TailStop::EndOfPreallocation => None,
-                        TailStop::NotAFrame => (quarantined_bytes > 0).then_some(scan.stop_offset),
-                        TailStop::Incomplete(_) => Some(scan.stop_offset),
-                        TailStop::ReadError => Some(scan.stop_offset),
-                    };
-                    report.tail_stop = Some(scan.stop);
-                }
-            }
-        }
-
-        // --- step 9: both halves, each with its own error type --------------
-        //
-        // The shard domain is anchored on the checkpoint when there is one and
-        // on the first replayed frame otherwise; the repository domain is
-        // anchored on the checkpoint's catalog, extended by the first replayed
-        // frame of any repository the catalog does not already know.
-        verify_replayed_sequences(
-            &replayed,
-            checkpointed.then(|| committed.saturating_add(1)),
-            &checkpoint.catalog,
-        )?;
-
-        // --- step 10: receipt visibility ------------------------------------
-        //
-        // Over the checkpointed receipts and over one synthesized per replayed
-        // frame, so the promotion runs against both halves: an operation whose
-        // first visibility was durably captured must not move, and one that
-        // was only replayed must be promoted to recovery publication time.
-        let recovery_publication_micros = now_micros();
-        let mut receipts = checkpoint.receipts.clone();
-        for facts in &replayed {
-            let mut record = receipt_for(facts, recovery_publication_micros)?;
-            // Not durably captured: this frame was replayed, not restored
-            // from a checkpoint. `None` is what makes step 10 promote it.
-            record.first_receipt_visibility_micros = None;
-            receipts.push(record);
-        }
-        report.promotions = recovery::promote_receipt_visibility(
-            &mut receipts,
-            recovery_publication_micros,
-            DRIVE_TERMINAL_STATUS_GRACE_MICROS,
-        )?;
-
-        report.adopted_shard_sequences = adopted_shard_sequences;
-        report.quarantined_bytes = quarantined_bytes;
-        debug_assert_eq!(
-            report.quarantined.is_some(),
-            quarantined_bytes > 0,
-            "a quarantine record and a non-zero byte count are the same fact \
-             and are produced by the same call; they can never disagree"
-        );
-        // Scope 3.8 step 12: computed, never a default.
-        report.ready = !report.offline_rebuild_required;
-
-        debug_assert_eq!(
-            used_manifest_fallback,
-            matches!(
-                report.manifest_source,
-                Some(recovery::ManifestSource::Fallback { .. })
-            ),
-            "the fallback decision and the reported manifest source must agree"
-        );
-        Ok(DriveRecovery::from_report(report, tail_stop_offset))
+        recovery::recover_shard(root, shard, &config).map(DriveRecovery::from_recovered)
     }
 }
 
@@ -909,6 +723,7 @@ impl ShardDrive {
 /// transaction.
 fn receipt_for(
     facts: &FrameFacts,
+    recovered: &recovery::RecoveredPayloadFacts,
     first_visible_micros: i64,
 ) -> Result<crate::checkpoint::ReceiptRecord, StoreError> {
     Ok(crate::checkpoint::ReceiptRecord {
@@ -918,7 +733,8 @@ fn receipt_for(
         repo_sequence: facts.repo_sequence,
         shard_sequence: facts.shard_sequence,
         current_authority: facts.current_authority,
-        objects_new: facts.objects.len() as u64,
+        refs: recovered.applied_refs.clone(),
+        objects_new: recovered.objects_new,
         retry_until_micros: facts.retry_until_micros,
         first_receipt_visibility_micros: Some(first_visible_micros),
         // Recomputed by `recovery::promote_receipt_visibility`, which may only
@@ -980,33 +796,7 @@ impl PayloadFacts for DrivePayloadFacts {
     fn extend(&self, facts: &mut FrameFacts, payload: &[u8]) -> Result<(), StoreError> {
         let namespace = *facts.namespace.as_bytes();
         match TransactionFramePayloadV1::decode_canonical(payload) {
-            Ok(decoded) => {
-                let extracted = decoded.facts()?;
-                if extracted.repo_id.0 != namespace {
-                    return Err(StoreError::Corruption(format!(
-                        "frame header names namespace {} but its payload names repository {}",
-                        facts.namespace.to_hex(),
-                        hex::encode(extracted.repo_id.0)
-                    )));
-                }
-                if extracted.repo_sequence != facts.repo_sequence {
-                    return Err(StoreError::Corruption(format!(
-                        "frame header carries repo_sequence {} but its payload carries {}",
-                        facts.repo_sequence, extracted.repo_sequence
-                    )));
-                }
-                facts.event_digest = extracted.event_digest;
-                facts.previous_event_digest = extracted.previous_event_digest;
-                facts.creates_namespace = decoded.repository_create.is_some();
-                facts.genesis_authority = decoded
-                    .repository_create
-                    .as_ref()
-                    .map(|create| create.genesis_authority)
-                    .unwrap_or(extracted.old_authority);
-                facts.current_authority = extracted.new_authority;
-                facts.retry_until_micros = extracted.retry_until_micros;
-                Ok(())
-            }
+            Ok(_) => recovery::CanonicalPayloadFacts.extend(facts, payload),
             Err(_) => {
                 facts.event_digest = synthetic_event_digest(&namespace, Some(facts.repo_sequence));
                 facts.previous_event_digest =
@@ -1019,68 +809,28 @@ impl PayloadFacts for DrivePayloadFacts {
             }
         }
     }
-}
 
-fn drive_frame_facts(frame: &Frame) -> Result<FrameFacts, StoreError> {
-    let mut facts = FrameFacts::from_header(&frame.header);
-    DrivePayloadFacts.extend(&mut facts, &frame.payload)?;
-    Ok(facts)
-}
+    fn permits_implicit_namespace_anchor(&self) -> bool {
+        true
+    }
 
-/// Recovery step 9 for the driven shard, through A2's two verifiers.
-///
-/// They return distinct, non-interchangeable fault types by construction, so a
-/// shard-domain fault and a repository-domain fault can never arrive as the
-/// same error — which is what scope 4-A2 deliverable 4 requires and what a
-/// single hand-rolled contiguity loop here would have destroyed.
-///
-/// Both domains need an anchor, and the anchor is stated rather than implied:
-///
-/// - `first_expected` is the checkpoint's committed sequence plus one when a
-///   checkpoint was loaded. Without one there is nothing above which the shard
-///   sequence is known to be contiguous, so the first replayed frame anchors
-///   itself; a verifier started at zero would report a gap for every store
-///   that has ever rotated, and one started at the first frame *with* a
-///   checkpoint present would miss a hole between the two.
-/// - `catalog` is the checkpoint's namespace catalog. A repository the catalog
-///   does not know is anchored on its own first replayed frame, because the
-///   drive seam has no earlier durable state to chain onto.
-fn verify_replayed_sequences(
-    replayed: &[FrameFacts],
-    first_expected: Option<u64>,
-    catalog: &NamespaceCatalog,
-) -> Result<(), StoreError> {
-    let anchor = match first_expected.or_else(|| replayed.first().map(|f| f.shard_sequence)) {
-        Some(anchor) => anchor,
-        None => return Ok(()),
-    };
-    recovery::verify_shard_sequence(replayed, anchor).map_err(StoreError::from)?;
-
-    let mut catalog = catalog.clone();
-    let mut chained: Vec<FrameFacts> = Vec::with_capacity(replayed.len());
-    for facts in replayed {
-        if catalog.get(&facts.namespace).is_none() {
-            catalog.bind(NamespaceRecord {
-                namespace: facts.namespace,
-                genesis_authority: facts.genesis_authority,
-                current_authority: facts.current_authority,
-                lifecycle: NamespaceLifecycle::Active,
-                storage_mode: NamespaceStorageMode::Full,
-                repo_sequence: facts.repo_sequence,
-                previous_event_digest: facts.event_digest,
-            })?;
-        } else {
-            chained.push(facts.clone());
+    fn recovered(&self, payload: &[u8]) -> Result<recovery::RecoveredPayloadFacts, StoreError> {
+        match TransactionFramePayloadV1::decode_canonical(payload) {
+            Ok(_) => recovery::CanonicalPayloadFacts.recovered(payload),
+            Err(_) => Ok(recovery::RecoveredPayloadFacts::default()),
         }
     }
-    recovery::verify_repo_chain(&chained, &catalog).map_err(StoreError::from)?;
-    Ok(())
 }
 
-/// The single `*.journal` in a shard's `active/`, if there is one.
-///
-/// More than one is a corruption, not a choice to make: only the shard owner
-/// names anything under its shard, and it opens exactly one journal at a time.
+fn drive_frame_facts(
+    frame: &Frame,
+) -> Result<(FrameFacts, recovery::RecoveredPayloadFacts), StoreError> {
+    let mut facts = FrameFacts::from_header(&frame.header);
+    DrivePayloadFacts.extend(&mut facts, &frame.payload)?;
+    let recovered = DrivePayloadFacts.recovered(&frame.payload)?;
+    Ok((facts, recovered))
+}
+
 fn active_journal_path(paths: &ShardPaths) -> Result<Option<PathBuf>, StoreError> {
     let dir = match std::fs::read_dir(paths.active()) {
         Ok(dir) => dir,

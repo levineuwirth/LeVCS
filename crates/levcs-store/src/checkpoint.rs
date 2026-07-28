@@ -30,10 +30,11 @@ use std::io::IoSlice;
 use std::path::{Path, PathBuf};
 
 use levcs_core::ObjectId;
+use levcs_protocol::v2::{RefTarget, MAX_REF_UPDATES};
 
 use crate::format::{CHECKPOINT_DIGEST_DOMAIN, CHECKPOINT_MAGIC, STORAGE_VERSION};
 use crate::index::{NamespaceCatalog, NamespaceLifecycle, NamespaceRecord, NamespaceStorageMode};
-use crate::types::{DurabilityCounters, NamespaceId, OperationId, StoreError};
+use crate::types::{AppliedRef, DurabilityCounters, NamespaceId, OperationId, StoreError};
 
 /// 88 bytes of named fields, zero padding to 96, then a 32-byte header digest.
 /// Every byte that is not a named field must be zero, for the same reason
@@ -50,6 +51,18 @@ const MAX_CHECKPOINT_NAMESPACES: u32 = 4_000_000;
 const MAX_CHECKPOINT_REFS: u32 = 64_000_000;
 const MAX_CHECKPOINT_RECEIPTS: u32 = 64_000_000;
 const MAX_REF_NAME_LEN: u16 = 1024;
+
+/// Checkpoint-body capability: every retained receipt carries its complete
+/// applied-ref result.
+///
+/// Checkpoints are derived and independently versioned by their flags within
+/// storage version 1. A version-1 checkpoint with flags zero predates this
+/// capability. It remains readable only when it has no retained receipts;
+/// otherwise accepting it would publish a receipt with an invented empty ref
+/// result. Such generations are rejected and recovery enters its existing
+/// explicit offline-rebuild path when no newer complete generation exists.
+const CHECKPOINT_FLAG_RECEIPT_REFS: u32 = 1 << 0;
+const CHECKPOINT_KNOWN_FLAGS: u32 = CHECKPOINT_FLAG_RECEIPT_REFS;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -68,8 +81,10 @@ pub enum CheckpointError {
     Magic,
     #[error("checkpoint storage version {0} is not readable")]
     StorageVersion(u16),
-    #[error("checkpoint flags and reserved fields must be zero")]
+    #[error("checkpoint has unknown flags or non-zero reserved fields")]
     Flags,
+    #[error("checkpoint predates complete applied-ref receipt retention")]
+    ReceiptRefsUnavailable,
     #[error("checkpoint header digest does not recompute")]
     HeaderDigest,
     #[error("checkpoint trailer magic or repeated total_len does not match")]
@@ -125,6 +140,12 @@ pub struct ReceiptRecord {
     pub repo_sequence: u64,
     pub shard_sequence: u64,
     pub current_authority: ObjectId,
+    /// The exact per-transaction result, including deletions and force.
+    ///
+    /// This cannot be reconstructed from the checkpoint's current ref table:
+    /// that table has neither the old value nor transaction membership, and a
+    /// deleted ref is absent from it entirely.
+    pub refs: Vec<AppliedRef>,
     pub objects_new: u64,
     pub retry_until_micros: i64,
     /// `None` when the crash preceded a durable capture of first visibility.
@@ -286,8 +307,148 @@ fn read_optional_i64(
     }
 }
 
+fn put_optional_object_id(out: &mut Vec<u8>, value: Option<ObjectId>) {
+    match value {
+        Some(value) => {
+            out.push(1);
+            out.extend_from_slice(value.as_bytes());
+        }
+        None => out.push(0),
+    }
+}
+
+fn read_optional_object_id(
+    r: &mut Reader<'_>,
+    what: &'static str,
+) -> Result<Option<ObjectId>, CheckpointError> {
+    match r.u8(what)? {
+        0 => Ok(None),
+        1 => Ok(Some(ObjectId(r.bytes32(what)?))),
+        _ => Err(CheckpointError::Body(
+            "optional object-id presence byte must be 0 or 1",
+        )),
+    }
+}
+
+fn ref_target_parts(target: &RefTarget) -> (u8, &str) {
+    match target {
+        RefTarget::Branch(name) => (1, name),
+        RefTarget::Release(name) => (2, name),
+    }
+}
+
+fn validate_ref_target(name: &str) -> Result<(), StoreError> {
+    if name.len() > MAX_REF_NAME_LEN as usize {
+        return Err(StoreError::LimitExceeded {
+            limit: "checkpoint_receipt_ref_name_len",
+            observed: name.len() as u64,
+            allowed: MAX_REF_NAME_LEN as u64,
+        });
+    }
+    if name.is_empty()
+        || name.as_bytes().contains(&0)
+        || levcs_core::refs::validate_ref_name(name).is_err()
+    {
+        return Err(StoreError::Corruption(
+            "checkpoint receipt contains an invalid applied-ref target".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Checkpoint-local physical encoding of the frozen `AppliedRefV1` value.
+///
+/// The protocol codec intentionally keeps its element codec private. Plan
+/// §13 keeps these checkpoint bytes internal, so this codec delegates name
+/// validation to the same `levcs-core` function and pins the complete logical
+/// value rather than reaching through a private protocol implementation.
+fn put_applied_refs(out: &mut Vec<u8>, refs: &[AppliedRef]) -> Result<(), StoreError> {
+    if refs.len() > MAX_REF_UPDATES {
+        return Err(StoreError::LimitExceeded {
+            limit: "checkpoint_receipt_applied_refs",
+            observed: refs.len() as u64,
+            allowed: MAX_REF_UPDATES as u64,
+        });
+    }
+    let mut targets = std::collections::BTreeSet::new();
+    put_u32(out, refs.len() as u32);
+    for applied in refs {
+        if !targets.insert(applied.target.clone()) {
+            return Err(StoreError::Corruption(
+                "checkpoint receipt contains duplicate applied-ref targets".into(),
+            ));
+        }
+        let (kind, name) = ref_target_parts(&applied.target);
+        validate_ref_target(name)?;
+        out.push(kind);
+        put_u16(out, name.len() as u16);
+        out.extend_from_slice(name.as_bytes());
+        put_optional_object_id(out, applied.old);
+        put_optional_object_id(out, applied.new);
+        out.push(u8::from(applied.force));
+    }
+    Ok(())
+}
+
+fn read_applied_refs(r: &mut Reader<'_>) -> Result<Vec<AppliedRef>, CheckpointError> {
+    let count = r.u32("receipt applied-ref count")?;
+    if count as usize > MAX_REF_UPDATES {
+        return Err(CheckpointError::CountCeiling("receipt applied refs"));
+    }
+    // Seven bytes is the smallest valid record: kind, name length, one-byte
+    // name, two absent object IDs, and force.
+    let mut refs = Vec::with_capacity((count as usize).min(r.bytes.len() / 7 + 1));
+    let mut targets = std::collections::BTreeSet::new();
+    for _ in 0..count {
+        let kind = r.u8("receipt ref target kind")?;
+        let name_len = r.u16("receipt ref target name length")?;
+        if name_len > MAX_REF_NAME_LEN {
+            return Err(CheckpointError::CountCeiling(
+                "receipt ref target name length",
+            ));
+        }
+        if name_len == 0 {
+            return Err(CheckpointError::Body("receipt ref target name length"));
+        }
+        let name = std::str::from_utf8(r.take(name_len as usize, "receipt ref target name")?)
+            .map_err(|_| CheckpointError::Body("receipt ref target name utf-8"))?
+            .to_owned();
+        if name.as_bytes().contains(&0) || levcs_core::refs::validate_ref_name(&name).is_err() {
+            return Err(CheckpointError::Body("receipt ref target name"));
+        }
+        let target = match kind {
+            1 => RefTarget::Branch(name),
+            2 => RefTarget::Release(name),
+            _ => return Err(CheckpointError::Body("receipt ref target kind")),
+        };
+        if !targets.insert(target.clone()) {
+            return Err(CheckpointError::Body(
+                "duplicate receipt applied-ref target",
+            ));
+        }
+        let old = read_optional_object_id(r, "receipt old ref object")?;
+        let new = read_optional_object_id(r, "receipt new ref object")?;
+        let force = match r.u8("receipt applied-ref force")? {
+            0 => false,
+            1 => true,
+            _ => return Err(CheckpointError::Body("receipt applied-ref force")),
+        };
+        refs.push(AppliedRef {
+            target,
+            old,
+            new,
+            force,
+        });
+    }
+    Ok(refs)
+}
+
 impl Checkpoint {
     pub fn encode(&self) -> Result<Vec<u8>, StoreError> {
+        self.encode_with_receipt_refs(true)
+    }
+
+    fn encode_with_receipt_refs(&self, include_receipt_refs: bool) -> Result<Vec<u8>, StoreError> {
         if self.catalog.len() as u64 > MAX_CHECKPOINT_NAMESPACES as u64 {
             return Err(StoreError::LimitExceeded {
                 limit: "checkpoint_namespaces",
@@ -349,6 +510,9 @@ impl Checkpoint {
             put_u64(&mut body, rec.repo_sequence);
             put_u64(&mut body, rec.shard_sequence);
             body.extend_from_slice(&rec.current_authority.0);
+            if include_receipt_refs {
+                put_applied_refs(&mut body, &rec.refs)?;
+            }
             put_u64(&mut body, rec.objects_new);
             put_i64(&mut body, rec.retry_until_micros);
             put_optional_i64(&mut body, rec.first_receipt_visibility_micros);
@@ -361,7 +525,14 @@ impl Checkpoint {
         header.extend_from_slice(&CHECKPOINT_MAGIC);
         put_u16(&mut header, STORAGE_VERSION);
         put_u16(&mut header, CHECKPOINT_HEADER_LEN as u16);
-        put_u32(&mut header, 0); // flags: must be zero
+        put_u32(
+            &mut header,
+            if include_receipt_refs {
+                CHECKPOINT_FLAG_RECEIPT_REFS
+            } else {
+                0
+            },
+        );
         header.extend_from_slice(&self.root_uuid);
         put_u16(&mut header, self.shard_index);
         put_u16(&mut header, 0); // reserved
@@ -408,9 +579,11 @@ impl Checkpoint {
         if head.u16("header_len")? as usize != CHECKPOINT_HEADER_LEN {
             return Err(CheckpointError::Body("header_len"));
         }
-        if head.u32("flags")? != 0 {
+        let checkpoint_flags = head.u32("flags")?;
+        if checkpoint_flags & !CHECKPOINT_KNOWN_FLAGS != 0 {
             return Err(CheckpointError::Flags);
         }
+        let has_receipt_refs = checkpoint_flags & CHECKPOINT_FLAG_RECEIPT_REFS != 0;
         let file_root_uuid = head.bytes16("root_uuid")?;
         let file_shard = head.u16("shard_index")?;
         if head.u16("reserved")? != 0 || head.u32("reserved")? != 0 {
@@ -543,7 +716,9 @@ impl Checkpoint {
         if receipt_count > MAX_CHECKPOINT_RECEIPTS {
             return Err(CheckpointError::CountCeiling("receipts"));
         }
-        let mut receipts = Vec::with_capacity((receipt_count as usize).min(body.len() / 161 + 1));
+        let minimum_receipt_len = if has_receipt_refs { 165 } else { 161 };
+        let mut receipts =
+            Vec::with_capacity((receipt_count as usize).min(body.len() / minimum_receipt_len + 1));
         for _ in 0..receipt_count {
             receipts.push(ReceiptRecord {
                 namespace: NamespaceId(r.bytes32("receipt namespace")?),
@@ -552,6 +727,11 @@ impl Checkpoint {
                 repo_sequence: r.u64("repo_sequence")?,
                 shard_sequence: r.u64("shard_sequence")?,
                 current_authority: ObjectId(r.bytes32("current_authority")?),
+                refs: if has_receipt_refs {
+                    read_applied_refs(&mut r)?
+                } else {
+                    Vec::new()
+                },
                 objects_new: r.u64("objects_new")?,
                 retry_until_micros: r.i64("retry_until_micros")?,
                 first_receipt_visibility_micros: read_optional_i64(&mut r, "first_visibility")?,
@@ -561,6 +741,9 @@ impl Checkpoint {
 
         if !r.finished() {
             return Err(CheckpointError::TrailingBytes);
+        }
+        if !has_receipt_refs && !receipts.is_empty() {
+            return Err(CheckpointError::ReceiptRefsUnavailable);
         }
 
         Ok(Self {
@@ -719,13 +902,13 @@ pub fn install(
             .open(&tmp_path)?;
         let end = crate::sys::write_vectored_all(&mut file, &[IoSlice::new(&bytes)], counters)
             .map_err(|e| {
-                StoreError::Io(std::io::Error::new(
+                StoreError::from(std::io::Error::new(
                     e.kind(),
                     format!("checkpoint body write failed: {e}"),
                 ))
             })?;
         if end != bytes.len() as u64 {
-            return Err(StoreError::Io(std::io::Error::new(
+            return Err(StoreError::from(std::io::Error::new(
                 std::io::ErrorKind::WriteZero,
                 format!(
                     "short write installing checkpoint: wrote {end} of {} bytes; \
@@ -739,7 +922,7 @@ pub fn install(
     crate::sys::rename_noreplace(&tmp_path, &final_path).map_err(|e| {
         // Leave the temporary behind for forensics rather than unlinking it
         // on a path that already surprised us.
-        StoreError::Io(e)
+        StoreError::from(e)
     })?;
     crate::sys::fsync_dir(dir, counters)?;
     Ok(final_path)
@@ -827,6 +1010,20 @@ mod tests {
                     repo_sequence: 7,
                     shard_sequence: 4241,
                     current_authority: oid(0x21),
+                    refs: vec![
+                        AppliedRef {
+                            target: RefTarget::Branch("refs/branches/main".into()),
+                            old: Some(oid(0x60)),
+                            new: Some(oid(0x61)),
+                            force: false,
+                        },
+                        AppliedRef {
+                            target: RefTarget::Release("refs/releases/old".into()),
+                            old: Some(oid(0x62)),
+                            new: None,
+                            force: true,
+                        },
+                    ],
                     objects_new: 3,
                     retry_until_micros: 1_700_000_900_000_000,
                     first_receipt_visibility_micros: Some(1_700_000_000_500_000),
@@ -839,6 +1036,7 @@ mod tests {
                     repo_sequence: 14,
                     shard_sequence: 4242,
                     current_authority: oid(0x22),
+                    refs: Vec::new(),
                     objects_new: 0,
                     retry_until_micros: 1_700_000_900_000_000,
                     first_receipt_visibility_micros: None,
@@ -854,6 +1052,52 @@ mod tests {
         let bytes = checkpoint.encode().expect("encode");
         let decoded = Checkpoint::decode(&bytes, &ROOT, SHARD).expect("decode");
         assert_eq!(decoded, checkpoint);
+        assert_eq!(
+            decoded.receipts[0].refs, checkpoint.receipts[0].refs,
+            "old/new values, deletion, force, target kind, and order are receipt data"
+        );
+    }
+
+    #[test]
+    fn a_legacy_checkpoint_with_receipts_requires_offline_rebuild() {
+        let legacy = sample()
+            .encode_with_receipt_refs(false)
+            .expect("legacy fixture");
+        assert_eq!(
+            Checkpoint::decode(&legacy, &ROOT, SHARD).unwrap_err(),
+            CheckpointError::ReceiptRefsUnavailable,
+            "inventing an empty applied-ref result would turn a committed receipt into a lie"
+        );
+    }
+
+    #[test]
+    fn a_legacy_checkpoint_without_receipts_remains_readable() {
+        let mut checkpoint = sample();
+        checkpoint.receipts.clear();
+        let legacy = checkpoint
+            .encode_with_receipt_refs(false)
+            .expect("legacy fixture");
+        assert_eq!(
+            Checkpoint::decode(&legacy, &ROOT, SHARD).expect("no receipt information is missing"),
+            checkpoint
+        );
+    }
+
+    #[test]
+    fn a_directory_of_legacy_receipt_checkpoints_enters_offline_rebuild() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let checkpoint = sample();
+        let legacy = checkpoint
+            .encode_with_receipt_refs(false)
+            .expect("legacy fixture");
+        std::fs::write(dir.path().join(checkpoint.file_name()), legacy).expect("write fixture");
+        match load_newest_valid(dir.path(), &ROOT, SHARD, 8).expect("load") {
+            CheckpointLoad::OfflineRebuildRequired { rejected } => {
+                assert_eq!(rejected.len(), 1);
+                assert_eq!(rejected[0].1, CheckpointError::ReceiptRefsUnavailable);
+            }
+            other => panic!("missing receipt data must require offline rebuild, got {other:?}"),
+        }
     }
 
     #[test]
@@ -899,7 +1143,7 @@ mod tests {
         );
 
         let mut flags = good.clone();
-        flags[12] = 1;
+        flags[12] |= 2;
         assert_eq!(
             Checkpoint::decode(&flags, &ROOT, SHARD).unwrap_err(),
             CheckpointError::Flags

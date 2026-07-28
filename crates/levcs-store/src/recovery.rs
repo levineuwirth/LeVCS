@@ -75,17 +75,35 @@
 //! device actually retained, which is the input A3's external ACK
 //! reconciliation needs to catch a device that lied about a flush.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use levcs_core::ObjectId;
+use im::Vector;
+use levcs_core::{ObjectId, ObjectType};
 use levcs_protocol::oracle::{self, RecoveredTailFact, RecoveryOutcome};
+use levcs_protocol::v2::{RefMutation, RefTarget, StagedProjectionInstallV1, TypedRefCas};
 
-use crate::checkpoint::{Checkpoint, CheckpointLoad, ReceiptRecord};
-use crate::format::{CurrentPointer, FrameError, FrameHeader, JournalHeader, Manifest};
-use crate::index::{IndexDelta, IndexKey, IndexLocation, NamespaceCatalog};
-use crate::journal::{QuarantinedTail, ScannedFrame, TailScan};
-use crate::segment::{self, ShardPaths};
+use crate::checkpoint::{Checkpoint, CheckpointError, CheckpointLoad, ReceiptRecord, RefRecord};
+use crate::format::{
+    CurrentPointer, Frame, FrameError, FrameHeader, FrameObjectsV1, JournalHeader, Manifest,
+    TailRange, TransactionFramePayloadV1, JOURNAL_HEADER_LEN,
+};
+use crate::index::{IndexDelta, IndexKey, IndexLocation, IndexRun, NamespaceCatalog};
+use crate::journal::{Journal, QuarantinedTail, ScannedFrame, TailScan, TailStop};
+use crate::options::StoreOptions;
+use crate::roots::{
+    GenerationId, IndexDeltaLayer, LayeredObjectIndex, PinnedFile, RetainedGeneration,
+    RetainedIndexRun, RetainedProjectionArtifact, RetainedSegment as RootRetainedSegment,
+    RetainedTail,
+};
+use crate::segment::{self, RootLayout, SegmentReader, ShardPaths};
+use crate::staging::{
+    ProjectionRecoveryResolver, RecoveredProjectionArtifacts, RecoveredProjectionOutcome,
+    RecoveredProjectionResolution,
+};
+use crate::sys;
 use crate::types::{DurabilityCounters, NamespaceId, OperationId, StoreError};
 
 // ===========================================================================
@@ -115,6 +133,30 @@ pub enum ReferencedFileFault {
 /// worth the open on every startup.
 pub trait ReferencedFileValidator {
     fn validate(&self, dir: &Path, filename: &str) -> Result<(), ReferencedFileFault>;
+
+    fn validate_segment(&self, dir: &Path, range: &TailRange) -> Result<(), ReferencedFileFault> {
+        self.validate(dir, &range.filename)
+    }
+
+    fn validate_index(
+        &self,
+        dir: &Path,
+        generation: u64,
+        filename: &str,
+    ) -> Result<(), ReferencedFileFault> {
+        let _ = generation;
+        self.validate(dir, filename)
+    }
+
+    fn validate_checkpoint(
+        &self,
+        dir: &Path,
+        shard_sequence: u64,
+        filename: &str,
+    ) -> Result<(), ReferencedFileFault> {
+        let _ = shard_sequence;
+        self.validate(dir, filename)
+    }
 }
 
 pub struct PresenceAndLengthValidator {
@@ -185,6 +227,107 @@ impl ReferencedFileValidator for SegmentFooterValidator {
         segment::SegmentReader::open(&dir.join(filename), &self.root_uuid)
             .map(|_| ())
             .map_err(|e| ReferencedFileFault::Invalid(e.to_string()))
+    }
+}
+
+/// Full validator used by the production entry point.
+///
+/// Manifest fallback is decided only after every kind of referent has passed
+/// its real reader. Validating index/checkpoint files later would turn a bad
+/// `CURRENT` generation into a hard open failure instead of falling back to a
+/// valid predecessor, contrary to recovery step 2.
+struct ProductionReferentValidator {
+    root_uuid: [u8; 16],
+    shard_index: u16,
+}
+
+impl ReferencedFileValidator for ProductionReferentValidator {
+    fn validate(&self, dir: &Path, filename: &str) -> Result<(), ReferencedFileFault> {
+        PresenceAndLengthValidator { minimum_len: 1 }.validate(dir, filename)?;
+        let path = dir.join(filename);
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some("seg") => {
+                let reader = SegmentReader::open(&path, &self.root_uuid)
+                    .map_err(|error| ReferencedFileFault::Invalid(error.to_string()))?;
+                let header = reader
+                    .journal_header()
+                    .map_err(|error| ReferencedFileFault::Invalid(error.to_string()))?;
+                validate_journal_binding(
+                    &header,
+                    &self.root_uuid,
+                    self.shard_index,
+                    Some(&reader.footer().journal_id),
+                    None,
+                )
+                .map_err(|error| ReferencedFileFault::Invalid(error.to_string()))
+            }
+            Some("idx") => IndexRun::open(&path, &self.root_uuid)
+                .map(|_| ())
+                .map_err(|error| ReferencedFileFault::Invalid(error.to_string())),
+            Some(crate::checkpoint::CHECKPOINT_EXTENSION) => {
+                let bytes = std::fs::read(&path)
+                    .map_err(|error| ReferencedFileFault::Unreadable(error.to_string()))?;
+                Checkpoint::decode(&bytes, &self.root_uuid, self.shard_index)
+                    .map(|_| ())
+                    .map_err(|error| ReferencedFileFault::Invalid(error.to_string()))
+            }
+            _ => Err(ReferencedFileFault::Invalid(
+                "manifest referent has an unknown file extension".into(),
+            )),
+        }
+    }
+
+    fn validate_segment(&self, dir: &Path, range: &TailRange) -> Result<(), ReferencedFileFault> {
+        self.validate(dir, &range.filename)?;
+        let reader = SegmentReader::open(&dir.join(&range.filename), &self.root_uuid)
+            .map_err(|error| ReferencedFileFault::Invalid(error.to_string()))?;
+        let footer = reader.footer();
+        if footer.generation != range.generation
+            || footer.first_shard_sequence != range.first_shard_sequence
+            || footer.last_shard_sequence != range.last_shard_sequence
+        {
+            return Err(ReferencedFileFault::Invalid(format!(
+                "segment footer tuple ({}, {}, {}) disagrees with manifest row ({}, {}, {})",
+                footer.generation,
+                footer.first_shard_sequence,
+                footer.last_shard_sequence,
+                range.generation,
+                range.first_shard_sequence,
+                range.last_shard_sequence
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_index(
+        &self,
+        dir: &Path,
+        generation: u64,
+        filename: &str,
+    ) -> Result<(), ReferencedFileFault> {
+        self.validate(dir, filename)?;
+        let run = IndexRun::open(&dir.join(filename), &self.root_uuid)
+            .map_err(|error| ReferencedFileFault::Invalid(error.to_string()))?;
+        if run.generation() != generation {
+            return Err(ReferencedFileFault::Invalid(format!(
+                "index run declares generation {}, manifest row declares {generation}",
+                run.generation()
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_checkpoint(
+        &self,
+        _dir: &Path,
+        _shard_sequence: u64,
+        _filename: &str,
+    ) -> Result<(), ReferencedFileFault> {
+        // Checkpoints are derived state selected in normative recovery step 3.
+        // Missing, corrupt, or tuple-mismatched rows fall back within this
+        // manifest's ordered checkpoint list; they do not invalidate the
+        // transaction-authority tail closure selected in step 2.
+        Ok(())
     }
 }
 
@@ -292,28 +435,30 @@ fn load_generation(
             cause: e.to_string(),
         }
     })?;
+    validate_manifest_sequence_coverage(&manifest)
+        .map_err(|cause| ManifestFallbackReason::ReferentCorrupt { generation, cause })?;
 
     for range in &manifest.retained_tail_ranges {
         files
-            .validate(&paths.segments(), &range.filename)
+            .validate_segment(&paths.segments(), range)
             .map_err(|cause| ManifestFallbackReason::ReferentFileInvalid {
                 generation,
                 filename: range.filename.clone(),
                 cause,
             })?;
     }
-    for (_, filename) in &manifest.index_runs {
+    for (run_generation, filename) in &manifest.index_runs {
         files
-            .validate(&paths.indexes(), filename)
+            .validate_index(&paths.indexes(), *run_generation, filename)
             .map_err(|cause| ManifestFallbackReason::ReferentFileInvalid {
                 generation,
                 filename: filename.clone(),
                 cause,
             })?;
     }
-    for (_, filename) in &manifest.checkpoints {
+    for (shard_sequence, filename) in &manifest.checkpoints {
         files
-            .validate(&paths.checkpoints(), filename)
+            .validate_checkpoint(&paths.checkpoints(), *shard_sequence, filename)
             .map_err(|cause| ManifestFallbackReason::ReferentFileInvalid {
                 generation,
                 filename: filename.clone(),
@@ -321,6 +466,60 @@ fn load_generation(
             })?;
     }
     Ok(manifest)
+}
+
+fn validate_manifest_sequence_coverage(manifest: &Manifest) -> Result<(), String> {
+    if manifest.base_generation != 0 {
+        return Err(format!(
+            "Phase 1 recovery cannot interpret nonzero base_generation {}",
+            manifest.base_generation
+        ));
+    }
+
+    if manifest
+        .checkpoints
+        .iter()
+        .any(|(sequence, _)| *sequence > manifest.committed_shard_sequence)
+    {
+        return Err("checkpoint row is newer than the manifest's committed sequence".into());
+    }
+
+    let ranges = &manifest.retained_tail_ranges;
+    if ranges.is_empty() {
+        return Err(
+            "Phase 1 manifests may not have an empty retained tail; an empty shard has no manifest"
+                .into(),
+        );
+    }
+    if ranges[0].first_shard_sequence != 0 {
+        return Err(format!(
+            "Phase 1 retained tail begins at {}, expected 0",
+            ranges[0].first_shard_sequence
+        ));
+    }
+    for pair in ranges.windows(2) {
+        let expected = pair[0]
+            .last_shard_sequence
+            .checked_add(1)
+            .ok_or_else(|| "retained tail sequence overflow".to_string())?;
+        if pair[1].first_shard_sequence != expected {
+            return Err(format!(
+                "retained tail gap or overlap: generation {} ends at {}, generation {} begins at {}",
+                pair[0].generation,
+                pair[0].last_shard_sequence,
+                pair[1].generation,
+                pair[1].first_shard_sequence
+            ));
+        }
+    }
+    let last = ranges.last().expect("non-empty").last_shard_sequence;
+    if last != manifest.committed_shard_sequence {
+        return Err(format!(
+            "retained tail ends at {last}, manifest commits through {}",
+            manifest.committed_shard_sequence
+        ));
+    }
+    Ok(())
 }
 
 /// Recovery step 2, with the fault taxonomy scope 4-A2 requires.
@@ -342,9 +541,9 @@ pub fn resolve_manifest(
     max_candidates: usize,
 ) -> Result<Option<ManifestSelection>, StoreError> {
     let mut rejected: Vec<(u64, ManifestFallbackReason)> = Vec::new();
-    let fallback_reason: Option<ManifestFallbackReason>;
+    let current = segment::read_current(paths, root_uuid)?;
 
-    match segment::read_current(paths, root_uuid)? {
+    match current {
         Some(pointer) => match load_generation(paths, pointer.generation, root_uuid, files) {
             Ok(manifest) => {
                 return Ok(Some(ManifestSelection {
@@ -357,35 +556,69 @@ pub fn resolve_manifest(
             }
             Err(reason) => {
                 rejected.push((pointer.generation, reason.clone()));
-                fallback_reason = Some(reason);
+                // A valid pointer naming a missing or corrupt manifest gives
+                // recovery no closure to compare with an older generation.
+                // Guessing would silently roll back acknowledged transactions.
+                let refused_manifest =
+                    match segment::read_manifest(paths, pointer.generation, root_uuid) {
+                        Ok(manifest) if validate_manifest_sequence_coverage(&manifest).is_ok() => {
+                            manifest
+                        }
+                        Ok(_) | Err(_) => return Ok(None),
+                    };
+
+                let mut generations = segment::list_manifest_generations(paths)?;
+                generations.sort_unstable_by(|a, b| b.cmp(a));
+                for generation in generations.into_iter().take(max_candidates.max(1)) {
+                    if generation == pointer.generation {
+                        continue;
+                    }
+                    match load_generation(paths, generation, root_uuid, files) {
+                        Ok(manifest)
+                            if manifest.committed_shard_sequence
+                                == refused_manifest.committed_shard_sequence
+                                && manifest.retained_tail_ranges
+                                    == refused_manifest.retained_tail_ranges =>
+                        {
+                            return Ok(Some(ManifestSelection {
+                                manifest,
+                                generation,
+                                path: paths.manifest(generation),
+                                source: ManifestSource::Fallback {
+                                    reason: reason.clone(),
+                                },
+                                rejected,
+                            }));
+                        }
+                        Ok(_) => return Ok(None),
+                        Err(cause) => rejected.push((generation, cause)),
+                    }
+                }
+                return Ok(None);
             }
         },
-        None => fallback_reason = Some(classify_current_failure(paths, root_uuid)),
-    }
-
-    let reason = fallback_reason.expect("a fallback is only reached after a recorded failure");
-    let mut generations = segment::list_manifest_generations(paths)?;
-    generations.sort_unstable_by(|a, b| b.cmp(a));
-    for generation in generations.into_iter().take(max_candidates.max(1)) {
-        if rejected.iter().any(|(g, _)| *g == generation) {
-            continue;
-        }
-        match load_generation(paths, generation, root_uuid, files) {
-            Ok(manifest) => {
-                return Ok(Some(ManifestSelection {
+        None => {
+            let reason = classify_current_failure(paths, root_uuid);
+            let mut generations = segment::list_manifest_generations(paths)?;
+            generations.sort_unstable_by(|a, b| b.cmp(a));
+            let Some(generation) = generations.into_iter().next() else {
+                return Ok(None);
+            };
+            match load_generation(paths, generation, root_uuid, files) {
+                Ok(manifest) => Ok(Some(ManifestSelection {
                     manifest,
                     generation,
                     path: paths.manifest(generation),
-                    source: ManifestSource::Fallback {
-                        reason: reason.clone(),
-                    },
+                    source: ManifestSource::Fallback { reason },
                     rejected,
-                }))
+                })),
+                Err(cause) => {
+                    rejected.push((generation, cause));
+                    Ok(None)
+                }
             }
-            Err(cause) => rejected.push((generation, cause)),
         }
     }
-    Ok(None)
 }
 
 // ===========================================================================
@@ -406,6 +639,80 @@ pub fn load_checkpoint(
     // prune cannot turn startup into a linear hunt (plan §5.3).
     let max_candidates = (checkpoint_retain.max(2) as usize) * 4;
     crate::checkpoint::load_newest_valid(checkpoint_dir, root_uuid, shard_index, max_candidates)
+}
+
+/// Load checkpoints only through the selected manifest's authoritative rows.
+///
+/// A valid file in the directory is not sufficient authority: it may belong
+/// to a newer manifest generation that recovery rejected, or may be an orphan
+/// left between checkpoint installation and manifest installation. Selecting
+/// it would publish derived state beyond the selected journal/segment closure.
+fn load_authoritative_checkpoint(
+    paths: &ShardPaths,
+    selection: Option<&ManifestSelection>,
+    root_uuid: &[u8; 16],
+    shard_index: u16,
+    checkpoint_retain: u32,
+) -> Result<CheckpointLoad, StoreError> {
+    let Some(selection) = selection else {
+        let stray = crate::checkpoint::list_generations(&paths.checkpoints())?;
+        if stray.is_empty() {
+            return Ok(CheckpointLoad::Empty);
+        }
+        return Ok(CheckpointLoad::OfflineRebuildRequired {
+            rejected: stray
+                .into_iter()
+                .map(|(_, path)| {
+                    (
+                        path,
+                        CheckpointError::Body(
+                            "checkpoint is unreferenced because no authoritative manifest exists",
+                        ),
+                    )
+                })
+                .collect(),
+        });
+    };
+
+    if selection.manifest.checkpoints.is_empty() {
+        return Ok(CheckpointLoad::Empty);
+    }
+
+    let max_candidates = (checkpoint_retain.max(2) as usize) * 4;
+    let mut rejected = Vec::new();
+    for (declared_sequence, filename) in selection
+        .manifest
+        .checkpoints
+        .iter()
+        .rev()
+        .take(max_candidates.max(1))
+    {
+        let path = paths.checkpoints().join(filename);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                rejected.push((path, CheckpointError::Unreadable(error.to_string())));
+                continue;
+            }
+        };
+        match Checkpoint::decode(&bytes, root_uuid, shard_index) {
+            Ok(checkpoint) if checkpoint.shard_committed_sequence == *declared_sequence => {
+                return Ok(CheckpointLoad::Loaded {
+                    checkpoint: Box::new(checkpoint),
+                    path,
+                    rejected,
+                });
+            }
+            Ok(_) => rejected.push((
+                path,
+                CheckpointError::Body(
+                    "checkpoint shard sequence disagrees with authoritative manifest row",
+                ),
+            )),
+            Err(error) => rejected.push((path, error)),
+        }
+    }
+    Ok(CheckpointLoad::OfflineRebuildRequired { rejected })
 }
 
 // ===========================================================================
@@ -671,9 +978,120 @@ impl FrameFacts {
     }
 }
 
+/// Payload state needed for complete root reconstruction but not for the
+/// sequence-verification seam represented by [`FrameFacts`].
+///
+/// Kept separate so adding D0-B recovery state does not break Wave A's public
+/// `FrameFacts` struct literals.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RecoveredPayloadFacts {
+    pub ref_updates: Vec<TypedRefCas>,
+    pub applied_refs: Vec<crate::types::AppliedRef>,
+    pub objects_new: u64,
+    pub first_receipt_visibility_micros: Option<i64>,
+    pub staged_projection_install: Option<StagedProjectionInstallV1>,
+    pub objects: Vec<(ObjectId, u8)>,
+}
+
 /// Extracts the payload half of [`FrameFacts`].
 pub trait PayloadFacts {
     fn extend(&self, facts: &mut FrameFacts, payload: &[u8]) -> Result<(), StoreError>;
+
+    fn recovered(&self, _payload: &[u8]) -> Result<RecoveredPayloadFacts, StoreError> {
+        Ok(RecoveredPayloadFacts::default())
+    }
+
+    /// The drive seam predates canonical transaction payloads and can create
+    /// opaque scripted frames. Production extractors leave this false:
+    /// appearing without a repository-create frame is then corruption.
+    fn permits_implicit_namespace_anchor(&self) -> bool {
+        false
+    }
+}
+
+/// Production payload extractor.
+///
+/// A physical frame is complete without interpreting its payload, but a frame
+/// cannot enter a recovered logical root until its transaction payload has
+/// also passed the canonical decoder. The drive seam injects its explicit
+/// scripted-payload extractor through [`RecoveryConfig`]; production callers
+/// use this one.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct CanonicalPayloadFacts;
+
+impl PayloadFacts for CanonicalPayloadFacts {
+    fn extend(&self, facts: &mut FrameFacts, payload: &[u8]) -> Result<(), StoreError> {
+        let decoded = TransactionFramePayloadV1::decode_canonical(payload)?;
+        let extracted = decoded.facts()?;
+        if extracted.repo_id.0 != *facts.namespace.as_bytes() {
+            return Err(StoreError::Corruption(format!(
+                "frame header names namespace {} but its payload names repository {}",
+                facts.namespace.to_hex(),
+                hex::encode(extracted.repo_id.0)
+            )));
+        }
+        if extracted.repo_sequence != facts.repo_sequence {
+            return Err(StoreError::Corruption(format!(
+                "frame header carries repo_sequence {} but its payload carries {}",
+                facts.repo_sequence, extracted.repo_sequence
+            )));
+        }
+
+        facts.event_digest = extracted.event_digest;
+        facts.previous_event_digest = extracted.previous_event_digest;
+        facts.creates_namespace = decoded.repository_create.is_some();
+        facts.genesis_authority = decoded
+            .repository_create
+            .as_ref()
+            .map(|create| create.genesis_authority)
+            .unwrap_or(extracted.old_authority);
+        facts.current_authority = extracted.new_authority;
+        facts.retry_until_micros = extracted.retry_until_micros;
+        facts.objects = match decoded.objects {
+            FrameObjectsV1::Inline(objects) => objects
+                .into_iter()
+                .map(|object| (object.object_id, object_type_code(object.object_type)))
+                .collect(),
+            FrameObjectsV1::StagedProjectionInstall(_) => Vec::new(),
+        };
+        Ok(())
+    }
+
+    fn recovered(&self, payload: &[u8]) -> Result<RecoveredPayloadFacts, StoreError> {
+        let decoded = TransactionFramePayloadV1::decode_canonical(payload)?;
+        let extracted = decoded.facts()?;
+        let mut recovered = RecoveredPayloadFacts {
+            ref_updates: decoded.ref_cas.clone(),
+            applied_refs: decoded.committed.transaction.refs.clone(),
+            objects_new: extracted.objects_new,
+            first_receipt_visibility_micros: Some(extracted.first_receipt_visibility_micros),
+            ..RecoveredPayloadFacts::default()
+        };
+        match decoded.objects {
+            FrameObjectsV1::Inline(objects) => {
+                recovered.objects = objects
+                    .into_iter()
+                    .map(|object| (object.object_id, object_type_code(object.object_type)))
+                    .collect();
+            }
+            FrameObjectsV1::StagedProjectionInstall(install) => {
+                recovered.staged_projection_install = Some(install);
+            }
+        }
+        Ok(recovered)
+    }
+}
+
+fn object_type_code(value: ObjectType) -> u8 {
+    // Exhaustive so a new logical object type cannot acquire an accidental
+    // recovered-index representation.
+    match value {
+        ObjectType::Blob => 1,
+        ObjectType::Tree => 2,
+        ObjectType::Commit => 3,
+        ObjectType::Release => 4,
+        ObjectType::Authority => 5,
+    }
 }
 
 /// A shard-sequence fault.
@@ -998,6 +1416,9 @@ pub struct ShardRecoveryReport {
     pub tail_stop: Option<crate::journal::TailStop>,
     pub quarantined: Option<PathBuf>,
     pub quarantined_bytes: u64,
+    /// Durable hard link to the original active journal, before recovery
+    /// copied or sealed any prefix. The inode is byte-for-byte crash evidence.
+    pub preserved_journal: Option<PathBuf>,
     pub promotions: Vec<VisibilityPromotion>,
     /// Scope 3.8 step 12: readiness is true only after replay and
     /// catalog/genesis validation complete. A computed field, never a default.
@@ -1017,10 +1438,213 @@ impl ShardRecoveryReport {
             tail_stop: None,
             quarantined: None,
             quarantined_bytes: 0,
+            preserved_journal: None,
             promotions: Vec::new(),
             ready: false,
         }
     }
+}
+
+// ===========================================================================
+// Production shard recovery
+// ===========================================================================
+
+/// Bounded inputs to the shared recovery path.
+///
+/// Both `StoreEngine::open` and the `store-internals` drive seam call
+/// [`recover_shard`] with this type. The payload extractor is the only
+/// deliberate variation: production uses [`CanonicalPayloadFacts`], while the
+/// drive also supports the opaque scripted frames its writer API predates.
+pub struct RecoveryConfig<'a> {
+    pub max_manifest_candidates: usize,
+    pub manifest_retain: u32,
+    pub checkpoint_retain: u32,
+    pub journal_preallocate_bytes: u64,
+    pub terminal_status_grace_micros: i64,
+    pub max_active_index_entries: u64,
+    pub max_active_index_bytes: u64,
+    pub max_index_runs: u32,
+    pub max_open_index_runs: u32,
+    pub max_replay_frames: u64,
+    pub max_replay_bytes: u64,
+    pub payload_facts: &'a dyn PayloadFacts,
+    /// Staging-owned read-only resolution and lifecycle seam.
+    ///
+    /// A canonical committed staged-install frame cannot become ready without
+    /// this resolver supplying its exact namespace membership and live
+    /// artifact ownership.
+    pub(crate) projection_recovery_resolver: Option<&'a dyn ProjectionRecoveryResolver>,
+}
+
+impl<'a> RecoveryConfig<'a> {
+    pub fn from_store_options(options: &StoreOptions) -> Self {
+        static CANONICAL: CanonicalPayloadFacts = CanonicalPayloadFacts;
+        Self {
+            max_manifest_candidates: options.manifest_retain as usize,
+            manifest_retain: options.manifest_retain,
+            checkpoint_retain: options.checkpoint_retain,
+            journal_preallocate_bytes: options.journal_preallocate_bytes,
+            terminal_status_grace_micros: options.terminal_status_grace_micros,
+            max_active_index_entries: options.max_active_index_entries,
+            max_active_index_bytes: options.max_active_index_bytes,
+            max_index_runs: options.max_index_runs,
+            max_open_index_runs: options.max_open_index_runs,
+            max_replay_frames: options.max_replay_frames,
+            max_replay_bytes: options.max_replay_bytes,
+            payload_facts: &CANONICAL,
+            projection_recovery_resolver: None,
+        }
+    }
+
+    pub(crate) fn with_projection_recovery_resolver(
+        mut self,
+        resolver: &'a dyn ProjectionRecoveryResolver,
+    ) -> Self {
+        self.projection_recovery_resolver = Some(resolver);
+        self
+    }
+}
+
+/// Root-wide recovery and ownership session.
+///
+/// A store root may contain several shards, but `LOCK` is root-wide. B1 opens
+/// one session, recovers every shard through it, and retains the session for
+/// the engine's lifetime. That prevents another process from entering between
+/// shard recoveries or immediately after readiness. The drive's one-shot
+/// [`recover_shard`] wrapper uses the same type and simply drops it afterward.
+pub struct RecoverySession {
+    layout: RootLayout,
+    root_uuid: [u8; 16],
+    shard_count: u16,
+    _lock: File,
+}
+
+impl std::fmt::Debug for RecoverySession {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RecoverySession")
+            .field("root", &self.layout.root)
+            .field("root_uuid", &hex::encode(self.root_uuid))
+            .field("shard_count", &self.shard_count)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RecoverySession {
+    pub fn open(root: &Path) -> Result<Self, StoreError> {
+        let layout = RootLayout::new(root);
+        // Validate FORMAT before taking LOCK so an unrecognized root is never
+        // modified merely by attempting to open it.
+        let marker = segment::read_format(&layout)?;
+        let lock = segment::lock_root(&layout)?;
+        Ok(Self {
+            layout,
+            root_uuid: marker.root_uuid,
+            shard_count: marker.shard_count,
+            _lock: lock,
+        })
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.layout.root
+    }
+
+    pub fn root_uuid(&self) -> [u8; 16] {
+        self.root_uuid
+    }
+
+    pub fn shard_count(&self) -> u16 {
+        self.shard_count
+    }
+
+    pub fn recover_shard(
+        &self,
+        shard: u16,
+        config: &RecoveryConfig<'_>,
+    ) -> Result<RecoveredShard, StoreError> {
+        recover_shard_under_lock(self, shard, config)
+    }
+}
+
+/// One manifest-retained sealed segment, kept open for the recovered root's
+/// lifetime.
+#[derive(Clone)]
+pub struct RecoveredSegment {
+    pub generation: u64,
+    pub first_shard_sequence: u64,
+    pub last_shard_sequence: u64,
+    pub path: PathBuf,
+    pub reader: Arc<SegmentReader>,
+}
+
+impl std::fmt::Debug for RecoveredSegment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecoveredSegment")
+            .field("generation", &self.generation)
+            .field("first_shard_sequence", &self.first_shard_sequence)
+            .field("last_shard_sequence", &self.last_shard_sequence)
+            .field("path", &self.path)
+            .finish()
+    }
+}
+
+impl PartialEq for RecoveredSegment {
+    fn eq(&self, other: &Self) -> bool {
+        self.generation == other.generation
+            && self.first_shard_sequence == other.first_shard_sequence
+            && self.last_shard_sequence == other.last_shard_sequence
+            && self.path == other.path
+    }
+}
+
+impl Eq for RecoveredSegment {}
+
+/// The fresh active journal recovery fenced before reporting write readiness.
+#[derive(Clone, Debug)]
+pub struct RecoveredTail {
+    pub logical_generation: u64,
+    pub journal_id: [u8; 16],
+    pub path: PathBuf,
+    pub validated_through: u64,
+    file: Arc<File>,
+}
+
+impl RecoveredTail {
+    pub fn file(&self) -> &File {
+        &self.file
+    }
+}
+
+impl PartialEq for RecoveredTail {
+    fn eq(&self, other: &Self) -> bool {
+        self.logical_generation == other.logical_generation
+            && self.journal_id == other.journal_id
+            && self.path == other.path
+            && self.validated_through == other.validated_through
+    }
+}
+
+impl Eq for RecoveredTail {}
+
+/// Everything needed to construct one shard of `CommittedRoot`.
+#[derive(Clone, Debug)]
+pub struct RecoveredShard {
+    pub shard_index: u16,
+    pub catalog: NamespaceCatalog,
+    pub refs: Vec<RefRecord>,
+    pub receipts: Vec<ReceiptRecord>,
+    pub index: LayeredObjectIndex,
+    /// Live ownership of every artifact retained by the selected generation.
+    pub retained_generation: Arc<RetainedGeneration>,
+    pub segments: Vec<RecoveredSegment>,
+    pub tail: Option<RecoveredTail>,
+    pub manifest_generation: Option<u64>,
+    pub manifest_path: Option<PathBuf>,
+    pub committed_shard_sequence: Option<u64>,
+    pub repo_sequences: BTreeMap<NamespaceId, u64>,
+    pub projection_resolutions: Vec<RecoveredProjectionResolution>,
+    pub tail_stop_offset: Option<u64>,
+    pub report: ShardRecoveryReport,
 }
 
 /// Turn a checkpoint load into the state the later steps consume.
@@ -1046,5 +1670,1424 @@ pub fn checkpoint_for_recovery(
             report.ready = false;
             None
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ReplayedFrame {
+    facts: FrameFacts,
+    payload: RecoveredPayloadFacts,
+    generation: u64,
+    offset: u64,
+    len: u64,
+}
+
+/// Shared, non-feature-gated production recovery entry point.
+///
+/// This function is the one ordering of recovery steps 1–12. The engine and
+/// drive seam may choose different payload extractors, but neither owns a
+/// manifest, checkpoint, tail, sequence, visibility, or index decision.
+pub fn recover_shard(
+    root: &Path,
+    shard: u16,
+    config: &RecoveryConfig<'_>,
+) -> Result<RecoveredShard, StoreError> {
+    RecoverySession::open(root)?.recover_shard(shard, config)
+}
+
+fn recover_shard_under_lock(
+    session: &RecoverySession,
+    shard: u16,
+    config: &RecoveryConfig<'_>,
+) -> Result<RecoveredShard, StoreError> {
+    if shard >= session.shard_count {
+        return Err(StoreError::FormatMismatch(format!(
+            "shard {shard} is outside the root's frozen topology of {} shards",
+            session.shard_count
+        )));
+    }
+    let layout = &session.layout;
+    let root_uuid = session.root_uuid;
+    let paths = layout.shard(shard);
+    let counters = Arc::new(DurabilityCounters::default());
+    let mut report = ShardRecoveryReport::new(shard);
+
+    let referents = ProductionReferentValidator {
+        root_uuid,
+        shard_index: shard,
+    };
+    let selection = resolve_manifest(
+        &paths,
+        &root_uuid,
+        &referents,
+        config.max_manifest_candidates,
+    )?;
+    let mut selection = match selection {
+        Some(selection) => {
+            report.manifest_generation = Some(selection.generation);
+            report.manifest_source = Some(selection.source.clone());
+            Some(selection)
+        }
+        None if segment::list_manifest_generations(&paths)?.is_empty() => None,
+        None => return Err(StoreError::RecoveryRequired),
+    };
+
+    let mut segments = Vec::new();
+    let mut sealed_runs_newest_first = Vector::new();
+    let mut retained_index_runs = Vec::new();
+    let mut retained_checkpoints = Vec::new();
+    if let Some(selection) = &selection {
+        if selection.manifest.index_runs.len() as u64 > config.max_index_runs as u64 {
+            return Err(StoreError::LimitExceeded {
+                limit: "max_index_runs",
+                observed: selection.manifest.index_runs.len() as u64,
+                allowed: config.max_index_runs as u64,
+            });
+        }
+        if selection.manifest.index_runs.len() as u64 > config.max_open_index_runs as u64 {
+            return Err(StoreError::LimitExceeded {
+                limit: "max_open_index_runs",
+                observed: selection.manifest.index_runs.len() as u64,
+                allowed: config.max_open_index_runs as u64,
+            });
+        }
+        for (generation, filename) in selection.manifest.index_runs.iter().rev() {
+            let path = paths.indexes().join(filename);
+            let run = Arc::new(IndexRun::open(&path, &root_uuid)?);
+            if run.generation() != *generation {
+                return Err(StoreError::Corruption(format!(
+                    "manifest names index generation {generation}, but {} carries generation {}",
+                    path.display(),
+                    run.generation()
+                )));
+            }
+            sealed_runs_newest_first.push_back(Arc::clone(&run));
+            retained_index_runs.push(RetainedIndexRun::new(path, run));
+        }
+        for (_, filename) in &selection.manifest.checkpoints {
+            let path = paths.checkpoints().join(filename);
+            retained_checkpoints.push(PinnedFile::open(path)?);
+        }
+    }
+
+    let load = load_authoritative_checkpoint(
+        &paths,
+        selection.as_ref(),
+        &root_uuid,
+        shard,
+        config.checkpoint_retain,
+    )?;
+    let selected_checkpoint = match &load {
+        CheckpointLoad::Loaded {
+            checkpoint, path, ..
+        } => Some((checkpoint.shard_committed_sequence, path.clone())),
+        CheckpointLoad::Empty | CheckpointLoad::OfflineRebuildRequired { .. } => None,
+    };
+    let checkpoint = match checkpoint_for_recovery(load, &root_uuid, shard, &mut report) {
+        Some(checkpoint) => checkpoint,
+        None => {
+            debug_assert!(report.offline_rebuild_required);
+            return Err(StoreError::RecoveryRequired);
+        }
+    };
+    if let Some((_, path)) = selected_checkpoint {
+        if !retained_checkpoints
+            .iter()
+            .any(|entry| entry.path() == path)
+        {
+            retained_checkpoints.push(PinnedFile::open(path)?);
+        }
+    }
+
+    let checkpointed = report.checkpoint_sequence.is_some();
+    let committed = checkpoint.shard_committed_sequence;
+    let mut adopted_shard_sequences = Vec::new();
+    let mut replayed = Vec::new();
+    let mut replayed_bytes = 0u64;
+    let mut retained_segments = Vec::new();
+    let mut retained_tails = Vec::new();
+    if checkpointed {
+        let mut accounted: Vec<u64> = checkpoint
+            .receipts
+            .iter()
+            .map(|receipt| receipt.shard_sequence)
+            .filter(|sequence| *sequence <= committed)
+            .collect();
+        accounted.sort_unstable();
+        adopted_shard_sequences.extend(accounted);
+    }
+
+    if let Some(selection) = &selection {
+        for range in &selection.manifest.retained_tail_ranges {
+            let path = paths.segments().join(&range.filename);
+            let reader = Arc::new(SegmentReader::open(&path, &root_uuid)?);
+            validate_journal_binding(
+                &reader.journal_header()?,
+                &root_uuid,
+                shard,
+                Some(&reader.footer().journal_id),
+                None,
+            )?;
+            if reader.footer().generation != range.generation
+                || reader.footer().first_shard_sequence != range.first_shard_sequence
+                || reader.footer().last_shard_sequence != range.last_shard_sequence
+            {
+                return Err(StoreError::Corruption(format!(
+                    "manifest range does not match sealed segment {}",
+                    path.display()
+                )));
+            }
+
+            if !checkpointed || range.last_shard_sequence > committed {
+                for (sequence, offset, len) in reader.footer().offsets.clone() {
+                    if checkpointed && sequence <= committed {
+                        continue;
+                    }
+                    let frame = reader.read_frame(sequence)?;
+                    let (facts, payload) = frame_facts(&frame, config.payload_facts)?;
+                    account_replay(config, &mut replayed_bytes, len, replayed.len() as u64 + 1)?;
+                    adopted_shard_sequences.push(sequence);
+                    replayed.push(ReplayedFrame {
+                        facts,
+                        payload,
+                        generation: range.generation,
+                        offset,
+                        len,
+                    });
+                }
+            }
+            retained_segments.push(RootRetainedSegment::new(
+                range.generation,
+                reader.footer().journal_id,
+                range.first_shard_sequence,
+                range.last_shard_sequence,
+                PinnedFile::open(paths.segments().join(&range.filename))?,
+            ));
+            segments.push(RecoveredSegment {
+                generation: range.generation,
+                first_shard_sequence: range.first_shard_sequence,
+                last_shard_sequence: range.last_shard_sequence,
+                path,
+                reader,
+            });
+        }
+    }
+
+    let mut tail_stop_offset = None;
+    let mut quarantined_bytes = 0;
+    let mut recovered_tail = None;
+    let mut must_create_fresh = false;
+    let mut fresh_preallocation = config.journal_preallocate_bytes;
+    if let Some(path) = active_journal_path(&paths)? {
+        let file = File::open(&path)?;
+        let mut header_bytes = [0u8; JOURNAL_HEADER_LEN];
+        sys::pread_exact(&file, 0, &mut header_bytes)?;
+        let header = JournalHeader::decode(&header_bytes)?;
+        fresh_preallocation = header.preallocated_len;
+        let manifest_covered_through = selection.as_ref().and_then(|selected| {
+            selected
+                .manifest
+                .retained_tail_ranges
+                .last()
+                .map(|range| range.last_shard_sequence)
+        });
+        let covered_through = if checkpointed {
+            Some(manifest_covered_through.unwrap_or(committed).max(committed))
+        } else {
+            manifest_covered_through
+        };
+        validate_journal_binding(&header, &root_uuid, shard, None, covered_through)?;
+
+        let disposition = match &selection {
+            Some(selection) => classify_active_journal(
+                &paths,
+                &selection.manifest,
+                &header.journal_id,
+                &root_uuid,
+            )?,
+            None => ActiveJournalDisposition::Replay,
+        };
+        report.active_journal = Some(disposition.clone());
+        match disposition {
+            ActiveJournalDisposition::AlreadySealed { .. } => {
+                report.preserved_journal = Some(preserve_crash_journal(
+                    &path,
+                    &layout.quarantine_dir(),
+                    &header,
+                    &counters,
+                )?);
+                drop(file);
+                complete_interrupted_seal(&path, &paths, &counters)?;
+                must_create_fresh = true;
+            }
+            ActiveJournalDisposition::Replay => {
+                let recovery_generation = recovery_generation_for_journal(
+                    &paths,
+                    &root_uuid,
+                    &header.journal_id,
+                    config,
+                )?;
+                let from = if checkpointed && checkpoint.active_journal_id == header.journal_id {
+                    checkpoint
+                        .active_journal_offset
+                        .max(JOURNAL_HEADER_LEN as u64)
+                } else {
+                    JOURNAL_HEADER_LEN as u64
+                };
+                let full_scan =
+                    crate::journal::scan_journal(&file, &header, JOURNAL_HEADER_LEN as u64);
+                let resumes_checkpoint_journal =
+                    checkpointed && checkpoint.active_journal_id == header.journal_id;
+                if !resumes_checkpoint_journal {
+                    if let (Some(covered), Some(first)) =
+                        (covered_through, full_scan.frames.first())
+                    {
+                        if first.shard_sequence <= covered {
+                            return Err(ShardSequenceFault::Duplicate {
+                                shard_sequence: first.shard_sequence,
+                            }
+                            .into());
+                        }
+                        let expected = covered.saturating_add(1);
+                        if first.shard_sequence != expected {
+                            return Err(ShardSequenceFault::Gap {
+                                expected,
+                                observed: first.shard_sequence,
+                            }
+                            .into());
+                        }
+                    }
+                }
+                let (scan, record) = recover_journal_tail(
+                    &layout.quarantine_dir(),
+                    &file,
+                    &header,
+                    from,
+                    &counters,
+                )?;
+                quarantined_bytes = record.as_ref().map(|record| record.bytes).unwrap_or(0);
+                report.quarantined = record.map(|record| record.path);
+                for scanned in &scan.frames {
+                    let mut frame_bytes =
+                        vec![0u8; usize::try_from(scanned.len).map_err(|_| FrameError::Length)?];
+                    sys::pread_exact(&file, scanned.offset, &mut frame_bytes)?;
+                    let frame = Frame::decode(&frame_bytes, &header.journal_id)?;
+                    let (facts, payload) = frame_facts(&frame, config.payload_facts)?;
+                    account_replay(
+                        config,
+                        &mut replayed_bytes,
+                        scanned.len,
+                        replayed.len() as u64 + 1,
+                    )?;
+                    adopted_shard_sequences.push(scanned.shard_sequence);
+                    replayed.push(ReplayedFrame {
+                        facts,
+                        payload,
+                        generation: recovery_generation,
+                        offset: scanned.offset,
+                        len: scanned.len,
+                    });
+                }
+                tail_stop_offset = match scan.stop {
+                    TailStop::EndOfPreallocation => None,
+                    TailStop::NotAFrame => (quarantined_bytes > 0).then_some(scan.stop_offset),
+                    TailStop::Incomplete(_) | TailStop::ReadError => Some(scan.stop_offset),
+                };
+                report.tail_stop = Some(scan.stop.clone());
+
+                let damaged = matches!(
+                    full_scan.stop,
+                    TailStop::Incomplete(_) | TailStop::ReadError | TailStop::EndOfPreallocation
+                ) || quarantined_bytes > 0;
+                let must_replace = damaged || !full_scan.frames.is_empty();
+                if must_replace {
+                    report.preserved_journal = Some(preserve_crash_journal(
+                        &path,
+                        &layout.quarantine_dir(),
+                        &header,
+                        &counters,
+                    )?);
+
+                    if !full_scan.frames.is_empty() {
+                        let segment_path = segment::seal_recovered_prefix(
+                            &file,
+                            &header,
+                            &full_scan,
+                            &paths,
+                            recovery_generation,
+                            &counters,
+                        )?;
+                        let filename = segment_path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .ok_or_else(|| {
+                                StoreError::Corruption(
+                                    "recovery segment name is not valid UTF-8".into(),
+                                )
+                            })?
+                            .to_string();
+                        let first = full_scan.frames.first().expect("non-empty").shard_sequence;
+                        let last = full_scan.frames.last().expect("non-empty").shard_sequence;
+
+                        let (mut retained_tail_ranges, index_runs, checkpoints) = selection
+                            .as_ref()
+                            .map(|selected| {
+                                (
+                                    selected.manifest.retained_tail_ranges.clone(),
+                                    selected.manifest.index_runs.clone(),
+                                    selected.manifest.checkpoints.clone(),
+                                )
+                            })
+                            .unwrap_or((Vec::new(), Vec::new(), Vec::new()));
+                        retained_tail_ranges.push(TailRange {
+                            generation: recovery_generation,
+                            first_shard_sequence: first,
+                            last_shard_sequence: last,
+                            filename,
+                        });
+                        let manifest = Manifest {
+                            root_uuid,
+                            generation: recovery_generation,
+                            base_generation: 0,
+                            retained_tail_ranges,
+                            index_runs,
+                            checkpoints,
+                            committed_shard_sequence: last,
+                        };
+                        validate_manifest_sequence_coverage(&manifest)
+                            .map_err(StoreError::Corruption)?;
+                        segment::install_manifest(
+                            &paths,
+                            &manifest,
+                            config.manifest_retain,
+                            &counters,
+                        )?;
+
+                        let reader = Arc::new(SegmentReader::open(&segment_path, &root_uuid)?);
+                        retained_segments.push(RootRetainedSegment::new(
+                            recovery_generation,
+                            header.journal_id,
+                            first,
+                            last,
+                            PinnedFile::open(segment_path.clone())?,
+                        ));
+                        segments.push(RecoveredSegment {
+                            generation: recovery_generation,
+                            first_shard_sequence: first,
+                            last_shard_sequence: last,
+                            path: segment_path,
+                            reader,
+                        });
+
+                        let manifest_path = paths.manifest(recovery_generation);
+                        selection = Some(ManifestSelection {
+                            manifest,
+                            generation: recovery_generation,
+                            path: manifest_path,
+                            source: ManifestSource::Current,
+                            rejected: Vec::new(),
+                        });
+                        report.manifest_generation = Some(recovery_generation);
+                    }
+
+                    drop(file);
+                    complete_interrupted_seal(&path, &paths, &counters)?;
+                    must_create_fresh = true;
+                } else {
+                    let shared_file = Arc::new(file);
+                    let retained_tail =
+                        PinnedFile::from_shared(path.clone(), Arc::clone(&shared_file));
+                    recovered_tail = Some(RecoveredTail {
+                        logical_generation: recovery_generation,
+                        journal_id: header.journal_id,
+                        path,
+                        validated_through: JOURNAL_HEADER_LEN as u64,
+                        file: shared_file,
+                    });
+                    retained_tails.push(RetainedTail::new(recovery_generation, retained_tail));
+                }
+            }
+        }
+    } else {
+        must_create_fresh = true;
+    }
+
+    if must_create_fresh {
+        let last_committed = selection
+            .as_ref()
+            .and_then(|selected| {
+                selected
+                    .manifest
+                    .retained_tail_ranges
+                    .last()
+                    .map(|range| range.last_shard_sequence)
+            })
+            .or(checkpointed.then_some(committed));
+        let first_shard_sequence = last_committed
+            .map(|sequence| sequence.saturating_add(1))
+            .unwrap_or(0);
+        let logical_generation = selection
+            .as_ref()
+            .and_then(|selected| {
+                selected
+                    .manifest
+                    .retained_tail_ranges
+                    .last()
+                    .map(|range| range.generation)
+            })
+            .unwrap_or(0)
+            .saturating_add(1);
+        let (tail, retained) = create_fresh_active_journal(
+            &paths,
+            root_uuid,
+            shard,
+            first_shard_sequence,
+            fresh_preallocation,
+            logical_generation,
+            Arc::clone(&counters),
+        )?;
+        recovered_tail = Some(tail);
+        retained_tails.push(retained);
+    }
+
+    let replayed_facts: Vec<FrameFacts> =
+        replayed.iter().map(|frame| frame.facts.clone()).collect();
+    let mut catalog = checkpoint.catalog.clone();
+    verify_and_apply_catalog(
+        &replayed_facts,
+        checkpointed.then(|| committed.saturating_add(1)),
+        &mut catalog,
+        config.payload_facts.permits_implicit_namespace_anchor(),
+    )?;
+
+    let recovery_publication_micros = now_micros();
+    let mut receipts = checkpoint.receipts.clone();
+    for frame in &replayed {
+        receipts.push(receipt_for_recovery(frame, recovery_publication_micros));
+    }
+    report.promotions = promote_receipt_visibility(
+        &mut receipts,
+        recovery_publication_micros,
+        config.terminal_status_grace_micros,
+    )?;
+
+    let mut refs = checkpoint.refs.clone();
+    apply_recovered_refs(&mut refs, &replayed)?;
+
+    let mut delta = IndexDelta::new(
+        config.max_active_index_entries,
+        config.max_active_index_bytes,
+    );
+    for frame in &replayed {
+        let frame_len = u32::try_from(frame.len).map_err(|_| StoreError::LimitExceeded {
+            limit: "frame_len",
+            observed: frame.len,
+            allowed: u32::MAX as u64,
+        })?;
+        for (object, object_type) in &frame.payload.objects {
+            delta.insert(
+                IndexKey::new(frame.facts.namespace, *object),
+                IndexLocation {
+                    segment_generation: frame.generation,
+                    frame_offset: frame.offset,
+                    frame_len,
+                    object_type: *object_type,
+                    shard_sequence: frame.facts.shard_sequence,
+                },
+            )?;
+        }
+    }
+
+    // Resolve committed staged projections newest-first so their membership
+    // layers preserve the same first-hit ordering as ordinary replay. A final
+    // frame is already authoritative here; missing staging ownership is
+    // corruption and cannot be converted into an empty projection.
+    let mut committed_sessions = BTreeSet::new();
+    let mut recovered_projections: Vec<(u64, RecoveredProjectionArtifacts)> = Vec::new();
+    for frame in replayed.iter().rev() {
+        let Some(descriptor) = frame.payload.staged_projection_install.as_ref() else {
+            continue;
+        };
+        if !committed_sessions.insert(descriptor.session_id) {
+            return Err(StoreError::Corruption(format!(
+                "staged projection session {} appears in more than one committed frame",
+                hex::encode(descriptor.session_id)
+            )));
+        }
+        let resolver = config.projection_recovery_resolver.ok_or_else(|| {
+            StoreError::Corruption(format!(
+                "committed staged projection session {} has no recovery resolver",
+                hex::encode(descriptor.session_id)
+            ))
+        })?;
+        let artifacts = resolver.resolve_committed(frame.facts.namespace, descriptor)?;
+        if artifacts.descriptor() != descriptor {
+            return Err(StoreError::Corruption(format!(
+                "staging recovery returned a different descriptor for committed session {}",
+                hex::encode(descriptor.session_id)
+            )));
+        }
+        recovered_projections.push((frame.facts.shard_sequence, artifacts));
+    }
+
+    let mut projection_outcomes = BTreeMap::new();
+    if let Some(resolver) = config.projection_recovery_resolver {
+        for session_id in resolver.transferred_sessions(shard)?.iter().copied() {
+            projection_outcomes
+                .entry(session_id)
+                .or_insert(RecoveredProjectionOutcome::ProvedAbsent);
+        }
+    }
+    for session_id in committed_sessions {
+        projection_outcomes.insert(session_id, RecoveredProjectionOutcome::Committed);
+    }
+    let projection_resolutions: Vec<_> = projection_outcomes
+        .into_iter()
+        .map(|(session_id, outcome)| RecoveredProjectionResolution {
+            session_id,
+            outcome,
+        })
+        .collect();
+
+    report.adopted_shard_sequences = adopted_shard_sequences;
+    report.quarantined_bytes = quarantined_bytes;
+    report.ready = !report.offline_rebuild_required && recovered_tail.is_some();
+    let committed_shard_sequence = replayed
+        .last()
+        .map(|frame| frame.facts.shard_sequence)
+        .or(checkpointed.then_some(committed))
+        .or_else(|| {
+            selection.as_ref().and_then(|selected| {
+                selected
+                    .manifest
+                    .retained_tail_ranges
+                    .last()
+                    .map(|range| range.last_shard_sequence)
+            })
+        });
+    let repo_sequences = catalog
+        .iter()
+        .map(|(namespace, record)| (*namespace, record.repo_sequence))
+        .collect();
+
+    let through_shard_sequence = committed_shard_sequence.unwrap_or(0);
+    let mut delta_layers_newest_first = Vector::new();
+    if !delta.is_empty() {
+        delta_layers_newest_first.push_back(IndexDeltaLayer::new(
+            shard,
+            through_shard_sequence,
+            Arc::new(delta),
+        ));
+    }
+    let mut all_runs_newest_first = Vector::new();
+    let mut retained_projection_artifacts = Vec::new();
+    for (shard_sequence, artifacts) in &recovered_projections {
+        if !artifacts.index_delta().is_empty() {
+            delta_layers_newest_first.push_back(IndexDeltaLayer::new(
+                shard,
+                *shard_sequence,
+                Arc::clone(artifacts.index_delta()),
+            ));
+        }
+        for run in artifacts.index_runs_newest_first() {
+            all_runs_newest_first.push_back(Arc::clone(run));
+        }
+        retained_index_runs.extend_from_slice(artifacts.retained_index_runs());
+        retained_projection_artifacts.extend_from_slice(artifacts.retained_artifacts());
+    }
+    for run in sealed_runs_newest_first {
+        all_runs_newest_first.push_back(run);
+    }
+    let open_run_count = u64::try_from(all_runs_newest_first.len()).unwrap_or(u64::MAX);
+    if open_run_count > u64::from(config.max_index_runs) {
+        return Err(StoreError::LimitExceeded {
+            limit: "max_index_runs",
+            observed: open_run_count,
+            allowed: u64::from(config.max_index_runs),
+        });
+    }
+    if open_run_count > u64::from(config.max_open_index_runs) {
+        return Err(StoreError::LimitExceeded {
+            limit: "max_open_index_runs",
+            observed: open_run_count,
+            allowed: u64::from(config.max_open_index_runs),
+        });
+    }
+    validate_retained_object_sources(
+        &retained_segments,
+        &retained_tails,
+        &retained_projection_artifacts,
+    )?;
+    let index = LayeredObjectIndex::new(delta_layers_newest_first, all_runs_newest_first);
+    let generation_id = GenerationId::new(
+        shard,
+        selection
+            .as_ref()
+            .map(|selection| selection.generation)
+            .unwrap_or(0),
+    );
+    let retained_generation = Arc::new(RetainedGeneration::new(
+        generation_id,
+        retained_segments.into(),
+        retained_index_runs.into(),
+        retained_checkpoints.into(),
+        retained_tails.into(),
+        retained_projection_artifacts.into(),
+    ));
+
+    let recovered = RecoveredShard {
+        shard_index: shard,
+        catalog,
+        refs,
+        receipts,
+        index,
+        retained_generation,
+        segments,
+        tail: recovered_tail,
+        manifest_generation: selection.as_ref().map(|selection| selection.generation),
+        manifest_path: selection.as_ref().map(|selection| selection.path.clone()),
+        committed_shard_sequence,
+        repo_sequences,
+        projection_resolutions,
+        tail_stop_offset,
+        report,
+    };
+
+    // Lifecycle notification is last. At this point the complete physical
+    // proof, lookup layers, and every live pin are held by `recovered`.
+    // Implementations must make notification idempotent because a later
+    // notification failure keeps the shard unready and recovery retries.
+    if let Some(resolver) = config.projection_recovery_resolver {
+        for resolution in recovered.projection_resolutions.iter().copied() {
+            resolver.notify_recovered(resolution)?;
+        }
+    }
+
+    Ok(recovered)
+}
+
+fn validate_retained_object_sources(
+    segments: &[RootRetainedSegment],
+    tails: &[RetainedTail],
+    projections: &[RetainedProjectionArtifact],
+) -> Result<(), StoreError> {
+    let mut generations: BTreeMap<u64, (&'static str, PathBuf)> = BTreeMap::new();
+    let mut insert = |generation: u64, kind: &'static str, path: &Path| {
+        if let Some((existing_kind, existing_path)) = generations.get(&generation) {
+            if *existing_kind != kind || existing_path.as_path() != path {
+                return Err(StoreError::Corruption(format!(
+                    "logical object generation {generation} names both {existing_kind} {} and \
+                     {kind} {}",
+                    existing_path.display(),
+                    path.display()
+                )));
+            }
+        } else {
+            generations.insert(generation, (kind, path.to_path_buf()));
+        }
+        Ok(())
+    };
+    for segment in segments {
+        insert(segment.logical_generation, "segment", segment.path())?;
+    }
+    for tail in tails {
+        insert(tail.logical_generation, "active tail", tail.path())?;
+    }
+    for projection in projections {
+        insert(
+            projection.logical_generation,
+            "projection artifact",
+            projection.path(),
+        )?;
+    }
+    Ok(())
+}
+
+fn account_replay(
+    config: &RecoveryConfig<'_>,
+    bytes: &mut u64,
+    frame_len: u64,
+    frames: u64,
+) -> Result<(), StoreError> {
+    if frames > config.max_replay_frames {
+        return Err(StoreError::LimitExceeded {
+            limit: "max_replay_frames",
+            observed: frames,
+            allowed: config.max_replay_frames,
+        });
+    }
+    *bytes = bytes
+        .checked_add(frame_len)
+        .ok_or(StoreError::LimitExceeded {
+            limit: "max_replay_bytes",
+            observed: u64::MAX,
+            allowed: config.max_replay_bytes,
+        })?;
+    if *bytes > config.max_replay_bytes {
+        return Err(StoreError::LimitExceeded {
+            limit: "max_replay_bytes",
+            observed: *bytes,
+            allowed: config.max_replay_bytes,
+        });
+    }
+    Ok(())
+}
+
+fn frame_facts(
+    frame: &Frame,
+    payload: &dyn PayloadFacts,
+) -> Result<(FrameFacts, RecoveredPayloadFacts), StoreError> {
+    let mut facts = FrameFacts::from_header(&frame.header);
+    payload.extend(&mut facts, &frame.payload)?;
+    let recovered = payload.recovered(&frame.payload)?;
+    Ok((facts, recovered))
+}
+
+fn verify_and_apply_catalog(
+    replayed: &[FrameFacts],
+    first_expected: Option<u64>,
+    catalog: &mut NamespaceCatalog,
+    permits_implicit_namespace_anchor: bool,
+) -> Result<(), StoreError> {
+    if let Some(first_expected) =
+        first_expected.or_else(|| replayed.first().map(|f| f.shard_sequence))
+    {
+        verify_shard_sequence(replayed, first_expected)?;
+    }
+
+    if permits_implicit_namespace_anchor {
+        let mut anchored = catalog.clone();
+        let mut chained = Vec::new();
+        for facts in replayed {
+            if anchored.get(&facts.namespace).is_none() {
+                anchored.bind(crate::index::NamespaceRecord {
+                    namespace: facts.namespace,
+                    genesis_authority: facts.genesis_authority,
+                    current_authority: facts.current_authority,
+                    lifecycle: crate::index::NamespaceLifecycle::Active,
+                    storage_mode: crate::index::NamespaceStorageMode::Full,
+                    repo_sequence: facts.repo_sequence,
+                    previous_event_digest: facts.event_digest,
+                })?;
+            } else {
+                chained.push(facts.clone());
+            }
+        }
+        verify_repo_chain(&chained, &anchored)?;
+    } else {
+        verify_repo_chain(replayed, catalog)?;
+    }
+
+    for facts in replayed {
+        if catalog.get(&facts.namespace).is_none() {
+            if !facts.creates_namespace && !permits_implicit_namespace_anchor {
+                return Err(RepoSequenceFault::UnknownNamespace {
+                    namespace: facts.namespace.to_hex(),
+                }
+                .into());
+            }
+            catalog.bind(crate::index::NamespaceRecord {
+                namespace: facts.namespace,
+                genesis_authority: facts.genesis_authority,
+                current_authority: facts.current_authority,
+                lifecycle: crate::index::NamespaceLifecycle::Active,
+                storage_mode: crate::index::NamespaceStorageMode::Full,
+                repo_sequence: facts.repo_sequence,
+                previous_event_digest: facts.event_digest,
+            })?;
+        } else {
+            catalog.advance(
+                &facts.namespace,
+                facts.current_authority,
+                facts.repo_sequence,
+                facts.event_digest,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn receipt_for_recovery(frame: &ReplayedFrame, visible_at: i64) -> ReceiptRecord {
+    let facts = &frame.facts;
+    ReceiptRecord {
+        namespace: facts.namespace,
+        operation_id: facts.operation_id,
+        operation_digest: facts.operation_digest,
+        repo_sequence: facts.repo_sequence,
+        shard_sequence: facts.shard_sequence,
+        current_authority: facts.current_authority,
+        refs: frame.payload.applied_refs.clone(),
+        objects_new: frame.payload.objects_new,
+        retry_until_micros: facts.retry_until_micros,
+        // A replayed receipt's original first-visibility instant was not
+        // durably checkpointed. Step 10 promotes it to publication below.
+        first_receipt_visibility_micros: None,
+        receipt_visible_until_micros: visible_at,
+    }
+}
+
+fn apply_recovered_refs(
+    refs: &mut Vec<RefRecord>,
+    replayed: &[ReplayedFrame],
+) -> Result<(), StoreError> {
+    let mut state: BTreeMap<(NamespaceId, u8, Vec<u8>), ObjectId> = refs
+        .iter()
+        .map(|record| {
+            (
+                (record.namespace, record.ref_kind, record.name.clone()),
+                record.target,
+            )
+        })
+        .collect();
+
+    for frame in replayed {
+        let facts = &frame.facts;
+        for update in &frame.payload.ref_updates {
+            let (kind, name) = match &update.target {
+                RefTarget::Branch(name) => (1u8, name.as_bytes().to_vec()),
+                RefTarget::Release(name) => (2u8, name.as_bytes().to_vec()),
+            };
+            let key = (facts.namespace, kind, name);
+            let observed = state.get(&key).copied();
+            if observed != update.expected {
+                return Err(StoreError::Corruption(format!(
+                    "committed ref CAS for namespace {} does not match recovered state",
+                    facts.namespace.to_hex()
+                )));
+            }
+            match update.mutation {
+                RefMutation::Set(target) => {
+                    state.insert(key, target);
+                }
+                RefMutation::Delete => {
+                    state.remove(&key);
+                }
+            }
+        }
+    }
+
+    *refs = state
+        .into_iter()
+        .map(|((namespace, ref_kind, name), target)| RefRecord {
+            namespace,
+            ref_kind,
+            name,
+            target,
+        })
+        .collect();
+    Ok(())
+}
+
+fn recovery_generation_for_journal(
+    paths: &ShardPaths,
+    root_uuid: &[u8; 16],
+    active_journal_id: &[u8; 16],
+    config: &RecoveryConfig<'_>,
+) -> Result<u64, StoreError> {
+    let per_manifest = usize::try_from(config.max_index_runs)
+        .unwrap_or(usize::MAX)
+        .saturating_add(config.checkpoint_retain as usize)
+        .saturating_add(16);
+    let budget = config
+        .max_manifest_candidates
+        .max(1)
+        .saturating_mul(per_manifest)
+        .max(64);
+    let mut inspected = 0usize;
+    let mut maximum = 0u64;
+    let mut resumable = BTreeSet::new();
+
+    let manifests = segment::list_manifest_generations(paths)?;
+    inspected = inspected.saturating_add(manifests.len());
+    if inspected > budget {
+        return Err(StoreError::LimitExceeded {
+            limit: "recovery_generation_artifacts",
+            observed: inspected as u64,
+            allowed: budget as u64,
+        });
+    }
+    maximum = maximum.max(manifests.into_iter().max().unwrap_or(0));
+
+    for (dir, extension) in [(paths.segments(), "seg"), (paths.indexes(), "idx")] {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
+            let path = entry?.path();
+            if path.extension().and_then(|value| value.to_str()) != Some(extension) {
+                continue;
+            }
+            inspected = inspected.saturating_add(1);
+            if inspected > budget {
+                return Err(StoreError::LimitExceeded {
+                    limit: "recovery_generation_artifacts",
+                    observed: inspected as u64,
+                    allowed: budget as u64,
+                });
+            }
+            let name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .ok_or_else(|| {
+                    StoreError::Corruption(format!(
+                        "immutable artifact name {} is not UTF-8",
+                        path.display()
+                    ))
+                })?;
+            let stem = name.strip_suffix(&format!(".{extension}")).ok_or_else(|| {
+                StoreError::Corruption(format!(
+                    "immutable artifact {} has an invalid extension",
+                    path.display()
+                ))
+            })?;
+            let decoded_generation = if extension == "seg" {
+                SegmentReader::open(&path, root_uuid).ok().map(|reader| {
+                    if &reader.footer().journal_id == active_journal_id {
+                        resumable.insert(reader.footer().generation);
+                    }
+                    reader.footer().generation
+                })
+            } else {
+                IndexRun::open(&path, root_uuid)
+                    .ok()
+                    .map(|run| run.generation())
+            };
+            let generation = decoded_generation
+                .or_else(|| {
+                    let text = if extension == "seg" {
+                        stem.split('-').next().unwrap_or("")
+                    } else {
+                        stem
+                    };
+                    text.parse::<u64>().ok()
+                })
+                .ok_or_else(|| {
+                    StoreError::Corruption(format!(
+                        "immutable artifact {} is invalid and has no generation in its name",
+                        path.display()
+                    ))
+                })?;
+            maximum = maximum.max(generation);
+        }
+    }
+
+    let prefix = format!(".recovery-{}-", hex::encode(active_journal_id));
+    let entries = std::fs::read_dir(paths.segments())?;
+    for entry in entries {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let Some(generation_text) = name
+            .strip_prefix(&prefix)
+            .and_then(|suffix| suffix.strip_suffix(".prefix"))
+        else {
+            continue;
+        };
+        inspected = inspected.saturating_add(1);
+        if inspected > budget {
+            return Err(StoreError::LimitExceeded {
+                limit: "recovery_generation_artifacts",
+                observed: inspected as u64,
+                allowed: budget as u64,
+            });
+        }
+        let generation = generation_text.parse::<u64>().map_err(|_| {
+            StoreError::Corruption(format!(
+                "recovery prefix {} has an invalid generation",
+                path.display()
+            ))
+        })?;
+        maximum = maximum.max(generation);
+        resumable.insert(generation);
+    }
+
+    if resumable.len() > 1 {
+        return Err(StoreError::Corruption(format!(
+            "active journal {} has recovery artifacts in multiple generations: {:?}",
+            hex::encode(active_journal_id),
+            resumable
+        )));
+    }
+    if let Some(generation) = resumable.into_iter().next() {
+        if generation != maximum {
+            return Err(StoreError::Corruption(format!(
+                "recovery artifact generation {generation} for journal {} is below occupied \
+                 immutable generation {maximum}",
+                hex::encode(active_journal_id)
+            )));
+        }
+        return Ok(generation);
+    }
+
+    maximum.checked_add(1).ok_or_else(|| {
+        StoreError::Corruption("no generation remains for recovery artifacts".into())
+    })
+}
+
+fn preserve_crash_journal(
+    active_path: &Path,
+    quarantine_dir: &Path,
+    header: &JournalHeader,
+    counters: &DurabilityCounters,
+) -> Result<PathBuf, StoreError> {
+    use std::os::unix::fs::MetadataExt;
+
+    std::fs::create_dir_all(quarantine_dir)?;
+    let evidence = quarantine_dir.join(format!(
+        "{}-{}-{}.journal.evidence",
+        hex::encode(header.journal_id),
+        header.shard_index,
+        header.first_shard_sequence
+    ));
+    match sys::link_noreplace(active_path, &evidence) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let original = std::fs::metadata(active_path)?;
+            let retained = std::fs::metadata(&evidence)?;
+            if original.dev() != retained.dev() || original.ino() != retained.ino() {
+                return Err(StoreError::Corruption(format!(
+                    "journal evidence name {} is occupied by another inode",
+                    evidence.display()
+                )));
+            }
+        }
+        Err(error) => return Err(error.into()),
+    }
+    sys::fsync_dir(quarantine_dir, counters)?;
+    Ok(evidence)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_fresh_active_journal(
+    paths: &ShardPaths,
+    root_uuid: [u8; 16],
+    shard: u16,
+    first_shard_sequence: u64,
+    preallocated_len: u64,
+    logical_generation: u64,
+    counters: Arc<DurabilityCounters>,
+) -> Result<(RecoveredTail, RetainedTail), StoreError> {
+    let journal_id = fresh_recovery_journal_id(root_uuid, shard, first_shard_sequence);
+    let journal = Journal::create(
+        &paths.active(),
+        journal_id,
+        first_shard_sequence,
+        shard,
+        root_uuid,
+        preallocated_len,
+        now_micros(),
+        Arc::clone(&counters),
+    )?;
+    let path = journal.path().to_path_buf();
+    let shared_file = Arc::new(journal.file().try_clone()?);
+    let retained = RetainedTail::new(
+        logical_generation,
+        PinnedFile::from_shared(path.clone(), Arc::clone(&shared_file)),
+    );
+    Ok((
+        RecoveredTail {
+            logical_generation,
+            journal_id,
+            path,
+            validated_through: JOURNAL_HEADER_LEN as u64,
+            file: shared_file,
+        },
+        retained,
+    ))
+}
+
+fn fresh_recovery_journal_id(
+    root_uuid: [u8; 16],
+    shard: u16,
+    first_shard_sequence: u64,
+) -> [u8; 16] {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"levcs-recovery-journal-id/v1\0");
+    hasher.update(&root_uuid);
+    hasher.update(&shard.to_le_bytes());
+    hasher.update(&first_shard_sequence.to_le_bytes());
+    hasher.update(&now_micros().to_le_bytes());
+    hasher.update(&std::process::id().to_le_bytes());
+    hasher.update(&NEXT.fetch_add(1, Ordering::Relaxed).to_le_bytes());
+    let digest = hasher.finalize();
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&digest.as_bytes()[..16]);
+    out
+}
+
+fn active_journal_path(paths: &ShardPaths) -> Result<Option<PathBuf>, StoreError> {
+    let dir = match std::fs::read_dir(paths.active()) {
+        Ok(dir) => dir,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mut found = Vec::new();
+    for entry in dir {
+        let path = entry?.path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "journal")
+        {
+            found.push(path);
+        }
+    }
+    match found.len() {
+        0 => Ok(None),
+        1 => Ok(found.pop()),
+        count => Err(StoreError::Corruption(format!(
+            "shard directory {} holds {count} active journals; exactly one is expected",
+            paths.active().display()
+        ))),
+    }
+}
+
+fn now_micros() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_micros() as i64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod production_session_tests {
+    use std::sync::Mutex;
+
+    use levcs_protocol::v2::ProjectionMode;
+
+    use super::*;
+    use crate::format::{frame_total_len, Frame};
+    use crate::roots::{ProjectionArtifactFormat, RetainedProjectionArtifact};
+    use crate::staging::RecoveredProjectionArtifacts;
+
+    struct StagedFacts {
+        descriptor: StagedProjectionInstallV1,
+    }
+
+    impl PayloadFacts for StagedFacts {
+        fn extend(&self, facts: &mut FrameFacts, _payload: &[u8]) -> Result<(), StoreError> {
+            facts.event_digest = ObjectId([12; 32]);
+            facts.previous_event_digest = ObjectId([0; 32]);
+            facts.creates_namespace = true;
+            facts.genesis_authority = ObjectId([13; 32]);
+            facts.current_authority = ObjectId([13; 32]);
+            facts.retry_until_micros = i64::MAX;
+            Ok(())
+        }
+
+        fn recovered(&self, _payload: &[u8]) -> Result<RecoveredPayloadFacts, StoreError> {
+            Ok(RecoveredPayloadFacts {
+                objects_new: self.descriptor.object_count,
+                staged_projection_install: Some(self.descriptor.clone()),
+                ..RecoveredPayloadFacts::default()
+            })
+        }
+    }
+
+    struct StagedResolver {
+        namespace: NamespaceId,
+        descriptor: StagedProjectionInstallV1,
+        artifacts: RecoveredProjectionArtifacts,
+        absent_session: [u8; 16],
+        notifications: Mutex<Vec<RecoveredProjectionResolution>>,
+    }
+
+    impl ProjectionRecoveryResolver for StagedResolver {
+        fn transferred_sessions(&self, _shard_index: u16) -> Result<Arc<[[u8; 16]]>, StoreError> {
+            Ok(Arc::from([self.descriptor.session_id, self.absent_session]))
+        }
+
+        fn resolve_committed(
+            &self,
+            namespace: NamespaceId,
+            descriptor: &StagedProjectionInstallV1,
+        ) -> Result<RecoveredProjectionArtifacts, StoreError> {
+            assert_eq!(namespace, self.namespace);
+            assert_eq!(descriptor, &self.descriptor);
+            Ok(self.artifacts.clone())
+        }
+
+        fn notify_recovered(
+            &self,
+            resolution: RecoveredProjectionResolution,
+        ) -> Result<(), StoreError> {
+            self.notifications
+                .lock()
+                .expect("notification mutex")
+                .push(resolution);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn one_session_holds_lock_continuously_across_all_shards() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let counters = DurabilityCounters::default();
+        segment::initialize_root(&RootLayout::new(dir.path()), 2, [7u8; 16], 1, &counters)
+            .expect("initialize");
+
+        let mut options = StoreOptions::new(dir.path());
+        options.shard_count = 2;
+        let config = RecoveryConfig::from_store_options(&options);
+        let session = RecoverySession::open(dir.path()).expect("first opener");
+
+        assert!(matches!(
+            RecoverySession::open(dir.path()),
+            Err(StoreError::AlreadyLocked)
+        ));
+        let shard0 = session.recover_shard(0, &config).expect("recover shard 0");
+        assert!(shard0.report.ready);
+        assert!(matches!(
+            RecoverySession::open(dir.path()),
+            Err(StoreError::AlreadyLocked)
+        ));
+        let shard1 = session.recover_shard(1, &config).expect("recover shard 1");
+        assert!(shard1.report.ready);
+        assert!(matches!(
+            RecoverySession::open(dir.path()),
+            Err(StoreError::AlreadyLocked)
+        ));
+
+        drop(session);
+        RecoverySession::open(dir.path()).expect("lock released only with session");
+    }
+
+    #[test]
+    fn committed_staged_projection_is_indexed_pinned_and_notified_before_readiness() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root_uuid = [7u8; 16];
+        let counters = Arc::new(DurabilityCounters::default());
+        let layout = RootLayout::new(dir.path());
+        segment::initialize_root(&layout, 1, root_uuid, 1, &counters).expect("initialize");
+        let paths = layout.shard(0);
+
+        let namespace = NamespaceId([21; 32]);
+        let descriptor = StagedProjectionInstallV1 {
+            session_id: [22; 16],
+            manifest_digest: ObjectId([23; 32]),
+            projection: ProjectionMode::Full,
+            object_count: 1,
+            object_bytes: 17,
+            membership_root: ObjectId([24; 32]),
+            artifact_set_digest: ObjectId([25; 32]),
+        };
+        let object = ObjectId([26; 32]);
+        let artifact_path = dir.path().join("staged-projection.chunk");
+        let artifact_file = File::create(&artifact_path).expect("artifact");
+        let mut staged_delta = IndexDelta::new(8, 4096);
+        staged_delta
+            .insert(
+                IndexKey::new(namespace, object),
+                IndexLocation {
+                    segment_generation: 55,
+                    frame_offset: 0,
+                    frame_len: 17,
+                    object_type: 1,
+                    shard_sequence: 0,
+                },
+            )
+            .expect("index staged object");
+        let artifacts = RecoveredProjectionArtifacts::new(
+            descriptor.clone(),
+            Arc::new(staged_delta),
+            Arc::from([]),
+            Arc::from([RetainedProjectionArtifact::new(
+                55,
+                ProjectionArtifactFormat::CanonicalStageChunkV1,
+                PinnedFile::new(artifact_path.clone(), artifact_file),
+            )]),
+        )
+        .expect("resolved artifacts");
+        let resolver = StagedResolver {
+            namespace,
+            descriptor: descriptor.clone(),
+            artifacts,
+            absent_session: [27; 16],
+            notifications: Mutex::new(Vec::new()),
+        };
+        let facts = StagedFacts {
+            descriptor: descriptor.clone(),
+        };
+
+        let journal_id = [28; 16];
+        let mut journal = Journal::create(
+            &paths.active(),
+            journal_id,
+            0,
+            0,
+            root_uuid,
+            1024 * 1024,
+            1,
+            Arc::clone(&counters),
+        )
+        .expect("journal");
+        let payload = vec![1];
+        let frame = Frame {
+            header: FrameHeader {
+                flags: 0,
+                total_len: frame_total_len(payload.len() as u64),
+                journal_id,
+                shard_sequence: 0,
+                repo_sequence: 0,
+                namespace: *namespace.as_bytes(),
+                operation_id: [29; 16],
+                operation_digest: ObjectId([30; 32]),
+                payload_len: payload.len() as u64,
+                payload_digest: ObjectId([0; 32]),
+            },
+            payload,
+        };
+        journal
+            .append_group_and_fence(&[frame])
+            .expect("append staged frame");
+        drop(journal);
+
+        let mut options = StoreOptions::new(dir.path());
+        options.shard_count = 1;
+        options.journal_preallocate_bytes = 1024 * 1024;
+        let mut config = RecoveryConfig::from_store_options(&options);
+        config.payload_facts = &facts;
+        let config = config.with_projection_recovery_resolver(&resolver);
+        let session = RecoverySession::open(dir.path()).expect("recovery session");
+        let recovered = session.recover_shard(0, &config).expect("recover");
+
+        assert!(recovered.report.ready);
+        let location = recovered
+            .index
+            .lookup(&IndexKey::new(namespace, object))
+            .location
+            .expect("staged object membership");
+        assert_eq!(location.segment_generation, 55);
+        assert_eq!(
+            recovered
+                .retained_generation
+                .projection_artifacts
+                .first()
+                .expect("projection pin")
+                .path(),
+            artifact_path
+        );
+        assert_eq!(
+            recovered.projection_resolutions,
+            vec![
+                RecoveredProjectionResolution {
+                    session_id: descriptor.session_id,
+                    outcome: RecoveredProjectionOutcome::Committed,
+                },
+                RecoveredProjectionResolution {
+                    session_id: [27; 16],
+                    outcome: RecoveredProjectionOutcome::ProvedAbsent,
+                },
+            ]
+        );
+        assert_eq!(
+            *resolver.notifications.lock().expect("notifications"),
+            recovered.projection_resolutions
+        );
     }
 }

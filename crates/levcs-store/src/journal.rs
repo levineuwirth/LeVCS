@@ -243,13 +243,30 @@ impl Journal {
             )));
         }
         let path = active_dir.join(format!("{first_shard_sequence}.journal"));
-        let mut file = File::options()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)?;
+        if path.exists() {
+            let (journal, scan) = Self::open(&path, &root_uuid, Arc::clone(&counters))?;
+            let header = journal.header();
+            if header.shard_index != shard_index
+                || header.first_shard_sequence != first_shard_sequence
+                || header.preallocated_len != preallocated_len
+                || !scan.frames.is_empty()
+                || scan.stop_offset != JOURNAL_HEADER_LEN as u64
+            {
+                return Err(StoreError::Corruption(format!(
+                    "occupied fresh-journal target {} is not the requested empty journal",
+                    path.display()
+                )));
+            }
+            sys::fsync_dir(active_dir, &counters)?;
+            return Ok(journal);
+        }
 
-        let header = JournalHeader {
+        // Target-scoped and deterministic: one interrupted creation can leave
+        // at most one invisible construction artifact. Re-entry either reuses
+        // a fully fenced empty journal or reconstructs a partial pre-publish
+        // file in place; it never allocates another temp name.
+        let temporary = active_dir.join(format!(".{first_shard_sequence}.journal.tmp"));
+        let requested_header = JournalHeader {
             shard_index,
             root_uuid,
             journal_id,
@@ -257,11 +274,58 @@ impl Journal {
             preallocated_len,
             created_at_micros,
         };
-        sys::preallocate(&file, preallocated_len)?;
-        let encoded = header.encode()?;
-        sys::seek_to(&mut file, 0)?;
-        sys::write_vectored_all(&mut file, &[IoSlice::new(&encoded)], &counters)?;
-        sys::fdatasync(&file, &counters)?;
+        let existed = temporary.exists();
+        let mut file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&temporary)?;
+        let decoded_header = if existed {
+            let mut bytes = [0u8; JOURNAL_HEADER_LEN];
+            sys::pread_exact(&file, 0, &mut bytes)
+                .ok()
+                .and_then(|()| JournalHeader::decode(&bytes).ok())
+        } else {
+            None
+        };
+        let header = if let Some(header) = decoded_header {
+            if header.root_uuid != root_uuid
+                || header.shard_index != shard_index
+                || header.first_shard_sequence != first_shard_sequence
+                || header.preallocated_len != preallocated_len
+            {
+                return Err(StoreError::Corruption(format!(
+                    "fresh-journal temp {} belongs to a different target",
+                    temporary.display()
+                )));
+            }
+            let scan = scan_journal(&file, &header, JOURNAL_HEADER_LEN as u64);
+            if !scan.frames.is_empty() || scan.stop_offset != JOURNAL_HEADER_LEN as u64 {
+                return Err(StoreError::Corruption(format!(
+                    "fresh-journal temp {} is not empty",
+                    temporary.display()
+                )));
+            }
+            // Re-fence before publication. Exact bytes in page cache do not
+            // prove the previous process reached its fdatasync.
+            sys::fdatasync(&file, &counters)?;
+            header
+        } else {
+            // The deterministic temp is unpublished and target-scoped. A bad
+            // or partial header can only be an interrupted construction for
+            // this missing final name, so finish that construction in place.
+            sys::truncate(&file, 0, &counters)?;
+            sys::preallocate(&file, preallocated_len)?;
+            let encoded = requested_header.encode()?;
+            sys::seek_to(&mut file, 0)?;
+            sys::write_vectored_all(&mut file, &[IoSlice::new(&encoded)], &counters)?;
+            sys::fdatasync(&file, &counters)?;
+            requested_header
+        };
+        if let Err(error) = sys::rename_noreplace(&temporary, &path) {
+            return Err(error.into());
+        }
         sys::fsync_dir(active_dir, &counters)?;
 
         Ok(Self {

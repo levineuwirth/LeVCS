@@ -890,6 +890,89 @@ This is the second frozen Phase 0 classification found to be physically wrong. B
 found by asking what state the device is actually in, rather than by checking the model
 against itself.
 
+##### Contract review 2026-07-27-A
+
+Wave B's D0-B publication freeze requires nine amendments to Wave A frozen or
+signature-frozen surfaces. They land as one reviewed interface change before B1, B3, or B4
+is dispatched:
+
+- `lib.rs` declares and re-exports the immutable publication roots and runtime-agnostic
+  completion primitive.
+- The workspace and `levcs-store` manifests take `im`; `Cargo.lock` records the resolved
+  graph. Decision 9.7 applies structural sharing to repositories, terminal
+  receipts/tombstones, typed refs, and transient operation statuses. Canonically iterated
+  refs use `OrdMap`; unordered hot lookup maps use the HAMT-backed `HashMap`.
+- `recovery.rs` exposes one production recovery path returning `RecoveredShard`, including
+  the complete layered index, catalog, refs, exact receipts, sequences, report, staging
+  resolutions, and live retained segment/index/checkpoint/tail ownership. A root-wide
+  `RecoverySession` holds `LOCK` continuously across all shard recoveries and is retained by
+  the engine; the one-shot drive wrapper uses that same session. `drive.rs` now retains the
+  recovered state instead of projecting it down to diagnostics.
+- `options.rs` gains the status-root and projection-staging session/principal/global
+  count/object/byte/file/age/rate/debt ceilings. Startup checks all non-zero and nesting
+  constraints and, with checked ceiling arithmetic, refuses a configuration in which one
+  maximal projection cannot finish before the session horizon.
+- `types.rs` makes the exact shared completion outcome cloneable. `StoreError::Io` carries
+  `Arc<std::io::Error>` and a handwritten `From<std::io::Error>` preserves existing `?`
+  call sites without reconstructing the error; `StoreError::Overloaded` is the typed
+  status-capacity refusal from decision 9.8.
+- `transaction.rs` and `staging.rs` freeze the opaque projection-adoption handle. The handle
+  is the pin, exposes only read-only resolution and committed-root reference proof, and must
+  end as adopted, definitively failed before append, or transferred to recovery. Recovery's
+  committed/proved-absent notification is part of the same seam, and cleanup may run only
+  after recovery resolves the shard. A staging-owned recovery resolver turns every
+  authoritative committed descriptor into namespace-scoped index layers and live artifact
+  pins before readiness; notification alone is insufficient.
+
+The resolver exposed one Wave A index assumption that inline-only tests could not exercise.
+`IndexLocation` names the complete certified storage record, not naked object bytes. That
+record is a transaction frame for inline objects and a canonical digest-bound stage chunk
+for an adopted projection. The packed storage-version-1 fields do not change: the captured
+committed root maps `segment_generation` to a retained source kind and selects the
+corresponding decoder. Generation collisions across source kinds are corruption. This
+amends the `index.rs` contract without changing its bytes.
+
+Integration found one additional frozen-format defect. A canonical transaction frame
+contains the exact applied refs returned in `CommitReceipt`, but Wave A's checkpoint
+`ReceiptRecord` omitted them. After the replay horizon moved past the frame, current ref
+state could not reconstruct old values, deletions, `force`, or transaction membership, so
+the same committed retry could return a different receipt after reopen.
+
+`checkpoint.rs` therefore adds a bounded applied-ref vector to each retained receipt and
+sets authenticated checkpoint capability flag bit 0. Production recovery and the drive
+seam populate it only from the canonical committed transaction. A storage-version-1
+checkpoint without the flag remains readable if it has no retained receipts; if it has any,
+the generation is rejected as `ReceiptRefsUnavailable` and the existing fallback/offline
+rebuild policy applies. Older readers already reject the new non-zero flag. The derived
+checkpoint format therefore fails closed in both directions without a global
+`STORAGE_VERSION` bump; journal and segment authority bytes are unchanged.
+
+Production-path integration also found that Wave A's recovery stopped after logical replay:
+it did not perform normative step 8, so a damaged active journal could be reported ready
+without sealing its validated prefix and installing a fresh active journal. Recovery now
+preserves crash evidence, constructs the recovered segment and fresh journal through
+deterministic resumable names, validates any pre-existing construction artifact byte for
+byte, and publishes readiness only after the repaired physical state is complete.
+
+The same amendment tightens manifest authority. Checkpoints are derived and may fall back
+only among checkpoint rows retained by the selected authoritative manifest; their failure
+does not authorize a shorter transaction tail. Missing or corrupt authoritative segment
+bytes refuse readiness. If `CURRENT` is corrupt or missing, recovery may choose the highest
+valid finalized manifest only when no higher invalid finalized manifest makes the closure
+ambiguous. Manifest tuple validation includes segment generation/sequence coverage, index
+generation, and checkpoint sequence. Generation allocation scans immutable names and moves
+above rejected artifacts within a configured bound, so repair never reuses an ambiguous
+name. The drive checkpoint path now seals and publishes its checkpoint reference in one
+manifest installation, keeping the test seam subject to the production authority model.
+
+The new `roots.rs` and `completion.rs` files are not amendments to Wave A, but their
+interfaces freeze with this review. The completion state stores exactly
+`Result<CommitReceipt, StoreError>` behind one mutex shared by outcome and the full waiter
+set. Publication wakes outside the mutex, a dropped waiter is not a publication failure,
+and every waiter receives one owned clone of the same result. The committed root uses pure,
+idempotent subtree merge and carries addressable live pins for every retained artifact so a
+captured read cannot race reclamation.
+
 ### Phase 1 — storage engine spine
 
 Lead first defines sealed transaction/frame/snapshot interfaces and file ownership. That deliverable (D0) landed on 2026-07-24 as `crates/levcs-store`: the frozen public API compiling against `StoreError::NotImplemented`, the file-ownership split, strict configuration validation, the single durability syscall funnel with its counters and fault hooks, the failpoint registry in enforced one-to-one correspondence with `oracle::AppendFailpoint`, and the journal-level drive seam that lets the crash harness run in Wave A. The enforced gate is `scripts/check-phase1.sh`, which runs `check-phase0.sh` first so the Phase 0 freeze stays enforced. That work is scoped in `doc/phase1-storage-spine-scope.md`, which realizes this section as a file-ownership matrix, a frozen `levcs-store` API, a physical format and durability/recovery specification, per-package deliverables and acceptance criteria, the Wave A adversarial review charter, and the capacity analysis for P2 on the frozen reference hardware. This plan remains authoritative; that document is the Phase 1 realization of it and lists the decisions that must be resolved before Wave A starts.

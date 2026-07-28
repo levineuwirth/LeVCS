@@ -18,7 +18,7 @@ use crate::format::{
     CurrentPointer, Frame, FrameError, JournalHeader, Manifest, SegmentFooter, FORMAT_MARKER_LEN,
     JOURNAL_HEADER_LEN, SEGMENT_FOOTER_LOCATOR_LEN, STORAGE_VERSION,
 };
-use crate::journal::Journal;
+use crate::journal::{Journal, TailScan};
 use crate::sys;
 use crate::types::{DurabilityCounters, StoreError};
 
@@ -304,6 +304,228 @@ pub fn seal_journal(
     Ok(destination)
 }
 
+/// Seal a recovery-validated prefix without ever modifying its source journal.
+///
+/// The crash image is forensic evidence. Recovery therefore copies exactly
+/// `0..scan.stop_offset` into a uniquely named, fenced artifact, opens that
+/// copy through the normal journal scanner, and seals the copy through
+/// [`seal_journal`]. The original descriptor is read-only throughout.
+///
+/// A crash may leave the deterministic final segment installed but not yet
+/// referenced by a manifest. Re-recovery accepts that artifact only after its
+/// footer, frame index, and every byte of the validated prefix agree with the
+/// source. An occupied name with different contents is corruption, never an
+/// overwrite.
+pub fn seal_recovered_prefix(
+    source: &File,
+    header: &JournalHeader,
+    scan: &TailScan,
+    paths: &ShardPaths,
+    generation: u64,
+    counters: &Arc<DurabilityCounters>,
+) -> Result<PathBuf, StoreError> {
+    if scan.frames.is_empty() {
+        return Err(StoreError::Corruption(
+            "recovery sealing refused: the validated prefix contains no frame".into(),
+        ));
+    }
+    if scan.frames.first().map(|frame| frame.offset) != Some(JOURNAL_HEADER_LEN as u64) {
+        return Err(StoreError::Corruption(
+            "recovery sealing refused: the validated prefix does not start after the header".into(),
+        ));
+    }
+    let last_end = scan
+        .frames
+        .last()
+        .and_then(|frame| frame.offset.checked_add(frame.len))
+        .ok_or_else(|| {
+            StoreError::Corruption("recovery sealing refused: invalid frame range".into())
+        })?;
+    if last_end != scan.stop_offset {
+        return Err(StoreError::Corruption(format!(
+            "recovery sealing refused: frame prefix ends at {last_end}, scan stops at {}",
+            scan.stop_offset
+        )));
+    }
+
+    let first = scan.frames.first().expect("non-empty").shard_sequence;
+    let last = scan.frames.last().expect("non-empty").shard_sequence;
+    let destination = paths.segment(generation, first, last);
+    let artifact = recovery_prefix_path(paths, header, generation);
+    if destination.exists() {
+        validate_recovered_segment(source, header, scan, &destination, generation)?;
+        if artifact.exists() {
+            let artifact_file = File::open(&artifact)?;
+            let compare_len = artifact_file.metadata()?.len().min(scan.stop_offset);
+            compare_prefix(source, &artifact_file, compare_len, &artifact)?;
+            sys::unlink(&artifact)?;
+            sys::fsync_dir(&paths.segments(), counters)?;
+        }
+        return Ok(destination);
+    }
+
+    let mut copied = File::options()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&artifact)?;
+    let existing_len = copied.metadata()?.len();
+    let compare_len = existing_len.min(scan.stop_offset);
+    compare_prefix(source, &copied, compare_len, &artifact)?;
+    if existing_len > scan.stop_offset {
+        // A crash after footer append but before publishing the segment may
+        // leave a sealed or partially sealed construction artifact. Its exact
+        // prefix proves ownership; discard only the construction suffix and
+        // run the normal seal again.
+        sys::truncate(&copied, scan.stop_offset, counters)?;
+    } else if existing_len < scan.stop_offset {
+        copy_exact_prefix(
+            source,
+            &mut copied,
+            existing_len,
+            scan.stop_offset,
+            counters,
+        )?;
+    }
+    sys::fdatasync(&copied, counters)?;
+    sys::fsync_dir(&paths.segments(), counters)?;
+    drop(copied);
+
+    let (mut journal, copied_scan) =
+        Journal::open(&artifact, &header.root_uuid, Arc::clone(counters))?;
+    if journal.header() != header
+        || copied_scan.frames != scan.frames
+        || copied_scan.stop_offset != scan.stop_offset
+    {
+        return Err(StoreError::Corruption(
+            "the fenced recovery prefix did not reopen as the source prefix".into(),
+        ));
+    }
+
+    let installed = seal_journal(&mut journal, paths, generation, counters)?;
+    validate_recovered_segment(source, header, scan, &installed, generation)?;
+
+    // The installed segment is a hard link to the now-sealed copy. Once its
+    // own name is fenced the uniquely named construction artifact is dead.
+    sys::unlink(&artifact)?;
+    sys::fsync_dir(&paths.segments(), counters)?;
+    Ok(installed)
+}
+
+fn recovery_prefix_path(paths: &ShardPaths, header: &JournalHeader, generation: u64) -> PathBuf {
+    paths.segments().join(format!(
+        ".recovery-{}-{generation}.prefix",
+        hex::encode(header.journal_id)
+    ))
+}
+
+fn copy_exact_prefix(
+    source: &File,
+    destination: &mut File,
+    from: u64,
+    through: u64,
+    counters: &DurabilityCounters,
+) -> Result<(), StoreError> {
+    const COPY_CHUNK: usize = 1 << 20;
+    let mut offset = from;
+    sys::seek_to(destination, from)?;
+    while offset < through {
+        let remaining = through - offset;
+        let len = usize::try_from(remaining.min(COPY_CHUNK as u64))
+            .map_err(|_| StoreError::Corruption("recovery prefix length overflow".into()))?;
+        let mut bytes = vec![0u8; len];
+        sys::pread_exact(source, offset, &mut bytes)?;
+        let end = sys::write_vectored_all(destination, &[IoSlice::new(&bytes)], counters)?;
+        let expected = offset
+            .checked_add(len as u64)
+            .ok_or_else(|| StoreError::Corruption("recovery prefix length overflow".into()))?;
+        if end != expected {
+            return Err(StoreError::Corruption(format!(
+                "short recovery-prefix copy: expected cursor {expected}, got {end}"
+            )));
+        }
+        offset = expected;
+    }
+    Ok(())
+}
+
+fn compare_prefix(
+    source: &File,
+    artifact: &File,
+    through: u64,
+    artifact_path: &Path,
+) -> Result<(), StoreError> {
+    const COMPARE_CHUNK: usize = 1 << 20;
+    let mut offset = 0u64;
+    while offset < through {
+        let remaining = through - offset;
+        let len = usize::try_from(remaining.min(COMPARE_CHUNK as u64))
+            .map_err(|_| StoreError::Corruption("recovery prefix length overflow".into()))?;
+        let mut original = vec![0u8; len];
+        let mut retained = vec![0u8; len];
+        sys::pread_exact(source, offset, &mut original)?;
+        sys::pread_exact(artifact, offset, &mut retained)?;
+        if original != retained {
+            return Err(StoreError::Corruption(format!(
+                "recovery construction artifact {} differs from its source at offset {offset}",
+                artifact_path.display()
+            )));
+        }
+        offset += len as u64;
+    }
+    Ok(())
+}
+
+fn validate_recovered_segment(
+    source: &File,
+    header: &JournalHeader,
+    scan: &TailScan,
+    destination: &Path,
+    generation: u64,
+) -> Result<(), StoreError> {
+    let reader = SegmentReader::open(destination, &header.root_uuid)?;
+    let footer = reader.footer();
+    let expected_offsets: Vec<(u64, u64, u64)> = scan
+        .frames
+        .iter()
+        .map(|frame| (frame.shard_sequence, frame.offset, frame.len))
+        .collect();
+    if reader.journal_header()? != *header
+        || footer.journal_id != header.journal_id
+        || footer.generation != generation
+        || footer.first_shard_sequence != scan.frames.first().expect("non-empty").shard_sequence
+        || footer.last_shard_sequence != scan.frames.last().expect("non-empty").shard_sequence
+        || footer.offsets != expected_offsets
+    {
+        return Err(StoreError::Corruption(format!(
+            "occupied recovery segment {} does not describe the validated prefix",
+            destination.display()
+        )));
+    }
+
+    const COMPARE_CHUNK: usize = 1 << 20;
+    let segment = File::open(destination)?;
+    let mut offset = 0u64;
+    while offset < scan.stop_offset {
+        let remaining = scan.stop_offset - offset;
+        let len = usize::try_from(remaining.min(COMPARE_CHUNK as u64))
+            .map_err(|_| StoreError::Corruption("recovery prefix length overflow".into()))?;
+        let mut original = vec![0u8; len];
+        let mut installed = vec![0u8; len];
+        sys::pread_exact(source, offset, &mut original)?;
+        sys::pread_exact(&segment, offset, &mut installed)?;
+        if original != installed {
+            return Err(StoreError::Corruption(format!(
+                "occupied recovery segment {} differs from the crash prefix at offset {offset}",
+                destination.display()
+            )));
+        }
+        offset += len as u64;
+    }
+    Ok(())
+}
+
 /// Step 6 of scope 3.4: drop the `active/` name, now that the manifest
 /// generation naming the segment is durable.
 ///
@@ -364,12 +586,37 @@ pub fn install_manifest(
     let final_path = paths.manifest(manifest.generation);
     let tmp = manifests.join(format!("{}.tmp", manifest_filename(manifest.generation)));
 
+    let encoded = manifest.encode()?;
     // 1, 2
-    write_fenced(&tmp, &manifest.encode()?, counters)?;
+    if tmp.exists() {
+        let existing = std::fs::read(&tmp)?;
+        if existing != encoded {
+            return Err(StoreError::Corruption(format!(
+                "manifest temp for generation {} contains different bytes",
+                manifest.generation
+            )));
+        }
+        let file = File::open(&tmp)?;
+        // Exact visible bytes do not prove the interrupted attempt reached its
+        // fence. Fence them again before publishing the final name.
+        sys::fdatasync(&file, counters)?;
+    } else {
+        write_fenced(&tmp, &encoded, counters)?;
+    }
     // 3 — never overwrite an existing generation.
     if let Err(e) = sys::rename_noreplace(&tmp, &final_path) {
+        if e.kind() != std::io::ErrorKind::AlreadyExists {
+            let _ = sys::unlink(&tmp);
+            return Err(e.into());
+        }
+        let existing = std::fs::read(&final_path)?;
         let _ = sys::unlink(&tmp);
-        return Err(e.into());
+        if existing != encoded {
+            return Err(StoreError::Corruption(format!(
+                "manifest generation {} already exists with different contents",
+                manifest.generation
+            )));
+        }
     }
     // 4
     sys::fsync_dir(&manifests, counters)?;

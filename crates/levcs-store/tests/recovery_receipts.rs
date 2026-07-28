@@ -28,6 +28,7 @@ fn receipt(
         repo_sequence: id as u64,
         shard_sequence: id as u64,
         current_authority: ObjectId([0xA1; 32]),
+        refs: Vec::new(),
         objects_new: 1,
         retry_until_micros: retry_until,
         first_receipt_visibility_micros: first_visible,

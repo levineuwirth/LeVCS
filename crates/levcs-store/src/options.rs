@@ -74,6 +74,24 @@ pub struct StoreOptions {
     pub max_refs_per_transaction: u32,
     pub max_projection_objects: u64,
     pub max_projection_bytes: u64,
+    pub max_projection_chunks: u32,
+    /// Maximum number of transient entries in `OperationStatusRoot`.
+    pub max_status_entries: u64,
+
+    // --- projection staging ---------------------------------------------
+    pub staging_max_sessions_per_principal: u32,
+    pub staging_max_sessions_global: u32,
+    pub staging_max_objects_per_principal: u64,
+    pub staging_max_objects_global: u64,
+    pub staging_max_bytes_per_principal: u64,
+    pub staging_max_bytes_global: u64,
+    pub staging_max_files_per_session: u64,
+    pub staging_max_files_per_principal: u64,
+    pub staging_max_files_global: u64,
+    pub staging_session_max_age_micros: i64,
+    pub staging_finalize_margin_micros: i64,
+    pub minimum_projection_transfer_bytes_per_second: u64,
+    pub staging_max_compaction_debt_bytes: u64,
 
     // --- retention and time ---------------------------------------------
     pub max_retry_window_micros: i64,
@@ -116,6 +134,24 @@ impl Default for StoreOptions {
             max_refs_per_transaction: 4_096,
             max_projection_objects: 100_000_000,
             max_projection_bytes: 1024 * 1024 * 1024 * 1024,
+            max_projection_chunks: 1_000_000,
+            max_status_entries: 1_000_000,
+            staging_max_sessions_per_principal: 2,
+            staging_max_sessions_global: 16,
+            staging_max_objects_per_principal: 200_000_000,
+            staging_max_objects_global: 800_000_000,
+            staging_max_bytes_per_principal: 2 * 1024 * 1024 * 1024 * 1024,
+            staging_max_bytes_global: 8 * 1024 * 1024 * 1024 * 1024,
+            staging_max_files_per_session: 1_000_002,
+            staging_max_files_per_principal: 2_000_000,
+            staging_max_files_global: 8_000_000,
+            // A maximal 1 TiB projection at the supported 16 MiB/s floor
+            // takes a little over 18 hours. The 24-hour session horizon
+            // leaves room for the five-minute finalize margin.
+            staging_session_max_age_micros: 24 * 60 * 60 * 1_000_000,
+            staging_finalize_margin_micros: 5 * 60 * 1_000_000,
+            minimum_projection_transfer_bytes_per_second: 16 * 1024 * 1024,
+            staging_max_compaction_debt_bytes: 8 * 1024 * 1024 * 1024 * 1024,
             // Plan §7 stage 3 initial hosted defaults: +/-60 s skew, 1 s timer
             // resolution, at least 121 s replay retention.
             max_retry_window_micros: 900_000_000,
@@ -192,10 +228,98 @@ impl StoreOptions {
             "max_objects_per_transaction must be nonzero"
         );
         require!(
+            self.max_projection_objects >= 1,
+            "max_projection_objects must be nonzero"
+        );
+        require!(
+            self.max_projection_bytes >= 1,
+            "max_projection_bytes must be nonzero"
+        );
+        require!(
+            self.max_projection_chunks >= 1,
+            "max_projection_chunks must be nonzero"
+        );
+        require!(
+            self.max_status_entries >= 1,
+            "max_status_entries must be nonzero"
+        );
+        require!(
             self.max_refs_per_transaction >= 1
                 && (self.max_refs_per_transaction as usize) <= levcs_protocol::v2::MAX_REF_UPDATES,
             "max_refs_per_transaction must be in 1..={}",
             levcs_protocol::v2::MAX_REF_UPDATES
+        );
+        require!(
+            self.staging_max_sessions_per_principal >= 1
+                && self.staging_max_sessions_per_principal <= self.staging_max_sessions_global,
+            "staging session limits must be nonzero and per-principal <= global"
+        );
+        require!(
+            self.staging_max_objects_per_principal >= self.max_projection_objects
+                && self.staging_max_objects_per_principal <= self.staging_max_objects_global,
+            "staging object limits must admit one maximal projection and \
+             per-principal must be <= global"
+        );
+        require!(
+            self.staging_max_bytes_per_principal >= self.max_projection_bytes
+                && self.staging_max_bytes_per_principal <= self.staging_max_bytes_global,
+            "staging byte limits must admit one maximal projection and \
+             per-principal must be <= global"
+        );
+        require!(
+            self.staging_max_files_per_session >= u64::from(self.max_projection_chunks) + 2
+                && self.staging_max_files_per_session <= self.staging_max_files_per_principal
+                && self.staging_max_files_per_principal <= self.staging_max_files_global,
+            "staging file limits must admit one maximal projection's chunks, \
+             session record, and manifest, and \
+             per-session <= per-principal <= global"
+        );
+        require!(
+            self.staging_session_max_age_micros > 0,
+            "staging_session_max_age_micros must be positive"
+        );
+        require!(
+            self.staging_finalize_margin_micros >= 0,
+            "staging_finalize_margin_micros must not be negative"
+        );
+        require!(
+            self.minimum_projection_transfer_bytes_per_second >= 1,
+            "minimum_projection_transfer_bytes_per_second must be nonzero"
+        );
+        require!(
+            self.staging_max_compaction_debt_bytes >= self.max_projection_bytes,
+            "staging_max_compaction_debt_bytes must admit one maximal projection"
+        );
+
+        let transfer_seconds = self
+            .max_projection_bytes
+            .checked_add(self.minimum_projection_transfer_bytes_per_second - 1)
+            .ok_or_else(|| {
+                StoreError::InvalidConfiguration(
+                    "projection transfer ceiling division overflows u64".into(),
+                )
+            })?
+            / self.minimum_projection_transfer_bytes_per_second;
+        let transfer_micros = transfer_seconds.checked_mul(1_000_000).ok_or_else(|| {
+            StoreError::InvalidConfiguration("projection transfer duration overflows u64".into())
+        })?;
+        let transfer_micros = i64::try_from(transfer_micros).map_err(|_| {
+            StoreError::InvalidConfiguration(
+                "projection transfer duration does not fit signed microseconds".into(),
+            )
+        })?;
+        let required_session_age = transfer_micros
+            .checked_add(self.staging_finalize_margin_micros)
+            .ok_or_else(|| {
+                StoreError::InvalidConfiguration(
+                    "projection transfer duration plus finalize margin overflows i64".into(),
+                )
+            })?;
+        require!(
+            required_session_age <= self.staging_session_max_age_micros,
+            "max projection requires {required_session_age}us at the supported transfer floor, \
+             exceeding staging_session_max_age_micros ({})",
+            self.staging_session_max_age_micros
         );
 
         require!(
@@ -320,6 +444,46 @@ mod tests {
         let mut o = valid();
         o.max_retry_window_micros = i64::MAX;
         o.terminal_status_grace_micros = 1;
+        assert!(o.validate().is_err());
+    }
+
+    #[test]
+    fn zero_status_or_staging_bounds_are_refused() {
+        let mut o = valid();
+        o.max_status_entries = 0;
+        assert!(o.validate().is_err());
+
+        let mut o = valid();
+        o.staging_max_sessions_global = 0;
+        assert!(o.validate().is_err());
+
+        let mut o = valid();
+        o.minimum_projection_transfer_bytes_per_second = 0;
+        assert!(o.validate().is_err());
+    }
+
+    #[test]
+    fn staging_feasibility_is_checked_before_startup() {
+        let mut o = valid();
+        o.staging_session_max_age_micros = o.staging_finalize_margin_micros;
+        assert!(
+            o.validate().is_err(),
+            "a session too short for one maximal transfer must be refused"
+        );
+    }
+
+    #[test]
+    fn staging_nested_bounds_must_be_monotonic() {
+        let mut o = valid();
+        o.staging_max_bytes_per_principal = o.max_projection_bytes - 1;
+        assert!(o.validate().is_err());
+
+        let mut o = valid();
+        o.staging_max_files_per_principal = o.staging_max_files_per_session - 1;
+        assert!(o.validate().is_err());
+
+        let mut o = valid();
+        o.staging_max_files_per_session = u64::from(o.max_projection_chunks) + 1;
         assert!(o.validate().is_err());
     }
 

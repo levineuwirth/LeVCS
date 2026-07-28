@@ -135,33 +135,17 @@ fn a_corrupt_current_falls_back_to_the_newest_valid_predecessor_manifest() {
 }
 
 #[test]
-fn a_corrupt_current_whose_newest_manifest_is_also_corrupt_falls_further_back() {
+fn a_corrupt_current_with_a_higher_invalid_manifest_refuses_lossy_fallback() {
     let shard = two_generations();
     shard.corrupt("CURRENT", 12);
     shard.corrupt("manifests/4.manifest", 30);
 
-    let selection = resolve(&shard).expect("generation 3 must be reachable");
-    assert_eq!(selection.generation, 3);
-    match selection.source {
-        ManifestSource::Fallback {
-            reason: ManifestFallbackReason::CurrentCorrupt(_),
-        } => {}
-        ref other => panic!(
-            "the reported reason is why CURRENT was abandoned, not why an \
-             intermediate generation was skipped; got {other:?}"
-        ),
-    }
     assert_eq!(
-        selection.rejected.len(),
-        1,
-        "the skipped generation must be reported, not silently passed over"
+        resolve(&shard),
+        None,
+        "a finalized higher manifest exists but its committed closure cannot be \
+         proved; generation 3 may be a shorter acknowledged prefix"
     );
-    assert_eq!(selection.rejected[0].0, 4);
-    match selection.rejected[0].1 {
-        ManifestFallbackReason::ReferentCorrupt { generation, .. } => assert_eq!(generation, 4),
-        ref other => panic!("expected a corrupt referent, got {other:?}"),
-    }
-    assert_agrees_with_a1(&shard);
 }
 
 #[test]
@@ -202,26 +186,18 @@ fn a_current_naming_another_store_root_is_refused_as_a_pointer_failure() {
 // ===========================================================================
 
 #[test]
-fn a_valid_current_naming_a_missing_manifest_generation_falls_back() {
+fn a_valid_current_naming_a_missing_manifest_generation_refuses_to_guess() {
     let shard = two_generations();
     // The pointer stays intact and keeps naming generation 9, which was never
     // written. This is a failure the single-`CURRENT` layout could not express.
     shard.write_current(9, ROOT_UUID);
 
-    let selection = resolve(&shard).expect("the newest present generation must be reachable");
-    assert_eq!(selection.generation, 4);
     assert_eq!(
-        selection.source,
-        ManifestSource::Fallback {
-            reason: ManifestFallbackReason::ReferentMissing { generation: 9 }
-        },
-        "an absent referent is not the same fault as a pointer that does not validate"
+        resolve(&shard),
+        None,
+        "without generation 9's manifest bytes recovery cannot prove that \
+         generation 4 has the same committed closure"
     );
-    assert_eq!(
-        selection.rejected,
-        vec![(9, ManifestFallbackReason::ReferentMissing { generation: 9 })]
-    );
-    assert_agrees_with_a1(&shard);
 }
 
 // ===========================================================================
@@ -229,49 +205,45 @@ fn a_valid_current_naming_a_missing_manifest_generation_falls_back() {
 // ===========================================================================
 
 #[test]
-fn a_valid_current_naming_a_manifest_that_fails_its_own_checksum_falls_back() {
+fn a_valid_current_naming_a_corrupt_manifest_refuses_to_guess() {
     let shard = two_generations();
     // CURRENT still names 4 and still validates. Generation 4's own bytes are
     // damaged.
     shard.corrupt("manifests/4.manifest", 40);
 
-    let selection = resolve(&shard).expect("generation 3 must be reachable");
-    assert_eq!(selection.generation, 3);
-    match selection.source {
-        ManifestSource::Fallback {
-            reason: ManifestFallbackReason::ReferentCorrupt { generation, .. },
-        } => assert_eq!(generation, 4),
-        ref other => panic!(
-            "a corrupt referent is a third distinct branch, not the corrupt-pointer \
-             one; got {other:?}"
-        ),
-    }
-    assert_agrees_with_a1(&shard);
+    assert_eq!(
+        resolve(&shard),
+        None,
+        "corrupt generation 4 cannot prove generation 3 authorizes the same tail"
+    );
 }
 
 #[test]
-fn the_three_branches_report_three_different_reasons() {
-    // The point of scope 4-A2's "may not be collapsed" is only checkable by
-    // comparing the three outcomes against each other.
+fn only_a_pointer_failure_with_a_highest_valid_manifest_permits_fallback() {
     let corrupt_pointer = {
         let shard = two_generations();
         shard.corrupt("CURRENT", 12);
-        resolve(&shard).expect("selected").source
+        resolve(&shard)
     };
     let missing_referent = {
         let shard = two_generations();
         shard.write_current(9, ROOT_UUID);
-        resolve(&shard).expect("selected").source
+        resolve(&shard)
     };
     let corrupt_referent = {
         let shard = two_generations();
         shard.corrupt("manifests/4.manifest", 40);
-        resolve(&shard).expect("selected").source
+        resolve(&shard)
     };
 
-    assert_ne!(corrupt_pointer, missing_referent);
-    assert_ne!(corrupt_pointer, corrupt_referent);
-    assert_ne!(missing_referent, corrupt_referent);
+    assert_eq!(
+        corrupt_pointer
+            .expect("highest immutable manifest validates")
+            .generation,
+        4
+    );
+    assert_eq!(missing_referent, None);
+    assert_eq!(corrupt_referent, None);
 }
 
 // ===========================================================================
@@ -279,7 +251,7 @@ fn the_three_branches_report_three_different_reasons() {
 // ===========================================================================
 
 #[test]
-fn a_corrupt_segment_referenced_by_the_active_manifest_forces_a_fallback() {
+fn a_corrupt_segment_referenced_by_current_refuses_a_shorter_closure() {
     let shard = two_generations();
     // Generation 4's manifest is intact; the segment it names is truncated to
     // nothing, which is what a failed link or a partially copied restore leaves
@@ -288,19 +260,11 @@ fn a_corrupt_segment_referenced_by_the_active_manifest_forces_a_fallback() {
     // place A2 and A1 legitimately disagree.
     std::fs::write(shard.paths.segments().join("4-0-9.seg"), b"").expect("truncate segment");
 
-    let selection = resolve(&shard).expect("generation 3 must be reachable");
-    assert_eq!(selection.generation, 3);
     assert_eq!(
-        selection.source,
-        ManifestSource::Fallback {
-            reason: ManifestFallbackReason::ReferentFileInvalid {
-                generation: 4,
-                filename: "4-0-9.seg".into(),
-                cause: ReferencedFileFault::TooShort,
-            }
-        },
-        "scope 3.8 step 2 falls back when ANY referenced file fails validation, \
-         not only when the manifest itself is corrupt"
+        resolve(&shard),
+        None,
+        "generation 3 names a different immutable segment closure; accepting it \
+         could discard acknowledged generation-4 transactions"
     );
 
     let (a1, _) = segment::load_manifest_with_fallback(&shard.paths, &ROOT_UUID)
@@ -314,23 +278,11 @@ fn a_corrupt_segment_referenced_by_the_active_manifest_forces_a_fallback() {
 }
 
 #[test]
-fn a_missing_segment_referenced_by_the_active_manifest_forces_a_fallback() {
+fn a_missing_segment_referenced_by_current_refuses_a_shorter_closure() {
     let shard = two_generations();
     std::fs::remove_file(shard.paths.segments().join("4-0-9.seg")).expect("remove");
 
-    let selection = resolve(&shard).expect("generation 3 must be reachable");
-    assert_eq!(selection.generation, 3);
-    assert_eq!(
-        selection.source,
-        ManifestSource::Fallback {
-            reason: ManifestFallbackReason::ReferentFileInvalid {
-                generation: 4,
-                filename: "4-0-9.seg".into(),
-                cause: ReferencedFileFault::Missing,
-            }
-        }
-    );
-    assert_agrees_with_a1(&shard);
+    assert_eq!(resolve(&shard), None);
 }
 
 #[test]
@@ -377,7 +329,7 @@ fn a_manifest_whose_generation_disagrees_with_its_file_name_is_refused() {
 // ===========================================================================
 
 #[test]
-fn the_fallback_scan_is_bounded() {
+fn an_invalid_highest_finalized_manifest_is_never_skipped() {
     let shard = ShardDir::new();
     shard.write_placeholder_segment("1-0-9.seg", SEGMENT_LEN);
     shard.write_manifest(&manifest(1, "1-0-9.seg"));
@@ -402,15 +354,18 @@ fn the_fallback_scan_is_bounded() {
          of reach; startup must refuse rather than hunt linearly"
     );
 
-    let selection = resolve_manifest(
-        &shard.paths,
-        &ROOT_UUID,
-        &PresenceAndLengthValidator::default(),
-        64,
-    )
-    .expect("resolution")
-    .expect("with a larger cap the good generation is found");
-    assert_eq!(selection.generation, 1);
+    assert_eq!(
+        resolve_manifest(
+            &shard.paths,
+            &ROOT_UUID,
+            &PresenceAndLengthValidator::default(),
+            64,
+        )
+        .expect("resolution"),
+        None,
+        "a larger scan bound must not license rollback past a finalized higher \
+         generation whose closure cannot be proved"
+    );
 }
 
 #[test]

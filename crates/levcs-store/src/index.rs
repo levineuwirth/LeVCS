@@ -149,13 +149,19 @@ impl IndexKey {
     }
 }
 
-/// Where the frame carrying an object lives.
+/// Where the certified storage record carrying an object lives.
 ///
-/// The location names the *frame*, not the object bytes inside it: the frame
-/// is the unit the format certifies — its trailer certifies the whole — so a
-/// reader validates the frame and then takes the object out of the validated
-/// payload. Pointing straight at object bytes would let a reader return bytes
-/// from a frame it never proved complete.
+/// For inline transactions the record is a complete journal frame. For an
+/// adopted projection it is a canonical, digest-bound staged chunk retained
+/// by the same committed generation. In both cases the location names the
+/// whole certified record, never the object bytes inside it: a reader
+/// validates the frame or chunk first and only then extracts the object.
+/// Pointing straight at object bytes would let a reader return bytes from a
+/// record it never proved complete.
+///
+/// The physical field names remain `frame_offset`/`frame_len` in storage
+/// version 1. Source kind is resolved from the generation pin in the captured
+/// `CommittedRoot`, so the packed index bytes do not need a new discriminant.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct IndexLocation {
     pub segment_generation: u64,

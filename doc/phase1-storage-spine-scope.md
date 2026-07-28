@@ -5,11 +5,13 @@ The rewrite plan remains authoritative. Where this document is more specific, it
 lead's Phase 1 realization of the plan; where it appears to contradict the plan, the plan
 wins and this document is defective.
 
-Status: **Wave A frozen 2026-07-26 at `5ee9c6b`; Wave B scoped, D0-B not yet started.**
+Status: **Wave A frozen 2026-07-26 at `5ee9c6b`; Wave B scoped, D0-B implemented and
+gate-green 2026-07-27.**
 Sections 9.1-9.6 were resolved on 2026-07-24 and are recorded there with their conditions;
 9.7 and 9.8 were ruled on 2026-07-26 and are recorded in §6.9, and contract review
-2026-07-26-A resolved the `EvidenceHandoffFailure` classification (§6.3). D0-B is unblocked;
-no open decision remains. Contract review 2026-07-24-B
+2026-07-26-A resolved the `EvidenceHandoffFailure` classification (§6.3). D0-B is complete,
+its frozen-surface implementation amendments are recorded by contract review 2026-07-27-A,
+and B1/B3/B4 dispatch is unblocked; no open decision remains. Contract review 2026-07-24-B
 (sections 9.1 and 9.2) has been applied to `bench/result-schema.json` and
 `bench/reference-hardware.toml` and recorded in the plan document. `crates/levcs-store`
 exists with the frozen API, the ownership split, the durability funnel, the failpoint
@@ -323,6 +325,7 @@ D0 lands; `Cargo.lock` is a reviewed artifact per §10.
 |---|---|---|
 | `arc-swap` | §5.1 mandates `ArcSwap<CommittedRoot>`, explicitly not `RwLock<Arc<_>>` | — |
 | `crossbeam-channel` | §7 "bounded crossbeam-style channels" to shard threads | `std::sync::mpsc` is unbounded/single-consumer |
+| `im` | §5.3 requires structurally shared hot publication maps; decision 9.7 applies it to repositories, receipts/tombstones, typed refs, and transient statuses | `Arc<BTreeMap>` clone-on-write is O(entries); a hand-rolled HAMT puts correctness risk in every captured read root |
 | `rustix` | `renameat2(RENAME_NOREPLACE)`, `O_TMPFILE`, `fdatasync`, `fallocate`, `pwritev`, `flock` without hand-rolled `libc` unsafe | raw `libc` (more unsafe surface), `nix` (heavier) |
 | `memmap2` | §5.3 memory-mapped immutable index runs | read-based runs; revisit if mmap SIGBUS-on-truncate handling proves worse |
 | `hdrhistogram` | §10 HDR-style histograms in the result bundle | — |
@@ -669,10 +672,13 @@ Normative rules attached to this sequence:
 
 ```text
  1  acquire LOCK; validate FORMAT and root_uuid
- 2  read CURRENT -> manifests/<generation>.manifest; if CURRENT is missing/corrupt or
-    any referenced file fails validation, fall back to the newest valid manifest
-    generation whose referenced files all validate
- 3  load the newest of >=2 validated checkpoints. Three outcomes, kept distinct:
+ 2  read CURRENT -> manifests/<generation>.manifest. If CURRENT is missing/corrupt,
+    select the highest valid finalized manifest only when no higher finalized manifest is
+    invalid. Never move to a shorter committed tail because a newer authoritative segment
+    is missing/corrupt; that is RecoveryRequired, not fallback. Derived checkpoint failure
+    is handled by step 3 and does not invalidate the transaction-authority manifest.
+ 3  from the selected manifest's retained checkpoint rows, load the newest of >=2
+    validated checkpoints. Three outcomes, kept distinct:
       no checkpoint directory entries at all -> a fresh root; replay from the start
       at least one validates                 -> load the newest
       entries exist and all fail validation  -> explicit offline rebuild mode
@@ -699,6 +705,21 @@ has zero checkpoint generations and is perfectly healthy; treating that as "all 
 failed" would license a replay from sequence zero on a *corrupt* store, which is the exact
 failure the rule exists to prevent. Emptiness and total corruption must be distinguishable
 by the type recovery returns, not by a comment.
+
+Contract review 2026-07-27-A narrows the original step-2 phrase "any referenced file." It
+was unsafe as written. If manifest 2 authorizes sealed frames 4–5 and checkpoint 5 is
+corrupt, falling back to manifest 1 may authorize only frames 0–3 while the active journal
+correctly begins at 6. Treating the shorter state as recovered manufactures acknowledged
+loss. Checkpoints are derived: keep manifest 2's transaction tail, load retained checkpoint
+3 from manifest 2, then replay sealed frames 4–5 and active frame 6. If every retained
+checkpoint fails, enter explicit offline rebuild.
+
+The same asymmetry is stricter for authority bytes. A missing or corrupt segment cannot be
+made safe by selecting an older manifest that omits it; recovery must refuse readiness. A
+corrupt or missing `CURRENT` may still select the highest valid immutable manifest in the
+directory, including one installed just before a crash prevented the pointer swap, but it
+may not skip a higher invalid finalized manifest and guess that the lower committed closure
+is complete.
 
 Two rules in there carry most of the risk and must be individually asserted, not asserted
 in aggregate:
@@ -791,16 +812,20 @@ Acceptance: for each of the following, a dedicated test, not a shared one — to
 frame; complete frame after a torn frame (must be discarded); zeroed tail; stale
 preallocated content in the tail; `EIO` on tail read; corrupt checkpoint (one generation,
 then both); corrupt segment referenced by the active manifest; **corrupt `CURRENT` with a
-valid predecessor manifest**; **valid `CURRENT` naming a missing manifest generation**;
-**valid `CURRENT` naming a manifest that fails its own checksum**; wrong `journal_id`;
-wrong `root_uuid`; shard-sequence duplicate; repo-sequence gap; `previous_event_digest`
-mismatch.
+highest valid immutable manifest and no higher invalid finalized manifest**; **valid
+`CURRENT` naming a missing manifest generation**; **valid `CURRENT` naming a manifest that
+fails its own checksum**; wrong `journal_id`; wrong `root_uuid`; shard-sequence duplicate;
+repo-sequence gap; `previous_event_digest` mismatch.
 
 The three manifest cases are distinct branches of recovery step 2 and may not be collapsed.
-Corrupt-`CURRENT` exercises "the pointer does not validate"; the two naming cases exercise
-"the pointer validates but its referent does not" — a failure the single-`CURRENT` layout
-could not express and which the pointer design introduces. All three must fall back to the
-newest valid manifest generation rather than to an error.
+A corrupt pointer may select the highest valid immutable manifest only when no higher
+invalid finalized manifest makes the committed closure ambiguous. A valid pointer naming a
+missing or corrupt manifest, or an authoritative manifest naming a missing or corrupt
+segment, must refuse readiness rather than silently shorten the acknowledged transaction
+tail. Checkpoint corruption is different because checkpoints are derived: recovery keeps
+the selected manifest, falls back among that manifest's retained checkpoint rows, and
+replays its remaining authoritative segments. These are the safe-fallback constraints of
+contract review 2026-07-27-A.
 
 ### A3 — StoreHarness
 
@@ -1164,7 +1189,7 @@ frozen surface: `format.rs`, `journal.rs`, `segment.rs`, `index.rs`, `checkpoint
 golden corpus. **No Wave B package may edit any of them.** A change any package believes it
 needs is an interface request to the lead, arbitrated and — if granted — recorded as a
 contract review in `doc/instance-throughput-rewrite-plan.md`. D0-B already exercises this:
-seven of its nine items amend a frozen or signature-frozen file, and each is a recorded
+nine of its eleven items amend a frozen or signature-frozen file, and each is a recorded
 amendment rather than an edit.
 
 The frozen surface is the **library**. Wave A's harness — `src/bin/store-crash-driver.rs`,
@@ -1185,7 +1210,7 @@ What Wave A already delivers, so no package rebuilds it:
 | Object index | `index::{IndexDelta, IndexRunBuilder, IndexRun}` | Namespace-scoped keys, Bloom-filtered sealed runs. |
 | Namespace catalog | `index::NamespaceCatalog` | `bind`, `advance`, `set_lifecycle`. |
 | Durable ref/receipt tables | `checkpoint::{RefRecord, ReceiptRecord, Checkpoint}` | Install and prune have production callers as of the freeze. |
-| Recovery | `recovery::*` | The algorithms are complete. The production **entry point** returning a `RecoveredShard` does not exist yet and is D0-B item 5; `ShardDrive::reopen_through_recovery` is a `store-internals` test seam, not it. |
+| Recovery | `recovery::*` | Wave A supplies parsing, validation, and logical replay. The production **entry point** returning a `RecoveredShard` is D0-B item 5; the physically complete step-8 repair and manifest-authority corrections are D0-B item 11. `ShardDrive::reopen_through_recovery` is a `store-internals` test seam, not the engine path. |
 | Retention arithmetic | `oracle::{retained_terminal_status, recovered_receipt_visibility}` | Frozen; compute from these, never restate. |
 
 ### 6.1 Ownership matrix
@@ -1226,11 +1251,28 @@ work, and every row touching a frozen Wave A file is a **contract amendment reco
 | 2 | The completion primitive behind `async fn submit` | `completion.rs` *(new)* | no |
 | 3 | `pub mod roots;` and `pub mod completion;` plus re-exports | `lib.rs` | **yes** |
 | 4 | `im` dependency (decision 9.7). **No dependency for item 2** — see below | `Cargo.toml`, workspace `Cargo.toml`, `Cargo.lock` | **yes** |
-| 5 | `RecoveredShard` and a non-feature-gated production recovery entry point | `recovery.rs` | **yes** |
+| 5 | `RecoverySession`, `RecoveredShard`, and a non-feature-gated production recovery entry point | `recovery.rs` | **yes** |
 | 6 | `ShardDrive::reopen_through_recovery` re-pointed onto item 5 | `drive.rs` | **yes** |
 | 7 | Staging and status-root limits (§6.5, decision 9.8) | `options.rs` | **yes** |
-| 8 | `StoreError::Overloaded { limit, retry_after_micros }` | `types.rs` | **yes** |
-| 9 | The adoption seam: `ProjectionAdoption` handle (resolve, pin, three-way outcome, reference proof) and `ValidatedTransactionBuilder::adopt_projection(StagedProjectionInstallV1, ProjectionAdoption)` | `transaction.rs`, `staging.rs` | signature frozen |
+| 8 | Cloneable exact completion outcomes: `StoreError: Clone`, `Io(Arc<std::io::Error>)` with lossless `From`, and `Overloaded { limit, retry_after_micros }` | `types.rs` (plus mechanical construction call sites) | **yes** |
+| 9 | The adoption seam: `ProjectionAdoption` handle (resolve, pin, three-way outcome, reference proof), `ValidatedTransactionBuilder::adopt_projection(StagedProjectionInstallV1, ProjectionAdoption)`, and recovery resolution of committed staged artifacts into the same index/generation ownership model | `transaction.rs`, `staging.rs`, `roots.rs`, `recovery.rs`, `index.rs` | **yes** |
+| 10 | Retain exact `CommitReceipt.refs` in checkpoint receipt rows, populated from the canonical frame by production recovery and the drive seam | `checkpoint.rs`, `recovery.rs`, `drive.rs` | **yes** |
+| 11 | Complete normative recovery step 8 and manifest authority: deterministically preserve and seal the validated active prefix, install a fresh active journal before readiness, validate authoritative manifest tuples, select only its retained checkpoints, allocate generations above rejected immutable artifacts, and publish drive checkpoints through the manifest | `journal.rs`, `segment.rs`, `recovery.rs`, `drive.rs`, recovery tests | **yes** |
+
+**Item 10 is a D0-B integration finding, not B1 work.** A replayed canonical frame carries
+the exact applied refs in `committed.transaction.refs`, but Wave A's `ReceiptRecord` omitted
+them. Once a checkpoint moves the replay horizon past that frame, the current ref table
+cannot recover old values, deleted refs, `force`, or which refs belonged to that
+transaction. Returning an empty projection would make a committed retry differ across
+reopen.
+
+New checkpoints therefore set an authenticated checkpoint capability flag and encode the
+complete bounded applied-ref vector in every retained receipt row. A storage-version-1
+checkpoint without that flag remains readable when it has no retained receipts. If it has
+any, it is rejected as `ReceiptRefsUnavailable` and follows the existing explicit offline
+rebuild path; inventing empty receipt refs is forbidden. Readers predating the amendment
+already reject the non-zero flag, so compatibility fails closed in both directions without
+a global storage-version bump. Contract review 2026-07-27-A records the amendment.
 
 **Item 5 is a blocker discovered in review and is the reason this section was rewritten.**
 The first draft required `StoreEngine::open` to recover through
@@ -1247,6 +1289,13 @@ the engine recover identically by construction rather than by review. If the two
 again, it must be because somebody changed the shared function, not because a caller quietly
 grew its own.
 
+`LOCK` is root-wide, so the production entry point is owned by a `RecoverySession` that
+holds it continuously while every shard is recovered and then moves into `StoreEngine` for
+the engine's lifetime. A free one-shard wrapper exists for the drive seam and is implemented
+by creating that same session. Acquiring and dropping one lock per shard would leave a
+second process able to enter between shards or immediately after recovery but before
+readiness, invalidating the recovered root before its first read.
+
 **`RecoveredShard` must carry everything `CommittedRoot` needs, which is more than the
 replayed tail.** A first draft listed "an index delta" and that is a defect: an object whose
 only index entry lives in a sealed `IndexRun` or a checkpointed generation would be present
@@ -1256,7 +1305,10 @@ pinned against reclamation. The contents are therefore:
 - the namespace catalog, ref state, and receipt table;
 - the **complete layered index** — the replayed delta *over* the ordered set of sealed
   `IndexRun` references the selected manifest and checkpoint generation retain, in the
-  lookup order `CommittedRoot` will use, not the delta alone;
+  lookup order `CommittedRoot` will use, not the delta alone. For a committed
+  `StagedProjectionInstallV1`, the staging-owned recovery resolver must supply its exact
+  namespace-scoped membership and live artifact/index pins before readiness; a notification
+  without incorporating those objects is not complete recovery;
 - **every retained generation reference** — segments, index runs, and checkpoint
   generations — so constructing the root transfers ownership of the things that keep those
   files alive rather than merely naming them;
@@ -2056,7 +2108,7 @@ D0  lead skeleton, frozen API, sys/failpoint shims, deps, decisions 9.1-9.5
                               Wave A frozen 2026-07-26 at 5ee9c6b
                                          |
 D0-B  lead: roots.rs, completion.rs, RecoveredShard entry point, adoption handle,
-      lib/deps/options/error amendments (9 items, 7 touching frozen files)
+      lib/deps/options/error/recovery amendments (11 items, 9 touching frozen files)
                                          |
      +-- B1 NamespaceTxn   ---+
      +-- B3 StagingSessions ---+--> Wave B freeze gate + adversarial review
@@ -2083,7 +2135,8 @@ matrix that can express the class of defect Wave A shipped.
 
 Sections 9.1-9.6 are resolved, so Wave A was unblocked once D0 landed; 9.7 and 9.8 were ruled
 on 2026-07-26 in §6.9, and contract review 2026-07-26-A closed the `EvidenceHandoffFailure`
-conflict, so D0-B is unblocked. The item that was sequenced ahead of A3 —
+conflict. D0-B is implemented and gate-green, so B1, B3, and B4 dispatch is unblocked. The
+item that was sequenced ahead of A3 —
 **contract review 2026-07-24-B**, the `result-schema.json` per-flag
 conditional with its re-pin requirement and the top-level `promotable`, the added
 `workload.generator` field, and `reference-hardware.toml`'s `store_directory_attributes` —

@@ -74,6 +74,20 @@ pub struct Fixture {
     pub wave_a_asserted: Vec<String>,
     pub wave_a_unasserted: Vec<String>,
     pub wave_b_asserted: Vec<String>,
+    /// By what path the root the Wave B rows exercise was created, as a short
+    /// stable token.
+    ///
+    /// A **tripwire**, matched by exact equality in `crash_matrix.rs`. It was a
+    /// paragraph matched with `.contains("StoreEngine::open")`, and a substring
+    /// test is too weak for a tripwire: it keeps passing on a value that has
+    /// drifted to mean something else, because the substring survives the
+    /// drift. The history — that the non-production seeding weakness existed
+    /// and is now closed — lives in [`Fixture::root_seeded_by_reason`], which is
+    /// where an essay belongs; it is not in the value being matched.
+    pub root_seeded_by: String,
+    /// Why the token above is what it is. Required non-empty: a tripwire whose
+    /// justification can be deleted silently is a token nobody can audit.
+    pub root_seeded_by_reason: String,
     pub wave_b_exit_conditions: Vec<String>,
 }
 
@@ -129,16 +143,28 @@ pub fn load_fixture() -> Fixture {
         .get("wave_b_assertion_scope")
         .expect("the fixture must record which halves Wave B asserts");
     let wave_b_asserted = string_list(wave_b_scope.get("asserted").expect("asserted"));
-    assert!(
-        wave_b_scope
-            .get("root_seeded_by")
-            .and_then(|v| v.as_str())
-            .is_some_and(|r| !r.is_empty()),
-        "the Wave B rows are driven against a root that StoreEngine::open cannot yet \
-         create, and the fixture must say by what path it was created instead. Scope 5 \
-         charter item 8 is about exactly this: a property asserted against a store that \
-         production never built is asserted against the wrong store."
-    );
+    let root_seeded_by = wave_b_scope
+        .get("root_seeded_by")
+        .and_then(|v| v.as_str())
+        .filter(|r| !r.is_empty())
+        .expect(
+            "the fixture must say by what path the root the Wave B rows exercise was \
+             created. Scope 5 charter item 8 is about exactly this: a property asserted \
+             against a store that production never built is asserted against the wrong \
+             store, and a reader of the fixture must be able to tell which it is \
+             without reading the harness.",
+        )
+        .to_string();
+    let root_seeded_by_reason = wave_b_scope
+        .get("root_seeded_by_reason")
+        .and_then(|v| v.as_str())
+        .filter(|r| !r.is_empty())
+        .expect(
+            "root_seeded_by is a short token matched by exact equality, so the reason it \
+             carries that value must live beside it. A tripwire whose justification can \
+             be dropped without anything failing is a token nobody can audit.",
+        )
+        .to_string();
 
     let wave_b_exit_conditions = string_list(
         document
@@ -181,6 +207,8 @@ pub fn load_fixture() -> Fixture {
         wave_a_asserted,
         wave_a_unasserted,
         wave_b_asserted,
+        root_seeded_by,
+        root_seeded_by_reason,
         wave_b_exit_conditions,
     }
 }

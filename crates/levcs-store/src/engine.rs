@@ -11,9 +11,11 @@
 //! This is the first vertical slice: one retained [`RecoverySession`] across
 //! every shard, one shard writer per shard wired
 //! `GroupBuilder` -> `append_group_and_fence` -> [`ShardSubtree`] -> committed
-//! root CAS -> completion, and the publication ordering of scope 6.3. The
-//! startup states other than "a valid `FORMAT` opens through production
-//! recovery", the signer pool and its suffix repair, coalescing, terminal
+//! root CAS -> completion, and the publication ordering of scope 6.3. Startup
+//! states 1 and 2 are implemented — an absent or empty root is initialized
+//! under the root lock, and a valid `FORMAT` opens through production
+//! recovery. States 3 and 4, the signer pool and its suffix repair,
+//! coalescing, terminal
 //! retention, rotation/sealing, and `RepoSnapshot` are later B1 assignments
 //! and refuse with a [`StoreError::NotImplemented`] naming themselves. None of
 //! them returns a partial result or a plausible default; a caller that reaches
@@ -64,7 +66,7 @@ use crate::roots::{
     ShardSequenceMap, ShardSubtree, StatusEntry, StatusReservation, TerminalStatusEntry,
     TerminalStatusMap, TypedRefMap,
 };
-use crate::segment::RootLayout;
+use crate::segment::{self, RootLayout};
 use crate::snapshot::RepoSnapshot;
 use crate::staging::ProjectionStaging;
 use crate::transaction::ValidatedTransaction;
@@ -125,6 +127,31 @@ struct EngineShared {
     /// asserted.
     _staging: Arc<ProjectionStaging>,
     _session: RecoverySession,
+    /// What startup state 1 actually cost, or `None` when this open did not
+    /// initialize.
+    ///
+    /// Charter item 7: "state 1 created the tree and fsynced it" is otherwise
+    /// a claim about [`initialize_root_state_1`] rather than an observation. A
+    /// test that opens an absent root can read the directory fsyncs the
+    /// initialization performed instead of inferring them from the tree it
+    /// left behind — and, just as importantly, an open of state 2 can assert
+    /// this is `None`, which is the only direct evidence that reopening a
+    /// formatted root writes nothing.
+    ///
+    /// `#[cfg(test)]` because exposing it is a frozen-surface change; see the
+    /// interface request in this deliverable's report.
+    #[cfg(test)]
+    initialization: Option<DurabilityCounterSnapshot>,
+    /// What recovery concluded about each shard during this open, in shard
+    /// order.
+    ///
+    /// The engine consumes these reports and keeps only their effects, which
+    /// is right for production and leaves nothing to compare against the drive
+    /// seam — `DriveRecovery` retains its report precisely so the two can be
+    /// compared, and the engine side had no counterpart. `#[cfg(test)]` for
+    /// the same reason as [`EngineShared::initialization`].
+    #[cfg(test)]
+    recovery_reports: Vec<crate::recovery::ShardRecoveryReport>,
     /// Observed committed-root CAS contention.
     ///
     /// Charter item 7: the re-merge path is otherwise only reachable as a race,
@@ -163,9 +190,15 @@ impl StoreEngine {
     /// modification. It never infers legacy state merely from a missing
     /// marker.
     ///
-    /// **This slice implements the second state only.** The other three are
-    /// refused by name below, before anything is written, so a caller cannot
-    /// mistake "not built yet" for "your root is broken".
+    /// **This slice implements states 1 and 2**, including state 1's
+    /// crash-resume shape: a root whose initialization was interrupted is
+    /// recognized by the marker this path installs before it builds anything
+    /// and is finished rather than refused
+    /// ([`RootStartupState::InterruptedInitialization`]). States 3 and 4 are
+    /// still refused by name below, after a read-only classification and before
+    /// anything is written, so a caller cannot mistake "not built yet" for
+    /// "your root is broken". See [`classify_root`] for why the classification
+    /// itself creates nothing.
     ///
     /// Recovery runs through **one** [`RecoverySession`] for every shard, and
     /// that session then moves into the engine. `LOCK` is root-wide: taking
@@ -179,18 +212,12 @@ impl StoreEngine {
         // the root would make the refusal depend on the root's state.
         options.validate()?;
 
-        let layout = RootLayout::new(&options.root);
-        if !layout.format_path().exists() {
-            // States 1, 3, and 4 are distinguished by inspecting a root this
-            // slice does not yet classify. Refusing without probing is the
-            // same rule those states obey: no writes, no inference.
-            return Err(StoreError::NotImplemented(
-                "StoreEngine::open startup states 1, 3, and 4 (initialize an absent or empty \
-                 root, LegacyLayout, UnrecognizedLayout) — B1 NamespaceTxn, scope 6-B1 \
-                 deliverable 1",
-            ));
-        }
-
+        // Hoisted above every root access on purpose. This used to run after
+        // the `FORMAT` probe, which was harmless while state 1 refused — but
+        // now that an absent root is *initialized*, a signerless configuration
+        // reaching this point would have already created a tree, written
+        // `FORMAT`, and fsynced the parent before failing. A configuration
+        // error must not be able to leave a root behind.
         let signer = options.signer.clone().ok_or_else(|| {
             StoreError::InvalidConfiguration(
                 "a CommitEvidenceSigner must be registered by instance composition before the \
@@ -198,6 +225,31 @@ impl StoreEngine {
                     .into(),
             )
         })?;
+
+        let layout = RootLayout::new(&options.root);
+        #[cfg_attr(not(test), allow(unused_variables))]
+        let initialization =
+            match classify_root(&layout)? {
+                // Both reach the same code because they are the same state: a root
+                // that has never finished initializing. The second one only carries
+                // residue this code path wrote, and `initialize_root_state_1`
+                // re-decides which it is under the lock before it writes anything.
+                RootStartupState::AbsentOrEmpty | RootStartupState::InterruptedInitialization => {
+                    Some(initialize_root_state_1(&layout, &options)?)
+                }
+                RootStartupState::Formatted => None,
+                // States 3 and 4 share one refusal because telling them apart is
+                // the legacy recognizer, and returning `UnrecognizedLayout` for a
+                // root that is in fact a legacy instance would tell an operator
+                // holding real data "refusing to modify" instead of the migration
+                // command. Nothing here has written, probed, or inferred.
+                RootStartupState::NonEmptyWithoutFormat => return Err(StoreError::NotImplemented(
+                    "StoreEngine::open startup states 3 and 4 (LegacyLayout carrying the exact \
+                     migrate-store command, UnrecognizedLayout) — B1 NamespaceTxn, scope 6-B1 \
+                     deliverable 1. The root is non-empty and carries no FORMAT; it has not been \
+                     modified",
+                )),
+            };
 
         let session = RecoverySession::open(&options.root)?;
         if session.shard_count() != options.shard_count {
@@ -253,6 +305,10 @@ impl StoreEngine {
             options,
             _staging: staging,
             _session: session,
+            #[cfg(test)]
+            initialization,
+            #[cfg(test)]
+            recovery_reports: recovered.iter().map(|shard| shard.report.clone()).collect(),
             #[cfg(test)]
             root_cas_retries: std::sync::atomic::AtomicU64::new(0),
         });
@@ -445,6 +501,723 @@ impl Drop for StoreEngine {
             }
         }
     }
+}
+
+// ===========================================================================
+// Startup: classifying the root (plan §5.2, scope 3.1)
+// ===========================================================================
+
+/// Which of plan §5.2's startup states a root is in, decided by reading and
+/// nothing else.
+///
+/// States 3 and 4 share a variant because this pass does not implement the
+/// legacy recognizer that separates them. That is a deliberate under-
+/// classification, not a catch-all: the variant is named for exactly the
+/// condition it holds — non-empty, no `FORMAT` — and `open` refuses it by
+/// naming both unbuilt states. Charter item 6 forbids a `_ =>` arm; it does
+/// not require inventing a distinction whose recognizer has not been written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RootStartupState {
+    /// §5.2 state 1. The path does not exist, or it is a directory holding
+    /// nothing that this store did not create before it had decided anything.
+    AbsentOrEmpty,
+    /// §5.2 state 2. A `FORMAT` entry exists. Whether it *validates* is
+    /// deliberately not decided here; see [`classify_root`].
+    Formatted,
+    /// §5.2 state 1, interrupted. The root carries this store's own
+    /// initialization marker and nothing outside the skeleton that
+    /// [`segment::initialize_root`] builds, so it is a root that started
+    /// initializing and never finished.
+    ///
+    /// Not a fifth plan state: it is state 1 observed part-way through, and it
+    /// resolves to the same action state 1 takes. It exists as its own variant
+    /// because the *evidence* is different — an empty root proves nothing has
+    /// been written, this one proves that what was written was written by this
+    /// code path — and because charter item 6 requires the condition that
+    /// authorizes a write to be named rather than folded into a neighbour.
+    InterruptedInitialization,
+    /// §5.2 states 3 and 4, undivided this pass.
+    NonEmptyWithoutFormat,
+}
+
+// ---------------------------------------------------------------------------
+// The initialization marker (plan §5.2 state 1, crash-resume)
+// ---------------------------------------------------------------------------
+
+/// The name of the marker that says "this root is mid-initialization".
+///
+/// Computed from `layout.root` here rather than added to [`RootLayout`],
+/// because `RootLayout` is A1's frozen surface. Giving the name one definition
+/// there is filed as an interface request; until it moves, this is the only
+/// place in the crate that spells it.
+const INITIALIZING_NAME: &str = "INITIALIZING";
+
+/// The staging name the marker is installed from, so the marker itself is
+/// never observed torn.
+const INITIALIZING_TMP_NAME: &str = "INITIALIZING.tmp";
+
+/// First bytes of the marker. The whole point of the classification is that
+/// this cannot be produced by accident: a directory that merely *looks* like an
+/// abandoned root has no reason to contain a file whose first sixteen bytes are
+/// this string.
+const INITIALIZING_MAGIC: &[u8; 16] = b"levcs-store-init";
+
+/// 16 magic + 1 version + 2 shard_count + 8 created_at_micros.
+const INITIALIZING_MARKER_LEN: usize = 27;
+
+/// The exact bytes of the marker for one initialization attempt.
+///
+/// `shard_count` and `created_at_micros` are **evidence, not input**. A resume
+/// restarts from the configuration the resuming process was given, not from the
+/// one recorded here — the interrupted attempt published nothing, so it has no
+/// claim on the topology. They are recorded so that an operator looking at
+/// residue can see what the interrupted attempt intended, which is the one
+/// question the file's existence alone cannot answer.
+fn initializing_marker_bytes(shard_count: u16, created_at_micros: i64) -> [u8; 27] {
+    let mut bytes = [0u8; INITIALIZING_MARKER_LEN];
+    bytes[..16].copy_from_slice(INITIALIZING_MAGIC);
+    bytes[16] = 1;
+    bytes[17..19].copy_from_slice(&shard_count.to_le_bytes());
+    bytes[19..27].copy_from_slice(&created_at_micros.to_le_bytes());
+    bytes
+}
+
+/// Open `path` if and only if it is a **regular file holding exactly this code
+/// path's marker**, and return the open descriptor so a caller that then wants
+/// to act on those bytes acts on the object it validated rather than on the
+/// name a second time.
+///
+/// Four conditions, all necessary, none inferred from the name:
+///
+/// 1. **Regular file, not a symlink** — [`crate::sys::open_regular_nofollow`]
+///    opens with `O_NOFOLLOW` and checks the type through `fstat` on the
+///    descriptor it got. A symlink here is not "our marker whose bytes live
+///    elsewhere", it is somebody else's name, and following it would let a link
+///    planted in the root decide what this process reads and (see
+///    [`install_initializing_marker`]) writes.
+/// 2. **Exactly [`INITIALIZING_MARKER_LEN`] bytes** — one byte more is read
+///    than the marker occupies, so a longer file is rejected by the same
+///    comparison that rejects a shorter one.
+/// 3. **[`INITIALIZING_MAGIC`]**, which nothing else in this crate and nothing
+///    in a legacy layout writes.
+/// 4. **A version this build knows.**
+///
+/// `Ok(None)` for every failure, including absence: the caller has already seen
+/// the name in a `read_dir` that may be a moment stale, and a marker that
+/// vanished between the scan and this read is a root with no marker. Every one
+/// of these answers means the same thing to every caller — *these are not our
+/// bytes* — so they are one variant rather than a distinction no caller acts
+/// on.
+fn open_exact_marker(path: &std::path::Path) -> Result<Option<std::fs::File>, StoreError> {
+    let file = match crate::sys::open_regular_nofollow(path)? {
+        Some(file) => file,
+        None => return Ok(None),
+    };
+    // One byte more than the marker, so a longer file is rejected by the same
+    // length comparison that rejects a shorter one.
+    let mut bytes = [0u8; INITIALIZING_MARKER_LEN + 1];
+    let read = crate::sys::pread(&file, 0, &mut bytes)?;
+    if read == INITIALIZING_MARKER_LEN && &bytes[..16] == INITIALIZING_MAGIC && bytes[16] == 1 {
+        Ok(Some(file))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Whether `<root>/INITIALIZING` is this code path's marker.
+///
+/// Judged on content and file type, never on the name alone. A file of any
+/// other length, with any other first sixteen bytes, or that is not a regular
+/// file at all, is somebody else's and is treated as unrecognized content — the
+/// direction that wastes an operator's time rather than the one that destroys
+/// their data.
+fn initializing_marker_is_ours(layout: &RootLayout) -> Result<bool, StoreError> {
+    Ok(open_exact_marker(&layout.root.join(INITIALIZING_NAME))?.is_some())
+}
+
+/// Decide the startup state of `layout.root` **without creating, modifying, or
+/// removing anything**.
+///
+/// One `read_dir` and a name comparison. No `create_dir_all`, no `File::open`
+/// with `create`, no lock — a probe that creates a directory has already
+/// broken state 4's byte-identity guarantee before the refusal it exists to
+/// support is even reached, and there would be no test that could tell.
+///
+/// # The names this function has to rule on
+///
+/// - **`FORMAT` present.** State 2, on the strength of the *name* alone. A
+///   `FORMAT` that fails to decode is still `FORMAT`: it is not evidence of an
+///   empty root, and treating it as one would let a corrupt marker authorize
+///   `initialize_root` to build a fresh tree over a populated one. Validation
+///   is [`segment::read_format`]'s job inside [`RecoverySession::open`], where
+///   failing is a refusal and never a rebuild.
+/// - **`LOCK`, present as a regular file.** Ignored. It is not store data and
+///   it is not evidence that anything has been decided: `LOCK` is a zero-length
+///   file that [`segment::lock_root`] creates with `create(true)` as a side
+///   effect of *asking* whether the root is busy, so any process that merely
+///   probed the root leaves one. Treating it as state 4 would permanently wedge
+///   a root that has no bytes to lose.
+/// - **`INITIALIZING.tmp`, present as a regular file holding exactly the
+///   marker.** Ignored, on the same reasoning and on nothing weaker. It is the
+///   staging name the marker below is installed from, and it normally exists
+///   only between a fenced write and the `rename_noreplace` that consumes it.
+/// - **`INITIALIZING` present as a regular file, and every other entry inside
+///   the initialization skeleton.**
+///   [`RootStartupState::InterruptedInitialization`] — see below.
+/// - **Anything else.** State 3 or 4, refused without modification. Including
+///   `FORMAT.tmp` on its own: it is residue this code path writes, but by
+///   itself it is residue from *after* the marker was installed and then
+///   removed, which cannot happen — a `FORMAT.tmp` with no marker beside it is
+///   somebody else's file.
+///
+/// # Why a name is never enough, and why the *type* of every entry is checked
+///
+/// Contract review finding P1 (2026-07-29). This function used to ignore
+/// `INITIALIZING.tmp` **whatever it was**, on the argument that the name can
+/// only be this code path's residue by construction — and
+/// [`build_root_under_lock`] then opened it with `create` + `truncate`. The
+/// argument is not available here, twice over. It is the very claim the
+/// classification is running in order to establish, and before the store owns
+/// the root it has no standing to assume anything about what is in it. An
+/// operator's regular file of that name in an otherwise-empty configured root
+/// was destroyed silently; a **symlink** of that name was followed, so the
+/// truncation landed on a file outside the root entirely, and the link was then
+/// renamed away and unlinked so the evidence went with it.
+///
+/// So every entry is judged by `DirEntry::file_type`, which reports the type of
+/// the directory entry itself and never of a symlink's target, and the two
+/// names whose contents can authorize anything are additionally opened with
+/// `O_NOFOLLOW` and validated ([`open_exact_marker`]). A symlink at `LOCK`,
+/// `INITIALIZING`, `INITIALIZING.tmp`, or `FORMAT.tmp`, and a directory or fifo
+/// at any of them, is a foreign entry and disqualifies the root. `FORMAT` is
+/// still decided on its name alone, which stays safe for the opposite reason:
+/// nothing on the state-2 path ever creates or truncates it — `initialize_root`
+/// installs it only by `rename_noreplace`, which refuses an occupied name
+/// including a symlink — so the worst a planted `FORMAT` can do is be read and
+/// fail to decode, which is a refusal.
+///
+/// # The cost of this, stated rather than discovered
+///
+/// A torn or partially written `INITIALIZING.tmp` — a crash between its
+/// creation and its fence — is now **refused** rather than overwritten, and
+/// that refusal is permanent until an operator removes the file. That is the
+/// intended trade and it is the same asymmetry the rest of this classification
+/// is built on: refusing a resumable root costs an operator time, and
+/// overwriting a real file costs them data. There is no test that can tell a
+/// torn marker of ours from a stranger's truncated file, because there is no
+/// difference between them on disk.
+///
+/// # Why an interrupted initialization is recognized, and how it cannot be
+/// confused with a root that merely looks abandoned
+///
+/// [`segment::initialize_root`] creates `quarantine/`, `staging/`, `shards/`
+/// and the per-shard tree *before* it installs `FORMAT`. A crash anywhere in
+/// that window used to leave a non-empty root with no `FORMAT`, which this
+/// function classified as states 3/4 and `open` refused — permanently, with a
+/// message about legacy layouts and migration, for a root that had never held
+/// a byte of anyone's data. That is why [`initialize_root_state_1`] installs
+/// `INITIALIZING` as its first durable act and removes it as its last.
+///
+/// Two independent conditions must both hold before this returns
+/// `InterruptedInitialization`, and each alone is enough to exclude a genuine
+/// unrecognized layout:
+///
+/// 1. **`INITIALIZING` decodes as this code path's marker** — a regular file of
+///    exactly [`INITIALIZING_MARKER_LEN`] bytes, opened `O_NOFOLLOW`, opening
+///    with [`INITIALIZING_MAGIC`] and a version this build knows. Nothing else
+///    in this crate, and nothing in a legacy layout, writes that file. A
+///    human's note that happens to be named `INITIALIZING` fails on content.
+/// 2. **Every entry in the root is inside the initialization skeleton, with the
+///    type this store creates it as** — `LOCK`, `INITIALIZING`,
+///    `INITIALIZING.tmp` and `FORMAT.tmp` as regular files, `quarantine`,
+///    `staging` and `shards` as directories, and nothing else. A single foreign
+///    name — a legacy `<64-hex>/` repository directory, a `notes.txt`, anything
+///    an operator put there — disqualifies the root however convincing the
+///    marker is, and so does a right name of the wrong type.
+///
+/// So mistaking a real root for an abandoned one requires an operator to have
+/// placed a byte-exact copy of this marker into a directory that otherwise
+/// contains only names this store invented. The asymmetry is deliberate: the
+/// failure this can produce is a refusal that wastes time, and the failure it
+/// cannot produce is initializing over somebody's data.
+///
+/// The ordering makes the converse hole impossible too. The marker is fenced,
+/// and the root directory fsynced, *before* the first directory of the tree is
+/// created — so a durable partial tree always has a durable marker beside it,
+/// and there is no crash point that leaves tree residue this function would
+/// refuse.
+///
+/// A missing directory and an empty directory are the same state and are
+/// deliberately not distinguished. That is now true because
+/// [`initialize_root_state_1`] fences every directory entry it creates on the
+/// way down to the root, not because `initialize_root` fsyncs `root.parent()`:
+/// that parent fsync covers exactly one link, and a root reached through
+/// several newly created ancestors has several.
+fn classify_root(layout: &RootLayout) -> Result<RootStartupState, StoreError> {
+    let entries = match std::fs::read_dir(&layout.root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RootStartupState::AbsentOrEmpty)
+        }
+        // Every other failure — `ENOTDIR` because the configured root is a
+        // regular file, `EACCES`, `ELOOP` — is reported as itself. A root this
+        // process cannot read is not a root it may conclude is empty, and the
+        // refusal has modified nothing.
+        Err(error) => return Err(StoreError::from(error)),
+    };
+
+    let mut has_format = false;
+    let mut has_marker = false;
+    // Anything that is neither `FORMAT` nor an ignorable probe artifact.
+    // Non-empty in the sense states 3 and 4 mean it.
+    let mut has_content = false;
+    // Anything outside the closed set of names an initialization can leave.
+    let mut has_foreign = false;
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        // `DirEntry::file_type` is the type of the entry itself: it is `lstat`,
+        // never `stat`, so a symlink reports as a symlink and this loop cannot
+        // be made to describe an object outside the root.
+        let kind = entry.file_type()?;
+
+        if name == std::ffi::OsStr::new("FORMAT") {
+            has_format = true;
+            continue;
+        }
+        // Probe residue, ignorable only in the exact shape the probe leaves.
+        if name == std::ffi::OsStr::new("LOCK") {
+            if kind.is_file() {
+                continue;
+            }
+            has_content = true;
+            has_foreign = true;
+            continue;
+        }
+        // The staging name, ignorable only when it is a regular file carrying
+        // this code path's marker byte for byte. Anything else at that name —
+        // a symlink, a directory, a stranger's file, a torn write — is foreign,
+        // because the alternative is deciding it is ours and then writing
+        // through it.
+        if name == std::ffi::OsStr::new(INITIALIZING_TMP_NAME) {
+            if kind.is_file()
+                && open_exact_marker(&layout.root.join(INITIALIZING_TMP_NAME))?.is_some()
+            {
+                continue;
+            }
+            has_content = true;
+            has_foreign = true;
+            continue;
+        }
+        has_content = true;
+        if name == std::ffi::OsStr::new(INITIALIZING_NAME) {
+            // Content is checked below, once, and only if nothing foreign was
+            // found; the type is checked here because a non-regular entry at
+            // this name is foreign whatever it would have read as.
+            if kind.is_file() {
+                has_marker = true;
+            } else {
+                has_foreign = true;
+            }
+            continue;
+        }
+        // The rest of what `segment::initialize_root` creates directly in the
+        // root, each with the type it creates it as. Named exhaustively rather
+        // than pattern-matched: a name this list does not contain must
+        // disqualify the root, and a wildcard here is the one edit that would
+        // silently stop it doing so. The type is part of the name's meaning —
+        // a symlink called `FORMAT.tmp` is not residue, it is an instruction to
+        // write outside the root, and `segment::write_fenced` would follow it.
+        if !matches!(
+            (name.to_str(), kind.is_file(), kind.is_dir()),
+            (Some("FORMAT.tmp"), true, _)
+                | (Some("quarantine"), _, true)
+                | (Some("staging"), _, true)
+                | (Some("shards"), _, true)
+        ) {
+            has_foreign = true;
+        }
+    }
+
+    // Order is plan §5.2's order. `FORMAT` wins over everything below it
+    // because state 2 is decided before any other state; the interrupted shape
+    // is decided next because it is state 1 and its evidence is positive; and
+    // "empty" is evaluated against the same scan rather than a second one, so
+    // no interleaved writer can make the two disagree.
+    if has_format {
+        return Ok(RootStartupState::Formatted);
+    }
+    if has_marker && !has_foreign && initializing_marker_is_ours(layout)? {
+        return Ok(RootStartupState::InterruptedInitialization);
+    }
+    Ok(if has_content {
+        RootStartupState::NonEmptyWithoutFormat
+    } else {
+        RootStartupState::AbsentOrEmpty
+    })
+}
+
+/// Plan §5.2 startup state 1: build the v2 tree under the root lock.
+///
+/// # Why the lock, and why it is taken here rather than inherited
+///
+/// Initializing a root is a mutation, and two processes configured for the
+/// same absent path will otherwise both classify it `AbsentOrEmpty` and both
+/// run [`segment::initialize_root`]. The loser's `rename_noreplace` of
+/// `FORMAT` would fail, but only after it had already created a shard tree and
+/// fsynced it into a root the winner had begun to consider its own. So the
+/// classification is repeated **under the lock**, and it is the second answer
+/// that authorizes the write. That is the whole race: `FORMAT` is installed by
+/// a no-replace rename as the last durable act of initialization, so if the
+/// second classification still says `AbsentOrEmpty` while this process holds
+/// `LOCK`, no other process can be mid-initialization.
+///
+/// The lock is a [`segment::RootLock`] and is released by dropping it, which
+/// issues an explicit `LOCK_UN` rather than relying on a descriptor close a
+/// concurrently forked child can extend (commit `e050b6d`).
+///
+/// The same rule governs the resume path. Finding an `INITIALIZING` marker
+/// before the lock authorizes nothing: another process may be building that
+/// tree *right now*, in which case this one is refused `AlreadyLocked` and never
+/// reaches the second classification. It is the classification taken **while
+/// holding `LOCK`** that authorizes finishing someone else's interrupted
+/// initialization, and by then the only process that could have been mid-build
+/// has released the lock and is gone.
+///
+/// # Why the lock is then released and immediately retaken
+///
+/// [`RecoverySession::open`] takes `LOCK` itself, and there is no constructor
+/// that adopts an already-held one — adding it is a change to A2's frozen
+/// surface and is filed as an interface request, not made here. The gap is
+/// safe but it is a real gap and worth stating exactly: an initialized root is
+/// complete and durable the moment this returns, so a second process entering
+/// the window can only take state 2, and if it does, this process's
+/// `RecoverySession::open` is refused `AlreadyLocked` — the correct answer for
+/// a root another process owns, not a corruption. What the window cannot
+/// produce is two initializations, because the second process no longer
+/// classifies the root as empty.
+fn initialize_root_state_1(
+    layout: &RootLayout,
+    options: &StoreOptions,
+) -> Result<DurabilityCounterSnapshot, StoreError> {
+    let counters = DurabilityCounters::default();
+
+    // `LOCK` lives inside the root, so the directory has to exist before it
+    // can be locked. This is the one write that precedes the lock, and it is
+    // the write state 1 is defined to perform: creating the path is
+    // idempotent, two racing processes both succeed, and neither has yet
+    // written a byte either could lose. It is reached only after the read-only
+    // classification said the root has never been initialized, so it never runs
+    // against states 2, 3, or 4.
+    create_and_fence_root_path(&layout.root, &counters)?;
+    let lock = segment::lock_root(layout)?;
+
+    match classify_root(layout)? {
+        // Both are state 1. The second says the marker is already on disk, so
+        // `build_root_under_lock` re-fences the name it finds instead of
+        // installing a second one.
+        RootStartupState::AbsentOrEmpty => {
+            build_root_under_lock(layout, options, false, &counters)?
+        }
+        RootStartupState::InterruptedInitialization => {
+            build_root_under_lock(layout, options, true, &counters)?
+        }
+        // Another process initialized this root between the first
+        // classification and this lock. Its tree is complete and fsynced, so
+        // there is nothing to do and nothing to repair; the caller falls
+        // straight through to state 2.
+        RootStartupState::Formatted => {}
+        // Non-empty with no `FORMAT` and no marker, discovered only under the
+        // lock. The refusal is the same one state 3/4 gets, and this path has
+        // written nothing but the directories it was told were absent.
+        RootStartupState::NonEmptyWithoutFormat => {
+            return Err(StoreError::NotImplemented(
+                "StoreEngine::open startup states 3 and 4 (LegacyLayout carrying the exact \
+                 migrate-store command, UnrecognizedLayout) — B1 NamespaceTxn, scope 6-B1 \
+                 deliverable 1. The root became non-empty without a FORMAT between \
+                 classification and the root lock; it has not been modified",
+            ))
+        }
+    }
+
+    drop(lock);
+    Ok(counters.snapshot())
+}
+
+/// Create every missing directory on the way to `root`, and fence each new
+/// directory entry — deepest first.
+///
+/// # Why this is not `create_dir_all` followed by `initialize_root`
+///
+/// `create_dir_all` creates *every* missing ancestor, and
+/// [`segment::initialize_root`] fences exactly one link: `root.parent()`. So a
+/// configured root of `.../not/yet/a-root` under an existing directory left the
+/// entries naming `not` and `yet` unfenced, while `open` returned success. A
+/// power loss could then take an ancestor and the whole initialized root with
+/// it — a store that reported itself initialized, reachable only through
+/// directory entries no one had made durable.
+///
+/// # Why fencing rather than refusing an absent parent
+///
+/// Refusing would have been less code and is genuinely safe. It was rejected
+/// because it moves a durability defect onto the operator as a configuration
+/// restriction: a root path under a per-instance directory the store is
+/// expected to create is the ordinary deployment shape, and `StoreEngine::open`
+/// already promises to build an absent root. "Absent" would then have had to
+/// mean "absent by exactly one component", which is a rule nothing on disk
+/// explains and which every caller would have to learn by being refused.
+///
+/// # The ordering, which is the whole content of the fix
+///
+/// Only the directories *this call* creates are fenced, and a directory entry
+/// lives in the parent that names it — so fencing directory `D` is fsyncing
+/// `parent(D)`. They are fenced deepest first: a child's entry must be durable
+/// before the entry naming its parent, because the reverse order can leave a
+/// crash image in which a fenced parent names a child that was never fenced.
+/// For `base/a/b/c` with `base` already present, that is fsync(`b`), fsync(`a`),
+/// fsync(`base`) — one fsync per created directory.
+///
+/// `c`'s own contents are not this function's concern: it is empty here, and
+/// [`segment::initialize_root`] fsyncs the root itself once it has built the
+/// tree inside it.
+///
+/// Routed through `sys::fsync_dir` because that module is the crate's sole
+/// durability funnel; a raw `File::open(..).sync_all()` here would be invisible
+/// to the counters that make this fix testable at all.
+fn create_and_fence_root_path(
+    root: &std::path::Path,
+    counters: &DurabilityCounters,
+) -> Result<(), StoreError> {
+    // Deepest first. `try_exists` rather than `exists` so that a path this
+    // process cannot stat is an error instead of silently "missing" — creating
+    // over an `EACCES` would be a refusal turned into a mutation.
+    let mut missing: Vec<&std::path::Path> = Vec::new();
+    let mut cursor = Some(root);
+    while let Some(path) = cursor {
+        if path.try_exists()? {
+            break;
+        }
+        missing.push(path);
+        cursor = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty());
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    // Shallowest first: a directory cannot be created before the one that names
+    // it. `create_dir` rather than `create_dir_all` so that what this call
+    // created is exactly what it fences — `create_dir_all` would silently
+    // absorb an ancestor another process created in the same instant and leave
+    // this one believing it had made the link.
+    for path in missing.iter().rev() {
+        match std::fs::create_dir(path) {
+            Ok(()) => {}
+            // A racing initializer of the same path got there first. Its own
+            // fence covers the link either way, and fencing it twice is
+            // harmless; refusing here would make two correct processes fight.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(StoreError::from(error)),
+        }
+    }
+
+    for path in &missing {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        crate::sys::fsync_dir(parent, counters)?;
+    }
+    Ok(())
+}
+
+/// Install the initialization marker, build the tree, and remove the marker.
+///
+/// The order is the contract [`classify_root`] reads back:
+///
+/// 1. `INITIALIZING.tmp` is created with `O_EXCL`, written and fenced
+///    ([`install_initializing_marker`]), renamed onto `INITIALIZING` with
+///    `rename_noreplace`, and the root directory fsynced. The marker is
+///    therefore never observable torn under its installed name, and it is
+///    durable **before** any part of the tree exists.
+/// 2. [`segment::initialize_root`] builds the tree and installs `FORMAT`.
+/// 3. The marker is unlinked and the removal fenced.
+///
+/// A crash in step 1 leaves at most `LOCK` and `INITIALIZING.tmp`. A *whole*
+/// `INITIALIZING.tmp` classifies as an empty root and is adopted by the next
+/// attempt; a torn one is refused, which is the trade
+/// [`install_initializing_marker`] states. A crash in step 2 leaves the marker and a partial
+/// skeleton, which classify as `InterruptedInitialization` and land back here.
+/// A crash in step 3 leaves a complete, valid root, which classifies as state 2
+/// — the marker is then inert litter that `FORMAT` outranks, and removing it on
+/// a state-2 open is rejected precisely because it would make reopening a
+/// formatted root a mutation.
+///
+/// `resuming` says the marker is already there. It is passed rather than
+/// re-derived because `rename_noreplace` onto an existing `INITIALIZING` would
+/// fail, and because re-deciding it here would be a third classification that
+/// could disagree with the one taken under the lock.
+///
+/// A resume restarts the build from the *current* configuration rather than the
+/// one the marker records: the interrupted attempt published no `FORMAT`, so it
+/// froze no topology and has no claim on this one. If the two disagree on
+/// `shard_count`, the surplus shard directories from the wider attempt are left
+/// behind — empty, referenced by no `FORMAT`, and read by nothing, since every
+/// consumer iterates `0..FORMAT.shard_count`.
+fn build_root_under_lock(
+    layout: &RootLayout,
+    options: &StoreOptions,
+    resuming: bool,
+    counters: &DurabilityCounters,
+) -> Result<(), StoreError> {
+    let marker = layout.root.join(INITIALIZING_NAME);
+    if resuming {
+        // The marker exists but its *name* may not be durable: the crash could
+        // have landed between the rename and the fsync below. Fencing it again
+        // before touching the tree is what keeps "a durable partial tree always
+        // has a durable marker beside it" true across a second interruption.
+        crate::sys::fsync_dir(&layout.root, counters)?;
+    } else {
+        let tmp = layout.root.join(INITIALIZING_TMP_NAME);
+        let bytes = initializing_marker_bytes(options.shard_count, now_micros());
+        install_initializing_marker(&tmp, &bytes, counters)?;
+        crate::sys::rename_noreplace(&tmp, &marker)?;
+        crate::sys::fsync_dir(&layout.root, counters)?;
+    }
+
+    segment::initialize_root(
+        layout,
+        options.shard_count,
+        fresh_root_uuid(),
+        now_micros(),
+        counters,
+    )?;
+
+    // Last, and after `FORMAT` is durable. Removing it earlier would open a
+    // window in which the tree exists, `FORMAT` does not, and nothing says the
+    // residue is ours — which is the exact defect this marker was added to
+    // close.
+    crate::sys::unlink(&marker)?;
+    crate::sys::fsync_dir(&layout.root, counters)?;
+    Ok(())
+}
+
+/// Put the marker's bytes at the staging name and fence them, **without ever
+/// writing through a name this process has not established is its own**. The
+/// name is not durable when this returns; the caller renames and fsyncs the
+/// directory.
+///
+/// # The two branches, and why neither of them can truncate
+///
+/// The ordinary case creates the name: [`crate::sys::create_new_nofollow`] is
+/// `O_CREAT | O_EXCL | O_NOFOLLOW`, so it either brings a brand-new regular
+/// file into existence in *this* directory or reports that the name is taken.
+/// `O_CREAT | O_EXCL` is specified to fail on a symlink whether or not the link
+/// resolves, so there is no arrangement of the root that can redirect this
+/// write.
+///
+/// The name being taken is the interesting case, and this is where contract
+/// review finding P1 was. What used to happen was `create` + `truncate`: an
+/// operator's file at that name was destroyed, and a *symlink* at that name was
+/// followed so the destruction landed on a file outside the root, after which
+/// the link was renamed and unlinked and the evidence went with it. What
+/// happens now is that the occupant is validated by [`open_exact_marker`] —
+/// regular file, exact length, exact magic, known version — and only *then*
+/// adopted, in place, by fencing the bytes that are already there. Adoption
+/// writes nothing: the file already holds exactly what this call was about to
+/// write, so the fence is the whole remaining act.
+///
+/// Adopting the occupant's bytes rather than replacing them also keeps the
+/// resume rule consistent. `shard_count` and `created_at_micros` in the marker
+/// are evidence of the interrupted attempt, not input to this one
+/// ([`initializing_marker_bytes`]), and the resume-from-`INITIALIZING` path
+/// already carries the earlier attempt's bytes forward untouched. This does the
+/// same thing one step earlier.
+///
+/// # What is refused, and what that costs
+///
+/// Everything else at that name: a stranger's file, a symlink, a directory, and
+/// a **torn or partially written marker** — a crash between the create and the
+/// fence. The torn case is the one that costs something real: a root that was
+/// previously resumable now needs an operator to remove one file before it will
+/// initialize. That is the intended trade, and it is not close. Refusing a
+/// resumable root costs an operator time; overwriting a real file costs them
+/// their data. And nothing on disk distinguishes our torn 12-byte marker from a
+/// stranger's truncated 12-byte file, so a rule that recovers the first
+/// necessarily destroys the second.
+///
+/// # Standing disclosure
+///
+/// This began as a second copy of `segment::write_fenced`, which is private to
+/// A1's file, and the duplication was filed as an interface request. The two
+/// are no longer the same function: this one cannot truncate and cannot follow
+/// a symlink, and `segment::write_fenced` still can. The request therefore
+/// changes shape rather than going away — if one of them is hoisted, it must be
+/// this one, and `FORMAT.tmp` should be opened through it. That is an interface
+/// request against a frozen file and is recorded in this deliverable's report,
+/// not made here.
+fn install_initializing_marker(
+    tmp: &std::path::Path,
+    bytes: &[u8],
+    counters: &DurabilityCounters,
+) -> Result<(), StoreError> {
+    match crate::sys::create_new_nofollow(tmp)? {
+        Some(mut file) => {
+            crate::sys::write_vectored_all(&mut file, &[std::io::IoSlice::new(bytes)], counters)?;
+            crate::sys::fdatasync(&file, counters)?;
+            Ok(())
+        }
+        // Reachable in normal operation when a previous attempt crashed between
+        // the create and the rename, and reachable adversarially at any time,
+        // since the classification that ran a moment ago under `LOCK` is a
+        // statement about the past. Both are handled by looking, not by
+        // assuming.
+        None => match open_exact_marker(tmp)? {
+            Some(file) => {
+                crate::sys::fdatasync(&file, counters)?;
+                Ok(())
+            }
+            None => Err(StoreError::UnrecognizedLayout(format!(
+                "{}: the initialization staging name is occupied by something that is not this \
+                 store's marker — a foreign file, a symlink, a directory, or a torn marker from \
+                 an interrupted attempt. Refusing to write through it; nothing has been modified. \
+                 Remove that entry to let the root initialize",
+                tmp.display()
+            ))),
+        },
+    }
+}
+
+/// A fresh `root_uuid` for a root being initialized.
+///
+/// `FORMAT.root_uuid` binds every `CURRENT`, manifest, journal, segment, index
+/// run, and checkpoint in the root (scope 3.1), and its whole job is to make a
+/// file copied in from another instance detectable. So it must not be a
+/// function of anything two roots can share — the path in particular, since a
+/// root deleted and recreated at the same path is exactly the case this is
+/// meant to catch.
+///
+/// **Duplication, disclosed rather than hidden:** `drive.rs` has a private
+/// `fresh_id` doing the same thing for journal and root identifiers. This is a
+/// second implementation of "derive 16 bytes with enough entropy to be unique
+/// per process and per call", and it is here because `drive.rs` is A1's file
+/// and is `#[cfg(feature = "store-internals")]`, so neither borrowing it nor
+/// editing it is available to this deliverable. Hoisting one into `sys` is
+/// filed as an interface request.
+fn fresh_root_uuid() -> [u8; 16] {
+    use std::sync::atomic::AtomicU64;
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let stack = 0u8;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"levcs-store-root-uuid/v1\0");
+    hasher.update(&now_micros().to_le_bytes());
+    hasher.update(&COUNTER.fetch_add(1, Ordering::Relaxed).to_le_bytes());
+    hasher.update(&std::process::id().to_le_bytes());
+    hasher.update(&(&stack as *const u8 as usize).to_le_bytes());
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    id
 }
 
 // ===========================================================================
@@ -2147,7 +2920,7 @@ impl StoreEngine {
 #[allow(clippy::let_unit_value)]
 mod tests {
     use std::future::Future;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
     use std::sync::Mutex;
     use std::task::{Context, Poll, Wake, Waker};
@@ -2272,17 +3045,6 @@ mod tests {
         Arc::new(DurabilityCounters::default())
     }
 
-    fn initialized_root(_serial: &WriterSerial, path: &Path, shard_count: u16) {
-        segment::initialize_root(
-            &RootLayout::new(path),
-            shard_count,
-            [0x11; 16],
-            now_micros(),
-            &counters(),
-        )
-        .expect("initialize the store root");
-    }
-
     fn options(_serial: &WriterSerial, root: &Path, shard_count: u16) -> StoreOptions {
         let mut options = StoreOptions::new(root);
         options.shard_count = shard_count;
@@ -2294,9 +3056,19 @@ mod tests {
         options
     }
 
+    /// Every writer test's root, built by the entry point a consumer calls.
+    ///
+    /// This used to seed the root with `segment::initialize_root` and then
+    /// open it, because `StoreEngine::open` refused startup state 1. That was
+    /// the charter item 8 weakening at the heart of this deliverable: the
+    /// production `submit` was being exercised over a root production could
+    /// not create. With state 1 implemented there is nothing left to seed —
+    /// the first call initializes and every later call on the same path is
+    /// state 2, which is also what makes the reopen tests below reopens rather
+    /// than re-seedings.
     fn open(serial: &WriterSerial, root: &Path, shard_count: u16) -> StoreEngine {
-        initialized_root(serial, root, shard_count);
-        StoreEngine::open(options(serial, root, shard_count)).expect("open the initialized root")
+        StoreEngine::open(options(serial, root, shard_count))
+            .expect("open initializes an absent root and reopens a formatted one")
     }
 
     /// The client principal on whose behalf a transaction is submitted.
@@ -2420,30 +3192,1027 @@ mod tests {
             .expect("the lock is released when the engine is dropped");
     }
 
+    // -----------------------------------------------------------------------
+    // Plan §5.2's startup states, one test per state
+    //
+    // Charter item 8: every one of these asserts against `StoreEngine::open`,
+    // the entry point a consumer calls, and never against `classify_root` or
+    // `segment::initialize_root` directly. A root that only `initialize_root`
+    // can create is a root the production path has never been shown to build.
+    // -----------------------------------------------------------------------
+
+    /// A recursive, order-independent image of a directory tree: relative
+    /// path, whether it is a directory, and the exact bytes of every file.
+    ///
+    /// This is what "byte-identical after the refusal" is asserted with. It
+    /// deliberately captures *contents* rather than mtimes: an mtime can
+    /// change for reasons outside this process, and a test that flakes on it
+    /// would be retried rather than believed. What it must catch is a probe
+    /// that created a directory, truncated a file, or appended a byte, and it
+    /// catches all three including the empty-directory case, which a
+    /// contents-only digest would miss.
+    fn tree_image(root: &Path) -> Vec<(PathBuf, bool, Vec<u8>)> {
+        fn walk(base: &Path, dir: &Path, out: &mut Vec<(PathBuf, bool, Vec<u8>)>) {
+            let mut entries: Vec<_> = std::fs::read_dir(dir)
+                .expect("read a directory of the image")
+                .map(|entry| entry.expect("a directory entry").path())
+                .collect();
+            entries.sort();
+            for path in entries {
+                let relative = path
+                    .strip_prefix(base)
+                    .expect("every walked path is under the base")
+                    .to_path_buf();
+                if path.is_dir() {
+                    out.push((relative, true, Vec::new()));
+                    walk(base, &path, out);
+                } else {
+                    out.push((relative, false, std::fs::read(&path).expect("read a file")));
+                }
+            }
+        }
+        let mut image = Vec::new();
+        if root.exists() {
+            walk(root, root, &mut image);
+        }
+        image
+    }
+
+    /// State 1, absent path. The root's *name* does not exist when `open` is
+    /// called, so this also covers the case in which initialization has to
+    /// make a new directory entry durable in the parent.
     #[test]
-    fn a_root_without_format_is_refused_by_naming_the_unbuilt_startup_states() {
+    fn startup_state_1_initializes_an_absent_root_through_open() {
         let serial = writer_serial();
         let temporary = tempfile::tempdir().expect("tempdir");
-        match StoreEngine::open(options(&serial, temporary.path(), 1)) {
-            Err(StoreError::NotImplemented(reason)) => {
-                assert!(reason.contains("startup states 1, 3, and 4"), "{reason}")
+        let root = temporary.path().join("not").join("yet").join("a-root");
+        assert!(!root.exists());
+
+        let engine = StoreEngine::open(options(&serial, &root, 3))
+            .expect("startup state 1 initializes an absent root");
+
+        // Charter item 7: not "it must have fsynced", but how many times, and
+        // for which entry. The total is stated as its parts so that a change to
+        // any one of them fails here with its name attached.
+        //
+        // `segment::initialize_root` costs six directories per shard, each
+        // fsynced as it is created, plus the shard directory a second time once
+        // its children are durable — seven per shard — and then shards/,
+        // quarantine/, the root, and the root's parent. `staging/` is created
+        // and not separately fsynced, which is correct rather than missing: it
+        // is empty, so the only thing that has to become durable about it is
+        // its name in the root, and the root fsync is what covers that.
+        let inside_initialize_root = 3 * 7 + 4;
+        // The path is `<tmp>/not/yet/a-root` and none of the three exist, so
+        // `open` creates three directory entries before it can take the root
+        // lock — and fences each one by fsyncing the directory that names it:
+        // `yet` (which names `a-root`), `not` (which names `yet`), and the
+        // tempdir (which names `not`), in that order.
+        //
+        // This is the assertion the P1-1 finding turns on. `initialize_root`
+        // fsyncs `root.parent()` and nothing above it, so before the fix this
+        // number was zero and a power loss could take `not` or `yet` — and the
+        // root with them — from a store that had already reported itself
+        // initialized.
+        let created_ancestors = 3;
+        // The `INITIALIZING` marker: one fsync of the root to make its name
+        // durable before the tree is built, and one more to make its removal
+        // durable after `FORMAT` is installed.
+        let initialization_marker = 2;
+        let initialization = engine
+            .shared
+            .initialization
+            .expect("state 1 records what it cost");
+        assert_eq!(
+            initialization.fdatasync, 2,
+            "the INITIALIZING marker and FORMAT are each fenced exactly once"
+        );
+        assert_eq!(
+            initialization.fsync_dir,
+            created_ancestors + initialization_marker + inside_initialize_root,
+            "every created ancestor, the initialization marker's install and removal, \
+             every created directory, shards/, quarantine/, the root, and its parent"
+        );
+        assert_eq!(initialization.short_writes, 0);
+        assert!(
+            !root.join("INITIALIZING").exists(),
+            "a finished initialization leaves no marker behind"
+        );
+
+        // The root it built is the root the production path then opens: the
+        // frozen topology is the configured one, and it is readable through
+        // `FORMAT` rather than assumed.
+        assert_eq!(engine.shared.shard_count, 3);
+        let marker = segment::read_format(&RootLayout::new(&root)).expect("FORMAT is valid");
+        assert_eq!(marker.shard_count, 3);
+        assert_eq!(marker.root_uuid, engine.shared.root_uuid);
+
+        // And it is a *usable* root, not merely a well-formed one.
+        let namespace = NamespaceId([0x51; 32]);
+        block_on(engine.submit(create_transaction(namespace, 1)))
+            .expect("a transaction commits into a root open() created");
+    }
+
+    /// P1-1, isolated from every other cost in the open.
+    ///
+    /// The absolute count above is the whole claim, but it is one number made
+    /// of four terms, and a reader has to trust the arithmetic to believe the
+    /// ancestor term is in it. This asserts the ancestor term on its own: two
+    /// otherwise identical initializations whose roots differ only in how many
+    /// directory entries have to be created must differ in directory fsyncs by
+    /// exactly that many.
+    ///
+    /// Before the fix the difference was zero — `create_dir_all` made all the
+    /// entries and `initialize_root` fenced one of them — so this fails without
+    /// it, and it fails with a number rather than an absence.
+    #[test]
+    fn startup_state_1_fences_one_directory_entry_per_created_ancestor() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+
+        // One new entry: the root itself, inside an existing directory.
+        let shallow = temporary.path().join("shallow");
+        let shallow_cost = StoreEngine::open(options(&serial, &shallow, 1))
+            .expect("state 1 at depth one")
+            .shared
+            .initialization
+            .expect("state 1 records what it cost")
+            .fsync_dir;
+
+        // Three new entries: two ancestors and the root.
+        let deep = temporary.path().join("deep").join("er").join("still");
+        let deep_cost = StoreEngine::open(options(&serial, &deep, 1))
+            .expect("state 1 at depth three")
+            .shared
+            .initialization
+            .expect("state 1 records what it cost")
+            .fsync_dir;
+
+        assert_eq!(
+            deep_cost - shallow_cost,
+            2,
+            "two extra created ancestors must cost two extra directory fences; \
+             everything else about the two initializations is identical"
+        );
+    }
+
+    /// State 1, present but empty. Distinguished from the absent case only by
+    /// who created the directory entry, and required to reach the same place.
+    #[test]
+    fn startup_state_1_initializes_an_existing_empty_root() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+        assert_eq!(tree_image(temporary.path()), Vec::new());
+
+        let engine = StoreEngine::open(options(&serial, temporary.path(), 1))
+            .expect("an existing empty directory is startup state 1");
+        assert!(engine.shared.initialization.is_some());
+        assert!(temporary.path().join("FORMAT").exists());
+    }
+
+    /// State 1, and the deliberate decision inside it: a directory holding
+    /// only `LOCK` is empty.
+    ///
+    /// This is not a hypothetical. `segment::lock_root` opens `LOCK` with
+    /// `create(true)`, so an initialization that dies between taking the lock
+    /// and the `FORMAT` rename leaves precisely this, and so does any process
+    /// that merely asked whether the root was busy. Classifying it as
+    /// unrecognized would wedge a root with no bytes to lose.
+    #[test]
+    fn startup_state_1_treats_a_root_holding_only_lock_as_empty() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let layout = RootLayout::new(temporary.path());
+        drop(segment::lock_root(&layout).expect("probing the root creates LOCK"));
+
+        let image = tree_image(temporary.path());
+        assert_eq!(image.len(), 1, "exactly LOCK is present: {image:?}");
+        assert_eq!(image[0].0, PathBuf::from("LOCK"));
+
+        let engine = StoreEngine::open(options(&serial, temporary.path(), 1))
+            .expect("a root holding only LOCK is still startup state 1");
+        assert!(engine.shared.initialization.is_some());
+    }
+
+    /// State 1 is a mutation, so it happens under the root lock.
+    ///
+    /// The observable is the refusal: with `LOCK` held elsewhere, `open` on
+    /// what is otherwise a state-1 root must be refused `AlreadyLocked` and
+    /// must leave the root exactly as empty as it found it. An initialization
+    /// that ran before locking, or without locking, would create `FORMAT` here
+    /// — and two processes doing that concurrently is the race the lock
+    /// exists to close.
+    #[test]
+    fn startup_state_1_does_not_initialize_a_root_another_process_holds() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let layout = RootLayout::new(temporary.path());
+        let held = segment::lock_root(&layout).expect("take the root lock first");
+
+        assert!(matches!(
+            StoreEngine::open(options(&serial, temporary.path(), 1)),
+            Err(StoreError::AlreadyLocked)
+        ));
+        let image = tree_image(temporary.path());
+        assert_eq!(image.len(), 1, "nothing but LOCK was created: {image:?}");
+
+        // Releasing it makes the same call succeed, so the refusal was the
+        // lock and not something else about the root.
+        drop(held);
+        StoreEngine::open(options(&serial, temporary.path(), 1))
+            .expect("the same root initializes once the lock is released");
+        assert_eq!(segment::RootLock::release_failures(), 0);
+    }
+
+    /// P1-2. An initialization interrupted after it has left residue is
+    /// **finished** by the next `open` rather than refused for ever.
+    ///
+    /// Before the fix, any crash between `segment::initialize_root`'s first
+    /// `create_dir_all` and its `FORMAT` rename turned a brand-new root into a
+    /// permanently unopenable one: the root was non-empty and carried no
+    /// `FORMAT`, so it was refused as states 3/4 — with a message about legacy
+    /// layouts and migration, for a root that had never held a byte of anyone's
+    /// data.
+    ///
+    /// The crash is simulated, not raced: the image below is written directly,
+    /// so this test has no timing in it at all. The load-bearing part of the
+    /// image — the marker — is produced by *production's own* encoder, so a
+    /// change to the marker format cannot leave this test passing against bytes
+    /// production no longer writes. The companion test below injects the
+    /// interruption into a real `open` instead, which is what proves production
+    /// writes the marker at the moment this image claims it does.
+    #[test]
+    fn startup_state_1_resumes_an_interrupted_initialization() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let root = temporary.path().join("interrupted");
+
+        // The crash image: the marker `open` installs as its first durable act,
+        // plus as much of the tree as `segment::initialize_root` had built when
+        // the power went — including a half-built shard directory, which is the
+        // deepest residue the window can produce.
+        std::fs::create_dir_all(root.join("quarantine")).expect("partial tree");
+        std::fs::create_dir_all(root.join("staging")).expect("partial tree");
+        std::fs::create_dir_all(root.join("shards").join("00").join("active"))
+            .expect("partial tree");
+        std::fs::write(
+            root.join("INITIALIZING"),
+            initializing_marker_bytes(2, now_micros()),
+        )
+        .expect("the marker production writes");
+
+        let engine = StoreEngine::open(options(&serial, &root, 2))
+            .expect("an interrupted initialization is finished, not refused");
+        assert!(
+            engine.shared.initialization.is_some(),
+            "the resume is an initialization, and is recorded as one"
+        );
+        assert!(root.join("FORMAT").exists());
+        assert!(
+            !root.join("INITIALIZING").exists(),
+            "the marker is removed once FORMAT is durable, so the finished root \
+             classifies as state 2 and not as an interrupted one"
+        );
+
+        // Usable, not merely well-formed. A resume that produced a tree nothing
+        // could commit into would satisfy every assertion above.
+        let namespace = NamespaceId([0x62; 32]);
+        block_on(engine.submit(create_transaction(namespace, 1)))
+            .expect("a transaction commits into a resumed root");
+    }
+
+    /// P1-2's dangerous direction, asserted rather than argued.
+    ///
+    /// Refusing a resumable root wastes an operator's time; adopting a root
+    /// that is not ours destroys their data. Each of these is one condition
+    /// away from the resumable shape, and each must be refused **and left
+    /// byte-identical**.
+    #[test]
+    fn an_unrecognized_layout_is_never_mistaken_for_an_interrupted_initialization() {
+        let serial = writer_serial();
+        let refuse = |label: &str, root: &Path| {
+            let before = tree_image(root);
+            match StoreEngine::open(options(&serial, root, 1)) {
+                Err(StoreError::NotImplemented(reason)) => {
+                    assert!(
+                        reason.contains("startup states 3 and 4"),
+                        "{label}: {reason}"
+                    );
+                }
+                other => panic!("{label}: expected a refusal, got {other:?}"),
             }
-            other => panic!("expected an explicit refusal, got {other:?}"),
+            assert_eq!(
+                tree_image(root),
+                before,
+                "{label}: a refused layout must be byte-identical afterwards"
+            );
+        };
+
+        // The whole initialization skeleton and no marker. This is the shape
+        // the classification must *not* adopt on the strength of the names
+        // alone: those names are ours, but without the marker there is nothing
+        // to say this directory was ever built by this store rather than
+        // arranged to look like it was.
+        let skeleton = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(skeleton.path().join("quarantine")).expect("skeleton");
+        std::fs::create_dir_all(skeleton.path().join("staging")).expect("skeleton");
+        std::fs::create_dir_all(skeleton.path().join("shards").join("00")).expect("skeleton");
+        refuse("skeleton without a marker", skeleton.path());
+
+        // A byte-exact marker with one foreign name beside it. The marker alone
+        // does not authorize anything: an initialization in progress cannot
+        // have produced a name this store never writes, so the foreign entry
+        // means the marker is in somebody else's directory.
+        let intruded = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            intruded.path().join("INITIALIZING"),
+            initializing_marker_bytes(1, now_micros()),
+        )
+        .expect("marker");
+        std::fs::create_dir_all(intruded.path().join("quarantine")).expect("skeleton");
+        std::fs::write(intruded.path().join("notes.txt"), b"someone's data\n").expect("foreign");
+        refuse("a valid marker with a foreign entry", intruded.path());
+
+        // A file of exactly the marker's length, under exactly the marker's
+        // name, that is not the marker. Length is not evidence; the magic is.
+        let impostor = tempfile::tempdir().expect("tempdir");
+        std::fs::write(impostor.path().join("INITIALIZING"), [0u8; 27]).expect("impostor");
+        refuse("a same-length file that is not the marker", impostor.path());
+
+        // The magic and nothing after it. A prefix of the marker is not the
+        // marker: accepting short reads would make every truncated file in the
+        // universe of this name a licence to initialize.
+        let truncated = tempfile::tempdir().expect("tempdir");
+        std::fs::write(truncated.path().join("INITIALIZING"), b"levcs-store-init").expect("short");
+        refuse("a truncated marker", truncated.path());
+
+        // A symlink of the marker's name, pointing at bytes that *are* a valid
+        // marker. The content test passes if it is allowed to run at all, so
+        // this is entirely a test of the type check: our marker is a regular
+        // file in this directory, not a name that resolves to one somewhere
+        // else.
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        let real_marker = elsewhere.path().join("borrowed-marker");
+        std::fs::write(&real_marker, initializing_marker_bytes(1, now_micros())).expect("marker");
+        let linked = tempfile::tempdir().expect("tempdir");
+        std::os::unix::fs::symlink(&real_marker, linked.path().join("INITIALIZING"))
+            .expect("symlink");
+        refuse("a symlink at the marker's name", linked.path());
+    }
+
+    /// Contract review finding P1, direction 1: **a regular file at the staging
+    /// name is not this store's residue and is not destroyed.**
+    ///
+    /// `classify_root` used to ignore `INITIALIZING.tmp` whatever it held,
+    /// because the name "can only be this code path's residue by construction"
+    /// — the one claim a classifier running *in order to establish* that is not
+    /// entitled to. `build_root_under_lock` then opened it `create` +
+    /// `truncate`. So an otherwise-empty configured root containing an
+    /// operator's file of that name lost it silently, and reported success.
+    ///
+    /// Every shape below is one that used to be overwritten, including the torn
+    /// marker — refusing that one is the trade `install_initializing_marker`
+    /// states, and it is asserted here so the trade is a fact rather than a
+    /// comment.
+    #[test]
+    fn a_foreign_entry_at_the_initializing_staging_name_is_refused_and_left_intact() {
+        let serial = writer_serial();
+        let refuse = |label: &str, root: &Path| {
+            let before = tree_image(root);
+            match StoreEngine::open(options(&serial, root, 1)) {
+                Err(StoreError::NotImplemented(reason)) => assert!(
+                    reason.contains("startup states 3 and 4"),
+                    "{label}: {reason}"
+                ),
+                other => panic!("{label}: expected a refusal, got {other:?}"),
+            }
+            assert_eq!(
+                tree_image(root),
+                before,
+                "{label}: a refused root must be byte-identical afterwards"
+            );
+        };
+
+        // An operator's file that happens to carry the name. This is the whole
+        // finding: nothing else is in the root, so before the fix `open`
+        // returned a working store and this file was gone.
+        let operators = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            operators.path().join("INITIALIZING.tmp"),
+            b"do not delete: staging notes for the migration\n",
+        )
+        .expect("operator file");
+        refuse("an operator's file at the staging name", operators.path());
+
+        // A prefix of the marker — the exact residue of a crash between the
+        // create and the fence. Refused, deliberately: nothing on disk tells it
+        // apart from a stranger's truncated file, so a rule that adopts this one
+        // destroys that one.
+        let torn = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            torn.path().join("INITIALIZING.tmp"),
+            &initializing_marker_bytes(1, now_micros())[..12],
+        )
+        .expect("torn marker");
+        refuse("a torn temporary marker", torn.path());
+
+        // The right length and the wrong bytes, and a directory. Both are
+        // "not a regular file holding our marker", and neither is a shape the
+        // classifier may fold into a neighbour.
+        let impostor = tempfile::tempdir().expect("tempdir");
+        std::fs::write(impostor.path().join("INITIALIZING.tmp"), [0u8; 27]).expect("impostor");
+        refuse("a same-length file that is not the marker", impostor.path());
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(directory.path().join("INITIALIZING.tmp")).expect("directory");
+        refuse("a directory at the staging name", directory.path());
+
+        // A fifo, asserted without `tree_image` — deliberately, and the reason
+        // is the point of the case. `tree_image` reads every entry it walks,
+        // and reading a fifo with no writer blocks for ever; using it here
+        // hangs the test before `open` is ever called. That is exactly the
+        // hazard on the production side: anything that opens a name in an
+        // unowned root before establishing its type can be stopped dead by one
+        // `mkfifo`. `classify_root` checks `file_type` first and never opens
+        // this entry, and `sys::open_regular_nofollow` passes `O_NONBLOCK` for
+        // the path that can reach one anyway. This test completes rather than
+        // timing out only because both of those hold.
+        let fifo = tempfile::tempdir().expect("tempdir");
+        let fifo_name = fifo.path().join("INITIALIZING.tmp");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &fifo_name,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o644),
+            0,
+        )
+        .expect("mkfifo");
+        match StoreEngine::open(options(&serial, fifo.path(), 1)) {
+            Err(StoreError::NotImplemented(reason)) => {
+                assert!(reason.contains("startup states 3 and 4"), "{reason}")
+            }
+            other => panic!("a fifo at the staging name: expected a refusal, got {other:?}"),
+        }
+        assert!(
+            std::os::unix::fs::FileTypeExt::is_fifo(
+                &fifo_name
+                    .symlink_metadata()
+                    .expect("the fifo is still there")
+                    .file_type()
+            ),
+            "the refusal must not have replaced the fifo with anything"
+        );
+        assert!(!fifo.path().join("FORMAT").exists());
+    }
+
+    /// Contract review finding P1, direction 2 and the worse one: **a symlink
+    /// at the staging name must not be written through.**
+    ///
+    /// `create` + `truncate` follows a final symlink, so the truncation landed
+    /// on a file the store had never owned and that was not even inside the
+    /// configured root — and the link was then renamed onto `INITIALIZING` and
+    /// unlinked, so the only evidence of what had been destroyed went with it.
+    ///
+    /// The assertion is on the *target*, outside the root, because that is
+    /// where the damage was. `O_CREAT | O_EXCL` is what makes it impossible:
+    /// it fails with `EEXIST` on a symlink whether or not the link resolves.
+    #[test]
+    fn a_symlink_at_the_initializing_staging_name_never_truncates_its_target() {
+        let serial = writer_serial();
+
+        let outside = tempfile::tempdir().expect("tempdir");
+        let victim = outside.path().join("payroll.db");
+        let contents: Vec<u8> = (0..4096u32).map(|byte| (byte % 251) as u8).collect();
+        std::fs::write(&victim, &contents).expect("the file outside the root");
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let link = root.path().join("INITIALIZING.tmp");
+        std::os::unix::fs::symlink(&victim, &link).expect("symlink");
+
+        match StoreEngine::open(options(&serial, root.path(), 1)) {
+            Err(StoreError::NotImplemented(reason)) => {
+                assert!(reason.contains("startup states 3 and 4"), "{reason}")
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+
+        assert_eq!(
+            std::fs::read(&victim).expect("the target still exists"),
+            contents,
+            "a symlink in the root must not be able to redirect a truncation at a \
+             file outside it"
+        );
+        assert_eq!(
+            std::fs::read_link(&link).expect("the link is still a link"),
+            victim,
+            "the link itself must not have been renamed or unlinked either — that is \
+             what removed the evidence"
+        );
+        assert!(
+            !root.path().join("FORMAT").exists(),
+            "the refusal must not have initialized the root"
+        );
+    }
+
+    /// The other half of the trade: a **whole** temporary marker still resumes,
+    /// and is *adopted* rather than rewritten.
+    ///
+    /// This is the shape a crash between the fence and the `rename_noreplace`
+    /// leaves, and it must not become collateral damage of the type and content
+    /// checks above.
+    ///
+    /// "Still resumes" alone cannot fail without the fix — the old code reached
+    /// the same working root by truncating the file and writing it again, which
+    /// is precisely the operation that destroyed an operator's file at the same
+    /// name. So the load-bearing assertion is a counter, not an outcome: two
+    /// otherwise identical initializations, one from an empty root and one from
+    /// a root already carrying a whole marker, must differ in durable bytes by
+    /// exactly the marker's length, because the second one does not write it.
+    /// Before the fix that difference was zero.
+    #[test]
+    fn a_whole_temporary_marker_is_adopted_rather_than_rewritten() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+
+        // The control: the same initialization with nothing staged.
+        let fresh = temporary.path().join("fresh");
+        let fresh_bytes = StoreEngine::open(options(&serial, &fresh, 1))
+            .expect("state 1 from an empty root")
+            .shared
+            .initialization
+            .expect("state 1 records what it cost")
+            .bytes_written;
+
+        let staged = temporary.path().join("staged");
+        std::fs::create_dir(&staged).expect("root");
+        std::fs::write(
+            staged.join("INITIALIZING.tmp"),
+            initializing_marker_bytes(1, now_micros()),
+        )
+        .expect("staged marker");
+
+        let engine = StoreEngine::open(options(&serial, &staged, 1))
+            .expect("a whole temporary marker is this store's residue and is resumed from");
+        let initialization = engine
+            .shared
+            .initialization
+            .expect("the resume is an initialization");
+        assert_eq!(
+            fresh_bytes - initialization.bytes_written,
+            INITIALIZING_MARKER_LEN as u64,
+            "the staged marker already holds what this attempt would have written, so \
+             adoption writes nothing and fences what is there; everything else about the \
+             two initializations is identical"
+        );
+        assert_eq!(
+            initialization.fdatasync, 2,
+            "adoption still costs exactly the marker's fence and FORMAT's"
+        );
+        assert!(staged.join("FORMAT").exists());
+        assert!(
+            !staged.join("INITIALIZING.tmp").exists(),
+            "the staging name is consumed by the rename onto INITIALIZING"
+        );
+        assert!(!staged.join("INITIALIZING").exists());
+
+        let namespace = NamespaceId([0x73; 32]);
+        block_on(engine.submit(create_transaction(namespace, 1)))
+            .expect("a transaction commits into a root resumed from a staged marker");
+    }
+
+    /// The same hazard at the other two names this file opens or ignores.
+    ///
+    /// `segment::lock_root` opens `LOCK` with `create(true).write(true)` and
+    /// `segment::write_fenced` opens `FORMAT.tmp` with `create` + `truncate`.
+    /// Both are in A1's frozen file, so neither open is changed here; what is
+    /// changed is that a root carrying a symlink at either name never reaches
+    /// them, because the classification that authorizes the write now refuses
+    /// it. The residual interface request is recorded in this deliverable's
+    /// report: those two opens are still follow-through opens for any caller
+    /// that reaches them by another route, and state 2's `lock_root` does.
+    #[test]
+    fn a_symlink_at_lock_or_format_tmp_is_refused_before_anything_opens_it() {
+        let serial = writer_serial();
+        let outside = tempfile::tempdir().expect("tempdir");
+
+        // `LOCK`, pointing at a name that does not exist. `create(true)` through
+        // this link would bring a file into being outside the root.
+        let absent = outside.path().join("not-there");
+        let locked = tempfile::tempdir().expect("tempdir");
+        std::os::unix::fs::symlink(&absent, locked.path().join("LOCK")).expect("symlink");
+        match StoreEngine::open(options(&serial, locked.path(), 1)) {
+            Err(StoreError::NotImplemented(reason)) => {
+                assert!(reason.contains("startup states 3 and 4"), "{reason}")
+            }
+            other => panic!("expected a refusal for a symlinked LOCK, got {other:?}"),
+        }
+        assert!(
+            !absent.exists(),
+            "a symlinked LOCK must not create a file outside the root"
+        );
+
+        // `FORMAT.tmp`, beside a valid marker — the one arrangement that would
+        // otherwise reach `segment::write_fenced`, because a `FORMAT.tmp` on its
+        // own is already refused for having no marker to explain it.
+        let victim = outside.path().join("ledger");
+        std::fs::write(&victim, b"balances\n").expect("the file outside the root");
+        let resumable = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            resumable.path().join("INITIALIZING"),
+            initializing_marker_bytes(1, now_micros()),
+        )
+        .expect("marker");
+        std::os::unix::fs::symlink(&victim, resumable.path().join("FORMAT.tmp")).expect("symlink");
+        match StoreEngine::open(options(&serial, resumable.path(), 1)) {
+            Err(StoreError::NotImplemented(reason)) => {
+                assert!(reason.contains("startup states 3 and 4"), "{reason}")
+            }
+            other => panic!("expected a refusal for a symlinked FORMAT.tmp, got {other:?}"),
         }
         assert_eq!(
-            std::fs::read_dir(temporary.path())
-                .expect("read the root")
-                .count(),
-            0,
-            "a refused startup must not write to the root"
+            std::fs::read(&victim).expect("the target still exists"),
+            b"balances\n",
+            "a symlink at FORMAT.tmp must not become a truncation outside the root"
         );
+    }
+
+    /// P1-2, with the interruption injected into a real `StoreEngine::open`
+    /// instead of written to disk.
+    ///
+    /// One directory fsync is made to fail. On an existing empty root the first
+    /// one `open` issues is the fence that makes the marker's *name* durable,
+    /// so this stops initialization at the earliest instant that can leave
+    /// residue — and proves the ordering the classification depends on: the
+    /// marker is on disk and the tree is not.
+    ///
+    /// Deterministic, not raced: the fault registry is one-shot and positional,
+    /// and this test holds the serial that makes it exclusively its own.
+    #[cfg(feature = "failpoints")]
+    #[test]
+    fn an_interrupted_open_leaves_a_marker_the_next_open_resumes_from() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+
+        crate::sys::arm(&serial, crate::sys::Fault::DirSyncEio);
+        let interrupted = StoreEngine::open(options(&serial, temporary.path(), 1));
+        crate::sys::disarm(&serial);
+        match interrupted {
+            Err(StoreError::NotImplemented(reason)) => {
+                panic!("an injected I/O failure must not read as an unbuilt state: {reason}")
+            }
+            Err(_) => {}
+            Ok(_) => panic!("the injected directory fsync failure did not stop the open"),
+        }
+
+        let marker = temporary.path().join("INITIALIZING");
+        assert_eq!(
+            std::fs::read(&marker)
+                .expect("the interrupted open left its marker")
+                .len(),
+            27,
+            "the marker is installed by rename, so it is whole or absent and never torn"
+        );
+        assert!(
+            !temporary.path().join("shards").exists(),
+            "the marker must become durable before the first directory of the tree exists, \
+             or a crash can leave tree residue with nothing to say whose it is"
+        );
+
+        let engine = StoreEngine::open(options(&serial, temporary.path(), 1))
+            .expect("the next open finishes what the interrupted one started");
+        assert!(engine.shared.initialization.is_some());
+        assert!(!marker.exists(), "the finished root carries no marker");
+        assert_eq!(segment::RootLock::release_failures(), 0);
+    }
+
+    /// State 2. Reopening a formatted root runs recovery and initializes
+    /// nothing — asserted directly, through the counter, rather than inferred
+    /// from the tree looking unchanged.
+    #[test]
+    fn startup_state_2_opens_a_formatted_root_without_reinitializing_it() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let root = temporary.path().join("root");
+
+        let first = StoreEngine::open(options(&serial, &root, 2)).expect("state 1");
+        let uuid = first.shared.root_uuid;
+        assert!(first.shared.initialization.is_some());
+        drop(first);
+
+        let second = StoreEngine::open(options(&serial, &root, 2)).expect("state 2");
+        assert!(
+            second.shared.initialization.is_none(),
+            "a formatted root must not be initialized again"
+        );
+        assert_eq!(
+            second.shared.root_uuid, uuid,
+            "the identity FORMAT froze is the identity the reopen carries"
+        );
+    }
+
+    /// States 3 and 4, both still refused this pass — and the property that
+    /// survives the refusal either way: **the root is byte-identical**.
+    ///
+    /// Both layouts are checked because the whole hazard of implementing state
+    /// 1 is that classifying "absent or empty" requires looking at a root that
+    /// might be neither, and a probe that creates so much as a directory has
+    /// destroyed this guarantee before the refusal is reached.
+    #[test]
+    fn startup_states_3_and_4_are_refused_by_name_and_leave_the_root_byte_identical() {
+        let serial = writer_serial();
+
+        // State 3's shape: the legacy instance signature, `<64-hex>/.levcs/`.
+        let legacy = tempfile::tempdir().expect("tempdir");
+        let repo = legacy.path().join("a".repeat(64));
+        std::fs::create_dir_all(repo.join(".levcs").join("objects")).expect("legacy tree");
+        std::fs::write(repo.join(".levcs").join("HEAD"), b"ref: refs/heads/main\n")
+            .expect("legacy file");
+
+        // State 4's shape: non-empty, no `FORMAT`, no legacy signature —
+        // including an empty directory and a zero-byte file, which a
+        // contents-only comparison would not notice being removed.
+        let unrecognized = tempfile::tempdir().expect("tempdir");
+        std::fs::write(unrecognized.path().join("notes.txt"), b"someone's data\n")
+            .expect("stray file");
+        std::fs::write(unrecognized.path().join("FORMAT.tmp"), b"\x00\x01\x02").expect("residue");
+        std::fs::create_dir_all(unrecognized.path().join("empty")).expect("stray directory");
+        std::fs::write(unrecognized.path().join("empty-file"), b"").expect("stray empty file");
+
+        for root in [legacy.path(), unrecognized.path()] {
+            let before = tree_image(root);
+            match StoreEngine::open(options(&serial, root, 1)) {
+                Err(StoreError::NotImplemented(reason)) => {
+                    assert!(reason.contains("startup states 3 and 4"), "{reason}");
+                    assert!(reason.contains("LegacyLayout"), "{reason}");
+                    assert!(reason.contains("UnrecognizedLayout"), "{reason}");
+                    assert!(reason.contains("has not been modified"), "{reason}");
+                }
+                other => panic!("expected an explicit refusal for {root:?}, got {other:?}"),
+            }
+            assert_eq!(
+                tree_image(root),
+                before,
+                "a refused non-empty layout must be byte-identical afterwards: {root:?}"
+            );
+        }
+    }
+
+    /// A `FORMAT` that exists but does not decode is state 2 and stays state
+    /// 2. The dangerous misclassification is the other direction: treating an
+    /// unreadable marker as "no marker, therefore empty" would authorize
+    /// `initialize_root` to build a fresh tree over a populated root.
+    #[test]
+    fn a_corrupt_format_is_refused_rather_than_reinitialized_over() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+        drop(StoreEngine::open(options(&serial, temporary.path(), 1)).expect("state 1"));
+
+        let format = RootLayout::new(temporary.path()).format_path();
+        let original = std::fs::read(&format).expect("read FORMAT");
+        std::fs::write(&format, vec![0u8; original.len()]).expect("corrupt FORMAT");
+        let before = tree_image(temporary.path());
+
+        let error = StoreEngine::open(options(&serial, temporary.path(), 1))
+            .expect_err("a corrupt FORMAT is refused");
+        assert!(
+            !matches!(error, StoreError::NotImplemented(_)),
+            "a corrupt marker is state 2's refusal, not an unbuilt state: {error:?}"
+        );
+        assert_eq!(
+            tree_image(temporary.path()),
+            before,
+            "the refusal must not have rebuilt the root"
+        );
+    }
+
+    /// Copy a whole directory tree, file bytes included.
+    ///
+    /// The equivalence test below needs *two* copies of one crash image
+    /// because recovery is a mutation: it seals the validated prefix,
+    /// quarantines the discarded tail, and opens a fresh journal. Running both
+    /// paths over one directory would compare the first path's recovery
+    /// against the second path's recovery of what the first left behind, which
+    /// would agree for the wrong reason.
+    #[cfg(feature = "store-internals")]
+    fn copy_tree(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).expect("create the destination");
+        for entry in std::fs::read_dir(from).expect("read the source") {
+            let entry = entry.expect("a directory entry");
+            let target = to.join(entry.file_name());
+            if entry.path().is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).expect("copy a file");
+            }
+        }
+    }
+
+    /// Scope 6.4 deliverable 1's second acceptance clause: **the engine and
+    /// the drive seam produce the same recovered state from one crash image.**
+    ///
+    /// The two go through `recovery::recover_shard`, so they agree by
+    /// construction — but "by construction" is exactly the kind of claim that
+    /// survives the construction changing. `ShardDrive::reopen_through_recovery`
+    /// makes one call to that function and `StoreEngine::open` makes one per
+    /// shard; if either ever grows a local decision, this is what notices.
+    ///
+    /// The image is built at production altitude: `StoreEngine::open`
+    /// initializes the root (startup state 1), real transactions are
+    /// submitted, sequenced, signed and fenced through `submit`, and only then
+    /// is the *journal file* damaged. The damage is a byte-level edit and not
+    /// a logic-level one, which is the only kind a crash can produce.
+    ///
+    /// # What is compared, and what is deliberately not
+    ///
+    /// Every field of `ShardRecoveryReport` that is a function of the crash
+    /// image. The two `PathBuf` fields — `quarantined` and `preserved_journal`
+    /// — are excluded because they name files inside two different copies and
+    /// can never be equal; their *contents* are covered by
+    /// `quarantined_bytes`, which is compared. The recovery configurations are
+    /// pinned to the drive's constants so that a disagreement here is a
+    /// disagreement about the algorithm rather than about tuning.
+    #[cfg(feature = "store-internals")]
+    #[test]
+    fn the_engine_and_the_drive_seam_recover_one_crash_image_identically() {
+        use crate::drive::{ShardDrive, DRIVE_PREALLOCATE_BYTES};
+
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let namespace = NamespaceId([0x9c; 32]);
+
+        // The drive's recovery configuration is a set of constants rather than
+        // a `StoreOptions`, so the engine's options are pinned to match it.
+        // Anything left unmatched would show up as an algorithmic
+        // disagreement, which is the one thing this test must not be able to
+        // report falsely.
+        let configured = |root: &Path| {
+            let mut configured = options(&serial, root, 1);
+            configured.journal_preallocate_bytes = DRIVE_PREALLOCATE_BYTES;
+            configured.manifest_retain = 2;
+            configured.checkpoint_retain = 2;
+            configured.terminal_status_grace_micros = 900_000_000;
+            configured.max_active_index_entries = 4_000_000;
+            configured.max_active_index_bytes = 512 * 1024 * 1024;
+            configured.max_index_runs = 64;
+            configured.max_open_index_runs = 32;
+            configured
+        };
+
+        let image = temporary.path().join("image");
+        {
+            let engine = StoreEngine::open(configured(&image)).expect("startup state 1");
+            block_on(engine.submit(create_transaction(namespace, 1))).expect("create");
+            block_on(engine.submit(push_transaction(namespace, 2, 0xb1, None))).expect("push");
+            block_on(engine.submit(push_transaction(namespace, 3, 0xb2, None))).expect("push");
+        }
+
+        // Where the fenced region ends, asked of the scanner rather than
+        // computed: there is one definition of where a journal ends and this
+        // test does not get to be a second one.
+        let layout = RootLayout::new(&image);
+        let root_uuid = segment::read_format(&layout).expect("FORMAT").root_uuid;
+        let journal_path = std::fs::read_dir(layout.shard(0).active())
+            .expect("read active/")
+            .map(|entry| entry.expect("entry").path())
+            .next()
+            .expect("one active journal");
+        let (stop_offset, last_frame) = {
+            let (_journal, scan) =
+                crate::journal::Journal::open(&journal_path, &root_uuid, counters())
+                    .expect("open the journal");
+            assert_eq!(scan.frames.len(), 3, "three fenced frames");
+            // A cleanly closed journal already stops early: the preallocated
+            // remainder is zeros, and zeros are `NotAFrame`. Stated here
+            // because it is why the damage below has to be a *torn frame* and
+            // not merely non-zero residue — the latter would produce the same
+            // classification a clean close does, and the comparison would no
+            // longer be about a crash.
+            assert_eq!(scan.stop, crate::journal::TailStop::NotAFrame);
+            let last = scan.frames.last().expect("a third frame").clone();
+            (scan.stop_offset, last)
+        };
+
+        // The crash residue: a frame whose header reached the device and whose
+        // tail did not — the interrupted append. Recovery must stop at it,
+        // discard it, and quarantine it, and both paths must reach the same
+        // verdict about *which* completeness condition failed.
+        {
+            use std::io::{Read, Seek, SeekFrom, Write};
+            let mut torn = vec![0u8; last_frame.len as usize];
+            let mut file = std::fs::File::open(&journal_path).expect("read the journal");
+            file.seek(SeekFrom::Start(last_frame.offset)).expect("seek");
+            file.read_exact(&mut torn).expect("read a whole frame");
+            drop(file);
+            torn.truncate(torn.len() - 8);
+
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&journal_path)
+                .expect("open the journal for damage");
+            file.seek(SeekFrom::Start(stop_offset)).expect("seek");
+            file.write_all(&torn).expect("write the torn frame");
+            file.sync_all().expect("fence the damage");
+        }
+
+        let through_drive_root = temporary.path().join("through-drive");
+        let through_engine_root = temporary.path().join("through-engine");
+        copy_tree(&image, &through_drive_root);
+        copy_tree(&image, &through_engine_root);
+
+        let drive = ShardDrive::reopen_through_recovery(&through_drive_root, 0)
+            .expect("the drive seam recovers the image");
+        let engine =
+            StoreEngine::open(configured(&through_engine_root)).expect("the engine recovers it");
+        let engine_report = engine.shared.recovery_reports[0].clone();
+        let drive_report = drive.report.clone();
+
+        // The image really was a crash image, or the comparison below is a
+        // comparison of two clean opens and proves nothing.
+        assert!(
+            drive_report.quarantined_bytes > 0,
+            "the damaged tail must have been discarded: {drive_report:?}"
+        );
+        assert!(
+            matches!(
+                drive_report.tail_stop,
+                Some(crate::journal::TailStop::Incomplete(_))
+            ),
+            "the tail must have been rejected as an incomplete frame: {drive_report:?}"
+        );
+
+        assert_eq!(engine_report.shard_index, drive_report.shard_index);
+        assert_eq!(
+            engine_report.adopted_shard_sequences,
+            drive_report.adopted_shard_sequences
+        );
+        assert_eq!(engine_report.tail_stop, drive_report.tail_stop);
+        assert_eq!(
+            engine_report.quarantined_bytes,
+            drive_report.quarantined_bytes
+        );
+        assert_eq!(engine_report.active_journal, drive_report.active_journal);
+        assert_eq!(
+            engine_report.manifest_generation,
+            drive_report.manifest_generation
+        );
+        assert_eq!(engine_report.manifest_source, drive_report.manifest_source);
+        assert_eq!(
+            engine_report.checkpoint_sequence,
+            drive_report.checkpoint_sequence
+        );
+        assert_eq!(
+            engine_report.offline_rebuild_required,
+            drive_report.offline_rebuild_required
+        );
+        assert_eq!(engine_report.promotions, drive_report.promotions);
+        assert_eq!(engine_report.ready, drive_report.ready);
+        assert!(engine_report.ready);
+
+        // And the engine turned that shared recovered state into a committed
+        // root a consumer can read, which is the half the drive seam has no
+        // opinion about: three operations survived the crash image, and the
+        // fourth — never submitted — is `Unknown` rather than invented.
+        for operation in 1u8..=3 {
+            assert!(
+                matches!(
+                    engine.transaction_status(namespace, OperationId([operation; 16])),
+                    Ok(TransactionStatus::Committed(_))
+                ),
+                "operation {operation} did not survive the crash image"
+            );
+        }
+        assert!(matches!(
+            engine.transaction_status(namespace, OperationId([4; 16])),
+            Ok(TransactionStatus::Unknown)
+        ));
+    }
+
+    /// A configuration error must not be able to leave a root behind. The
+    /// signer check runs before the root is touched at all, so a signerless
+    /// open of an absent path creates nothing — not even the directory.
+    #[test]
+    fn a_configuration_error_refuses_before_startup_state_1_creates_anything() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let root = temporary.path().join("never-created");
+
+        let mut without = options(&serial, &root, 1);
+        without.signer = None;
+        assert!(matches!(
+            StoreEngine::open(without),
+            Err(StoreError::InvalidConfiguration(_))
+        ));
+        assert!(!root.exists(), "a refused configuration created a root");
     }
 
     #[test]
     fn a_configured_shard_count_that_disagrees_with_format_is_refused() {
         let serial = writer_serial();
         let temporary = tempfile::tempdir().expect("tempdir");
-        initialized_root(&serial, temporary.path(), 4);
+        // The topology is frozen by the *production* initialization, so the
+        // mismatch is between two consumer-visible opens of one path rather
+        // than between a hand-seeded root and an open.
+        drop(open(&serial, temporary.path(), 4));
         match StoreEngine::open(options(&serial, temporary.path(), 2)) {
             Err(StoreError::FormatMismatch(reason)) => {
                 assert!(reason.contains("4 shards"), "{reason}")
@@ -2456,7 +4225,7 @@ mod tests {
     fn opening_without_a_signer_is_refused_rather_than_deferred_to_the_first_submit() {
         let serial = writer_serial();
         let temporary = tempfile::tempdir().expect("tempdir");
-        initialized_root(&serial, temporary.path(), 1);
+        drop(open(&serial, temporary.path(), 1));
         let mut without = options(&serial, temporary.path(), 1);
         without.signer = None;
         assert!(matches!(
@@ -2595,8 +4364,13 @@ mod tests {
     fn only_frame_payload(root: &Path) -> TransactionFramePayloadV1 {
         let layout = RootLayout::new(root);
         let paths = layout.shard(0);
+        // The root identity is read out of `FORMAT` rather than restated: the
+        // root is now built by `StoreEngine::open`, which mints a fresh
+        // `root_uuid` per root, and a hard-coded one here would be a second
+        // definition of the identity every file in the root is bound to.
+        let root_uuid = segment::read_format(&layout).expect("FORMAT").root_uuid;
         // Reopening sealed the validated prefix, so the frame is in a segment.
-        let (manifest, _) = segment::load_manifest_with_fallback(&paths, &[0x11; 16])
+        let (manifest, _) = segment::load_manifest_with_fallback(&paths, &root_uuid)
             .expect("manifest")
             .expect("a manifest exists after the reopen sealed the prefix");
         let range = manifest
@@ -2604,7 +4378,7 @@ mod tests {
             .last()
             .expect("one retained range");
         let reader =
-            segment::SegmentReader::open(&paths.segments().join(&range.filename), &[0x11; 16])
+            segment::SegmentReader::open(&paths.segments().join(&range.filename), &root_uuid)
                 .expect("segment");
         let frame = reader
             .read_frame(range.first_shard_sequence)
@@ -2617,13 +4391,14 @@ mod tests {
     fn all_frame_payloads(root: &Path) -> Vec<TransactionFramePayloadV1> {
         let layout = RootLayout::new(root);
         let paths = layout.shard(0);
-        let (manifest, _) = segment::load_manifest_with_fallback(&paths, &[0x11; 16])
+        let root_uuid = segment::read_format(&layout).expect("FORMAT").root_uuid;
+        let (manifest, _) = segment::load_manifest_with_fallback(&paths, &root_uuid)
             .expect("manifest")
             .expect("a manifest exists after the reopen sealed the prefix");
         let mut payloads = Vec::new();
         for range in &manifest.retained_tail_ranges {
             let reader =
-                segment::SegmentReader::open(&paths.segments().join(&range.filename), &[0x11; 16])
+                segment::SegmentReader::open(&paths.segments().join(&range.filename), &root_uuid)
                     .expect("segment");
             for sequence in range.first_shard_sequence..=range.last_shard_sequence {
                 let frame = reader.read_frame(sequence).expect("frame");
@@ -2719,7 +4494,6 @@ mod tests {
         let serial = writer_serial();
         let temporary = tempfile::tempdir().expect("tempdir");
         let namespace = NamespaceId([0x32; 32]);
-        initialized_root(&serial, temporary.path(), 1);
         let mut configured = options(&serial, temporary.path(), 1);
         configured.max_objects_per_transaction = 1;
         configured.max_refs_per_transaction = 1;
@@ -2837,7 +4611,6 @@ mod tests {
     fn concurrent_publication_from_two_shards_re_merges_and_never_loses_an_update() {
         let serial = writer_serial();
         let temporary = tempfile::tempdir().expect("tempdir");
-        initialized_root(&serial, temporary.path(), 2);
         let mut configured = options(&serial, temporary.path(), 2);
         configured.max_group_transactions = 2;
         configured.max_group_idle = Duration::from_millis(20);
@@ -2990,7 +4763,6 @@ mod tests {
             shared.committed.store(Arc::new(current.merge(&competing)));
         });
 
-        initialized_root(&serial, temporary.path(), 2);
         let engine = StoreEngine::open(options(&serial, temporary.path(), 2)).expect("open");
         let receipt = block_on(engine.submit(create_transaction(namespace, 1)))
             .expect("the contended publication still commits");
@@ -3094,7 +4866,6 @@ mod tests {
             let serial = writer_serial();
             let temporary = tempfile::tempdir().expect("tempdir");
             let namespace = NamespaceId([0x60 + expiring; 32]);
-            initialized_root(&serial, temporary.path(), 1);
             let mut configured = options(&serial, temporary.path(), 1);
             // Never the transaction ceiling: the idle bound is what closes this
             // group, and it is long enough that the short deadline passes while
@@ -3259,7 +5030,6 @@ mod tests {
         let serial = writer_serial();
         let temporary = tempfile::tempdir().expect("tempdir");
         let namespace = NamespaceId([0x70; 32]);
-        initialized_root(&serial, temporary.path(), 1);
         let mut configured = options(&serial, temporary.path(), 1);
         configured.max_group_transactions = 4;
         // Long enough that the idle bound cannot be what closes these groups.
@@ -3288,7 +5058,6 @@ mod tests {
         let serial = writer_serial();
         let temporary = tempfile::tempdir().expect("tempdir");
         let namespace = NamespaceId([0x80; 32]);
-        initialized_root(&serial, temporary.path(), 1);
         let mut configured = options(&serial, temporary.path(), 1);
         configured.max_group_transactions = 64;
         // One push frame is comfortably over 512 bytes once its evidence and
@@ -3722,7 +5491,6 @@ mod tests {
             let serial = writer_serial();
             let temporary = tempfile::tempdir().expect("tempdir");
             let namespace = NamespaceId([0x1e; 32]);
-            initialized_root(&serial, temporary.path(), 1);
             let mut configured = options(&serial, temporary.path(), 1);
             configured.max_group_transactions = 64;
             // Wide enough that one small frame leaves the group open, and

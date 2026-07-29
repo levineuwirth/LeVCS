@@ -372,18 +372,51 @@ fn open_refuses_an_invalid_configuration_before_anything_else() {
     }
 }
 
-/// Configuration validation runs before the not-implemented path, so a valid
-/// configuration reaches the engine and reports honestly that it is unbuilt.
+/// A configuration error must not be able to leave a root behind.
+///
+/// This replaces a D0-era assertion that `open` returned `NotImplemented` for
+/// any valid configuration, which B1 deliverable 1 obsoleted by implementing
+/// startup state 1. The replacement is the stronger property, and it is the
+/// one that had to be asserted the moment an absent root began to be
+/// *initialized* rather than refused: a configuration that passes
+/// `StoreOptions::validate` but omits the signer must still be refused, and
+/// refused before anything is created.
+///
+/// The ordering it pins is load-bearing rather than tidy. While state 1
+/// refused, the signer check could sit after the `FORMAT` probe harmlessly;
+/// once state 1 initializes, that same placement would create the directory
+/// tree, write `FORMAT`, and fsync the parent before failing — and this test,
+/// written against a fixed `/tmp` path as its predecessor was, would have
+/// silently created a real store root on every gate run on every machine. It
+/// therefore asserts the absence of the root, not merely the error, and it
+/// uses a path inside a temporary directory so that a future regression
+/// pollutes nothing outside the test.
 #[test]
-fn open_reports_not_implemented_for_a_valid_configuration() {
-    let options = StoreOptions::new("/tmp/levcs-store-d0");
+fn a_valid_but_signerless_configuration_is_refused_and_creates_no_root() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let root = directory.path().join("root");
+
+    // Valid in every respect `validate` can see; `StoreOptions::new` registers
+    // no signer, and instance composition is what supplies one.
+    let options = StoreOptions::new(&root);
+
     match StoreEngine::open(options) {
-        Err(StoreError::NotImplemented(what)) => {
-            assert!(what.contains("B1"), "the stub must name its owner: {what}");
+        Err(StoreError::InvalidConfiguration(msg)) => {
+            assert!(
+                msg.contains("CommitEvidenceSigner"),
+                "the refusal must name what is missing, got: {msg}"
+            );
         }
-        Err(other) => panic!("expected NotImplemented, got {other:?}"),
-        Ok(_) => panic!("D0 has no engine"),
+        Err(other) => panic!("expected InvalidConfiguration, got {other:?}"),
+        Ok(_) => panic!("a configuration with no signer must not open a store"),
     }
+
+    assert!(
+        !root.exists(),
+        "the refused configuration left {} behind; a startup that cannot \
+         sequence a transaction must not have initialized a root first",
+        root.display()
+    );
 }
 
 /// Shard assignment is frozen. Per-repository sequence ownership is only sound

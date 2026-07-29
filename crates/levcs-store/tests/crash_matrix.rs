@@ -348,32 +348,74 @@ fn the_pending_set_is_empty_at_phase_1_exit() {
     );
 }
 
-/// `StoreEngine::open` still refuses startup state 1, which is why the Wave B
-/// rows seed their root with `segment::initialize_root`.
+/// `StoreEngine::open` builds an absent root, which is why the Wave B rows no
+/// longer seed one of their own.
 ///
-/// Asserted rather than assumed, because the moment it stops being true the
-/// seeding disclosure in the fixture becomes a false statement about the
-/// harness, and a stale disclosure is worse than none: it tells a reader that a
-/// weakening still exists when the honest answer is that it does not.
+/// # This test used to assert the opposite, and that is the record
+///
+/// While `open` refused startup state 1, the Wave B rows created their root
+/// with `segment::initialize_root` and this test asserted the refusal, so that
+/// the moment it stopped being true the seeding disclosure in the fixture would
+/// be caught as a false statement about the harness rather than left standing.
+/// B1 landed state 1; the tripwire fired; the seeding is re-pointed at
+/// `StoreEngine::open` and the disclosure is retired. What is asserted here now
+/// is the property that replaced it — charter item 8 in the affirmative, at the
+/// altitude a consumer calls: the store these rows exercise is built by
+/// production, and a regression that returned `open` to refusing would be
+/// caught here rather than by every row failing for an unrelated-looking
+/// reason.
 #[test]
-fn the_production_open_still_refuses_to_create_a_root_and_the_fixture_says_so() {
+fn the_production_open_builds_the_root_the_wave_b_rows_exercise() {
     let directory = tempfile::tempdir().expect("tempdir");
-    let options = StoreOptions::new(directory.path().join("root"));
-    match StoreEngine::open(options) {
-        Err(StoreError::NotImplemented(reason)) => {
-            assert!(
-                reason.contains("startup states 1"),
-                "the refusal must still be the unbuilt startup states: {reason}"
-            );
-        }
-        Ok(_) => panic!(
-            "StoreEngine::open now creates an absent root, so the Wave B rows must be \
-             re-pointed at it and the fixture's root_seeded_by disclosure retired"
+    let root = directory.path().join("root");
+    let layout = levcs_store::segment::RootLayout::new(&root);
+    assert!(!layout.format_path().exists(), "the root must start absent");
+
+    // The same options the rows use, because an option set that differs from
+    // theirs would assert about a store nobody drives.
+    let engine = match StoreEngine::open(engine_matrix::options(&root, 1)) {
+        Ok(engine) => engine,
+        Err(StoreError::NotImplemented(reason)) => panic!(
+            "StoreEngine::open refuses to build an absent root again ({reason}). The Wave \
+             B rows create their store through it and assert that they did; a harness \
+             that went back to seeding its own root would be asserting the production \
+             submit path over a store production never built."
         ),
-        Err(other) => {
-            panic!("StoreEngine::open refused an absent root for an unexpected reason: {other:?}")
-        }
-    }
+        Err(other) => panic!("StoreEngine::open refused an absent root: {other:?}"),
+    };
+    assert!(
+        layout.format_path().exists(),
+        "StoreEngine::open returned without writing FORMAT"
+    );
+    drop(engine);
+
+    // And the fixture must say so, because the disclosure a reader gets is the
+    // fixture's, not this file's.
+    //
+    // **Exact equality, against a short stable token.** This was
+    // `.contains("StoreEngine::open")` against a paragraph, which is too weak
+    // for a tripwire: the substring survives almost any drift in what the
+    // paragraph means, so the assertion would keep passing on a value that had
+    // come to describe a different seeding path. A token has nothing to drift
+    // into — it either is this value or the fixture and this file disagree, and
+    // the disagreement is the point. The essay lives in the adjacent
+    // `root_seeded_by_reason`, which the loader requires non-empty, so moving
+    // the history out of the matched value did not make it droppable.
+    let fixture = harness::load_fixture();
+    assert_eq!(
+        fixture.root_seeded_by, "store_engine_open_state_1",
+        "the fixture must record, as an exact token, that the Wave B rows build their \
+         root through StoreEngine::open on an absent path — startup state 1, the \
+         production entry point"
+    );
+    assert!(
+        fixture
+            .root_seeded_by_reason
+            .contains("segment::initialize_root"),
+        "the reason field carries the history the token no longer does: that the rows \
+         once seeded their own root because open refused state 1, and that the \
+         weakening is closed rather than re-worded"
+    );
 }
 
 // ===========================================================================
@@ -1348,18 +1390,12 @@ fn assert_full_expectation(
         observation.prior_recovered
     );
 
-    // The root-lock release window documented on
-    // `engine_matrix::reopen_after_close`. Reported rather than asserted: the
-    // wait is compensating for a defect in a file B4 does not own, and a
-    // harness that stayed silent about it would be hiding the very thing it is
-    // working around.
-    if observation.lock_release_attempts > 1 {
-        eprintln!(
-            "crash_matrix: {row}: the root lock was still held after StoreEngine::drop \
-             returned; the reopen needed {} attempts over {:?}",
-            observation.lock_release_attempts, observation.lock_release_wait
-        );
-    }
+    // The root-lock release window that used to be reported here is gone with
+    // the wait that produced it: `engine_matrix::reopen_after_close` now
+    // asserts that the *first* `StoreEngine::open` after `drop` succeeds, so
+    // every row in this matrix carries that assertion at production altitude
+    // rather than a number describing how long it had to wait (contract review
+    // 2026-07-28-B, commit e050b6d).
 
     // Charter item 7: the class is checked against a syscall count, not a
     // comment. A class that says no bytes were written must show no fence, and

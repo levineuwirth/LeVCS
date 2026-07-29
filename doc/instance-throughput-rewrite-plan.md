@@ -1174,6 +1174,49 @@ interface request against B1 arises from this. Scope §6.6 records the consequen
 land: the bounded retry at `tests/support/engine_matrix.rs:516` is now compensating for a
 defect that no longer exists and must become a one-attempt assertion.
 
+##### Contract review 2026-07-28-D
+
+**Two no-follow `open(2)` primitives added to the frozen `sys.rs`.** Granted, and the grant is
+narrower than it looks: `sys.rs` gains `open_regular_nofollow` and `create_new_nofollow`, both
+pure syscall wrappers — one `open`, one `fstat` on the descriptor already held, and errno-to-
+variant mapping. Neither knows what a marker is, reads content, or decides a startup state.
+
+The defect that forced it. `StoreEngine::open`'s classifier ignored `INITIALIZING.tmp` by name
+regardless of type or contents, and initialization then opened that name with `create` plus
+`truncate`. An operator's regular file at that name was destroyed silently; a **symlink** at
+that name caused a file *outside the root* to be truncated to the marker's 27 bytes and the
+link then removed, so the store destroyed data it never owned and erased the evidence. Measured
+on a reverted copy: the victim went from 4096 bytes to 27, the link was gone, and `open`
+returned `Ok` reporting a working store.
+
+The justification for ignoring the name had been that only this code path could have written
+it. That reasoning was circular — it is the claim the classifier runs in order to establish,
+and before the store owns the root it has no standing to assume anything about the contents.
+
+Why the primitives belong in `sys.rs` rather than in `engine.rs`. These are new `open(2)` sites
+whose **flags are the safety property**. `sys.rs` is the sole funnel precisely so that the next
+author looking for how this crate opens files finds every such site in one place; an
+`O_NOFOLLOW`/`O_EXCL` open living alone in `engine.rs` is one the next author does not find,
+and what they write instead is `create(true).truncate(true)` — the defect this closes. The
+weaker alternative, a raw syscall at the call site with a comment, was rejected for that reason.
+Neither wrapper increments a durability counter, because neither produces durable bytes; the
+existing write and fence primitives still do the counting.
+
+`O_NONBLOCK` is load-bearing rather than defensive. A fifo at `INITIALIZING.tmp` made the
+pre-fix `O_WRONLY` open block forever: a single `mkfifo` in a configured root was an unbounded
+startup hang, not merely a data hazard. That was found while writing the tests, not predicted.
+
+**Four further symlink hazards are recorded and not fixed**, because they are in `segment.rs`
+and are A1's surface. Ranked: `lock_root` follows a final symlink at `LOCK` and is reachable on
+the state-2 path, where the classifier never runs — through a live link the process `flock`s a
+foreign inode and believes it holds the root lock, so two processes can both own one root and
+the exclusion scope §3.1 depends on is defeated. `write_fenced` repeats the `create`+`truncate`
+defect for `FORMAT.tmp`, closed from `open` by the new classifier but open to `initialize_root`'s
+direct callers. `initialize_root`'s `create_dir_all` follows a symlinked directory and builds a
+shard tree outside the root. `read_format` follows a link at `FORMAT`, read-only and lowest
+priority. The first is a correctness defect in the locking discipline and should be scheduled on
+its own, not folded into a later pass.
+
 ### Phase 1 — storage engine spine
 
 Lead first defines sealed transaction/frame/snapshot interfaces and file ownership. That deliverable (D0) landed on 2026-07-24 as `crates/levcs-store`: the frozen public API compiling against `StoreError::NotImplemented`, the file-ownership split, strict configuration validation, the single durability syscall funnel with its counters and fault hooks, the failpoint registry in enforced one-to-one correspondence with `oracle::AppendFailpoint`, and the journal-level drive seam that lets the crash harness run in Wave A. The enforced gate is `scripts/check-phase1.sh`, which runs `check-phase0.sh` first so the Phase 0 freeze stays enforced. That work is scoped in `doc/phase1-storage-spine-scope.md`, which realizes this section as a file-ownership matrix, a frozen `levcs-store` API, a physical format and durability/recovery specification, per-package deliverables and acceptance criteria, the Wave A adversarial review charter, and the capacity analysis for P2 on the frozen reference hardware. This plan remains authoritative; that document is the Phase 1 realization of it and lists the decisions that must be resolved before Wave A starts.

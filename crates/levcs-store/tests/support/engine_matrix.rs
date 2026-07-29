@@ -47,54 +47,55 @@ use levcs_protocol::oracle::{ImmediateStatus, RecoveredTailFact};
 use levcs_protocol::v2::TransactionEvidenceV1;
 use levcs_store::failpoints::{Failpoint, FailpointAction};
 use levcs_store::options::StoreOptions;
-use levcs_store::segment::{initialize_root, RootLayout};
+use levcs_store::segment::RootLayout;
 use levcs_store::transaction::StagedObject;
 use levcs_store::types::{
-    CommitEvidenceSigner, CommitReceipt, DurabilityCounters, NamespaceId, OperationId, SignerError,
-    StoreError, TransactionStatus,
+    CommitEvidenceSigner, CommitReceipt, NamespaceId, OperationId, SignerError, StoreError,
+    TransactionStatus,
 };
 use levcs_store::{StoreEngine, ValidatedTransaction};
 
 // ---------------------------------------------------------------------------
-// Seeding a root
+// Building the root through production
 // ---------------------------------------------------------------------------
 
-/// **Charter item 8 disclosure, stated where it is committed rather than in a
-/// report only.**
+/// Create the root **through the entry point a consumer calls**, and prove that
+/// is what happened.
 ///
-/// `StoreEngine::open` refuses startup state 1 — initializing an absent or
-/// empty root — by name (`engine.rs`, B1 deliverable 1, unimplemented). So a
-/// store that is about to be exercised through the production `submit` cannot
-/// be *created* through the production `open`. It is created here by calling
-/// `segment::initialize_root`, which is the same function state 1 will call
-/// when B1 implements it, but reached directly rather than through the
-/// entry point a consumer uses.
+/// # What this replaces, and why the replacement is the point
 ///
-/// This is a real weakening and it is named rather than buried: everything
-/// below asserts against the production path *after* the root exists, and
-/// nothing below asserts anything about how a root comes into existence. When
-/// B1 lands startup state 1, this function becomes one line — `StoreEngine::open`
-/// on an absent path — and the Wave B rows gain that half for free.
-pub const ROOT_SEEDED_BY_NON_PRODUCTION_PATH: &str =
-    "segment::initialize_root under the store-internals-adjacent public module, because \
-     StoreEngine::open still refuses startup state 1 (B1 deliverable 1)";
+/// Until B1 landed startup state 1, `StoreEngine::open` refused to initialize
+/// an absent root, so a store about to be exercised through the production
+/// `submit` could not be *created* through the production `open`. These rows
+/// seeded it with `segment::initialize_root` instead, and that weakening was
+/// disclosed here, in the fixture, and in three places in the B4 report:
+/// everything below asserted against the production path over a root
+/// production had not built. Charter item 8 is precisely about that shape.
+///
+/// State 1 exists now, so the weakening is closed rather than merely
+/// re-described. The assertions around the call are what make this a check and
+/// not a rename: the root is confirmed absent before, and the `FORMAT` marker
+/// is confirmed present after, so a future `open` that quietly stopped
+/// initializing would fail here instead of silently returning the harness to
+/// seeding its own store.
+pub fn open_absent_root(root: &Path, shard_count: u16, max_index_runs: u32) -> StoreEngine {
+    let layout = RootLayout::new(root);
+    assert!(
+        !layout.format_path().exists(),
+        "the row must build its store through StoreEngine::open, so the root must be \
+         absent before it: {}",
+        root.display()
+    );
 
-fn now_micros() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_micros() as i64)
-        .unwrap_or(0)
-}
+    let engine = StoreEngine::open(options_with_index_runs(root, shard_count, max_index_runs))
+        .expect("StoreEngine::open initializes an absent root (startup state 1)");
 
-pub fn seed_root(root: &Path, shard_count: u16) {
-    initialize_root(
-        &RootLayout::new(root),
-        shard_count,
-        [0x4b; 16],
-        now_micros(),
-        &DurabilityCounters::default(),
-    )
-    .expect("initialize the store root");
+    assert!(
+        layout.format_path().exists(),
+        "StoreEngine::open returned without writing FORMAT, so the store these rows \
+         exercise was not built by the production entry point after all"
+    );
+    engine
 }
 
 // ---------------------------------------------------------------------------
@@ -189,6 +190,13 @@ fn evidence() -> TransactionEvidenceV1 {
         command_digest: ObjectId([0x33; 32]),
         signature: [0x44; 64],
     }
+}
+
+fn now_micros() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0)
 }
 
 fn deadline() -> i64 {
@@ -495,64 +503,41 @@ pub fn disarm(serial: &Serial) {
 // Reopening after a close
 // ---------------------------------------------------------------------------
 
-/// How long the harness will wait for `LOCK` after `StoreEngine` was dropped.
-pub const LOCK_RELEASE_BUDGET: Duration = Duration::from_secs(30);
-
-/// What one close-and-reopen cost.
-pub struct Reopen {
-    pub engine: StoreEngine,
-    /// Attempts made. `1` means the lock was already free when `drop` returned.
-    pub attempts: u32,
-    pub waited: Duration,
-}
-
-/// Reopen a root after its engine was dropped, waiting for the root lock.
+/// Reopen a root after its engine was dropped. **One attempt.**
 ///
-/// # This wait is compensating for a defect, and it is not the harness's
+/// # This is an assertion, and it used to be a wait
 ///
 /// `StoreEngine::drop` closes every shard channel and joins every writer
-/// thread, so on its own account the root lock is released by the time `drop`
-/// returns. Measured, it is not: reopening immediately after `drop` returns
-/// fails `AlreadyLocked` in roughly one run in six, and the lock then becomes
-/// free between a few hundred microseconds and about 150 milliseconds later.
-/// Something outlives the join and holds the `RecoverySession`.
+/// thread, so the root lock is released by the time `drop` returns. Measured
+/// against the code as it stood, it was not: reopening immediately failed
+/// `AlreadyLocked` in roughly one run in six, and this function waited up to
+/// thirty seconds for the lock while publishing the attempt count.
 ///
-/// This matters outside the harness. Scope 3.1 says `AlreadyLocked` is a
-/// refusal and **never a wait**, so a consumer that closes a store and reopens
-/// it — a recovery drill, an in-place restart, the Phase 2 migrator — gets a
-/// spurious refusal with no defined retry. It is reported to the lead and to
-/// B1 as a finding rather than fixed here: `engine.rs` is not B4's file, and
-/// re-deriving its shutdown sequence in the harness is exactly the local
-/// restatement the ownership matrix exists to prevent.
+/// Commit `e050b6d` fixed the cause rather than the symptom. `flock` locks live
+/// on the *open file description*, so a concurrently forked child that
+/// inherited the descriptor kept the lock alive past the close;
+/// `segment::lock_root` now returns an RAII `RootLock` that issues an explicit
+/// `LOCK_UN` before dropping the descriptor. The wait was correct while the
+/// defect stood, and it must not outlive it: scope 3.1 says `AlreadyLocked` is
+/// a refusal and **never a wait**, so a harness that waits on it asserts
+/// something the store does not promise, and a wait that succeeds on the second
+/// try is exactly how a recurrence of this defect would stay invisible.
 ///
-/// The wait is therefore **bounded, measured, and reported**, not silent. It is
-/// not a retry-until-green: a single reopen either succeeds within the budget
-/// or the run fails, and `attempts` is published so a regression that lengthens
-/// the window shows up as a number rather than as an intermittent failure.
-pub fn reopen_after_close(root: &Path, shard_count: u16, max_index_runs: u32) -> Reopen {
-    let started = Instant::now();
-    let mut attempts = 0u32;
-    loop {
-        attempts += 1;
-        match StoreEngine::open(options_with_index_runs(root, shard_count, max_index_runs)) {
-            Ok(engine) => {
-                return Reopen {
-                    engine,
-                    attempts,
-                    waited: started.elapsed(),
-                }
-            }
-            Err(StoreError::AlreadyLocked) if started.elapsed() < LOCK_RELEASE_BUDGET => {
-                std::thread::sleep(Duration::from_micros(200));
-            }
-            Err(StoreError::AlreadyLocked) => panic!(
-                "the root lock was still held {:?} after StoreEngine::drop returned, over \
-                 {attempts} attempts. The known window is under a second; this is longer, \
-                 which means the holder is not merely slow to be reclaimed.",
-                started.elapsed()
-            ),
-            Err(other) => panic!("reopen through production recovery failed: {other:?}"),
-        }
+/// What this buys, stated because it is the point: the lead's own one-attempt
+/// assertion sits in `segment.rs` against `lock_root`, one level *below* the
+/// entry point a consumer calls. This one is at production altitude, through
+/// `StoreEngine::open` — charter item 8. Nothing else asserts it there.
+pub fn reopen_after_close(root: &Path, shard_count: u16, max_index_runs: u32) -> StoreEngine {
+    match StoreEngine::open(options_with_index_runs(root, shard_count, max_index_runs)) {
+        Ok(engine) => engine,
+        Err(StoreError::AlreadyLocked) => panic!(
+            "the root lock was still held on the first StoreEngine::open after \
+             StoreEngine::drop returned. Commit e050b6d releases it explicitly in \
+             RootLock::drop, and scope 3.1 makes AlreadyLocked a refusal rather than a \
+             wait, so this is a recurrence of that defect and not a slow reclaim to \
+             sleep through."
+        ),
+        Err(other) => panic!("reopen through production recovery failed: {other:?}"),
     }
 }
 
@@ -595,11 +580,6 @@ pub struct RowObservation {
     /// against a comment about where the fence sits.
     pub fences_before: u64,
     pub fences_after: u64,
-    /// How many `StoreEngine::open` attempts the reopen needed, and how long it
-    /// waited. `1` and a near-zero wait is the expected reading; anything else
-    /// is the root-lock release window documented on [`reopen_after_close`].
-    pub lock_release_attempts: u32,
-    pub lock_release_wait: Duration,
 }
 
 impl RowObservation {
@@ -641,13 +621,13 @@ pub fn drive_submit_row(
     let row = format!("{} [{}]", point.name(), action_name(action));
     let directory = tempfile::tempdir().expect("tempdir");
     let root = directory.path().join("root");
-    seed_root(&root, 1);
 
     let namespace = namespace_on_shard(0, 1, 0x5643_5342);
     let prior_operation = OperationId([0x11; 16]);
     let victim_operation = OperationId([0x22; 16]);
 
-    let engine = StoreEngine::open(options(&root, 1)).expect("open the seeded root");
+    // Built by production, not merely exercised through it.
+    let engine = open_absent_root(&root, 1, DEFAULT_MAX_INDEX_RUNS);
 
     let prior = submit(&engine, create_transaction(namespace, 0x11));
     assert!(
@@ -678,10 +658,7 @@ pub fn drive_submit_row(
     disarm(serial);
     drop(engine);
 
-    let reopen = reopen_after_close(&root, 1, DEFAULT_MAX_INDEX_RUNS);
-    let lock_release_attempts = reopen.attempts;
-    let lock_release_wait = reopen.waited;
-    let reopened = reopen.engine;
+    let reopened = reopen_after_close(&root, 1, DEFAULT_MAX_INDEX_RUNS);
     let recovered = reopened
         .transaction_status(namespace, victim_operation)
         .expect("status read");
@@ -700,8 +677,6 @@ pub fn drive_submit_row(
         prior_recovered,
         fences_before,
         fences_after,
-        lock_release_attempts,
-        lock_release_wait,
     }
 }
 
@@ -818,18 +793,12 @@ pub fn drive_root_cas_retry_row(
 
     let directory = tempfile::tempdir().expect("tempdir");
     let root = directory.path().join("root");
-    seed_root(&root, CONTENTION_SHARDS);
 
     let namespaces: Vec<NamespaceId> = (0..CONTENTION_SHARDS)
         .map(|shard| namespace_on_shard(shard, CONTENTION_SHARDS, 0x0CA5_0000 + shard as u64))
         .collect();
 
-    let engine = StoreEngine::open(options_with_index_runs(
-        &root,
-        CONTENTION_SHARDS,
-        CONTENTION_MAX_INDEX_RUNS,
-    ))
-    .expect("open the seeded root");
+    let engine = open_absent_root(&root, CONTENTION_SHARDS, CONTENTION_MAX_INDEX_RUNS);
     for (index, namespace) in namespaces.iter().enumerate() {
         let created = submit_plain(&engine, create_transaction(*namespace, 0x40 + index as u8));
         assert!(
@@ -944,10 +913,7 @@ pub fn drive_root_cas_retry_row(
     disarm(serial);
     drop(engine);
 
-    let reopen = reopen_after_close(&root, CONTENTION_SHARDS, CONTENTION_MAX_INDEX_RUNS);
-    let lock_release_attempts = reopen.attempts;
-    let lock_release_wait = reopen.waited;
-    let reopened = reopen.engine;
+    let reopened = reopen_after_close(&root, CONTENTION_SHARDS, CONTENTION_MAX_INDEX_RUNS);
     let recovered = reopened
         .transaction_status(namespace, victim_operation)
         .expect("status read");
@@ -972,8 +938,6 @@ pub fn drive_root_cas_retry_row(
             prior_recovered,
             fences_before,
             fences_after,
-            lock_release_attempts,
-            lock_release_wait,
         }),
     }
 }

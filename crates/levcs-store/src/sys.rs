@@ -336,6 +336,88 @@ pub(crate) fn unlink(path: &Path) -> io::Result<()> {
     std::fs::remove_file(path)
 }
 
+// ---------------------------------------------------------------------------
+// Opening a name this process does not yet own
+// ---------------------------------------------------------------------------
+//
+// Both of these exist for startup state 1, where the store has to look at, and
+// then write into, a directory it has not established is its own. Plain
+// `File::open` and `File::options().create(true).truncate(true)` both traverse a
+// symlink at the final component, so either one at a name an operator can
+// occupy is a write to a path outside the root. `open`/`stat` are therefore not
+// available on that path at all; these are.
+
+/// Open `path` read-only for *verification*, refusing to traverse a symlink at
+/// the final component and refusing anything that is not a regular file.
+///
+/// `Ok(None)` means "there is no regular file at exactly this path": absent, a
+/// symlink, a directory, a fifo, a socket, a device. Every caller is asking
+/// whether the bytes at a name are its own, and for all of those the answer is
+/// no — so they collapse into one variant rather than being distinguished by a
+/// caller that would treat them identically.
+///
+/// `O_NOFOLLOW` is what makes the symlink case an error rather than a read of
+/// somebody else's file, and the `fstat` is what makes it a *regular file*
+/// rather than a name that merely opened: `O_NOFOLLOW` says nothing about
+/// directories or fifos. The type is read from the descriptor already opened,
+/// not from a second path lookup, so the answer is about the object this call
+/// holds and cannot be changed underneath it.
+///
+/// `O_NONBLOCK` is load-bearing rather than incidental. Opening a fifo for
+/// reading blocks until a writer arrives, so without it a fifo left in a
+/// configured root would hang startup indefinitely — a denial of service
+/// reached by `mkfifo`, and one this function exists to be immune to because
+/// its whole job is to look at names it does not trust.
+pub(crate) fn open_regular_nofollow(path: &Path) -> io::Result<Option<File>> {
+    use rustix::fs::{FileType, Mode, OFlags};
+    let fd = match rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::NOENT) | Err(rustix::io::Errno::NOTDIR) => return Ok(None),
+        // `O_NOFOLLOW` on a symlink is `ELOOP` on Linux and `EMLINK` on some
+        // BSDs. Both mean "the final component is a symlink", which is exactly
+        // the answer this function is being asked for.
+        Err(rustix::io::Errno::LOOP) | Err(rustix::io::Errno::MLINK) => return Ok(None),
+        Err(e) => return Err(io::Error::from_raw_os_error(e.raw_os_error())),
+    };
+    let file = File::from(fd);
+    let stat =
+        rustix::fs::fstat(&file).map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))?;
+    if FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile {
+        Ok(Some(file))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Create `path` as a **new** regular file, or report that the name is taken.
+///
+/// `Ok(None)` means the name already exists — as anything at all, including a
+/// symlink. `O_CREAT | O_EXCL` is specified to fail with `EEXIST` on a symlink
+/// whether or not the link resolves, so this can never create or truncate a
+/// file outside the directory it names; `O_NOFOLLOW` is passed as well so the
+/// intent survives someone later relaxing the `O_EXCL`.
+///
+/// This is the only way anything in this crate may bring a new name into a
+/// directory the store has not yet established is its own. `create(true)` plus
+/// `truncate(true)` is the operation it replaces, and the difference is that
+/// this one cannot destroy a byte it did not write.
+pub(crate) fn create_new_nofollow(path: &Path) -> io::Result<Option<File>> {
+    use rustix::fs::{Mode, OFlags};
+    match rustix::fs::open(
+        path,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o644),
+    ) {
+        Ok(fd) => Ok(Some(File::from(fd))),
+        Err(rustix::io::Errno::EXIST) => Ok(None),
+        Err(e) => Err(io::Error::from_raw_os_error(e.raw_os_error())),
+    }
+}
+
 /// Truncate a file to `len`.
 ///
 /// In the funnel because it changes what is durable. `journal.rs` was calling

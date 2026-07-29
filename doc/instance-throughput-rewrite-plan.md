@@ -1217,6 +1217,53 @@ shard tree outside the root. `read_format` follows a link at `FORMAT`, read-only
 priority. The first is a correctness defect in the locking discipline and should be scheduled on
 its own, not folded into a later pass.
 
+##### Contract review 2026-07-29-A
+
+**The first of 2026-07-28-D's four recorded hazards is closed at the frozen surface.** Granted and
+landed by the lead, not by a package: `segment::lock_root` now takes `<root>/LOCK` through a third
+`sys.rs` primitive, `open_or_create_regular_nofollow` — `O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC |
+O_NONBLOCK`, no `O_TRUNC`, followed by an `fstat` on the descriptor already held. A name occupied by
+anything that is not a regular file is `UnrecognizedLayout`, and the type is established **before**
+`flock` is attempted, so a refused name is never locked even momentarily.
+
+Why this one was scheduled alone rather than folded into a later pass. The other three hazards risk
+a file. This one breaks a **safety property**: `flock` locks the inode a descriptor reached, not the
+name that was asked for, so a link at `LOCK` puts the root lock on a foreign inode and leaves the
+root's own lock file unlocked. Every single-writer argument above this layer — the shard writer, the
+publication window of scope §6.3, the poison-window reasoning — rests on §3.1 exclusion holding.
+Nothing is destroyed and everything downstream is permitted to race.
+
+Why `classify_root` was not sufficient, which is the whole reason this could not stay a B1 fix.
+B1's classifier does refuse a non-regular `LOCK`, but only on the `StoreEngine::open` path.
+`RecoverySession::open` and `drive.rs` call `lock_root` directly, with no classification anywhere
+ahead of them, and those are the callers a future `migrate-store` and every recovery tool reach
+through. A guarantee that holds only for one of three entry points is not a guarantee.
+
+Measured on a reverted copy, all three distinct failures observed rather than predicted:
+
+- **Two owners of one root.** First lock taken and *still held*; `LOCK` then replaced with a link to
+  an unlocked file elsewhere; the second `lock_root` returned `Ok`. A state, not a race.
+- **A dangling link at `LOCK` created a file outside the root**, because `create(true)` through an
+  unresolved link is a create at the target.
+- **A fifo at `LOCK` returned `Ok(RootLock)`** — the store reported holding the root lock on a pipe.
+  This was not in the ranked hazard; it was found by writing the test for the `fstat` arm.
+
+`FileType::RegularFile` is checked from the descriptor, never from a second path lookup, so the
+answer is about the object the caller holds and cannot be changed underneath it. One `O_CREAT` open
+rather than an `O_EXCL` create with a plain open on `EEXIST`: the single call leaves no window
+between deciding a name is taken and opening what is there.
+
+**Disclosed and not closed.** A device node at `LOCK` still receives one `open(2)` before the
+`fstat` refuses it. `O_NONBLOCK` stops that open from hanging — the fifo case is otherwise a startup
+denial of service — but a driver that acts on being opened has been opened. Closing it needs `O_PATH`
+classification plus a re-open of the same inode, which is more machinery than a hazard gated behind
+the privilege to `mknod` inside a configured store root warrants. Recorded, not silently accepted.
+
+The remaining three hazards from 2026-07-28-D stand unchanged and unfixed: `write_fenced` for
+`FORMAT.tmp`, `initialize_root`'s `create_dir_all`, and `read_format`. Their common shape is now
+one primitive away from a fix, but each needs its own refusal semantics decided, and none of them
+breaks an exclusion property.
+
 ##### Contract review 2026-07-28-C
 
 B4 re-pointed `store-bench` at a real `StoreEngine::submit` and found that four verification

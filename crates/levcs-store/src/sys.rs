@@ -340,12 +340,13 @@ pub(crate) fn unlink(path: &Path) -> io::Result<()> {
 // Opening a name this process does not yet own
 // ---------------------------------------------------------------------------
 //
-// Both of these exist for startup state 1, where the store has to look at, and
-// then write into, a directory it has not established is its own. Plain
-// `File::open` and `File::options().create(true).truncate(true)` both traverse a
-// symlink at the final component, so either one at a name an operator can
-// occupy is a write to a path outside the root. `open`/`stat` are therefore not
-// available on that path at all; these are.
+// These exist for the paths where the store has to look at, and then write
+// into, a directory it has not established is its own — startup state 1, and
+// `lock_root` on every path. Plain `File::open` and
+// `File::options().create(true)` both traverse a symlink at the final
+// component, so either one at a name an operator can occupy is a write to a
+// path outside the root. `open`/`stat` are therefore not available on those
+// paths at all; these are.
 
 /// Open `path` read-only for *verification*, refusing to traverse a symlink at
 /// the final component and refusing anything that is not a regular file.
@@ -415,6 +416,71 @@ pub(crate) fn create_new_nofollow(path: &Path) -> io::Result<Option<File>> {
         Ok(fd) => Ok(Some(File::from(fd))),
         Err(rustix::io::Errno::EXIST) => Ok(None),
         Err(e) => Err(io::Error::from_raw_os_error(e.raw_os_error())),
+    }
+}
+
+/// Open `path` read-write, creating it if absent, refusing to traverse a
+/// symlink at the final component and refusing anything that is not a regular
+/// file. Never truncates.
+///
+/// `Ok(None)` means "the name is occupied by something that is not a regular
+/// file": a symlink, a directory, a fifo, a socket, a device. Absent is not one
+/// of them — absent is the create case, and it returns the new file.
+///
+/// This is the shape [`open_regular_nofollow`] and [`create_new_nofollow`] do
+/// not cover: a name the store must *own and keep*, where an existing file is
+/// adopted rather than replaced and an absent one is brought into being. The
+/// only caller is `segment::lock_root`, which needs exactly this because
+/// `<root>/LOCK` is created as a side effect of asking whether a root is busy.
+///
+/// # Why the type check is not cosmetic here
+///
+/// `flock` locks the *inode*, not the name. A symlink at `LOCK` that a
+/// follow-through open traverses therefore takes the root lock on a foreign
+/// inode, and the root's own lock file is left unlocked — so a second process
+/// arriving at the same root takes it too, and both hold what each believes is
+/// exclusive ownership. That defeats the exclusion scope 3.1 is built on, which
+/// no amount of care at the `flock` call itself can restore. `O_NOFOLLOW` plus
+/// this `fstat` is what makes the locked inode provably the one the caller
+/// named.
+///
+/// One `O_CREAT` open, not an `O_EXCL` create followed by a plain open on
+/// `EEXIST`: the single call has no window between deciding the name is taken
+/// and opening what is there, so there is nothing for an adversary replacing
+/// the name to land in.
+///
+/// # What this still permits
+///
+/// A device node at the name receives one `open(2)` before the `fstat` refuses
+/// it. `O_NONBLOCK` is passed so that open cannot hang — the fifo case is a
+/// startup denial of service otherwise — but a driver that acts on being opened
+/// has still been opened. Closing that would need `O_PATH` for classification
+/// and a re-open of the same inode, which is more machinery than the hazard
+/// warrants: reaching it requires the privilege to `mknod` inside a configured
+/// store root. Recorded rather than silently accepted.
+pub(crate) fn open_or_create_regular_nofollow(path: &Path) -> io::Result<Option<File>> {
+    use rustix::fs::{FileType, Mode, OFlags};
+    let fd = match rustix::fs::open(
+        path,
+        OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::from_raw_mode(0o644),
+    ) {
+        Ok(fd) => fd,
+        // A symlink at the final component: `ELOOP` on Linux, `EMLINK` on some
+        // BSDs. `O_CREAT` through a *dangling* link is the same refusal, which
+        // is what stops this call from creating a file outside the root.
+        Err(rustix::io::Errno::LOOP) | Err(rustix::io::Errno::MLINK) => return Ok(None),
+        // A directory refuses `O_RDWR` before any type check runs.
+        Err(rustix::io::Errno::ISDIR) => return Ok(None),
+        Err(e) => return Err(io::Error::from_raw_os_error(e.raw_os_error())),
+    };
+    let file = File::from(fd);
+    let stat =
+        rustix::fs::fstat(&file).map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))?;
+    if FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile {
+        Ok(Some(file))
+    } else {
+        Ok(None)
     }
 }
 

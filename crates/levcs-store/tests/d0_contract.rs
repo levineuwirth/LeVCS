@@ -300,16 +300,34 @@ fn durability_syscalls_go_only_through_the_sys_funnel() {
             continue;
         }
         let text = std::fs::read_to_string(&path).expect("read source");
-        let mut in_test_module = false;
+        // Test-only code is exempt, and how that is decided matters twice over.
+        //
+        // The trigger is the `#[cfg(test)]` attribute at column zero — the thing
+        // that actually removes the code from a release build — and not the
+        // module's *name*. Matching `mod tests` exempted only modules that
+        // happen to be called that, so `segment.rs`'s `root_lock_tests` and
+        // `recovery.rs`'s `production_session_tests` were scanned as production
+        // code, while a file could equally have evaded the guard by naming a
+        // module `tests` and putting real code in it.
+        //
+        // The exemption also *ends*, at the next column-zero `}`. Latching it on
+        // for the rest of the file meant anything appended after a test module
+        // was unscanned — the one place a durability call is least likely to be
+        // noticed. rustfmt puts every top-level item's closing brace at column
+        // zero, so that boundary is mechanical here.
+        let mut in_test_item = false;
         for (n, line) in text.lines().enumerate() {
             let code = line.trim_start();
-            if code.starts_with("//") {
+            if line.starts_with("#[cfg(test)]") {
+                in_test_item = true;
+            }
+            if in_test_item {
+                if line == "}" {
+                    in_test_item = false;
+                }
                 continue;
             }
-            if code.contains("mod tests") {
-                in_test_module = true;
-            }
-            if in_test_module {
+            if code.starts_with("//") {
                 continue;
             }
             for needle in FORBIDDEN {
@@ -319,6 +337,11 @@ fn durability_syscalls_go_only_through_the_sys_funnel() {
             }
         }
     }
+    // `std::fs::remove_file(` and `fs::remove_file(` both match one line, so an
+    // offender is reported once per needle it happens to satisfy. That made a
+    // real report ambiguous to read; the finding is the line, not the needle.
+    offenders.sort();
+    offenders.dedup();
     assert!(
         offenders.is_empty(),
         "durability syscalls must go through sys.rs so DurabilityCounters sees \

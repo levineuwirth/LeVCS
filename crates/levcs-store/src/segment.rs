@@ -252,13 +252,41 @@ impl Drop for RootLock {
 ///
 /// The returned [`RootLock`] releases explicitly when dropped; see its
 /// documentation for why holding a bare `File` was not equivalent.
+///
+/// # Why the open goes through the no-follow funnel
+///
+/// Contract review 2026-07-29-A. This used to be
+/// `File::options().create(true).read(true).write(true).open(..)`, which
+/// traverses a symlink at `LOCK` — and `flock` locks the inode the descriptor
+/// reached, not the name that was asked for. A link at `LOCK` therefore put the
+/// root lock on a foreign inode while leaving the root itself unlocked, so a
+/// second process arriving at that same root took the lock as well and two
+/// owners each believed they held it exclusively. Scope 3.1 exclusion is the
+/// property the whole engine's single-writer reasoning rests on, so this is a
+/// safety defect rather than a data hazard: nothing is destroyed, and everything
+/// downstream is permitted to race.
+///
+/// `classify_root` refuses a non-regular `LOCK` on the `StoreEngine::open` path,
+/// but that is not where the guarantee can live. `RecoverySession::open` and
+/// `drive.rs` reach here directly, without any classification, and the check has
+/// to hold for them too. It is also strictly ordered: the type is established
+/// from the descriptor *before* `flock` is attempted, so a refused name is never
+/// locked even momentarily.
+///
+/// A `LOCK` that is not a regular file is [`StoreError::UnrecognizedLayout`] and
+/// not [`StoreError::AlreadyLocked`]: the root is not busy, it is malformed, and
+/// the two call for opposite operator responses.
 pub fn lock_root(layout: &RootLayout) -> Result<RootLock, StoreError> {
-    let file = File::options()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(layout.lock_path())?;
+    let path = layout.lock_path();
+    let file = match sys::open_or_create_regular_nofollow(&path)? {
+        Some(file) => file,
+        None => {
+            return Err(StoreError::UnrecognizedLayout(format!(
+                "{} is not a regular file; refusing to take the root lock on it",
+                path.display()
+            )));
+        }
+    };
     if sys::try_lock_exclusive(&file)? {
         Ok(RootLock { file })
     } else {
@@ -1016,6 +1044,130 @@ impl SegmentCache {
 #[cfg(test)]
 mod root_lock_tests {
     use super::*;
+
+    /// The exclusion defect a follow-through open at `LOCK` produced.
+    ///
+    /// `flock` locks the inode the descriptor reached. So with a symlink at
+    /// `LOCK`, the second caller's lock lands on a foreign inode and the root's
+    /// own lock file is left unlocked — and *both* callers hold what each
+    /// believes is exclusive ownership of one root. That is the scope 3.1
+    /// property every single-writer argument above this layer depends on.
+    ///
+    /// The first lock is taken before the link is planted, and is still held
+    /// when the second is attempted, so the arrangement is a state and not a
+    /// race. Against the previous open this test fails by taking the second
+    /// lock successfully.
+    #[test]
+    fn a_symlink_at_lock_cannot_produce_a_second_owner_of_one_root() {
+        let dir = tempfile::tempdir().expect("temp root");
+        let layout = RootLayout::new(dir.path());
+        let held = lock_root(&layout).expect("the first and only owner");
+
+        // The name is redirected at a file that exists and is unlocked, which is
+        // what makes the second `flock` succeed rather than fail for an
+        // unrelated reason.
+        let outside = tempfile::tempdir().expect("a directory outside the root");
+        let foreign = outside.path().join("elsewhere");
+        std::fs::write(&foreign, b"not the store's lock\n").expect("the foreign file");
+        std::fs::remove_file(layout.lock_path()).expect("unlink the real LOCK");
+        std::os::unix::fs::symlink(&foreign, layout.lock_path()).expect("plant the link");
+
+        match lock_root(&layout) {
+            Err(StoreError::UnrecognizedLayout(reason)) => {
+                assert!(reason.contains("LOCK"), "{reason}");
+            }
+            Ok(_) => panic!(
+                "a second caller took the root lock while the first still held it, because \
+                 the symlink at LOCK sent its flock to a foreign inode. Two processes now \
+                 own one root and scope 3.1 exclusion no longer holds."
+            ),
+            Err(other) => panic!("expected UnrecognizedLayout, got {other:?}"),
+        }
+        drop(held);
+    }
+
+    /// The same open, in its destructive form: a *dangling* link at `LOCK` and
+    /// `create(true)` brings a file into being outside the root.
+    #[test]
+    fn a_symlink_at_lock_creates_no_file_outside_the_root() {
+        let dir = tempfile::tempdir().expect("temp root");
+        let layout = RootLayout::new(dir.path());
+        let outside = tempfile::tempdir().expect("a directory outside the root");
+        let absent = outside.path().join("not-there");
+        std::os::unix::fs::symlink(&absent, layout.lock_path()).expect("plant the link");
+
+        // The outside file is checked before the refusal is classified, so a
+        // regression reports the damage rather than the error type.
+        let outcome = lock_root(&layout);
+        assert!(
+            !absent.exists(),
+            "taking the root lock created a file outside the root through a dangling symlink"
+        );
+        match outcome {
+            Err(StoreError::UnrecognizedLayout(_)) => {}
+            other => panic!("expected UnrecognizedLayout, got {other:?}"),
+        }
+    }
+
+    /// Every other non-regular occupant of the name, including the two that
+    /// reach different arms of the funnel: a directory refuses `O_RDWR` before
+    /// any type check runs, a fifo opens and is refused by the `fstat`.
+    ///
+    /// The fifo is the `O_NONBLOCK` case. A read-write open of a fifo does not
+    /// block on Linux, so what this asserts is the refusal, not the absence of a
+    /// hang; the flag carries the intent for the device nodes that would block.
+    #[test]
+    fn a_non_regular_file_at_lock_is_refused_rather_than_locked() {
+        // Both arms always run and both are reported: with one panicking early,
+        // the first failure would hide whatever the second did.
+        let mut wrong = Vec::new();
+        for (label, occupy) in [
+            (
+                "directory",
+                (|path: &Path| std::fs::create_dir(path).expect("mkdir")) as fn(&Path),
+            ),
+            ("fifo", |path: &Path| {
+                let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+                    .expect("a path with no interior NUL");
+                // SAFETY: `name` is a valid NUL-terminated path for the lifetime
+                // of the call.
+                let made = unsafe { libc::mkfifo(name.as_ptr(), 0o644) };
+                assert_eq!(made, 0, "mkfifo: {}", std::io::Error::last_os_error());
+            }),
+        ] {
+            let dir = tempfile::tempdir().expect("temp root");
+            let layout = RootLayout::new(dir.path());
+            occupy(&layout.lock_path());
+            match lock_root(&layout) {
+                Err(StoreError::UnrecognizedLayout(_)) => {}
+                other => wrong.push(format!("{label} at LOCK: {other:?}")),
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "a non-regular LOCK must be UnrecognizedLayout, not locked and not an untyped \
+             errno: {wrong:?}"
+        );
+    }
+
+    /// A regression guard, not a defect proof: the previous open already passed
+    /// `truncate(false)`. It is here because the amended open is the one place
+    /// an `O_TRUNC` would be easy to add and impossible to notice — `LOCK` holds
+    /// no bytes the store reads, so nothing else would ever complain.
+    #[test]
+    fn taking_the_lock_does_not_rewrite_an_existing_lock_file() {
+        let dir = tempfile::tempdir().expect("temp root");
+        let layout = RootLayout::new(dir.path());
+        std::fs::write(layout.lock_path(), b"operator note\n").expect("pre-existing LOCK");
+
+        let held = lock_root(&layout).expect("adopt the existing lock file");
+        assert_eq!(
+            std::fs::read(layout.lock_path()).expect("read LOCK"),
+            b"operator note\n",
+            "taking the root lock rewrote bytes it did not write"
+        );
+        drop(held);
+    }
 
     /// A second holder is refused, never queued (scope 3.1).
     #[test]

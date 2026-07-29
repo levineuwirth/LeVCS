@@ -653,7 +653,7 @@ fn initializing_marker_is_ours(layout: &RootLayout) -> Result<bool, StoreError> 
 ///   failing is a refusal and never a rebuild.
 /// - **`LOCK`, present as a regular file.** Ignored. It is not store data and
 ///   it is not evidence that anything has been decided: `LOCK` is a zero-length
-///   file that [`segment::lock_root`] creates with `create(true)` as a side
+///   file that [`segment::lock_root`] creates if absent, as a side
 ///   effect of *asking* whether the root is busy, so any process that merely
 ///   probed the root leaves one. Treating it as state 4 would permanently wedge
 ///   a root that has no bytes to lose.
@@ -3373,8 +3373,8 @@ mod tests {
     /// State 1, and the deliberate decision inside it: a directory holding
     /// only `LOCK` is empty.
     ///
-    /// This is not a hypothetical. `segment::lock_root` opens `LOCK` with
-    /// `create(true)`, so an initialization that dies between taking the lock
+    /// This is not a hypothetical. `segment::lock_root` creates `LOCK` if it is
+    /// absent, so an initialization that dies between taking the lock
     /// and the `FORMAT` rename leaves precisely this, and so does any process
     /// that merely asked whether the root was busy. Classifying it as
     /// unrecognized would wedge a root with no bytes to lose.
@@ -3782,14 +3782,19 @@ mod tests {
 
     /// The same hazard at the other two names this file opens or ignores.
     ///
-    /// `segment::lock_root` opens `LOCK` with `create(true).write(true)` and
-    /// `segment::write_fenced` opens `FORMAT.tmp` with `create` + `truncate`.
-    /// Both are in A1's frozen file, so neither open is changed here; what is
-    /// changed is that a root carrying a symlink at either name never reaches
-    /// them, because the classification that authorizes the write now refuses
-    /// it. The residual interface request is recorded in this deliverable's
-    /// report: those two opens are still follow-through opens for any caller
-    /// that reaches them by another route, and state 2's `lock_root` does.
+    /// `segment::lock_root` opens `LOCK` and `segment::write_fenced` opens
+    /// `FORMAT.tmp` with `create` + `truncate`. Both are in A1's frozen file, so
+    /// neither open was changed by this deliverable; what it changed is that a
+    /// root carrying a symlink at either name never reaches them, because the
+    /// classification that authorizes the write refuses it first.
+    ///
+    /// `lock_root` has since been amended by the lead (contract review
+    /// 2026-07-29-A) to open through the no-follow funnel, because
+    /// `RecoverySession::open` reaches it without any classification at all —
+    /// this test therefore no longer carries the `LOCK` guarantee alone, and the
+    /// assertion below it in `segment.rs` is the load-bearing one. `FORMAT.tmp`
+    /// is still a follow-through open for any caller that reaches
+    /// `initialize_root` by another route, and remains an open interface request.
     #[test]
     fn a_symlink_at_lock_or_format_tmp_is_refused_before_anything_opens_it() {
         let serial = writer_serial();

@@ -441,8 +441,14 @@ pub(crate) fn create_new_nofollow(path: &Path) -> io::Result<Option<File>> {
 /// arriving at the same root takes it too, and both hold what each believes is
 /// exclusive ownership. That defeats the exclusion scope 3.1 is built on, which
 /// no amount of care at the `flock` call itself can restore. `O_NOFOLLOW` plus
-/// this `fstat` is what makes the locked inode provably the one the caller
-/// named.
+/// this `fstat` is what makes the locked inode the one the caller's *name*
+/// resolved to.
+///
+/// It does not make the binding permanent, and scope 3.1 is explicit about the
+/// difference: a name replaced with a fresh regular file while a holder holds it
+/// still yields a second holder, because both opens are then of a regular file at
+/// exactly the right name. That case is an assumption about the deployment, not a
+/// property this function can supply.
 ///
 /// One `O_CREAT` open, not an `O_EXCL` create followed by a plain open on
 /// `EEXIST`: the single call has no window between deciding the name is taken
@@ -470,8 +476,14 @@ pub(crate) fn open_or_create_regular_nofollow(path: &Path) -> io::Result<Option<
         // BSDs. `O_CREAT` through a *dangling* link is the same refusal, which
         // is what stops this call from creating a file outside the root.
         Err(rustix::io::Errno::LOOP) | Err(rustix::io::Errno::MLINK) => return Ok(None),
-        // A directory refuses `O_RDWR` before any type check runs.
-        Err(rustix::io::Errno::ISDIR) => return Ok(None),
+        // A directory refuses `O_RDWR` before any type check runs, and a Unix
+        // socket refuses `open(2)` with `ENXIO` — so neither ever reaches the
+        // `fstat`. Both are mapped here rather than left to surface as `Io`,
+        // because "the name is occupied by something that is not a regular file"
+        // is precisely what they mean, and a caller that has to handle that
+        // answer in two shapes will handle one of them wrongly. `ENXIO` on a
+        // deviceless device node says the same thing.
+        Err(rustix::io::Errno::ISDIR) | Err(rustix::io::Errno::NXIO) => return Ok(None),
         Err(e) => return Err(io::Error::from_raw_os_error(e.raw_os_error())),
     };
     let file = File::from(fd);

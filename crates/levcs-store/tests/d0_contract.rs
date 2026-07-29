@@ -262,6 +262,137 @@ fn privileged_construction_is_not_reachable_from_an_engine() {
     }
 }
 
+/// Calls the durability funnel exists to intercept.
+///
+/// Writes are here for a reason found in review: `checkpoint.rs` used
+/// `File::write_all` directly, so checkpoint bytes and short writes were
+/// invisible to `DurabilityCounters` and the ENOSPC / short-write / cursor fault
+/// seam could not reach checkpoint installation at all. The original guard
+/// scanned only sync, rename, and unlink, so it passed. A funnel that covers
+/// durability but not the writes being made durable is not a funnel.
+const FORBIDDEN: &[&str] = &[
+    "sync_all(",
+    "sync_data(",
+    "std::fs::rename(",
+    "std::fs::remove_file(",
+    "fs::rename(",
+    "fs::remove_file(",
+    ".write_all(",
+    ".write_vectored(",
+    ".set_len(",
+    "std::fs::write(",
+    "fs::write(",
+];
+
+/// Scan one file's text for [`FORBIDDEN`] calls outside test-only code.
+///
+/// `Err` is a scanner failure and fails the guard exactly as an offender does:
+/// a shape it cannot reason about is not a shape it may assume is safe. Split
+/// out of the test so the scanner itself is testable on synthetic input —
+/// mutating real sources only ever probes the shapes those sources happen to
+/// contain, which is how the two defects below survived.
+///
+/// # How test-only code is exempted, and why not by name
+///
+/// The trigger is the `#[cfg(test)]` attribute at column zero — the thing that
+/// actually removes code from a release build. An earlier version matched the
+/// literal `mod tests`, which exempted only modules that happen to be called
+/// that (`segment.rs`'s `root_lock_tests` and `recovery.rs`'s
+/// `production_session_tests` were scanned as production code) while letting a
+/// file evade the guard entirely by naming a module `tests`.
+///
+/// The exemption is then bounded by the **shape of the attributed item**, which
+/// is the second defect. Ending it at the next column-zero `}` is right for a
+/// braced item and wrong for anything else: after
+///
+/// ```text
+/// #[cfg(test)]
+/// use crate::test_support;
+///
+/// fn shipping_code() {
+///     std::fs::write(..);
+/// }
+/// ```
+///
+/// the first column-zero `}` is *`shipping_code`'s*, so every line of it was
+/// skipped. A semicolon-terminated item therefore exempts only itself, and any
+/// third shape — including an item header rustfmt has split across lines — is a
+/// scanner error rather than a guess.
+fn scan_for_unfunnelled_calls(text: &str) -> Result<Vec<(usize, String)>, String> {
+    #[derive(PartialEq)]
+    enum Exempt {
+        No,
+        /// Until the item's closing brace at column zero.
+        UntilUnindentedBrace,
+    }
+
+    let lines: Vec<&str> = text.lines().collect();
+    let mut offenders = Vec::new();
+    let mut exempt = Exempt::No;
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index];
+        let code = line.trim_start();
+
+        if exempt == Exempt::UntilUnindentedBrace {
+            if line == "}" {
+                exempt = Exempt::No;
+            }
+            index += 1;
+            continue;
+        }
+
+        if line.starts_with("#[cfg(test)]") {
+            // The item this attribute applies to, past any further attributes,
+            // doc comments and blank lines.
+            let mut head = index + 1;
+            while head < lines.len() {
+                let candidate = lines[head].trim_start();
+                if candidate.is_empty() || candidate.starts_with('#') || candidate.starts_with("//")
+                {
+                    head += 1;
+                    continue;
+                }
+                break;
+            }
+            let Some(item) = lines.get(head).map(|l| l.trim_end()) else {
+                return Err(format!(
+                    "line {}: `#[cfg(test)]` with no item after it",
+                    index + 1
+                ));
+            };
+            if item.ends_with('{') {
+                exempt = Exempt::UntilUnindentedBrace;
+                index = head + 1;
+                continue;
+            }
+            if item.ends_with(';') {
+                // Only the item itself. Whatever follows is production code
+                // until something says otherwise.
+                index = head + 1;
+                continue;
+            }
+            return Err(format!(
+                "line {}: the scanner cannot bound a `#[cfg(test)]` item of this shape, so it \
+                 cannot tell where the exemption ends: `{}`. Keep the item header on one line, \
+                 or teach the scanner the shape — do not leave it guessing.",
+                head + 1,
+                item.trim()
+            ));
+        }
+
+        if !code.starts_with("//") {
+            for needle in FORBIDDEN {
+                if code.contains(needle) {
+                    offenders.push((index + 1, line.trim().to_string()));
+                }
+            }
+        }
+        index += 1;
+    }
+    Ok(offenders)
+}
+
 /// Nothing outside `sys.rs` may call a durability syscall directly.
 ///
 /// The counters are what turn "exactly one fence per group" and "no per-object
@@ -269,26 +400,6 @@ fn privileged_construction_is_not_reachable_from_an_engine() {
 /// that bypasses the funnel is invisible to them (scope 2.3).
 #[test]
 fn durability_syscalls_go_only_through_the_sys_funnel() {
-    // Writes are here for a reason found in review: `checkpoint.rs` used
-    // `File::write_all` directly, so checkpoint bytes and short writes were
-    // invisible to `DurabilityCounters` and the ENOSPC / short-write / cursor
-    // fault seam could not reach checkpoint installation at all. The original
-    // guard scanned only sync, rename, and unlink, so it passed. A funnel that
-    // covers durability but not the writes being made durable is not a funnel.
-    const FORBIDDEN: &[&str] = &[
-        "sync_all(",
-        "sync_data(",
-        "std::fs::rename(",
-        "std::fs::remove_file(",
-        "fs::rename(",
-        "fs::remove_file(",
-        ".write_all(",
-        ".write_vectored(",
-        ".set_len(",
-        "std::fs::write(",
-        "fs::write(",
-    ];
-
     let mut offenders = Vec::new();
     for path in rust_sources(&crate_src()) {
         // `sys.rs` is the funnel itself. `src/bin/**` are harness binaries that
@@ -300,41 +411,13 @@ fn durability_syscalls_go_only_through_the_sys_funnel() {
             continue;
         }
         let text = std::fs::read_to_string(&path).expect("read source");
-        // Test-only code is exempt, and how that is decided matters twice over.
-        //
-        // The trigger is the `#[cfg(test)]` attribute at column zero — the thing
-        // that actually removes the code from a release build — and not the
-        // module's *name*. Matching `mod tests` exempted only modules that
-        // happen to be called that, so `segment.rs`'s `root_lock_tests` and
-        // `recovery.rs`'s `production_session_tests` were scanned as production
-        // code, while a file could equally have evaded the guard by naming a
-        // module `tests` and putting real code in it.
-        //
-        // The exemption also *ends*, at the next column-zero `}`. Latching it on
-        // for the rest of the file meant anything appended after a test module
-        // was unscanned — the one place a durability call is least likely to be
-        // noticed. rustfmt puts every top-level item's closing brace at column
-        // zero, so that boundary is mechanical here.
-        let mut in_test_item = false;
-        for (n, line) in text.lines().enumerate() {
-            let code = line.trim_start();
-            if line.starts_with("#[cfg(test)]") {
-                in_test_item = true;
-            }
-            if in_test_item {
-                if line == "}" {
-                    in_test_item = false;
-                }
-                continue;
-            }
-            if code.starts_with("//") {
-                continue;
-            }
-            for needle in FORBIDDEN {
-                if code.contains(needle) {
-                    offenders.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
-                }
-            }
+        match scan_for_unfunnelled_calls(&text) {
+            Ok(found) => offenders.extend(
+                found
+                    .into_iter()
+                    .map(|(line, text)| format!("{}:{line}: {text}", path.display())),
+            ),
+            Err(reason) => panic!("{}: {reason}", path.display()),
         }
     }
     // `std::fs::remove_file(` and `fs::remove_file(` both match one line, so an
@@ -348,6 +431,109 @@ fn durability_syscalls_go_only_through_the_sys_funnel() {
          them; found direct calls:\n{}",
         offenders.join("\n")
     );
+}
+
+/// The scanner above, against the shapes it has to get right.
+///
+/// Synthetic input rather than mutated sources. Mutating `segment.rs` proves the
+/// scanner works on the shapes `segment.rs` happens to contain, which is exactly
+/// how both of its exemption defects survived a mutation check: no file in the
+/// crate currently has a semicolon-terminated `#[cfg(test)]` item followed by
+/// production code, so no mutation of a real file could produce one.
+#[test]
+fn the_funnel_scanner_bounds_a_test_exemption_by_the_shape_of_the_item() {
+    let lines = |found: Vec<(usize, String)>| -> Vec<usize> {
+        let mut out: Vec<usize> = found.into_iter().map(|(line, _)| line).collect();
+        out.dedup();
+        out
+    };
+
+    // Production code is found.
+    assert_eq!(
+        lines(
+            scan_for_unfunnelled_calls("fn ship() {\n    std::fs::write(p, b\"\");\n}\n")
+                .expect("a plain file scans")
+        ),
+        vec![2]
+    );
+
+    // A braced test item is exempt, and the exemption ends with it.
+    let braced = "\
+#[cfg(test)]
+mod named_anything {
+    fn setup() {
+        std::fs::write(p, b\"\");
+    }
+}
+
+fn ship() {
+    std::fs::remove_file(p);
+}
+";
+    assert_eq!(
+        lines(scan_for_unfunnelled_calls(braced).expect("a braced item scans")),
+        vec![9],
+        "the call inside the test module must be exempt and the one after it must not"
+    );
+
+    // The defect this shape check exists for: a semicolon-terminated test item
+    // exempts itself and nothing else. Under the previous rule the first
+    // column-zero `}` was `ship`'s, so the whole function was skipped.
+    let terminated = "\
+#[cfg(test)]
+use crate::test_support;
+
+fn ship() {
+    std::fs::write(p, b\"\");
+}
+";
+    assert_eq!(
+        lines(scan_for_unfunnelled_calls(terminated).expect("a semicolon-terminated item scans")),
+        vec![5],
+        "a `#[cfg(test)] use ...;` must not exempt the function that follows it"
+    );
+
+    // Stacked attributes and doc comments between the trigger and the item.
+    let stacked = "\
+#[cfg(test)]
+#[allow(dead_code)]
+/// A helper.
+mod support {
+    fn setup() {
+        std::fs::write(p, b\"\");
+    }
+}
+";
+    assert!(
+        lines(scan_for_unfunnelled_calls(stacked).expect("stacked attributes scan")).is_empty(),
+        "further attributes and doc comments must not hide the item's shape"
+    );
+
+    // A shape the scanner cannot bound is a failure, not an assumption. A
+    // multi-line item header is the realistic way to produce one.
+    let unsupported = "\
+#[cfg(test)]
+fn helper(
+    argument: usize,
+) {
+    std::fs::write(p, b\"\");
+}
+";
+    let reason = scan_for_unfunnelled_calls(unsupported)
+        .expect_err("an unbounded exemption must fail the guard rather than be guessed at");
+    assert!(reason.contains("cannot bound"), "{reason}");
+
+    // And a trailing attribute with nothing after it.
+    assert!(scan_for_unfunnelled_calls("#[cfg(test)]\n")
+        .expect_err("a dangling attribute is a scanner failure")
+        .contains("no item after it"));
+
+    // Comments are not code, in either position.
+    assert!(lines(
+        scan_for_unfunnelled_calls("fn ship() {\n    // std::fs::write(p, b\"\");\n}\n")
+            .expect("a commented call scans")
+    )
+    .is_empty());
 }
 
 /// `StoreError` is for inability to answer; `TransactionStatus` is for every

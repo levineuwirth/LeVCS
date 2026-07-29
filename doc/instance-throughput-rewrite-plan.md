@@ -1241,8 +1241,8 @@ through. A guarantee that holds only for one of three entry points is not a guar
 
 Measured on a reverted copy, all three distinct failures observed rather than predicted:
 
-- **Two owners of one root.** First lock taken and *still held*; `LOCK` then replaced with a link to
-  an unlocked file elsewhere; the second `lock_root` returned `Ok`. A state, not a race.
+- **A wrong-typed name is locked.** First lock taken and *still held*; `LOCK` then replaced with a
+  link to an unlocked file elsewhere; the second `lock_root` returned `Ok`. A state, not a race.
 - **A dangling link at `LOCK` created a file outside the root**, because `create(true)` through an
   unresolved link is a create at the target.
 - **A fifo at `LOCK` returned `Ok(RootLock)`** — the store reported holding the root lock on a pipe.
@@ -1263,6 +1263,46 @@ The remaining three hazards from 2026-07-28-D stand unchanged and unfixed: `writ
 `FORMAT.tmp`, `initialize_root`'s `create_dir_all`, and `read_format`. Their common shape is now
 one primitive away from a fix, but each needs its own refusal semantics decided, and none of them
 breaks an exclusion property.
+
+###### Amended after review, 2026-07-29
+
+Two findings against the above, both upheld.
+
+**The two-owner claim was overstated, and the correction is a scope amendment rather than a code
+change.** The regression arranges its wrong-typed name by *replacing* `LOCK` while the first holder
+holds it — and replacing it with a fresh **regular** file succeeds just as well, since both opens
+are then of a regular file at exactly the right name and nothing distinguishes the second from the
+first. So the type check closes "the name already resolves to the wrong kind of object", which is
+the operator-error and stale-state case, and does **not** close "the name is replaced under a
+holder". Scope 3.1 now states the two cases apart, says which one is in scope, and states the
+replacement case as an explicit deployment assumption: anything able to replace `LOCK` can equally
+unlink a journal, so advisory locking was never the boundary that would stop it. The assumption is
+pinned by `replacing_the_lock_file_still_admits_a_second_holder`, which asserts the *current*
+behavior deliberately — if a stable locking object is ever adopted, that test is expected to fail,
+and the failure is the signal that the documented assumption changed. §3.1 records locking the root
+**directory** as the candidate, and what it would cost: a frozen-surface change, and the removal of
+the "directory holding only `LOCK` is empty" special case that startup state 1 depends on.
+
+**The funnel guard's exemption could still latch, and the fix is a scanner that refuses to guess.**
+Bounding a `#[cfg(test)]` exemption at the next column-zero `}` is right for a braced item and wrong
+for every other shape: after `#[cfg(test)] use crate::test_support;` the first such brace belongs to
+the *next* function, so all of it was skipped. The scanner now reads the shape of the attributed
+item — braced items are exempt to their closing brace, semicolon-terminated items exempt only
+themselves, and any third shape (including an item header rustfmt split across lines) **fails the
+guard** rather than being assumed safe. A shape the scanner cannot bound is not a shape it may
+treat as harmless.
+
+It is also now a function over `&str` with synthetic tests, which is the load-bearing half. Mutating
+real sources only ever probes the shapes those sources happen to contain: no file in the crate has a
+semicolon-terminated `#[cfg(test)]` item followed by production code, so no mutation of a real file
+could have produced this defect. That is a general lesson about source-scanning guards and belongs
+with the charter's item 8 — assert against the path that runs — as its analogue for tooling.
+
+**One promise made exact rather than caveated.** A Unix socket at the name fails `open(2)` with
+`ENXIO` before any `fstat`, so it surfaced as `Io` while the documentation promised
+`UnrecognizedLayout`. `ENXIO` and `EISDIR` are both mapped to "not a regular file", which is what
+they mean here, and the socket case is now one of four occupants the test loop covers. Safety was
+never affected; the type of the refusal was.
 
 ##### Contract review 2026-07-28-C
 

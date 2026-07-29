@@ -408,6 +408,40 @@ created_at_micros, checksum }`, written then directory-synced. `root_uuid` binds
 `LOCK` is held with `flock(LOCK_EX|LOCK_NB)` for process lifetime. Failure is
 `AlreadyLocked`, never a wait.
 
+**What the root lock does and does not exclude** (contract review 2026-07-29-A, second
+finding). `flock` locks an *inode*. The name `<root>/LOCK` resolves to an inode once, at
+open, and nothing binds the name to that inode afterwards — so exclusion holds exactly as
+long as the name keeps resolving to the object the holder locked.
+
+Two cases follow, and only one of them is a defect the store can close:
+
+1. **The name already resolves elsewhere when a process arrives.** A symlink, a fifo, a
+   directory, a socket, or a device at `LOCK` — left by an operator, a restored backup, a
+   symlink farm, or a previous tenant of the directory. A follow-through open takes the
+   lock on a foreign inode, or on no inode the store owns, while the root itself stays
+   unlocked. **In scope and closed**: `segment::lock_root` opens through
+   `sys::open_or_create_regular_nofollow` and refuses anything that is not a regular file
+   at exactly that name, before `flock`.
+2. **The name is replaced while a holder holds it.** `unlink` plus `create`, or a `rename`
+   over it, gives the next arrival a fresh unlocked inode and a second holder — and this is
+   true of *any* regular file at any name, so the type check does not address it and no
+   check at this layer can. **Out of scope, and stated here as an assumption rather than
+   left implied**: scope 3.1 exclusion assumes no noncooperating mutation of the root
+   directory's entries while the root is held. The assumption is sound for the deployment
+   this store is built for — anything able to replace `LOCK` can equally unlink a journal or
+   a manifest, so advisory locking was never the boundary that would stop it — but it is an
+   assumption, not a property, and a test in `segment.rs` pins it so it cannot quietly be
+   believed to be stronger than it is.
+
+The strongest available strengthening, if case 2 is ever brought into scope, is to hold the
+lock on the **root directory** rather than on a file inside it: `rename` over a non-empty
+directory fails `ENOTEMPTY`, so an adversary must move the whole root aside, after which
+every subsequent path resolves into a different tree and the failure stops resembling
+successful exclusion. It is not free — it changes a frozen surface, and it removes the
+"directory holding only `LOCK` is empty" special case that startup state 1 currently needs,
+which is a simplification but a behavioral change to `classify_root` and its tests. Not
+scheduled here.
+
 Startup states (§5.2), decided in this order and with no inference:
 
 1. Path absent, or present and empty → initialize v2. Create the tree, write `FORMAT`,

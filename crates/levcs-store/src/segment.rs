@@ -1053,6 +1053,18 @@ mod root_lock_tests {
     /// believes is exclusive ownership of one root. That is the scope 3.1
     /// property every single-writer argument above this layer depends on.
     ///
+    /// # What this proves, and what it does not
+    ///
+    /// It proves that a `LOCK` whose name resolves to something other than a
+    /// regular file cannot be locked, which closes case 1 of the two in scope
+    /// 3.1. It is **not** proof of exclusion against *replacement*: planting a
+    /// fresh regular file here instead of a symlink still produces a second
+    /// holder, because the second caller opens and locks a new, unlocked inode
+    /// and no check at this layer can distinguish that from the first open.
+    /// [`replacing_the_lock_file_still_admits_a_second_holder`] pins that limit
+    /// deliberately. The lock method here is what is under test; the planting is
+    /// only how a wrong-typed name is arranged.
+    ///
     /// The first lock is taken before the link is planted, and is still held
     /// when the second is attempted, so the arrangement is a state and not a
     /// race. Against the previous open this test fails by taking the second
@@ -1078,10 +1090,46 @@ mod root_lock_tests {
             }
             Ok(_) => panic!(
                 "a second caller took the root lock while the first still held it, because \
-                 the symlink at LOCK sent its flock to a foreign inode. Two processes now \
-                 own one root and scope 3.1 exclusion no longer holds."
+                 the symlink at LOCK sent its flock to a foreign inode. A name that does not \
+                 resolve to a regular file must be refused before flock."
             ),
             Err(other) => panic!("expected UnrecognizedLayout, got {other:?}"),
+        }
+        drop(held);
+    }
+
+    /// The limit of what a lock on a file inside the root can give, pinned so it
+    /// cannot be mistaken for a property.
+    ///
+    /// Replacing `LOCK` with a fresh **regular** file while a holder holds it
+    /// produces a second holder. The no-follow open cannot help: both opens are
+    /// of a regular file at exactly the right name, and the only difference is
+    /// which inode the name resolved to, which the second caller has no way to
+    /// know was ever different. This is true of any regular file at any name.
+    ///
+    /// Scope 3.1 therefore states the assumption explicitly — no noncooperating
+    /// mutation of the root directory's entries while the root is held — and this
+    /// test is the machine-readable form of it. It asserts the *current* behavior
+    /// on purpose: if a stable locking object is ever adopted (§3.1 names locking
+    /// the root directory as the candidate), this test is expected to fail, and
+    /// that failure is the signal that the assumption changed.
+    #[test]
+    fn replacing_the_lock_file_still_admits_a_second_holder() {
+        let dir = tempfile::tempdir().expect("temp root");
+        let layout = RootLayout::new(dir.path());
+        let held = lock_root(&layout).expect("the first holder");
+
+        std::fs::remove_file(layout.lock_path()).expect("unlink the locked name");
+        let second = lock_root(&layout);
+
+        match second {
+            Ok(_) => {}
+            Err(other) => panic!(
+                "a stable locking object appears to have been adopted, or lock_root changed: a \
+                 replaced LOCK was refused with {other:?}. If that is intended, scope 3.1's \
+                 assumption about noncooperating mutation of the root directory is now \
+                 stronger than documented and both should be updated together."
+            ),
         }
         drop(held);
     }
@@ -1126,6 +1174,12 @@ mod root_lock_tests {
                 "directory",
                 (|path: &Path| std::fs::create_dir(path).expect("mkdir")) as fn(&Path),
             ),
+            // Refused by `open(2)` itself with `ENXIO`, so it never reaches the
+            // `fstat` — which is why the primitive maps that errno rather than
+            // letting it surface as an `Io` the caller would have to know about.
+            ("unix socket", |path: &Path| {
+                std::os::unix::net::UnixListener::bind(path).expect("bind");
+            }),
             ("fifo", |path: &Path| {
                 let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
                     .expect("a path with no interior NUL");

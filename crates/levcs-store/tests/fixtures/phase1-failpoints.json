@@ -5,7 +5,8 @@
   "notes": [
     "One row per levcs_store::failpoints::Failpoint. The row set, its order, and each row's wave are asserted against Failpoint::ALL and Failpoint::wave(); the wave partition is pinned by name in failpoints.rs and is never restated as a count here.",
     "Each row carries two independent derivations of the same answer: physical_state_class -> required_outcome through the class table in tests/support/group_model.rs, and levcs_protocol::oracle::append_publication_expectation(point).recovery_outcome through the frozen Phase 0 oracle. crash_matrix.rs asserts the observed outcome equals both. Two derivations that must agree is the point; a single one would only restate itself.",
-    "No catch-all match arm exists in crash_matrix.rs or in the class table. Contract review 2026-07-24-A shipped an unsound recovery classification because a catch-all left most outcomes unasserted."
+    "No catch-all match arm exists in crash_matrix.rs or in the class table. Contract review 2026-07-24-A shipped an unsound recovery classification because a catch-all left most outcomes unasserted.",
+    "Wave B rows are driven in-process through StoreEngine::submit rather than through a child process. HardExit is the only action that requires a parent, and no Wave B row uses it; the four fields Wave B adds are statements about a live engine that a dead child cannot be asked about. recovery_outcome is still observed by closing the engine and reopening through StoreEngine::open, so both waves answer that half the same way."
   ],
   "wave_a_assertion_scope": {
     "asserted": [
@@ -21,8 +22,8 @@
     "reason": "drive.rs has no engine, status root, sequencer, or signer, so there is no status to observe, no acknowledgment to permit or refuse, and no later-append admission control. These four fields are equally unassertable for every Wave A row, so they do not distinguish any row from another. Wave B re-asserts every row's complete FailpointExpectation through StoreEngine::submit."
   },
   "wave_b_exit_conditions": [
-    "The pending set is empty: no row carries wave = pending-wave-b.",
-    "Every row asserts its complete FailpointExpectation through submit, not only the two halves above.",
+    "The pending set is empty: no row carries the wave value that names an undriven obligation. Met. The literal is deliberately absent from this file, because scripts/check-phase1.sh greps for it and a check that matches its own documentation is a check that fails on a green tree.",
+    "Every row asserts its complete FailpointExpectation through submit, not only the two halves Wave A could reach. Met for the eight Wave B rows; the nine Wave A rows keep the two halves drive.rs can observe, since drive.rs has no status root to observe the others with and driving them twice would not add a fact.",
     "The Panic action is exercised on DuringCommittedRootBuild, BeforeRootCas, and DuringRootCasRetry, so the panic-in-publication coverage vacated by ruling WriterPanicAfterFence into Wave A is not lost. The failpoint enum names a location; the driver chooses the action; the two axes are independent."
   ],
   "rows": [
@@ -40,13 +41,18 @@
     },
     {
       "failpoint": "AfterMarkedResolving",
-      "wave": "pending-wave-b",
+      "wave": "B",
       "physical_state_class": "NoBytes",
       "required_outcome": "AbsentRetriable",
       "victim_placement": "first",
       "drive": null,
-      "pending_reason": "Requires the status root. Marking an operation Resolving is step 3 of the append ordering and lives in engine.rs; drive.rs has no status root, so the location does not exist to fire.",
-      "rationale": "Marking Resolving writes no journal byte, so the physical state is identical to BeforeAppend. The row is distinguished only by immediate_status and shard_poisoned, which is exactly why it is Wave B."
+      "submit": {
+        "actions": [
+          "fail"
+        ],
+        "requires_root_cas_contention": false
+      },
+      "rationale": "Marking Resolving writes no journal byte, so the physical state is identical to BeforeAppend. The row is distinguished only by immediate_status and shard_poisoned, which is why it needed an engine: the status root is the only place the difference exists."
     },
     {
       "failpoint": "DuringFrameWriteTorn",
@@ -74,13 +80,18 @@
     },
     {
       "failpoint": "EvidenceHandoffFailure",
-      "wave": "pending-wave-b",
+      "wave": "B",
       "physical_state_class": "NoBytes",
       "required_outcome": "AbsentRetriable",
       "victim_placement": "first",
       "drive": null,
-      "pending_reason": "Requires the sequencer's CommitEvidenceSigner handoff, which happens before append and lives in engine.rs. drive.rs has no signer, so the location does not exist to fire.",
-      "rationale": "Signer failure occurs before journal append and therefore writes nothing; it cannot produce an unsigned committed frame."
+      "submit": {
+        "actions": [
+          "fail"
+        ],
+        "requires_root_cas_contention": false
+      },
+      "rationale": "Fires at scope 6.3 step 2, before the group is marked Resolving and before any byte is written. Contract review 2026-07-26-A gave it the BeforeAppend shape: a routine SignerError::Unavailable is an availability event, and poisoning the shard for it would trade a real availability property for a safety property that was never at risk."
     },
     {
       "failpoint": "BeforeFence",
@@ -132,43 +143,66 @@
     },
     {
       "failpoint": "DuringCommittedRootBuild",
-      "wave": "pending-wave-b",
+      "wave": "B",
       "physical_state_class": "WholeFrameFenced",
       "required_outcome": "Committed",
       "victim_placement": "group-wide",
       "drive": null,
-      "pending_reason": "Requires the immutable shard subtree build of engine.rs. Wave B must exercise this row with the Panic action as well as Fail.",
-      "rationale": "The fence already succeeded, so the frames are durable regardless of what the in-memory build does. The shard poisons and recovery publishes the prefix exactly once."
+      "submit": {
+        "actions": [
+          "fail",
+          "panic"
+        ],
+        "requires_root_cas_contention": false
+      },
+      "rationale": "The fence returned before the subtree build begins, so the frame is durable and the transaction is committed on the device while the publication that would make it visible never happens. Recovery replays the fenced frame and publishes the receipt."
     },
     {
       "failpoint": "AllocationFailureBeforePublication",
-      "wave": "pending-wave-b",
+      "wave": "B",
       "physical_state_class": "WholeFrameFenced",
       "required_outcome": "Committed",
       "victim_placement": "group-wide",
       "drive": null,
-      "pending_reason": "Requires the publication path of engine.rs.",
-      "rationale": "Same durable state as AfterSuccessfulFence; the differential is entirely in the poison and status halves."
+      "submit": {
+        "actions": [
+          "fail"
+        ],
+        "requires_root_cas_contention": false
+      },
+      "rationale": "Same physical state as DuringCommittedRootBuild and reached one step later: the group is fenced, the subtree is built, and the allocation that would carry it into the root fails. Poisoning, because it is inside steps 4-8."
     },
     {
       "failpoint": "BeforeRootCas",
-      "wave": "pending-wave-b",
+      "wave": "B",
       "physical_state_class": "WholeFrameFenced",
       "required_outcome": "Committed",
       "victim_placement": "group-wide",
       "drive": null,
-      "pending_reason": "Requires the ArcSwap committed-root CAS of engine.rs. Wave B must exercise this row with the Panic action as well as Fail.",
-      "rationale": "The committed-root swap is the visibility boundary, and it has not happened; the journal bytes are nonetheless durable."
+      "submit": {
+        "actions": [
+          "fail",
+          "panic"
+        ],
+        "requires_root_cas_contention": false
+      },
+      "rationale": "The last instant at which a fenced group is still unpublished. Everything before the compare-and-swap has succeeded, so the transaction is durable; the shard is poisoned because a group that fenced and did not publish leaves the status root claiming Resolving for a committed transaction."
     },
     {
       "failpoint": "DuringRootCasRetry",
-      "wave": "pending-wave-b",
+      "wave": "B",
       "physical_state_class": "WholeFrameFenced",
       "required_outcome": "Committed",
       "victim_placement": "group-wide",
       "drive": null,
-      "pending_reason": "Requires the CAS merge loop under concurrent shard publication, which only exists in engine.rs. Wave B must exercise this row with the Panic action as well as Fail.",
-      "rationale": "A contended CAS re-merges against the newer root; dying inside the retry changes nothing about the durable prefix."
+      "submit": {
+        "actions": [
+          "fail",
+          "panic"
+        ],
+        "requires_root_cas_contention": true
+      },
+      "rationale": "Reached only after a lost compare-and-swap: another shard published between this shard's load of the committed root and its swap. The re-merge is against a newer root and the subtree is unchanged, so the outcome is identical to BeforeRootCas - which is the point, because a retry that resolved differently from a first attempt would make publication order observable."
     },
     {
       "failpoint": "WriterPanicBeforeFence",
@@ -196,23 +230,46 @@
     },
     {
       "failpoint": "AfterRootCasBeforeWaiterWake",
-      "wave": "pending-wave-b",
+      "wave": "B",
       "physical_state_class": "WholeFrameFencedAndPublished",
       "required_outcome": "Committed",
       "victim_placement": "group-wide",
       "drive": null,
-      "pending_reason": "Requires a published committed root and a receipt to be retrievable, both of which are engine.rs.",
-      "rationale": "The receipt is already visible, so acknowledgment is permitted and failing to wake a waiter cannot hide it. This is one of only two rows whose class is fenced-and-published."
+      "submit": {
+        "actions": [
+          "fail"
+        ],
+        "requires_root_cas_contention": false
+      },
+      "rationale": "Post-publication. The fence succeeded and the root published, so the transaction is committed; a waiter that never wakes is a hung request, not an absent transaction, and the receipt stays queryable through transaction_status."
     },
     {
       "failpoint": "BeforeResponse",
-      "wave": "pending-wave-b",
+      "wave": "B",
       "physical_state_class": "WholeFrameFencedAndPublished",
       "required_outcome": "Committed",
       "victim_placement": "group-wide",
       "drive": null,
-      "pending_reason": "Requires a published receipt and a response path, both of which are engine.rs.",
+      "submit": {
+        "actions": [
+          "fail"
+        ],
+        "requires_root_cas_contention": false
+      },
       "rationale": "Post-publication and pre-response: the receipt is already durable and idempotently retrievable by status or retry, and no reappend is required."
     }
-  ]
+  ],
+  "wave_b_assertion_scope": {
+    "asserted": [
+      "physical_state_class",
+      "recovery_outcome",
+      "shard_poisoned",
+      "immediate_status",
+      "acknowledgment_allowed",
+      "later_append_allowed_before_recovery"
+    ],
+    "reason": "With engine.rs the four fields Wave A could not reach are observable through the API a consumer calls: submit returns or refuses, transaction_status performs plan 5.1's two-root read, a second submit to the same shard says whether a later append is admitted, and a close-and-reopen through StoreEngine::open answers recovery_outcome the same way the Wave A rows answer it. Every Wave B row asserts the complete FailpointExpectation, field by field, against oracle::append_publication_expectation.",
+    "root_seeded_by": "segment::initialize_root. StoreEngine::open still refuses startup state 1 - initializing an absent or empty root is B1 deliverable 1 and is unimplemented - so the root these rows exercise cannot be created through the production open. This is a charter item 8 weakening and it is recorded here rather than only in a report: what is asserted below is the production submit, status, and reopen path over a root production did not build. When B1 lands state 1 this becomes StoreEngine::open on an absent path and the weakening disappears.",
+    "panic_ownership": "B1 implements phase-aware panic ownership: a panic in scope 6.3 steps 1-3 is definitively absent and leaves the writer thread alive; a panic in steps 4-8 poisons and kills the writer, so a later append is refused NotReady rather than accepted; a panic in steps 9-10 still delivers every receipt. The Panic rows confirm this from outside the engine, through submit and transaction_status, rather than by reading the catch sites."
+  }
 }

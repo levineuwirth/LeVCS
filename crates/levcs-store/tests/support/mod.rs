@@ -10,3 +10,15 @@
 
 pub mod group_model;
 pub mod harness;
+
+/// The Wave B submit-path harness (scope 6.6 deliverable 2).
+///
+/// Gated on `store-privileged` because building a `ValidatedTransaction` at
+/// all requires `PrivilegedConstruction`, which scope 2.2 deliberately makes
+/// unreachable without that feature. The Phase 1 gate runs
+/// `failpoints,store-internals,store-privileged`, so the eight Wave B rows are
+/// exercised on every gate run; `crash_matrix::the_submit_path_rows_are_driven_
+/// in_this_configuration` fails loudly rather than passing silently if they
+/// are not.
+#[cfg(feature = "store-privileged")]
+pub mod engine_matrix;

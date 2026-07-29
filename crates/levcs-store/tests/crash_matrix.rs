@@ -144,8 +144,9 @@ fn the_class_table_and_the_fixture_agree_on_every_row() {
 }
 
 #[test]
-fn wave_a_rows_carry_a_drive_plan_and_wave_b_rows_carry_a_reason() {
+fn wave_a_rows_carry_a_drive_plan_and_wave_b_rows_carry_a_submit_plan() {
     let fixture = harness::load_fixture();
+    let mut contention_rows = Vec::new();
     for row in &fixture.rows {
         let resolved = harness::resolve(row);
         match resolved.point.wave() {
@@ -156,30 +157,44 @@ fn wave_a_rows_carry_a_drive_plan_and_wave_b_rows_carry_a_reason() {
                 assert!(!plan.action.is_empty(), "row {} action", row.failpoint);
                 assert!(!plan.fault.is_empty(), "row {} fault", row.failpoint);
                 assert!(
-                    row.pending_reason.is_none(),
-                    "row {} is Wave A and must not be pending",
+                    row.submit.is_none(),
+                    "row {} is Wave A: it is driven through drive.rs, and claiming a \
+                     submit plan as well would mean two paths assert the same row \
+                     without either being the one under test",
                     row.failpoint
                 );
             }
             Wave::B => {
                 assert!(
                     row.drive.is_none(),
-                    "row {} is pending and must not claim a drive plan",
+                    "row {} needs an engine and must not claim a drive plan",
                     row.failpoint
                 );
-                let reason = row.pending_reason.as_ref().unwrap_or_else(|| {
+                let plan = row.submit.as_ref().unwrap_or_else(|| {
                     panic!(
-                        "pending row {} must carry its reason, exactly as Phase 0's \
-                         not-exercised adversarial rows do",
+                        "Wave B row {} must say which actions drive it through \
+                         StoreEngine::submit",
                         row.failpoint
                     )
                 });
                 assert!(
-                    reason.len() > 20,
-                    "row {}: 'pending' without a substantive reason is a hole with \
-                     a label on it",
+                    !plan.actions.is_empty(),
+                    "row {}: a Wave B row with no action is a pending row without the \
+                     word",
                     row.failpoint
                 );
+                for action in &plan.actions {
+                    assert!(
+                        action == "fail" || action == "panic",
+                        "row {}: the submit path can express Fail and Panic. HardExit \
+                         needs a parent process and Continue is not a fault; naming \
+                         either here would describe a run the harness cannot make: {action:?}",
+                        row.failpoint
+                    );
+                }
+                if plan.requires_root_cas_contention {
+                    contention_rows.push(row.failpoint.clone());
+                }
             }
         }
         assert!(
@@ -188,6 +203,47 @@ fn wave_a_rows_carry_a_drive_plan_and_wave_b_rows_carry_a_reason() {
             row.failpoint
         );
     }
+
+    assert_eq!(
+        contention_rows,
+        vec!["DuringRootCasRetry".to_string()],
+        "exactly one location is reachable only after a lost committed-root CAS. A \
+         second row acquiring the flag would mean a failpoint had been moved inside \
+         the retry loop without the matrix noticing; none acquiring it would mean \
+         DuringRootCasRetry had been driven by a path that never retried, which is \
+         the state B1 disclosed and this row exists to leave."
+    );
+}
+
+/// The three publication-side rows must be exercised with `Panic`, by name.
+///
+/// Ruling `WriterPanicAfterFence` into Wave A vacated the panic coverage of the
+/// publication half. A count here would not catch a row losing its `panic`
+/// action, and a check over "some row panics" would be satisfied by the wrong
+/// one.
+#[test]
+fn the_three_publication_side_rows_are_driven_with_the_panic_action() {
+    let fixture = harness::load_fixture();
+    let panicking: Vec<&str> = fixture
+        .rows
+        .iter()
+        .filter(|row| {
+            row.submit
+                .as_ref()
+                .is_some_and(|plan| plan.actions.iter().any(|action| action == "panic"))
+        })
+        .map(|row| row.failpoint.as_str())
+        .collect();
+    assert_eq!(
+        panicking,
+        vec![
+            "DuringCommittedRootBuild",
+            "BeforeRootCas",
+            "DuringRootCasRetry"
+        ],
+        "the fixture's own wave_b_exit_conditions names these three; the rows and the \
+         condition must not be able to drift apart"
+    );
 }
 
 #[test]
@@ -223,14 +279,41 @@ fn the_fixture_records_which_halves_wave_a_asserts_and_which_it_cannot() {
          to exercise with the Panic action, so the coverage vacated by ruling \
          WriterPanicAfterFence into Wave A is not lost"
     );
+    assert_eq!(
+        fixture.wave_b_asserted,
+        vec![
+            "physical_state_class".to_string(),
+            "recovery_outcome".to_string(),
+            "shard_poisoned".to_string(),
+            "immediate_status".to_string(),
+            "acknowledgment_allowed".to_string(),
+            "later_append_allowed_before_recovery".to_string(),
+        ],
+        "Wave B asserts the two halves Wave A could reach plus the four it could \
+         not; listing them by name is what makes one going missing a diff"
+    );
+    for field in &fixture.wave_a_unasserted {
+        assert!(
+            fixture.wave_b_asserted.contains(field),
+            "{field} was recorded as unassertable in Wave A, so Wave B owes it. A \
+             field that neither wave asserts is a hole with two labels on it."
+        );
+    }
 }
 
 /// Phase 1 exit requires zero pending rows.
 ///
-/// Inert while `engine.rs` is a skeleton, and it says so rather than passing
-/// silently — the same shape `check-phase1.sh` uses for its own inert checks.
-/// The probe is behavioral, not a grep: if `StoreEngine::open` stops returning
-/// `NotImplemented`, B1 has landed and every pending row is overdue.
+/// **Not inert any more.** It was, while `engine.rs` was a skeleton: the check
+/// asserted the pending set was *non*-empty, so the obligation could not be
+/// dropped by deleting rows instead of driving them. B1's engine landed and
+/// scope 6.6 deliverable 2 drove all eight, so the assertion is now
+/// unconditional in the other direction.
+///
+/// `check-phase1.sh`'s own version of this check is still inert — it fires only
+/// once `engine.rs` stops containing `NotImplemented`, and engine.rs still
+/// refuses startup states 1, 3, and 4 by name. So the gate would *not* catch a
+/// row that regressed to pending. This test would, and that is why it does not
+/// defer to the gate.
 #[test]
 fn the_pending_set_is_empty_at_phase_1_exit() {
     let fixture = harness::load_fixture();
@@ -240,35 +323,56 @@ fn the_pending_set_is_empty_at_phase_1_exit() {
         .filter(|row| row.wave == harness::PENDING_WAVE_B)
         .map(|row| row.failpoint.as_str())
         .collect();
-
-    if !engine_is_implemented() {
-        assert!(
-            !pending.is_empty(),
-            "engine.rs is still a skeleton, so the eight Wave B rows must still \
-             be pending; an empty pending set here would mean the obligation was \
-             dropped rather than met"
-        );
-        eprintln!(
-            "crash_matrix: {} rows pending Wave B (engine.rs is not implemented): {}",
-            pending.len(),
-            pending.join(", ")
-        );
-        return;
-    }
-
     assert!(
         pending.is_empty(),
-        "engine.rs is implemented, so no crash-matrix row may still be pending: {}",
+        "no crash-matrix row may be pending: {}",
         pending.join(", ")
+    );
+
+    let driven: Vec<&str> = fixture
+        .rows
+        .iter()
+        .filter(|row| row.submit.is_some())
+        .map(|row| row.failpoint.as_str())
+        .collect();
+    let expected: Vec<&str> = Failpoint::ALL
+        .iter()
+        .filter(|point| point.wave() == Wave::B)
+        .map(|point| point.name())
+        .collect();
+    assert_eq!(
+        driven, expected,
+        "the eight Wave B rows are named by the registry, not by this file. \
+         Restating them as a list here is how a failpoint added to failpoints.rs \
+         becomes a fixture diff rather than a silent hole."
     );
 }
 
-fn engine_is_implemented() -> bool {
+/// `StoreEngine::open` still refuses startup state 1, which is why the Wave B
+/// rows seed their root with `segment::initialize_root`.
+///
+/// Asserted rather than assumed, because the moment it stops being true the
+/// seeding disclosure in the fixture becomes a false statement about the
+/// harness, and a stale disclosure is worse than none: it tells a reader that a
+/// weakening still exists when the honest answer is that it does not.
+#[test]
+fn the_production_open_still_refuses_to_create_a_root_and_the_fixture_says_so() {
     let directory = tempfile::tempdir().expect("tempdir");
     let options = StoreOptions::new(directory.path().join("root"));
     match StoreEngine::open(options) {
-        Ok(_) => true,
-        Err(error) => !matches!(error, StoreError::NotImplemented(_)),
+        Err(StoreError::NotImplemented(reason)) => {
+            assert!(
+                reason.contains("startup states 1"),
+                "the refusal must still be the unbuilt startup states: {reason}"
+            );
+        }
+        Ok(_) => panic!(
+            "StoreEngine::open now creates an absent root, so the Wave B rows must be \
+             re-pointed at it and the fixture's root_seeded_by disclosure retired"
+        ),
+        Err(other) => {
+            panic!("StoreEngine::open refused an absent root for an unexpected reason: {other:?}")
+        }
     }
 }
 
@@ -1121,3 +1225,297 @@ fn the_drive_seam_a_wave_a_row_needs_is_present() {
          can be driven (scope 4-A1 deliverable 5)."
     );
 }
+
+// ===========================================================================
+// Driving the eight Wave B rows through StoreEngine::submit (scope 6.6 #2)
+// ===========================================================================
+//
+// Wave A asserted two halves of each row's `FailpointExpectation`. These rows
+// assert all six, because the four that were missing — `shard_poisoned`,
+// `immediate_status`, `acknowledgment_allowed`, and
+// `later_append_allowed_before_recovery` — are observable now that there is an
+// engine, and they are the only thing that distinguishes several rows from one
+// another. `AfterMarkedResolving` and `BeforeAppend` produce byte-identical
+// stores; the entire difference between them lives in those four fields.
+//
+// Every observation goes through a method a consumer calls. None goes through
+// an internal helper, a `cfg(test)` hook, or a field read. Scope 5 charter
+// item 8.
+
+#[cfg(feature = "store-privileged")]
+use support::engine_matrix;
+
+/// The one place the assertion is made, so every row is checked the same way
+/// and a row cannot quietly assert fewer fields than its neighbours.
+///
+/// Six separate equalities, never one aggregate comparison of two structs. A
+/// struct equality would report "expectation mismatch" and leave the reader to
+/// diff two `Debug` renderings; contract review 2026-07-24-A is on record that
+/// the field which is wrong is the one nobody looks at.
+#[cfg(feature = "store-privileged")]
+fn assert_full_expectation(
+    point: Failpoint,
+    class: PhysicalStateClass,
+    observation: &engine_matrix::RowObservation,
+) {
+    use levcs_protocol::oracle::{append_publication_expectation, AppendFailpoint};
+
+    let row = &observation.row;
+    let expectation = append_publication_expectation(AppendFailpoint::from(point));
+
+    // 1. physical_state_class -> recovery_outcome, and the frozen oracle's
+    //    recovery_outcome. The same two derivations Wave A compares, restated
+    //    here so a Wave B row is not exempt from the agreement Wave A enforces.
+    assert_eq!(
+        class.required_outcome(),
+        expectation.recovery_outcome,
+        "{row}: the physical state class {} implies {}, but the frozen oracle says {}",
+        class.name(),
+        harness::recovery_outcome_name(class.required_outcome()),
+        harness::recovery_outcome_name(expectation.recovery_outcome)
+    );
+
+    // 2. recovery_outcome, observed by closing the engine and reopening
+    //    through production recovery.
+    let fact = engine_matrix::recovered_fact(&observation.recovered, row);
+    assert!(
+        outcome_admits(expectation.recovery_outcome, fact),
+        "{row}: after a close and reopen through StoreEngine::open the victim reads \
+         back as {fact:?}, which the frozen oracle's {} does not admit. victim = {:?}, \
+         probe = {:?}, fences over the victim's group = {}",
+        harness::recovery_outcome_name(expectation.recovery_outcome),
+        observation.victim,
+        observation.probe,
+        observation.fences_during_victim()
+    );
+
+    // 3. shard_poisoned — the store naming itself poisoned, by variant.
+    assert_eq!(
+        observation.shard_poisoned_observed(),
+        expectation.shard_poisoned,
+        "{row}: the frozen oracle says shard_poisoned = {}. victim = {:?}, probe = {:?}",
+        expectation.shard_poisoned,
+        observation.victim,
+        observation.probe
+    );
+
+    // 4. immediate_status — plan §5.1's two-root read on the live engine.
+    let immediate = engine_matrix::immediate_status_of(&observation.immediate, row);
+    assert_eq!(
+        engine_matrix::immediate_status_name(immediate),
+        engine_matrix::immediate_status_name(expectation.immediate_status),
+        "{row}: transaction_status disagrees with the frozen oracle"
+    );
+
+    // 5. acknowledgment_allowed — a receipt obtainable through a consumer path.
+    assert_eq!(
+        observation.acknowledgment_allowed_observed(),
+        expectation.acknowledgment_allowed,
+        "{row}: the frozen oracle says acknowledgment_allowed = {}. victim = {:?}",
+        expectation.acknowledgment_allowed,
+        observation.victim
+    );
+    if !expectation.acknowledgment_allowed {
+        assert!(
+            observation.victim.receipt().is_none(),
+            "{row}: submit returned a receipt for an operation the oracle says may not \
+             be acknowledged, which is an acknowledgment whatever else is true"
+        );
+    }
+
+    // 6. later_append_allowed_before_recovery — a *different* transaction on
+    //    the same shard, before any reopen.
+    assert_eq!(
+        observation.later_append_allowed_observed(),
+        expectation.later_append_allowed_before_recovery,
+        "{row}: the frozen oracle says later_append_allowed_before_recovery = {}. \
+         probe = {:?}",
+        expectation.later_append_allowed_before_recovery,
+        observation.probe
+    );
+
+    // The transaction that committed before the fault is not collateral. Every
+    // row proves that too, exactly as the Wave A rows prove it for a prior
+    // group; a fault that costs an already-acknowledged transaction its receipt
+    // is acknowledged loss, whatever the row under test says.
+    assert!(
+        matches!(
+            observation.prior_recovered,
+            levcs_store::types::TransactionStatus::Committed(_)
+        ),
+        "{row}: the transaction acknowledged before the fault did not survive the \
+         reopen: {:?}",
+        observation.prior_recovered
+    );
+
+    // The root-lock release window documented on
+    // `engine_matrix::reopen_after_close`. Reported rather than asserted: the
+    // wait is compensating for a defect in a file B4 does not own, and a
+    // harness that stayed silent about it would be hiding the very thing it is
+    // working around.
+    if observation.lock_release_attempts > 1 {
+        eprintln!(
+            "crash_matrix: {row}: the root lock was still held after StoreEngine::drop \
+             returned; the reopen needed {} attempts over {:?}",
+            observation.lock_release_attempts, observation.lock_release_wait
+        );
+    }
+
+    // Charter item 7: the class is checked against a syscall count, not a
+    // comment. A class that says no bytes were written must show no fence, and
+    // a class that says the group was fenced must show exactly one.
+    let fences = observation.fences_during_victim();
+    let expected_fences = match class {
+        PhysicalStateClass::NoBytes => 0,
+        PhysicalStateClass::WholeFrameFenced => 1,
+        PhysicalStateClass::WholeFrameFencedAndPublished => 1,
+        // No Wave B row produces these two: the failpoints that tear a frame or
+        // stop short of the fence are all Wave A and are driven through
+        // drive.rs. Naming them is what makes a future row that moves into one
+        // of these classes fail here rather than silently skip the check.
+        PhysicalStateClass::PartialFrame => panic!(
+            "{row}: a Wave B row produced a partial frame; the submit path forms whole \
+             frames and the tearing failpoints are Wave A"
+        ),
+        PhysicalStateClass::WholeFrameUnfenced => panic!(
+            "{row}: a Wave B row produced an unfenced whole frame; every Wave B location \
+             is either before the mark or after the fence"
+        ),
+    };
+    assert_eq!(
+        fences,
+        expected_fences,
+        "{row}: physical state class {} implies {expected_fences} durability fence(s) \
+         for this group, and DurabilityCounters reports {fences}",
+        class.name()
+    );
+}
+
+#[cfg(feature = "store-privileged")]
+#[test]
+fn wave_b_rows_drive_through_submit_to_their_full_failpoint_expectation() {
+    let fixture = harness::load_fixture();
+    // One token for the whole test. The failpoint and fault registries are
+    // process-global one-shots, and a per-row token would let another test in
+    // this binary arm between two rows of this one.
+    let serial = engine_matrix::serial();
+    let mut driven: Vec<String> = Vec::new();
+
+    for row in &fixture.rows {
+        let resolved = harness::resolve(row);
+        if resolved.point.wave() != Wave::B {
+            continue;
+        }
+        let plan = row
+            .submit
+            .as_ref()
+            .expect("a Wave B row carries a submit plan");
+        if plan.requires_root_cas_contention {
+            // Driven by its own test below, which has to manufacture the lost
+            // compare-and-swap this location sits behind.
+            driven.push(row.failpoint.clone());
+            continue;
+        }
+
+        for action in &plan.actions {
+            let action = engine_matrix::action_from_name(action)
+                .unwrap_or_else(|| panic!("row {}: unknown action {action:?}", row.failpoint));
+            let observation = engine_matrix::drive_submit_row(&serial, resolved.point, action);
+            assert_full_expectation(resolved.point, resolved.class, &observation);
+        }
+        driven.push(row.failpoint.clone());
+    }
+
+    let expected: Vec<String> = Failpoint::ALL
+        .iter()
+        .filter(|point| point.wave() == Wave::B)
+        .map(|point| point.name().to_string())
+        .collect();
+    assert_eq!(
+        driven, expected,
+        "every Wave B row must actually have been driven, by name"
+    );
+}
+
+/// The row B1 disclosed was never armed.
+///
+/// `DuringRootCasRetry` sits inside `publish_subtree`'s retry loop, past a
+/// failed `compare_and_swap`. Submitting a transaction does not reach it; the
+/// only way there is a genuinely lost CAS, which means another shard publishing
+/// into the same committed root between this shard's load and its swap. The
+/// driver manufactures the load, not the mechanism: eight shard writer threads
+/// publish through the production path and the harness only chooses how much
+/// work each publication carries into the window.
+///
+/// # Why this is a hard failure and not a skip
+///
+/// A fault-injection row that quietly does nothing when it cannot reach its
+/// location is the state this row was already in — reachable in principle,
+/// unarmed in practice, and green either way. If the location stops being
+/// reachable, this test says so by name and by number.
+#[cfg(feature = "store-privileged")]
+#[test]
+fn during_root_cas_retry_drives_through_a_genuinely_lost_committed_root_cas() {
+    use std::time::Duration;
+
+    let fixture = harness::load_fixture();
+    let row = fixture
+        .rows
+        .iter()
+        .find(|row| row.failpoint == "DuringRootCasRetry")
+        .expect("the fixture carries the row");
+    let resolved = harness::resolve(row);
+    let plan = row.submit.as_ref().expect("a submit plan");
+    assert!(
+        plan.requires_root_cas_contention,
+        "this test manufactures contention; the fixture must say the row needs it"
+    );
+
+    let serial = engine_matrix::serial();
+    for action in &plan.actions {
+        let action = engine_matrix::action_from_name(action)
+            .unwrap_or_else(|| panic!("unknown action {action:?}"));
+        let run = engine_matrix::drive_root_cas_retry_row(
+            &serial,
+            action,
+            Duration::from_secs(CONTENTION_BUDGET_SECONDS),
+        );
+        assert!(
+            run.anomaly.is_none(),
+            "DuringRootCasRetry [{}]: a shard was refused for a reason this location \
+             does not produce, so no transaction in this run is the row's victim: {:?}",
+            engine_matrix::action_name(action),
+            run.anomaly
+        );
+        let observation = run.observation.unwrap_or_else(|| {
+            panic!(
+                "DuringRootCasRetry [{}] did not fire in {:?} across {} submitted \
+                 transactions on {} shards. The location is inside publish_subtree's \
+                 retry loop; not reaching it means either that no committed-root CAS \
+                 was ever lost — in which case the loop is unreachable and the row \
+                 cannot be asserted from outside the engine — or that the failpoint \
+                 has moved out of the retry. Either is a finding, and neither is a \
+                 reason to rerun.",
+                engine_matrix::action_name(action),
+                run.elapsed,
+                run.attempts,
+                engine_matrix::CONTENTION_SHARDS
+            )
+        });
+        eprintln!(
+            "crash_matrix: DuringRootCasRetry [{}] fired after {} transactions in {:?}",
+            engine_matrix::action_name(action),
+            run.attempts,
+            run.elapsed
+        );
+        assert_full_expectation(resolved.point, resolved.class, &observation);
+    }
+}
+
+/// How long the contention driver is given per action.
+///
+/// Chosen from measurement rather than from taste: see the campaign recorded in
+/// the B4 report. It is a ceiling on a search, not a timeout tuned until the
+/// test passed.
+#[cfg(feature = "store-privileged")]
+const CONTENTION_BUDGET_SECONDS: u64 = 120;

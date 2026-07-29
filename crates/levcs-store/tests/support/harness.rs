@@ -23,17 +23,37 @@ use super::group_model::{PhysicalStateClass, VictimPlacement};
 
 pub const FIXTURE_PATH: &str = "tests/fixtures/phase1-failpoints.json";
 
-/// The `wave` value a row carries when it cannot be driven until B1 lands.
+/// The `wave` value a row carried while it could not be driven at all.
 ///
 /// The same spelling Phase 0 used for its `not-exercised` adversarial rows,
 /// and the string `scripts/check-phase1.sh` greps for once `engine.rs` is
-/// implemented.
+/// implemented. **No row carries it any more** — B1's engine landed and scope
+/// 6.6 deliverable 2 drove all eight — and the constant stays because the test
+/// that proves the pending set is empty has to name what it is looking for.
+/// Deleting it would leave the check searching for nothing and passing.
 pub const PENDING_WAVE_B: &str = "pending-wave-b";
 
 #[derive(Clone, Debug)]
 pub struct DrivePlan {
     pub action: String,
     pub fault: String,
+}
+
+/// How a Wave B row is driven through `StoreEngine::submit`.
+///
+/// `actions` is a list rather than a single value because the failpoint enum
+/// names a *location* and the driver chooses the *action*; the two axes are
+/// independent, and the three publication-side rows must be exercised with
+/// both `Fail` and `Panic`. A row that named one action could not express that
+/// without a second row for the same location, which would break the
+/// one-row-per-failpoint invariant the first test in the matrix pins.
+#[derive(Clone, Debug)]
+pub struct SubmitPlan {
+    pub actions: Vec<String>,
+    /// Whether the location is reachable only after a lost committed-root CAS.
+    /// True for exactly one row, and the matrix asserts that rather than
+    /// letting a second row quietly acquire it.
+    pub requires_root_cas_contention: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -44,7 +64,7 @@ pub struct FixtureRow {
     pub required_outcome: String,
     pub victim_placement: String,
     pub drive: Option<DrivePlan>,
-    pub pending_reason: Option<String>,
+    pub submit: Option<SubmitPlan>,
     pub rationale: String,
 }
 
@@ -53,6 +73,7 @@ pub struct Fixture {
     pub rows: Vec<FixtureRow>,
     pub wave_a_asserted: Vec<String>,
     pub wave_a_unasserted: Vec<String>,
+    pub wave_b_asserted: Vec<String>,
     pub wave_b_exit_conditions: Vec<String>,
 }
 
@@ -104,6 +125,21 @@ pub fn load_fixture() -> Fixture {
         "the unasserted halves must carry their reason, not merely be listed"
     );
 
+    let wave_b_scope = document
+        .get("wave_b_assertion_scope")
+        .expect("the fixture must record which halves Wave B asserts");
+    let wave_b_asserted = string_list(wave_b_scope.get("asserted").expect("asserted"));
+    assert!(
+        wave_b_scope
+            .get("root_seeded_by")
+            .and_then(|v| v.as_str())
+            .is_some_and(|r| !r.is_empty()),
+        "the Wave B rows are driven against a root that StoreEngine::open cannot yet \
+         create, and the fixture must say by what path it was created instead. Scope 5 \
+         charter item 8 is about exactly this: a property asserted against a store that \
+         production never built is asserted against the wrong store."
+    );
+
     let wave_b_exit_conditions = string_list(
         document
             .get("wave_b_exit_conditions")
@@ -127,10 +163,15 @@ pub fn load_fixture() -> Fixture {
                     fault: string_field(plan, "fault"),
                 })
             }),
-            pending_reason: row
-                .get("pending_reason")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
+            submit: row.get("submit").and_then(|plan| {
+                plan.as_object().map(|_| SubmitPlan {
+                    actions: string_list(plan.get("actions").expect("submit.actions")),
+                    requires_root_cas_contention: plan
+                        .get("requires_root_cas_contention")
+                        .and_then(|v| v.as_bool())
+                        .expect("submit.requires_root_cas_contention"),
+                })
+            }),
             rationale: string_field(row, "rationale"),
         })
         .collect();
@@ -139,6 +180,7 @@ pub fn load_fixture() -> Fixture {
         rows,
         wave_a_asserted,
         wave_a_unasserted,
+        wave_b_asserted,
         wave_b_exit_conditions,
     }
 }
@@ -147,13 +189,17 @@ pub fn load_fixture() -> Fixture {
 // Name mapping, without catch-all arms
 // ---------------------------------------------------------------------------
 
-/// The fixture spells `Wave::A` as `"A"` and `Wave::B` as `"pending-wave-b"`,
-/// because a Wave B row is not merely "later" — it is an outstanding, named
-/// obligation, and `check-phase1.sh` greps for that exact string.
+/// The fixture spells `Wave::A` as `"A"` and `Wave::B` as `"B"`.
+///
+/// Wave B used to be spelled `pending-wave-b`, because a row that could not be
+/// driven was an outstanding obligation rather than merely a later one. The
+/// obligation is met: every Wave B row is now driven through
+/// `StoreEngine::submit`, so the wave is just a wave and the pending spelling
+/// belongs to no row.
 pub fn wave_name(wave: Wave) -> &'static str {
     match wave {
         Wave::A => "A",
-        Wave::B => PENDING_WAVE_B,
+        Wave::B => "B",
     }
 }
 

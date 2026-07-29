@@ -4,7 +4,7 @@
 //!
 //! The parent arms a failpoint by name and a physical fault by name; this
 //! child runs a scripted, seed-deterministic workload through the journal-level
-//! `drive.rs` seam in Wave A and through `StoreEngine::submit` from Wave B; the
+//! `drive.rs` seam; the
 //! failpoint fires (`Fail`, `Panic`, or `HardExit` via `_exit(3)`, which runs
 //! no destructor and flushes no buffer); the parent reopens through production
 //! recovery and classifies.
@@ -232,9 +232,25 @@ fn submit_group(
                 .append_group_and_fence(&frames)
                 .map_err(|e| format!("append_group_and_fence: {e}"))
         }
+        // B1's engine landed, and the eight Wave B failpoint rows are driven
+        // through `StoreEngine::submit` — in `tests/crash_matrix.rs`, in
+        // process, because the four fields those rows add are statements about
+        // a *live* engine that a dead child cannot be asked about (scope 6.6
+        // deliverable 2).
+        //
+        // What is still missing here, and is a named carry-forward rather than
+        // a closed item: the `HardExit` and `SIGKILL` paths. Those need the
+        // engine *in the child*, so that `_exit(3)` and `kill -9` land inside a
+        // real publication rather than inside a journal append. Wiring it is
+        // more than a call swap — the child has to build a signer, a validated
+        // transaction, and a root, and `StoreEngine::open` still cannot create
+        // one — so it is reported instead of half-done. Until then
+        // `scripts/verify-store-recovery.sh`'s randomized cycles kill a writer
+        // at the journal seam, and that is what its numbers mean.
         DrivePath::Submit => Err(
-            "submit path requires B1 engine.rs; levcs-store also has no async \
-             executor dependency, which is an open interface request to the lead"
+            "the submit path is not wired into the child process yet: the Wave B rows are \
+             driven in-process by tests/crash_matrix.rs, and the SIGKILL soak still drives \
+             the journal seam. Reported as a carry-forward, not silently substituted."
                 .to_string(),
         ),
     }

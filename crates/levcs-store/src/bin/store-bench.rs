@@ -39,11 +39,31 @@
 //!
 //! # What is blocked
 //!
-//! A full P2 bundle goes through `StoreEngine::submit`, which is B1's. In Wave
-//! A this binary compiles, its prechecks and its bundle emitter run against a
-//! short `drive.rs` run, and `emit-skeleton` produces a schema-valid bundle
-//! whose `verdicts` are all `not-applicable` and whose `run_id` says
-//! `skeleton`.
+//! `emit-skeleton --path submit` now drives the production `StoreEngine::submit`
+//! (scope 6.6 deliverable 3). It is still not a P2 run, and three of B1's
+//! unimplemented deliverables are why — every one of them a bound on the
+//! bundle, not merely on this file:
+//!
+//!   * `StoreEngine::open` refuses startup state 1, so the root is created by
+//!     `segment::initialize_root`. The measured path is production; the path
+//!     that built the store it measures is not.
+//!   * `submit` refuses after `max_index_runs` group publications, because
+//!     sealing the in-memory index delta into an `IndexRun` is unimplemented.
+//!     The ceiling is raised for the run, which means every delta layer ever
+//!     published is still resident and lookup fan-out grows for the whole run.
+//!     P2 measures a steady state; this is not one.
+//!   * `StoreEngine::checkpoint` is unimplemented, so no checkpoint is taken.
+//!     Section 7 requires that a P2 run not have been achieved with
+//!     checkpointing disabled. This one was.
+//!
+//! The bundle records none of those three, because `bench/result-schema.json`
+//! is `additionalProperties: false` throughout and has no field for the
+//! conditions a run was produced under. That is an amendment request to the
+//! lead, not an edit: a bundle whose caveats live only in a report is a bundle
+//! that reads as unconditional to everyone who receives it.
+//!
+//! The `run` subcommand — warmup, three repetitions, per-repetition fresh
+//! roots, trim settle — stays blocked on the same three.
 //!
 //! Real Ed25519 attestation signing is also blocked: `levcs-store` has no
 //! signing dependency and scope §1 forbids any `levcs_identity::` path in this
@@ -1488,6 +1508,682 @@ fn skeleton_ack_record(sequence: u64) -> AckRecord {
 }
 
 // ---------------------------------------------------------------------------
+// The Wave B run: through StoreEngine::submit
+// ---------------------------------------------------------------------------
+//
+// Scope 6.6 deliverable 3. The Wave A run drove `drive.rs`, the journal seam:
+// no sequencer, no signer, no status root, no index, no receipts. This one goes
+// through `StoreEngine::submit` — the entry point a consumer calls — so the
+// numbers are the store's, not the journal's. **Expect different numbers.**
+//
+// # What this run can and cannot claim, stated before the code
+//
+// Three of B1's unimplemented deliverables bound it, and every one of them is a
+// bound on the *bundle*, not merely on this file:
+//
+//   * `StoreEngine::open` refuses startup state 1, so the root is created by
+//     `segment::initialize_root`. The measured path is production; the path
+//     that made the store it measures is not.
+//   * `submit` refuses `NotImplemented` after `max_index_runs` group
+//     publications, because sealing the in-memory index delta into an
+//     `IndexRun` is unimplemented. The ceiling is raised here so the run can
+//     reach its measured seconds at all, which means the run holds every delta
+//     layer it ever published in memory and its lookup fan-out grows for the
+//     whole run. A P2 measurement is of a steady state; this is not one, and
+//     the bundle says so through `outcome` and its verdicts.
+//   * `StoreEngine::checkpoint` is unimplemented, so no checkpoint is taken.
+//     Section 7 requires that a P2 run not have been achieved with
+//     checkpointing disabled. This one was. That alone makes the
+//     `storage_primitive` gate unearnable today, whatever the rate says.
+//
+// What genuinely improves over Wave A: the signer is real Ed25519 and its cost
+// is measured rather than reported as a zero; every commit carries the
+// canonical three objects and a typed ref CAS, so `objects_new` is counted from
+// what the store staged instead of multiplied out of the commit count; and the
+// reconciliation reads each acknowledged operation back through
+// `transaction_status` on a reopened engine rather than comparing sequence
+// sets.
+
+/// Raised because index-delta sealing is unimplemented; see the note above.
+const ENGINE_MAX_INDEX_RUNS: u32 = 1_000_000;
+
+/// One commit's objects, matching the frozen workload: one 1 KiB blob, one
+/// tree, one commit.
+const ENGINE_BLOB_BYTES: usize = 1024;
+const ENGINE_TREE_BYTES: usize = 96;
+const ENGINE_COMMIT_BYTES: usize = 192;
+
+/// A real Ed25519 signer that records what signing cost.
+///
+/// Scope 5.2 requires the bundle to report signing cost separately, and the
+/// frozen workload's `[identity] real_ed25519 = true`. The harness owns the key
+/// because the store may not call into `levcs-identity` (scope §1); the library
+/// only ever sees the `CommitEvidenceSigner` trait.
+struct MeasuringSigner {
+    key: ed25519_dalek::SigningKey,
+    micros: std::sync::Mutex<Vec<u64>>,
+}
+
+impl MeasuringSigner {
+    fn new() -> Self {
+        // Deterministic, and deliberately so: the bundle has to be
+        // reproducible, and this key authenticates nothing outside the run.
+        let mut seed = [0u8; 32];
+        blake3::Hasher::new()
+            .update(b"levcs-store/store-bench/attestation-key/v1\0")
+            .finalize_xof()
+            .fill(&mut seed);
+        Self {
+            key: ed25519_dalek::SigningKey::from_bytes(&seed),
+            micros: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl levcs_store::types::CommitEvidenceSigner for MeasuringSigner {
+    fn key_epoch(&self) -> u64 {
+        1
+    }
+
+    fn public_key(&self) -> [u8; 32] {
+        self.key.verifying_key().to_bytes()
+    }
+
+    fn sign_event(
+        &self,
+        signing_digest: &ObjectId,
+    ) -> Result<[u8; 64], levcs_store::types::SignerError> {
+        use ed25519_dalek::Signer as _;
+        let started = Instant::now();
+        let signature = self.key.sign(signing_digest.as_bytes()).to_bytes();
+        let elapsed = started.elapsed().as_micros() as u64;
+        self.micros
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(elapsed);
+        Ok(signature)
+    }
+}
+
+/// Drive one future to completion on this thread.
+///
+/// `levcs-store` starts no runtime and takes no executor dependency, so neither
+/// does its benchmark. A submit that never completes is a hung request, and the
+/// deadline exists so the harness can say so instead of blocking forever.
+fn block_on_until<F: std::future::Future>(future: F, deadline: Duration) -> Option<F::Output> {
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    struct ThreadWaker(std::thread::Thread);
+    impl Wake for ThreadWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+
+    let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+    let mut context = Context::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    let started = Instant::now();
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => return Some(output),
+            Poll::Pending => {
+                let elapsed = started.elapsed();
+                if elapsed >= deadline {
+                    return None;
+                }
+                std::thread::park_timeout(deadline - elapsed);
+            }
+        }
+    }
+}
+
+fn engine_namespace(shard: u16, shard_count: u16) -> NamespaceId {
+    for attempt in 0..8192u64 {
+        let mut bytes = [0u8; 32];
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"levcs-store/store-bench/engine-namespace/v1\0");
+        hasher.update(&u64::from(shard).to_le_bytes());
+        hasher.update(&attempt.to_le_bytes());
+        hasher.finalize_xof().fill(&mut bytes);
+        let namespace = NamespaceId(bytes);
+        if levcs_store::StoreOptions::shard_of(&namespace, shard_count) == shard {
+            return namespace;
+        }
+    }
+    panic!("no namespace routed to shard {shard}");
+}
+
+fn engine_object(domain: &str, seed: &[u8], len: usize) -> (ObjectId, Vec<u8>) {
+    let mut raw = vec![0u8; len];
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(domain.as_bytes());
+    hasher.update(&[0u8]);
+    hasher.update(seed);
+    hasher.finalize_xof().fill(&mut raw);
+    (ObjectId(*blake3::hash(&raw).as_bytes()), raw)
+}
+
+fn engine_now_micros() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0)
+}
+
+fn engine_evidence() -> levcs_protocol::v2::TransactionEvidenceV1 {
+    levcs_protocol::v2::TransactionEvidenceV1::AdministrativeV1 {
+        actor: [0x7e; 32],
+        actor_key_epoch: 1,
+        command_digest: ObjectId([0x33; 32]),
+        signature: [0x44; 64],
+    }
+}
+
+/// What one engine-driven run measured.
+struct EngineRun {
+    latencies_micros: Vec<u64>,
+    transactions: u64,
+    objects_new: u64,
+    raw_bytes: u64,
+    elapsed: Duration,
+    acknowledged: u64,
+    acknowledged_loss: u64,
+    torn_transactions: u64,
+    repeated_adoptions: u64,
+    fences: u64,
+    /// Group publications, counted as fences: `journal::append_group_and_fence`
+    /// performs exactly one per group and A1's acceptance pins that.
+    groups: u64,
+    signing_micros_p50: f64,
+    signings: u64,
+    refused: u64,
+    first_refusal: Option<String>,
+    acknowledged_sequences_reconciled: bool,
+    ack_journal_digest: String,
+    lock_release_attempts: u32,
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_engine(
+    root: &Path,
+    ack_path: &Path,
+    group_len: usize,
+    seconds: u64,
+    shard_count: u16,
+    submitters_per_shard: usize,
+) -> Result<EngineRun, String> {
+    use levcs_store::segment::{initialize_root, RootLayout};
+    use levcs_store::transaction::StagedObject;
+    use levcs_store::types::{DurabilityCounters, OperationId, PrivilegedConstruction, StoreError};
+    use levcs_store::{StoreEngine, ValidatedTransaction};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    initialize_root(
+        &RootLayout::new(root),
+        shard_count,
+        [0x9e; 16],
+        engine_now_micros(),
+        &DurabilityCounters::default(),
+    )
+    .map_err(|e| format!("initialize_root: {e}"))?;
+
+    let signer = Arc::new(MeasuringSigner::new());
+    let build_options = || {
+        let mut options = levcs_store::StoreOptions::new(root);
+        options.shard_count = shard_count;
+        options.max_group_transactions = group_len as u32;
+        options.max_group_bytes = 8 * 1024 * 1024;
+        options.max_group_idle = Duration::from_millis(1);
+        options.journal_preallocate_bytes = 64 * 1024 * 1024;
+        options.max_index_runs = ENGINE_MAX_INDEX_RUNS;
+        options.signer = Some(signer.clone());
+        options
+    };
+
+    let engine = StoreEngine::open(build_options()).map_err(|e| format!("open: {e}"))?;
+
+    let namespaces: Vec<NamespaceId> = (0..shard_count)
+        .map(|shard| engine_namespace(shard, shard_count))
+        .collect();
+
+    let ack =
+        Mutex::new(ExternalAckJournal::open(ack_path).map_err(|e| format!("ack journal: {e}"))?);
+    let acknowledged = AtomicU64::new(0);
+
+    // One repository per shard, created before the measured window.
+    for (shard, namespace) in namespaces.iter().enumerate() {
+        let (genesis, raw) = engine_object(
+            "levcs-store/store-bench/genesis/v1",
+            &(shard as u64).to_le_bytes(),
+            64,
+        );
+        let transaction = ValidatedTransaction::builder(PrivilegedConstruction::assert_validated())
+            .namespace(*namespace)
+            .operation(
+                OperationId([0xc0 | shard as u8; 16]),
+                ObjectId([0xc0 | shard as u8; 32]),
+                engine_now_micros() + 600_000_000,
+            )
+            .create_repository(genesis)
+            .objects(vec![StagedObject {
+                id: genesis,
+                object_type: levcs_core::ObjectType::Authority,
+                raw,
+            }])
+            .refs(Vec::new())
+            .authority(None, Some(genesis))
+            .evidence(engine_evidence())
+            .build()
+            .map_err(|e| format!("build create: {e}"))?;
+        match block_on_until(engine.submit(transaction), Duration::from_secs(30)) {
+            Some(Ok(_)) => {}
+            Some(Err(error)) => return Err(format!("creating repository {shard}: {error}")),
+            None => return Err(format!("creating repository {shard} never completed")),
+        }
+    }
+
+    let stop = AtomicBool::new(false);
+    let refused = AtomicU64::new(0);
+    let first_refusal: Mutex<Option<String>> = Mutex::new(None);
+    let results: Mutex<Vec<(NamespaceId, OperationId, u64, u64)>> = Mutex::new(Vec::new());
+    let latencies: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+    let objects_new = AtomicU64::new(0);
+    let raw_bytes = AtomicU64::new(0);
+
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(seconds.max(1));
+
+    std::thread::scope(|scope| {
+        for shard in 0..shard_count {
+            for submitter in 0..submitters_per_shard {
+                let namespace = namespaces[shard as usize];
+                let engine = &engine;
+                let ack = &ack;
+                let acknowledged = &acknowledged;
+                let stop = &stop;
+                let refused = &refused;
+                let first_refusal = &first_refusal;
+                let results = &results;
+                let latencies = &latencies;
+                let objects_new = &objects_new;
+                let raw_bytes = &raw_bytes;
+                scope.spawn(move || {
+                    let mut ordinal = 0u64;
+                    let branch = format!("refs/heads/s{shard}-w{submitter}");
+                    let mut expected: Option<ObjectId> = None;
+                    let (authority, _) = engine_object(
+                        "levcs-store/store-bench/genesis/v1",
+                        &(shard as u64).to_le_bytes(),
+                        64,
+                    );
+                    while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+                        ordinal += 1;
+                        let mut seed = Vec::with_capacity(24);
+                        seed.extend_from_slice(&u64::from(shard).to_le_bytes());
+                        seed.extend_from_slice(&(submitter as u64).to_le_bytes());
+                        seed.extend_from_slice(&ordinal.to_le_bytes());
+
+                        let (blob, blob_raw) = engine_object(
+                            "levcs-store/store-bench/blob/v1",
+                            &seed,
+                            ENGINE_BLOB_BYTES,
+                        );
+                        let (tree, tree_raw) = engine_object(
+                            "levcs-store/store-bench/tree/v1",
+                            &seed,
+                            ENGINE_TREE_BYTES,
+                        );
+                        let (commit, commit_raw) = engine_object(
+                            "levcs-store/store-bench/commit/v1",
+                            &seed,
+                            ENGINE_COMMIT_BYTES,
+                        );
+                        let bytes = (blob_raw.len() + tree_raw.len() + commit_raw.len()) as u64;
+
+                        let mut operation_id = [0u8; 16];
+                        operation_id[..8].copy_from_slice(&ordinal.to_le_bytes());
+                        operation_id[8] = shard as u8;
+                        operation_id[9] = submitter as u8;
+                        let operation = OperationId(operation_id);
+
+                        let transaction = ValidatedTransaction::builder(
+                            PrivilegedConstruction::assert_validated(),
+                        )
+                        .namespace(namespace)
+                        .operation(
+                            operation,
+                            ObjectId(*blake3::hash(&seed).as_bytes()),
+                            engine_now_micros() + 600_000_000,
+                        )
+                        .objects(vec![
+                            StagedObject {
+                                id: blob,
+                                object_type: levcs_core::ObjectType::Blob,
+                                raw: blob_raw,
+                            },
+                            StagedObject {
+                                id: tree,
+                                object_type: levcs_core::ObjectType::Tree,
+                                raw: tree_raw,
+                            },
+                            StagedObject {
+                                id: commit,
+                                object_type: levcs_core::ObjectType::Commit,
+                                raw: commit_raw,
+                            },
+                        ])
+                        // A real typed ref CAS per commit. The bundle's
+                        // validation_flags claim `typed_ref_cas: true`, and at
+                        // this gate that claim is only worth anything if the
+                        // sequencer actually evaluated one.
+                        .refs(vec![levcs_protocol::v2::TypedRefCas {
+                            target: levcs_protocol::v2::RefTarget::Branch(branch.clone()),
+                            expected,
+                            mutation: levcs_protocol::v2::RefMutation::Set(commit),
+                            force: false,
+                        }])
+                        .authority(Some(authority), Some(authority))
+                        .evidence(engine_evidence())
+                        .build()
+                        .expect("a complete push transaction");
+
+                        let call = Instant::now();
+                        let outcome =
+                            block_on_until(engine.submit(transaction), Duration::from_secs(60));
+                        let micros = call.elapsed().as_micros() as u64;
+                        match outcome {
+                            Some(Ok(receipt)) => {
+                                // The fence returned. Acknowledgment is only
+                                // permitted once the acknowledgment is itself
+                                // durable on an independent journal, so this
+                                // happens before anything counts the commit.
+                                let record = AckRecord {
+                                    repo_id: ObjectId(*namespace.as_bytes()),
+                                    operation_id,
+                                    operation_digest: ObjectId(*blake3::hash(&seed).as_bytes()),
+                                    receipt_digest: ObjectId(
+                                        *blake3::hash(&operation_id).as_bytes(),
+                                    ),
+                                    repo_sequence: receipt.repo_sequence,
+                                    blob_ids: vec![blob],
+                                    tree_ids: vec![tree],
+                                    commit_ids: vec![commit],
+                                };
+                                {
+                                    let mut journal = ack.lock().unwrap_or_else(|p| p.into_inner());
+                                    if journal.append_durable(&record).is_err() {
+                                        stop.store(true, Ordering::Relaxed);
+                                        return;
+                                    }
+                                }
+                                acknowledged.fetch_add(1, Ordering::Relaxed);
+                                // The store's own count of the objects this
+                                // transaction introduced, not `3` restated by
+                                // the harness. `objects_new` derived from the
+                                // commit count is what makes
+                                // `verification.objects_new_equals_three_per_commit`
+                                // a tautology instead of a check.
+                                objects_new.fetch_add(receipt.objects_new, Ordering::Relaxed);
+                                raw_bytes.fetch_add(bytes, Ordering::Relaxed);
+                                latencies
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .push(micros);
+                                results.lock().unwrap_or_else(|p| p.into_inner()).push((
+                                    namespace,
+                                    operation,
+                                    receipt.repo_sequence,
+                                    ordinal,
+                                ));
+                                expected = Some(commit);
+                            }
+                            Some(Err(error)) => {
+                                refused.fetch_add(1, Ordering::Relaxed);
+                                let mut slot =
+                                    first_refusal.lock().unwrap_or_else(|p| p.into_inner());
+                                if slot.is_none() {
+                                    *slot = Some(format!("{error:?}"));
+                                }
+                                stop.store(true, Ordering::Relaxed);
+                                return;
+                            }
+                            None => {
+                                refused.fetch_add(1, Ordering::Relaxed);
+                                let mut slot =
+                                    first_refusal.lock().unwrap_or_else(|p| p.into_inner());
+                                if slot.is_none() {
+                                    *slot = Some("submit did not complete in 60s".to_string());
+                                }
+                                stop.store(true, Ordering::Relaxed);
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    });
+
+    let elapsed = started.elapsed();
+    let fences: u64 = (0..shard_count)
+        .map(|shard| {
+            engine
+                .durability_counters(shard)
+                .map(|counters| counters.fdatasync)
+                .unwrap_or(0)
+        })
+        .sum();
+
+    let latencies = latencies.into_inner().unwrap_or_else(|p| p.into_inner());
+    let results = results.into_inner().unwrap_or_else(|p| p.into_inner());
+    let refused = refused.load(Ordering::Relaxed);
+    let first_refusal = first_refusal
+        .into_inner()
+        .unwrap_or_else(|p| p.into_inner());
+    let acknowledged = acknowledged.load(Ordering::Relaxed);
+    let objects_new = objects_new.load(Ordering::Relaxed);
+    let raw_bytes = raw_bytes.load(Ordering::Relaxed);
+    let mut signing = signer
+        .micros
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    signing.sort_unstable();
+    let signings = signing.len() as u64;
+    let signing_p50 = percentile(&signing, 0.50) as f64;
+
+    drop(ack);
+    drop(engine);
+
+    // The root lock is not always free when `StoreEngine::drop` returns; see
+    // the same finding recorded in `tests/support/engine_matrix.rs`. Bounded
+    // and reported, never silent.
+    let lock_wait_started = Instant::now();
+    let mut lock_release_attempts = 0u32;
+    let reopened = loop {
+        lock_release_attempts += 1;
+        match StoreEngine::open(build_options()) {
+            Ok(engine) => break engine,
+            Err(StoreError::AlreadyLocked)
+                if lock_wait_started.elapsed() < Duration::from_secs(30) =>
+            {
+                std::thread::sleep(Duration::from_micros(200));
+            }
+            Err(other) => return Err(format!("reopen through production recovery: {other}")),
+        }
+    };
+
+    // Reconciliation, through the production status read rather than through a
+    // sequence-set comparison. Every operation this run acknowledged must read
+    // back `Committed` from a store that was closed and recovered.
+    let mut acknowledged_loss = 0u64;
+    for (namespace, operation, _, _) in &results {
+        // Every variant named. A fallback arm here would fold "the store
+        // refused the read" into "the operation is missing", and those are
+        // different findings: the first invalidates the reconciliation, the
+        // second invalidates the run.
+        use levcs_store::types::TransactionStatus as Status;
+        match reopened.transaction_status(*namespace, *operation) {
+            Ok(Status::Committed(_)) => {}
+            Ok(Status::Unknown) => acknowledged_loss += 1,
+            Ok(Status::Resolving { .. }) => acknowledged_loss += 1,
+            Ok(Status::Pending { .. }) => acknowledged_loss += 1,
+            Ok(Status::Expired { .. }) => acknowledged_loss += 1,
+            Err(error) => {
+                return Err(format!(
+                    "reading back an acknowledged operation failed: {error}. The \
+                     reconciliation cannot distinguish a lost commit from a failed read, \
+                     so the run is void rather than counted."
+                ))
+            }
+        }
+    }
+    drop(reopened);
+
+    // Per-repository sequence integrity, through the one shared checker.
+    let mut torn_transactions = 0u64;
+    let mut repeated_adoptions = 0u64;
+    for namespace in &namespaces {
+        let mut sequences: Vec<u64> = results
+            .iter()
+            .filter(|(candidate, _, _, _)| candidate == namespace)
+            .map(|(_, _, sequence, _)| *sequence)
+            .collect();
+        sequences.sort_unstable();
+        let classified = classify_adopted_set(&sequences);
+        torn_transactions += classified.missing_sequences;
+        repeated_adoptions += classified.repeated_adoptions();
+    }
+
+    let records = ExternalAckJournal::recover(ack_path).map_err(|e| format!("ack recover: {e}"))?;
+
+    Ok(EngineRun {
+        groups: fences,
+        transactions: acknowledged,
+        latencies_micros: latencies,
+        objects_new,
+        raw_bytes,
+        elapsed,
+        acknowledged,
+        acknowledged_loss,
+        torn_transactions,
+        repeated_adoptions,
+        fences,
+        signing_micros_p50: signing_p50,
+        signings,
+        refused,
+        first_refusal,
+        acknowledged_sequences_reconciled: acknowledged_loss == 0
+            && torn_transactions == 0
+            && repeated_adoptions == 0
+            && records.len() as u64 == acknowledged,
+        ack_journal_digest: digest_file(ack_path),
+        lock_release_attempts,
+    })
+}
+
+/// One measured run, whichever path produced it.
+///
+/// The two paths are the Wave A journal seam and the Wave B production
+/// `StoreEngine::submit`. Folding them into one shape here is what keeps the
+/// bundle emitter identical for both: the thing that must not differ between a
+/// seam measurement and a store measurement is how the measurement is
+/// *reported*.
+struct MeasuredRun {
+    latencies_micros: Vec<u64>,
+    groups: u64,
+    transactions: u64,
+    /// Counted from the objects the store actually staged on the submit path,
+    /// and derived as `transactions * 3` on the drive path, where there are no
+    /// objects. The difference is why
+    /// `verification.objects_new_equals_three_per_commit` stays forbidden at
+    /// this gate on the drive path: a derived figure asserted against its own
+    /// derivation is a tautology.
+    objects_new: u64,
+    objects_new_counted: bool,
+    bytes: u64,
+    elapsed: Duration,
+    acknowledged: u64,
+    acknowledged_loss: u64,
+    torn_transactions: u64,
+    repeated_adoptions: u64,
+    fences: u64,
+    signing_micros_p50: f64,
+    signings: u64,
+    acknowledged_sequences_reconciled: bool,
+    ack_journal_digest: String,
+    path: &'static str,
+    /// Submits refused or never completed. Non-zero ends the run: a benchmark
+    /// that keeps counting past a refusal is measuring a different workload
+    /// from the one it names.
+    refused: u64,
+    first_refusal: Option<String>,
+    /// Attempts the post-run reopen needed to acquire the root lock. `1` is the
+    /// expected reading; see the note on `run_engine`.
+    lock_release_attempts: u32,
+}
+
+impl From<SkeletonRun> for MeasuredRun {
+    fn from(run: SkeletonRun) -> Self {
+        Self {
+            groups: run.groups,
+            transactions: run.transactions,
+            objects_new: run.transactions * OBJECTS_PER_COMMIT,
+            objects_new_counted: false,
+            bytes: run.bytes,
+            elapsed: run.elapsed,
+            acknowledged: run.acknowledged,
+            acknowledged_loss: run.acknowledged_loss,
+            torn_transactions: run.torn_transactions,
+            repeated_adoptions: run.repeated_adoptions,
+            fences: run.fences,
+            signing_micros_p50: 0.0,
+            signings: 0,
+            acknowledged_sequences_reconciled: run.acknowledged_sequences_reconciled,
+            ack_journal_digest: run.ack_journal_digest,
+            latencies_micros: run.latencies_micros,
+            path: "drive",
+            refused: 0,
+            first_refusal: None,
+            lock_release_attempts: 1,
+        }
+    }
+}
+
+impl From<EngineRun> for MeasuredRun {
+    fn from(run: EngineRun) -> Self {
+        Self {
+            groups: run.groups,
+            transactions: run.transactions,
+            objects_new: run.objects_new,
+            objects_new_counted: true,
+            bytes: run.raw_bytes,
+            elapsed: run.elapsed,
+            acknowledged: run.acknowledged,
+            acknowledged_loss: run.acknowledged_loss,
+            torn_transactions: run.torn_transactions,
+            repeated_adoptions: run.repeated_adoptions,
+            fences: run.fences,
+            signing_micros_p50: run.signing_micros_p50,
+            signings: run.signings,
+            acknowledged_sequences_reconciled: run.acknowledged_sequences_reconciled,
+            ack_journal_digest: run.ack_journal_digest,
+            latencies_micros: run.latencies_micros,
+            path: "submit",
+            refused: run.refused,
+            first_refusal: run.first_refusal,
+            lock_release_attempts: run.lock_release_attempts,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Section 13 stop conditions, measured rather than quoted
 // ---------------------------------------------------------------------------
 
@@ -1606,7 +2302,12 @@ store-bench <precheck|emit-skeleton|run> [flags]
   precheck        --root P [--repo-root P] [--target-rate N]
   emit-skeleton   --root P --out P --allow-unsigned [--repo-root P]
                   [--seconds N] [--group-len N] [--skip-attribute-check]
-  run             --root P --out-dir P   (P2; requires B1's StoreEngine::submit)
+                  [--path submit|drive] [--shards N] [--submitters-per-shard N]
+  run             --root P --out-dir P   (P2; blocked, see below)
+
+--path submit is the default and goes through StoreEngine::submit. --path drive
+is the Wave A journal seam, kept so the two measurements can be compared rather
+than confused; it signs nothing, creates no object, and issues no receipt.
 
 The two prechecks are not optional and are not overridable except by
 --skip-attribute-check, which makes the run non-comparable and marks the
@@ -1773,7 +2474,29 @@ fn emit_skeleton(
     // promised. Same device here, different subtree — the strongest isolation
     // an unprivileged in-process harness can give it, and the reason the
     // deployed campaigns of §10 put it on another host.
-    let run = run_skeleton(&root, &ack_path, group_len, seconds)?;
+    let path = flags.get("path").unwrap_or("submit").to_string();
+    let run: MeasuredRun = if path == "submit" {
+        let shards = flags.number::<u16>("shards", 4)?;
+        let submitters = flags.number::<usize>("submitters-per-shard", group_len.max(1))?;
+        run_engine(&root, &ack_path, group_len, seconds, shards, submitters)?.into()
+    } else if path == "drive" {
+        run_skeleton(&root, &ack_path, group_len, seconds)?.into()
+    } else {
+        return Err(format!(
+            "--path must be submit or drive, got {path:?}. `submit` is the production \
+             StoreEngine path and the default; `drive` is the Wave A journal seam, kept \
+             so the two measurements can be compared rather than confused."
+        ));
+    };
+
+    if run.refused != 0 {
+        return Err(format!(
+            "the run was cut short by {} refused or incomplete submit(s); the first was \
+             {:?}. A benchmark that keeps counting past a refusal is measuring a \
+             different workload from the one it names.",
+            run.refused, run.first_refusal
+        ));
+    }
 
     // Precheck 2 must run against a root that exists, so it follows the run
     // that creates it. In a P2 run the shard directories are created by
@@ -1819,7 +2542,11 @@ fn emit_skeleton(
     // Section 13's two stop conditions, measured against A2's index.
     let index_cost = measure_index_costs()?;
 
-    let mut run_id = String::from("skeleton-wave-a-");
+    let mut run_id = if run.path == "submit" {
+        String::from("engine-wave-b-")
+    } else {
+        String::from("skeleton-wave-a-")
+    };
     run_id.push_str(&digest_hex(histogram_input.as_bytes())[..16]);
 
     let inputs = BundleInputs {
@@ -1841,7 +2568,7 @@ fn emit_skeleton(
         // lands `StoreEngine::submit`, `objects_new` must be counted
         // independently — from the objects the store actually staged — before
         // that flag may be emitted at any gate.
-        objects_new: run.transactions * OBJECTS_PER_COMMIT,
+        objects_new: run.objects_new,
         raw_bytes: run.bytes,
         application_bytes: run.bytes,
         latency_p50: percentile(&sorted, 0.50),
@@ -1868,15 +2595,23 @@ fn emit_skeleton(
         // is reported as zero. Scope 8.4's ~1.4-of-8-cores figure is a
         // prediction for P2 and must not be copied into a bundle as if it had
         // been measured.
-        signing_cores: 0.0,
+        // Measured, not predicted. The submit path signs every event with a
+        // real Ed25519 key and records the cost; the drive path signs nothing
+        // and reports a measured zero over zero signings. Scope 8.4's
+        // ~1.4-of-8-cores figure is a P2 prediction and is never copied here.
+        signing_cores: if run.elapsed.as_secs_f64() > 0.0 {
+            (run.signings as f64 * run.signing_micros_p50) / (run.elapsed.as_secs_f64() * 1e6)
+        } else {
+            0.0
+        },
         index_bytes_per_object: index_cost.packed_bytes_per_object,
         index_run_bytes_per_object: index_cost.run_bytes_per_object,
         checkpoint_lookup_fanout: index_cost.lookup_fanout,
         // Nothing signs below engine.rs, so this is a measured zero over zero
         // signings rather than an unmeasured field. `evidence_signings` carries
         // the denominator so a reader can tell the two apart.
-        evidence_signing_micros_p50: 0.0,
-        evidence_signings: 0,
+        evidence_signing_micros_p50: run.signing_micros_p50,
+        evidence_signings: run.signings,
         fences: run.fences,
         transactions: run.transactions,
         free_bytes_available: available,
@@ -1894,6 +2629,12 @@ fn emit_skeleton(
     println!("bundle_gate=storage_primitive");
     println!("bundle_promotable=false");
     println!("bundle_skeleton=true");
+    println!("bundle_path_driven={}", run.path);
+    println!("objects_new={}", run.objects_new);
+    println!("objects_new_counted={}", run.objects_new_counted);
+    println!("evidence_signings={}", run.signings);
+    println!("evidence_signing_micros_p50={:.1}", run.signing_micros_p50);
+    println!("lock_release_attempts={}", run.lock_release_attempts);
     println!("bundle_outcome={}", outcome.name());
     println!("groups={}", run.groups);
     println!("transactions={}", run.transactions);

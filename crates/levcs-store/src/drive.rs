@@ -30,7 +30,6 @@
 
 #![cfg(feature = "store-internals")]
 
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -52,7 +51,11 @@ pub struct ShardDrive {
     /// Held for the drive's lifetime. `reopen_through_recovery` takes the same
     /// lock, so a caller must drop the drive before reopening — which is the
     /// point: reopening is a close-and-reopen through recovery, not a peek.
-    _lock: File,
+    ///
+    /// A [`segment::RootLock`] rather than the `LOCK` file, so the release is
+    /// an explicit `LOCK_UN` and not a consequence of closing a descriptor a
+    /// concurrently forked child may still share.
+    _lock: segment::RootLock,
     journal: Journal,
     counters: Arc<DurabilityCounters>,
     /// Journal preallocation for this drive. Small by default so a crash

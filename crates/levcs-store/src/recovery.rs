@@ -1504,7 +1504,11 @@ pub struct RecoverySession {
     layout: RootLayout,
     root_uuid: [u8; 16],
     shard_count: u16,
-    _lock: File,
+    /// The root lock, released explicitly when the session drops. Not a bare
+    /// `File`: `flock` lives on the open file description, so a concurrently
+    /// forked child that inherited this descriptor would keep the lock alive
+    /// past the close. See [`segment::RootLock`].
+    _lock: segment::RootLock,
 }
 
 impl std::fmt::Debug for RecoverySession {

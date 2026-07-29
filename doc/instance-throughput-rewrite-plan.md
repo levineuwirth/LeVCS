@@ -1102,6 +1102,78 @@ is B3's file and folds into B3's fix pass. The gate is transiently red between t
 passes, which is accepted: landing the contract first is what keeps both packages from
 implementing against a surface that is about to move.
 
+##### Contract review 2026-07-28-B
+
+B4's crash harness found that an immediate reopen after `StoreEngine` is dropped
+intermittently fails `AlreadyLocked` — up to 29 retries over about 147 ms, seven failures in
+forty uninstrumented runs, on a single-shard engine. It compensated with a bounded, measured
+wait and filed the finding rather than fixing a file it does not own, which is what §6.0
+asks for. The finding is granted, and the fix lands in the frozen root-lock primitive
+(`segment.rs`, `sys.rs`) rather than in `StoreEngine::drop`.
+
+**What was actually wrong.** Not `Drop` ordering. `StoreEngine::drop` closes every shard
+channel, joins every writer, and leaves no extra `Arc<EngineShared>` behind; the refusal
+comes from `segment::lock_root`'s filesystem lock on `<root>/LOCK`, not from B3's
+process-wide staging guard, which returns `Conflict`. **An `flock` is held by the open file
+description, not by the file descriptor.** A concurrently forked child inherits a descriptor
+onto the parent's open descriptions, and `FD_CLOEXEC` closes it at `exec`, not at `fork`. So
+for the whole fork-to-exec window — and for as long as any forked child runs without
+exec'ing — the parent closing its `LOCK` descriptor releases nothing. Reproduced
+deterministically: an explicit `LOCK_UN` before the close makes an immediate reopen succeed
+*while the child still holds its inherited descriptor*.
+
+**The amendment.** `segment::lock_root` returns `RootLock` instead of `File`. `RootLock`
+issues `sys::unlock` — a new `LOCK_UN` beside the existing `try_lock_exclusive`, so the
+syscall stays inside the durability funnel — in `Drop`, before its `File` field closes.
+`Drop` is deliberately the *only* release path: an explicit `release()` returning the
+`LOCK_UN` error would have been a second way to do the same thing with no caller, which
+charter items 8 and 9 treat as a decoy rather than a safeguard. Both owners
+hold the guard: `recovery::RecoverySession` (which `engine.rs` retains for the engine's
+lifetime, so `StoreEngine` inherits the fix without an edit) and `drive::ShardDrive`. A
+`LOCK_UN` that fails in `Drop` cannot be returned and must not be swallowed, so it is
+counted in `RootLock::release_failures()` — charter item 7 applied to the one place where a
+claim would otherwise be all there is.
+
+**The weaker alternative, rejected: fix it only in `StoreEngine::drop`.** It would have
+turned the harness green. It leaves every other `lock_root` caller — `ShardDrive`, the
+one-shot `RecoverySession` in the drive's reopen path, and whatever Phase 2's migrator
+opens — holding a lock whose release is still a *consequence of a descriptor lifetime that a
+process outside this one can extend*. That is the property worth stating plainly: the lock
+lives on the open file description, so releasing it has to be an explicit act, and no amount
+of tightening the shutdown sequence changes who else holds a descriptor onto that
+description. A drop-ordering fix would also have looked correct in every single-process
+test, because the defect needs a concurrent fork to appear at all — which is exactly why it
+presented as a flake at one run in six and not as a failure.
+
+What would have gone wrong: a consumer that closes a store and reopens it — a recovery
+drill, an in-place restart, the Phase 2 migrator, any of which may spawn a subprocess — gets
+`AlreadyLocked`, which scope §3.1 defines as a refusal and never a wait. There is no defined
+retry, so the correct consumer behaviour on that error is to give up. The store would have
+been refusing itself, from a process that no longer exists, and reporting a state
+indistinguishable from a genuine second owner.
+
+**Regression evidence.** `segment.rs` gains a synchronized fork-inheritance test: the child
+is forked while the lock is held, signals readiness over a pipe, and blocks until the parent
+has completed its release *and its reopen*, so the inherited descriptor is provably open
+across the whole window. Nothing in it is timed. It passed 40/40 as landed; with the
+explicit unlock removed it failed 10/10 with `reopen was refused AlreadyLocked on its first
+attempt`. §5's Wave A record is why this had to be synchronized rather than raced: an
+intermittently failing fault test gets rerun until green, at which point a real regression
+and a flake are indistinguishable.
+
+**Measured, not asserted.** 200 close-and-immediately-reopen cycles through
+`StoreEngine::open`, concurrent with four threads spawning subprocesses (72,936 fork/execs
+during the run): `refusals=0`, `worst_tries=1`, `worst_elapsed=10.4ms`, against B4's
+reported `tries=29 elapsed=146ms`. The same measurement on the pre-fix release behaviour
+fails with `AlreadyLocked` within the first cycles under that load.
+
+Amended: `segment.rs` (`RootLock`, `lock_root`'s return type, the fork regression test),
+`sys.rs` (`unlock`), `recovery.rs` and `drive.rs` (both owners hold the guard). `engine.rs`
+required no change and none was made: it holds a `RecoverySession`, never a `File`, so no
+interface request against B1 arises from this. Scope §6.6 records the consequence B4 must
+land: the bounded retry at `tests/support/engine_matrix.rs:516` is now compensating for a
+defect that no longer exists and must become a one-attempt assertion.
+
 ### Phase 1 — storage engine spine
 
 Lead first defines sealed transaction/frame/snapshot interfaces and file ownership. That deliverable (D0) landed on 2026-07-24 as `crates/levcs-store`: the frozen public API compiling against `StoreError::NotImplemented`, the file-ownership split, strict configuration validation, the single durability syscall funnel with its counters and fault hooks, the failpoint registry in enforced one-to-one correspondence with `oracle::AppendFailpoint`, and the journal-level drive seam that lets the crash harness run in Wave A. The enforced gate is `scripts/check-phase1.sh`, which runs `check-phase0.sh` first so the Phase 0 freeze stays enforced. That work is scoped in `doc/phase1-storage-spine-scope.md`, which realizes this section as a file-ownership matrix, a frozen `levcs-store` API, a physical format and durability/recovery specification, per-package deliverables and acceptance criteria, the Wave A adversarial review charter, and the capacity analysis for P2 on the frozen reference hardware. This plan remains authoritative; that document is the Phase 1 realization of it and lists the decisions that must be resolved before Wave A starts.

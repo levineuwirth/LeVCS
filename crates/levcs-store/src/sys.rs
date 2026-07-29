@@ -412,6 +412,23 @@ pub(crate) fn try_lock_exclusive(file: &File) -> io::Result<bool> {
     }
 }
 
+/// Release a `flock` held on `file`'s **open file description**.
+///
+/// This is not redundant with closing the descriptor. `flock` is a property of
+/// the open file description, not of the descriptor: any descriptor that
+/// shares the description keeps the lock alive, and `fork` hands the child
+/// exactly such a descriptor. `FD_CLOEXEC` closes it at `exec`, not at `fork`,
+/// so between a concurrent fork and that child's `exec` — or for as long as a
+/// forked child runs without exec'ing — the parent closing its own descriptor
+/// releases nothing. Releasing must therefore be an explicit act.
+///
+/// Locking already lives in this module; unlocking stays beside it so the
+/// durability funnel remains the only place that issues the syscall.
+pub(crate) fn unlock(file: &File) -> io::Result<()> {
+    rustix::fs::flock(file, rustix::fs::FlockOperation::Unlock)
+        .map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))
+}
+
 /// Read the file position without moving it.
 pub(crate) fn cursor(file: &mut File) -> io::Result<u64> {
     file.stream_position()

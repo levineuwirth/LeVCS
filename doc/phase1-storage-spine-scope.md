@@ -1768,6 +1768,55 @@ Owns the crash driver, the benchmark, the matrix, and the recovery script.
    re-examined. If any becomes genuinely earnable, that is a schema amendment and a contract
    review — **request it, do not emit it.** `bench/result-schema.json` is lead-owned.
 
+#### Carry-forward: the SIGKILL cycles still drive the journal seam
+
+Recorded here because until now it existed only as a comment in the harness, and **a harness
+comment is not scope evidence**. It is a limitation on a §7 exit criterion, so it belongs
+where the exit criteria are read.
+
+`scripts/verify-store-recovery.sh`'s 100 randomized `SIGKILL` cycles drive the **journal
+seam** (`drive.rs`), not `StoreEngine::submit`. So `kill -9` and the driver's `_exit(3)`
+never land inside a real publication: they land inside a frame append and fence, which is
+one step of a publication and not the step where the status root, the sequencer, the
+acknowledgment, and the checkpoint install are at risk. Every ordering hazard that only
+exists between those is untested by this script, at any cycle count.
+
+Moving the cycles onto production submit is **blocked on `StoreEngine::open` startup state
+1**: the child process cannot create a store root through the production entry point, which
+still refuses that state by name (B1 deliverable 1). The same block is what forces
+`engine_matrix.rs` to seed roots through `segment::initialize_root`, and it is disclosed
+there as `ROOT_SEEDED_BY_NON_PRODUCTION_PATH`.
+
+Consequences, stated so no later reader has to reconstruct them:
+
+- The **acknowledged-crash-recovery exit criterion (§7) is only partly earned.** What is
+  earned is that the journal survives abrupt termination and recovery adopts exactly the
+  fenced prefix. What is not earned is that an *acknowledgment* survives a kill inside the
+  publication that produced it.
+- The figures the script reports — `recovery_failures=0`, `acknowledged_loss=0`,
+  `torn_transactions=0`, `repeated_adoptions=0` — mean what **Wave A** meant by them, over
+  the seam Wave A had. They are not a real-engine soak result and must not be quoted as one.
+- Closing this is B4 work once startup state 1 lands, and it is a re-point of an existing
+  script rather than a new harness. Expect the numbers to change; a change is the
+  measurement working.
+
+#### Consequence of contract review 2026-07-28-B: delete the reopen wait
+
+`segment::lock_root` now returns a `RootLock` guard that releases the root lock with an
+explicit `LOCK_UN` before closing the descriptor, which fixes the spurious `AlreadyLocked`
+B4 measured after `StoreEngine` is dropped (the lock lived on the open file description, and
+a concurrently forked child kept it alive past the close). The full record is in
+`doc/instance-throughput-rewrite-plan.md`.
+
+B4's bounded retry at `tests/support/engine_matrix.rs:516` (`reopen_after_close`) must
+therefore be replaced by a **one-attempt immediate-reopen assertion**: a single
+`StoreEngine::open` that must succeed, with no budget, no sleep, and no `attempts` field to
+publish. The wait was correct while the defect stood and is documented as compensating for
+it; it exists only for that reason and must not outlive it. Leaving it in place would hide a
+recurrence of exactly this defect behind a wait that succeeds on the second try — and §3.1
+says `AlreadyLocked` is a refusal and never a wait, so a harness that waits on it is
+asserting something the store does not promise.
+
 ### 6.7 B2 — StorageReviewer
 
 Read-only durability, concurrency, and security review of the whole crate. Same charter as

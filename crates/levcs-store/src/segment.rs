@@ -186,9 +186,73 @@ pub fn read_format(layout: &RootLayout) -> Result<crate::format::FormatMarker, S
     Ok(crate::format::FormatMarker::decode(&bytes)?)
 }
 
+/// Ownership of `<root>/LOCK`, released explicitly when dropped.
+///
+/// # Why this is a guard and not a `File`
+///
+/// `lock_root` used to return the open `File` and let the release fall out of
+/// closing it. That is wrong across a concurrent `fork`. `flock` is held by the
+/// **open file description**, not by the descriptor; a forked child inherits a
+/// descriptor onto the same description, and `FD_CLOEXEC` closes it at `exec`,
+/// not at `fork`. So for as long as any concurrently forked child has not yet
+/// exec'd, the owner closing its descriptor releases nothing, and the next
+/// `lock_root` on that root is refused `AlreadyLocked` — a refusal scope §3.1
+/// defines as final and never a wait, produced by a process that no longer
+/// exists as far as the store is concerned.
+///
+/// The fix is not to make closing more prompt. It is to stop making the
+/// release a consequence of a descriptor lifetime that a process outside this
+/// one can extend: [`RootLock::drop`] issues `LOCK_UN` *before* the descriptor
+/// closes, which releases the description's lock regardless of who else holds
+/// a descriptor onto it.
+pub struct RootLock {
+    /// Dropped after `Drop::drop` runs, so the unlock always precedes the
+    /// close.
+    file: File,
+}
+
+/// `LOCK_UN` failures observed in [`RootLock::drop`], where no error can be
+/// returned.
+///
+/// A `Drop` that swallows a failed release would turn this defect back into an
+/// intermittent one, and panicking in `Drop` can abort during an unwind. So the
+/// failure is counted instead: charter item 7, the same rule the durability
+/// counters follow. A non-zero reading means some root lock outlived its owner
+/// and the next `lock_root` on that root may be spuriously refused.
+static ROOT_LOCK_RELEASE_FAILURES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+impl RootLock {
+    /// How many times a [`RootLock`] failed to release in `Drop`. Zero in every
+    /// healthy run.
+    pub fn release_failures() -> u64 {
+        ROOT_LOCK_RELEASE_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl std::fmt::Debug for RootLock {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("RootLock").finish_non_exhaustive()
+    }
+}
+
+impl Drop for RootLock {
+    fn drop(&mut self) {
+        match sys::unlock(&self.file) {
+            Ok(()) => {}
+            Err(_) => {
+                ROOT_LOCK_RELEASE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 /// Take the exclusive root lock. Failure is `AlreadyLocked`, never a wait
 /// (scope 3.1).
-pub fn lock_root(layout: &RootLayout) -> Result<File, StoreError> {
+///
+/// The returned [`RootLock`] releases explicitly when dropped; see its
+/// documentation for why holding a bare `File` was not equivalent.
+pub fn lock_root(layout: &RootLayout) -> Result<RootLock, StoreError> {
     let file = File::options()
         .create(true)
         .read(true)
@@ -196,7 +260,7 @@ pub fn lock_root(layout: &RootLayout) -> Result<File, StoreError> {
         .truncate(false)
         .open(layout.lock_path())?;
     if sys::try_lock_exclusive(&file)? {
-        Ok(file)
+        Ok(RootLock { file })
     } else {
         Err(StoreError::AlreadyLocked)
     }
@@ -942,5 +1006,128 @@ impl SegmentCache {
         self.open
             .insert(path.to_path_buf(), (self.clock, Arc::clone(&reader)));
         Ok(reader)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Root-lock ownership tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod root_lock_tests {
+    use super::*;
+
+    /// A second holder is refused, never queued (scope 3.1).
+    #[test]
+    fn a_second_lock_on_a_held_root_is_refused() {
+        let dir = tempfile::tempdir().expect("temp root");
+        let layout = RootLayout::new(dir.path());
+
+        let held = lock_root(&layout).expect("first lock");
+        match lock_root(&layout) {
+            Ok(_) => panic!("a second holder took a lock that is already held"),
+            Err(StoreError::AlreadyLocked) => {}
+            Err(other) => panic!("expected AlreadyLocked, got {other:?}"),
+        }
+        drop(held);
+    }
+
+    /// The regression this guard exists for.
+    ///
+    /// A child is forked while the root lock is held, so it inherits a
+    /// descriptor onto the *same open file description* — which is where
+    /// `flock` lives. The child is then held open, by a pipe handshake rather
+    /// than by a sleep, across the parent's release and reopen. So the window
+    /// this reproduces is a state, not a race: for the whole duration of the
+    /// parent's reopen the child is provably alive and provably holding the
+    /// inherited descriptor, because it has written its ready byte and has not
+    /// yet been told to exit.
+    ///
+    /// With [`RootLock`]'s explicit `LOCK_UN`, the reopen succeeds on its
+    /// **first attempt**. Remove that unlock and let the release fall out of
+    /// closing the descriptor — what `lock_root` did before this amendment —
+    /// and this test fails with `AlreadyLocked` every time, because the child's
+    /// descriptor keeps the description's lock alive. `FD_CLOEXEC` does not
+    /// help: it closes at `exec`, and this child never execs.
+    ///
+    /// One attempt, not a bounded retry: a spurious `AlreadyLocked` is a
+    /// refusal scope §3.1 defines as final, so the only correct assertion is
+    /// that the very first reopen succeeds.
+    #[test]
+    fn a_forked_child_holding_the_inherited_lock_descriptor_cannot_block_a_reopen() {
+        let dir = tempfile::tempdir().expect("temp root");
+        let layout = RootLayout::new(dir.path());
+        let failures_before = RootLock::release_failures();
+
+        let lock = lock_root(&layout).expect("first lock");
+
+        let mut ready = [-1i32; 2];
+        let mut go = [-1i32; 2];
+        // SAFETY: both arrays are two `c_int`s, which is what `pipe` writes.
+        assert_eq!(unsafe { libc::pipe(ready.as_mut_ptr()) }, 0, "ready pipe");
+        // SAFETY: as above.
+        assert_eq!(unsafe { libc::pipe(go.as_mut_ptr()) }, 0, "go pipe");
+
+        // SAFETY: the child branch below calls only async-signal-safe
+        // functions and terminates with `_exit`, so forking a multi-threaded
+        // test process is sound here.
+        let child = unsafe { libc::fork() };
+        assert!(
+            child >= 0,
+            "fork failed: {}",
+            std::io::Error::last_os_error()
+        );
+        if child == 0 {
+            let mut byte = [1u8; 1];
+            // SAFETY: async-signal-safe calls on inherited descriptors only.
+            unsafe {
+                libc::write(ready[1], byte.as_ptr().cast(), 1);
+                // Blocks until the parent has finished its reopen. The
+                // inherited LOCK descriptor stays open for exactly that long.
+                libc::read(go[0], byte.as_mut_ptr().cast(), 1);
+                libc::_exit(0);
+            }
+        }
+
+        let mut byte = [0u8; 1];
+        // SAFETY: reading one byte into a one-byte buffer.
+        let read = unsafe { libc::read(ready[0], byte.as_mut_ptr().cast(), 1) };
+        assert_eq!(
+            read, 1,
+            "the child must be alive and holding the inherited LOCK descriptor \
+             before the parent releases; without that this test proves nothing"
+        );
+
+        // The parent's release. Explicit unlock first, then the close.
+        drop(lock);
+        let reopened = lock_root(&layout);
+
+        // Release the child only after the reopen has been attempted, so the
+        // inherited descriptor was open for the whole of it.
+        // SAFETY: writing one byte from a one-byte buffer.
+        unsafe { libc::write(go[1], byte.as_ptr().cast(), 1) };
+        let mut status = 0i32;
+        // SAFETY: `status` is a valid `c_int` out-parameter.
+        unsafe { libc::waitpid(child, &mut status, 0) };
+        for fd in [ready[0], ready[1], go[0], go[1]] {
+            // SAFETY: each descriptor was opened by `pipe` above and is closed once.
+            unsafe { libc::close(fd) };
+        }
+
+        match reopened {
+            Ok(_) => {}
+            Err(StoreError::AlreadyLocked) => panic!(
+                "reopen was refused AlreadyLocked on its first attempt while a forked child \
+                 still held the inherited LOCK descriptor. flock lives on the open file \
+                 description, so closing the parent's descriptor is not a release; RootLock \
+                 must issue LOCK_UN before the close."
+            ),
+            Err(other) => panic!("reopen failed for an unrelated reason: {other:?}"),
+        }
+        assert_eq!(
+            RootLock::release_failures(),
+            failures_before,
+            "a root lock failed to release in Drop"
+        );
     }
 }

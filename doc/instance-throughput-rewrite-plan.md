@@ -1217,6 +1217,183 @@ shard tree outside the root. `read_format` follows a link at `FORMAT`, read-only
 priority. The first is a correctness defect in the locking discipline and should be scheduled on
 its own, not folded into a later pass.
 
+##### Contract review 2026-07-28-C
+
+B4 re-pointed `store-bench` at a real `StoreEngine::submit` and found that four verification
+claims `bench/result-schema.json` declares not-applicable at `storage_primitive` have become
+genuinely earnable. It **requested rather than emitted** them, which is what §6.6 item 4 asks
+for. All four are granted, three with conditions that are landed as schema constraints rather
+than as prose, and one — `operation_receipts_reconciled` — is granted **in principle and is
+not earned by the emitter as it stands.** The schema and its contract tests land here; the
+emitter is B4's follow-up and is specified in scope §6.6.
+
+**1. Machine-readable run conditions, ranked first because the other three depend on it.**
+There was nowhere in a bundle to record that the root was seeded outside `StoreEngine::open`,
+that `max_index_runs` was raised, or that no checkpoint was taken. Every one of those is
+true of the run that produces today's numbers, and every one of them lived only in a harness
+comment and a human report. A bundle whose caveats live outside it reads as unconditional to
+everyone who receives it, and the people most likely to receive it without the report are the
+ones furthest from the harness.
+
+`run_conditions` is a new required top-level block with ten members: `initialization_path`,
+`mutation_path`, `checkpointing`, `index_maintenance`, `index_run_ceiling`,
+`receipt_reconciliation`, `objects_new_source`, `commit_id_uniqueness`, `build_profile`, and
+`environment_fidelity`. Every member is a closed enumeration; there is no free-text member and
+no catch-all value, and a contract test asserts both properties over the block rather than
+over a list this file also wrote.
+
+**A prose caveat field was rejected outright, and the reason is the whole design.** A string
+is something a consumer reads; these are things a consumer checks. The block is not a place to
+put disclosures beside the claims — it is what the claims are *conditioned on*.
+`objects_new_equals_three_per_commit` is forbidden when `objects_new_source` says the count was
+derived from the transaction total. `unique_blob_tree_commit_ids` is forbidden when
+`commit_id_uniqueness` says the check was per-record or inferred. `operation_receipts_reconciled`
+is forbidden when `receipt_reconciliation` says any `Committed` status was accepted, and
+*required* when it says otherwise. A harness can only declare what it did, and the declaration
+decides what it may claim. That is the difference between a caveat and a condition.
+
+Two of scope §7's exit clauses were prose until now and are mechanical here: a passing
+`storage_primitive` run must declare `checkpointing: "exercised"` — §7 requires the P2 runs not
+to have been achieved with checkpointing disabled — and `index_maintenance: "runs_sealed"`,
+because a run holding every index delta in memory with a lookup fan-out that grows for its
+whole duration is not the steady state a P2 number describes. It must also declare
+`initialization_path: "store_engine_open"` and `mutation_path: "store_engine_submit"`. The
+harness satisfies **two of the four** — B1's startup state 1 landed, so the submit path both
+creates its root and mutates it through the production entry points. It cannot satisfy
+`checkpointing` or `index_maintenance`, so it still cannot emit a passing P2 bundle, which is
+correct and was previously only an assertion in a comment.
+
+That the count moved from zero to two is worth stating rather than silently editing: the four
+conditions are not decoration on a number, they are the number's preconditions, and knowing
+which remain unmet says exactly how far the P2 criterion is from being earned. The two that
+remain are the two that make a P2 figure a steady-state measurement rather than a burst.
+
+**2. `objects_new_equals_three_per_commit`, granted for the production submit path.** The
+schema said it was absent at `storage_primitive` "which creates no objects". That stopped being
+true when the measured path became `submit`: the path stages the canonical three objects per
+commit and the harness sums `receipt.objects_new` from the store's own receipts. The condition
+is that the claim compares an **independently summed receipt total against a separately counted
+`3 × counted_commits`**. Both sides deriving from the transaction count is what the claim was
+originally excluded for — an assertion that cannot fail is not a check — and
+`objects_new_source` is what makes that exclusion survive the grant, at this gate and at every
+other.
+
+**3. `operation_receipts_reconciled`, granted in principle and not earned.**
+`store-bench.rs:2033` accepts any `TransactionStatus::Committed(_)` without comparing its
+payload, and the `receipt_digest` the harness journals is `blake3(operation_id)` — a digest of
+the operation, not of the receipt. So the run reads back that *something* committed, which is
+already what `acknowledged_sequences_reconciled` reports, and calling it receipt reconciliation
+would be a second name for the same evidence. The claim is landed as expressible and correctly
+constrained: an emitter that reconciles exact receipts, or a frozen canonical receipt digest,
+declares it and **must** then assert the claim; an emitter that does not declares
+`acceptance_of_any_committed_status` and **cannot**. Landing it now means closing it is an
+emitter change rather than a second schema amendment, and the schema description says in as
+many words that the current emitter does not earn it.
+
+**4. `unique_blob_tree_commit_ids`, granted for the production submit path**, on condition that
+uniqueness is established **globally across every recovered acknowledgment record**. Per-record
+uniqueness is not uniqueness — two records may each be internally distinct and still share a
+commit id — and distinct generator seed domains make a collision unlikely rather than absent,
+which is an argument about probability rather than an observation. `inferred_from_seed_domains`
+is therefore a *named* value of `commit_id_uniqueness` rather than something folded into the
+passing one: a harness that reasoned that way has a truthful thing to record and is refused the
+claim, which is a better outcome than having to choose between a lie and silence.
+
+**The branch conditional, which is the part that is easy to get wrong.** These are not global
+loosenings. A schema that merely *permitted* the three claims on both paths would hand the
+Wave A journal seam a way to assert what nothing below `engine.rs` can observe — and that is a
+worse defect than the one being fixed, because it arrives disguised as the fix. Two rules key
+on `gate == "storage_primitive"` and `run_conditions.mutation_path`:
+
+- **`journal_drive`** forbids all three claims outright *and* pins the four provenance
+  declarations to the only values the seam can truthfully make (`no_index_in_path`,
+  `no_receipts_in_path`, `derived_from_transaction_count`, `not_checked`). Forbidding the
+  claims alone would have left the same hole one field over: a drive-path bundle could declare
+  exact receipt reconciliation it has no receipts to perform, and nothing would have noticed.
+- **`store_engine_submit`** requires `unique_blob_tree_commit_ids` and
+  `objects_new_equals_three_per_commit`, both `const true`. Omission is a missing result here,
+  not an inapplicable one.
+
+`blobs_recomputed`, `metadata_complete`, and `commits_in_recovered_closure` stay unavailable on
+**both** paths and stay in the gate-wide rule, because they need the graph traversal plan §5.1
+forbids the store from performing. The gate-wide forbidden set is now exactly the claims no
+path can earn, and a contract test asserts its size so a future claim cannot be quietly parked
+there.
+
+**`max_index_runs` is now a named required member of `resources.configured_ceilings`.** It was
+reachable only through that block's free-form `additionalProperties`, so an emitter could omit
+the one ceiling this workload actually reaches — `submit` refuses `NotImplemented` at it — and
+the bundle stayed valid. It must be the value the run configured, read back from the options the
+store opened with. The schema cannot see the process's options, so the bite is a cross-check:
+`index_run_ceiling: "store_default"` bounds the recorded value at 64 and
+`"raised_because_index_sealing_unimplemented"` floors it at 65, and a bundle that declares one
+while recording the other is invalid in both directions. A contract test asserts that
+`StoreOptions::default`'s 64 is still 64, so the schema's bound and the library cannot drift in
+silence. What remains open is a bundle that lies about both consistently, which no schema
+closes, and it is stated here rather than left to be discovered.
+
+**The truthful-environment ruling: yes, and here is why.** `deployment.persistent_data_mount`
+and `deployment.tmpfs` were unconditional `const true` / `const false`, so B4's debug/tmpfs
+diagnostic run at 8,052/s **could not be encoded at all**. It was not disqualified — it was
+unrepresentable, which is a strictly worse state: the number existed, it was informative, and
+the only places it could live were a console and a paragraph. That is the same failure the
+`outcome` field was added to fix in review 2026-07-24-B, one block over, and the same argument
+applies. A schema that can only express successful runs is not a record of what was measured.
+
+The two fields relax to `type: boolean` and are **re-pinned** by
+`environment_fidelity: "reference_profile"`, which additionally requires a `release` build and
+a named hardware profile. `outcome: "pass"` requires `reference_profile` **at every gate**, so
+nothing a claim used to cost has changed — a `gate="storage_primitive"` bundle claiming P2
+still requires the real environment, by a rule that is one implication instead of two consts.
+Going the other way, `"diagnostic"` is not merely a label: outcome is bounded to `fail` or
+`preliminary` and no verdict may be `pass`. Recording a diagnostic run is worth nothing unless
+the record also refuses to let it be read as a result.
+
+What was **not** relaxed, deliberately: `overlay`, `remote_storage`, and `durability_enabled`
+keep their unconditional consts. A run with durability disabled is not a slower measurement of
+the same thing, it is a measurement of something else, and there is no diagnostic value in a
+fence-free number that would justify making it expressible.
+
+**Expected collateral: the emitter no longer produces a valid bundle, and the gate is red until
+B4's follow-up.** Exactly two fields are missing, on both paths:
+
+```
+[]: 'run_conditions' is a required property
+['resources', 'configured_ceilings']: 'max_index_runs' is a required property
+```
+
+`scripts/check-phase1.sh` does not run `scripts/verify-store-recovery.sh`, so the expectation
+was that the gate would stay green while bundle emission broke. **It does not, and the reason
+is worth recording:** the gate runs `store-bench`'s own unit tests, and since review
+2026-07-24-B three of them validate the emitted bundle against `bench/result-schema.json`
+rather than against a list of substrings. So the emitter's schema conformance is inside the
+gate, which is exactly the property that review was after — the drift is reported by the gate
+instead of by a script nobody ran. `the_emitted_bundle_validates_against_the_frozen_schema` and
+`a_failing_run_is_representable_rather_than_suppressed` fail with the two errors above;
+`the_schema_check_can_actually_fail` fails on its final assertion for the same reason and not a
+second one, because it asserts that a coordinated-omission mutation leaves a *clean* bundle and
+the base bundle is no longer clean. `scripts/verify-store-recovery.sh --cycles 2` was run
+directly rather than assumed and reports `matrix=pass`, `cycles_completed=2`,
+`acknowledged_loss=0`, `torn_transactions=0`, `repeated_adoptions=0`, `bundle=schema-invalid`,
+`VERIFY_EXIT=1`.
+
+All three failures are in `store-bench.rs`, which is B4's file, and the fix is scope §6.6 item
+5 rather than an edit here. This is the sequencing of 2026-07-28-A repeated deliberately: the
+gate is transiently red between the contract and the package's pass, and landing the contract
+first is what keeps B4 from implementing against a surface that is about to move. It is
+recorded rather than worked around, because a lead who edits the emitter to keep the gate green
+has moved a package's work into a review and left no one able to see that it happened.
+
+One measurement from that run belongs on the record, because it is what makes amendment 2 more
+than an argument: the submit path reported `objects_new=861` against `transactions=287`, summed
+from 287 independent receipts. Three per commit, counted rather than multiplied.
+
+Amended: `bench/result-schema.json`, `crates/levcs-protocol/tests/phase0_benchmark_contracts.rs`,
+and scope §6.6 and §7. `bench/reference-hardware.toml` required no change: the frozen profiles
+describe the reference environment, and `environment_fidelity` records which runs met it —
+putting a diagnostic profile in the frozen file would have made a non-comparable configuration
+part of what "frozen" means.
+
 ### Phase 1 — storage engine spine
 
 Lead first defines sealed transaction/frame/snapshot interfaces and file ownership. That deliverable (D0) landed on 2026-07-24 as `crates/levcs-store`: the frozen public API compiling against `StoreError::NotImplemented`, the file-ownership split, strict configuration validation, the single durability syscall funnel with its counters and fault hooks, the failpoint registry in enforced one-to-one correspondence with `oracle::AppendFailpoint`, and the journal-level drive seam that lets the crash harness run in Wave A. The enforced gate is `scripts/check-phase1.sh`, which runs `check-phase0.sh` first so the Phase 0 freeze stays enforced. That work is scoped in `doc/phase1-storage-spine-scope.md`, which realizes this section as a file-ownership matrix, a frozen `levcs-store` API, a physical format and durability/recovery specification, per-package deliverables and acceptance criteria, the Wave A adversarial review charter, and the capacity analysis for P2 on the frozen reference hardware. This plan remains authoritative; that document is the Phase 1 realization of it and lists the decisions that must be resolved before Wave A starts.

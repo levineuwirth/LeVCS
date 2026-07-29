@@ -237,15 +237,15 @@ done
 # ---------------------------------------------------------------------------
 
 bundle_status="skipped"
+zero_work_status="skipped"
+unaccounted_status="skipped"
 if [ "$run_bundle" = "1" ]; then
   echo "== skeleton result bundle ==" >&2
   if cargo build -q -p levcs-store \
       --features bench-harness,store-internals,store-privileged \
       --bin store-bench 2>/dev/null; then
     bundle_parent="$work/bundle"
-    bundle_root="$bundle_parent/root"
-    bundle_out="$work/storage-primitive-skeleton.json"
-    rm -rf "$bundle_parent" "$bundle_out"
+    rm -rf "$bundle_parent"
 
     # The frozen profile requires nodatacow on the journal and segment
     # directories, and store-bench refuses on mismatch rather than recording
@@ -257,8 +257,21 @@ if [ "$run_bundle" = "1" ]; then
     mkdir -p "$bundle_parent"
     chattr +C "$bundle_parent" 2>/dev/null || true
 
+    # Both paths, because the schema's verification rules branch on
+    # `run_conditions.mutation_path`: the production submit path is *required*
+    # to assert the two claims contract review 2026-07-28-C granted, and the
+    # journal seam is forbidden from asserting any of the three. A run that
+    # validated one path would leave the other's rules unexercised, and the
+    # unexercised one is where a seam bundle claiming what the seam cannot
+    # observe would appear.
+    bundle_status="schema-valid"
+    for bundle_variant in submit drive; do
+    bundle_root="$bundle_parent/$bundle_variant-root"
+    bundle_out="$work/storage-primitive-skeleton-$bundle_variant.json"
+    rm -rf "$bundle_root" "$bundle_out"
+
     if "$repo_root/target/debug/store-bench" emit-skeleton \
-        --root "$bundle_root" --out "$bundle_out" \
+        --root "$bundle_root" --out "$bundle_out" --path "$bundle_variant" \
         --allow-unsigned --seconds 2 --group-len 16 >&2; then
       if python3 - "$repo_root/bench/result-schema.json" "$bundle_out" >&2 <<'PY'
 import json, sys
@@ -278,7 +291,9 @@ for error in errors:
 sys.exit(1 if errors else 0)
 PY
       then
-        bundle_status="schema-valid"
+        # A later variant may only keep the status the earlier one earned; it
+        # can never upgrade a failure back to valid.
+        :
       else
         case $? in
           3) bundle_status="unvalidated-no-jsonschema" ;;
@@ -287,6 +302,63 @@ PY
       fi
     else
       bundle_status="refused"
+    fi
+    done
+
+    # The zero-work negative control.
+    #
+    # A run with no submitter measures nothing, yet the repositories are still
+    # created — so before this was fixed the bundle reported their fences and
+    # their signatures as measured work and asserted setup_traffic_excluded,
+    # unique_blob_tree_commit_ids, and objects_new_equals_three_per_commit over
+    # an empty set. Every one of those is vacuously true over zero commits, and
+    # bench/result-schema.json validates such a bundle without complaint: counts
+    # are nonnegative and the claims are const true. The schema therefore cannot
+    # be the thing that refuses it, and a gate that only ever ran the happy path
+    # would not notice the emitter's refusal being removed.
+    zero_work_root="$bundle_parent/zero-work-root"
+    zero_work_out="$work/storage-primitive-zero-work.json"
+    rm -rf "$zero_work_root" "$zero_work_out"
+    if "$repo_root/target/debug/store-bench" emit-skeleton \
+        --root "$zero_work_root" --out "$zero_work_out" --path submit \
+        --allow-unsigned --seconds 2 --group-len 16 \
+        --submitters-per-shard 0 >&2; then
+      zero_work_status="emitted"
+    else
+      zero_work_status="refused"
+    fi
+    # A refusal that still wrote a bundle is not a refusal.
+    if [ -f "$zero_work_out" ]; then
+      zero_work_status="emitted"
+    fi
+
+    # The incomplete-accounting negative control.
+    #
+    # A commit whose acknowledgment cannot be journaled is a transaction the
+    # store performed, fenced, and signed, and that the harness can never
+    # count. Until this was fixed the run merely stopped: the failure set no
+    # counter and recorded no error, so the emitter's refused-submit guard
+    # never saw it, and — because it happens after the first commit — neither
+    # did the zero-work guard. The bundle that came out omitted a committed
+    # transaction while still reporting its fence and its signature, and was
+    # schema-valid, exactly like the zero-work bundle above. The failure is
+    # induced with a write to /dev/full so the kernel supplies a real ENOSPC
+    # rather than the harness inventing one; a full tmpfs reaches the same
+    # code path with EDQUOT.
+    unaccounted_root="$bundle_parent/unaccounted-root"
+    unaccounted_out="$work/storage-primitive-unaccounted.json"
+    rm -rf "$unaccounted_root" "$unaccounted_out"
+    if "$repo_root/target/debug/store-bench" emit-skeleton \
+        --root "$unaccounted_root" --out "$unaccounted_out" --path submit \
+        --allow-unsigned --seconds 2 --group-len 4 \
+        --shards 1 --submitters-per-shard 1 \
+        --fail-ack-append-after 1 >&2; then
+      unaccounted_status="emitted"
+    else
+      unaccounted_status="refused"
+    fi
+    if [ -f "$unaccounted_out" ]; then
+      unaccounted_status="emitted"
     fi
   else
     bundle_status="build-failed"
@@ -311,6 +383,8 @@ echo "acknowledged_loss=$total_acknowledged_loss"
 echo "torn_transactions=$total_torn"
 echo "repeated_adoptions=$total_repeated"
 echo "bundle=$bundle_status"
+echo "zero_work_run=$zero_work_status"
+echo "unaccounted_ack_run=$unaccounted_status"
 
 exit_code=0
 [ "$matrix_status" = "fail" ] && exit_code=1
@@ -325,6 +399,13 @@ exit_code=0
 [ "$bundle_status" = "unvalidated-no-jsonschema" ] && exit_code=1
 [ "$bundle_status" = "refused" ] && exit_code=1
 [ "$bundle_status" = "build-failed" ] && exit_code=1
+# A zero-work run that produced a bundle is a bundle whose claims are vacuous,
+# and it is schema-valid, so this is the only place it can be caught.
+[ "$zero_work_status" = "emitted" ] && exit_code=1
+# A run that could not account for a committed transaction and emitted a bundle
+# anyway published totals for a workload that did not happen, and that bundle is
+# schema-valid too.
+[ "$unaccounted_status" = "emitted" ] && exit_code=1
 
 echo "VERIFY_EXIT=$exit_code"
 exit "$exit_code"

@@ -14,6 +14,7 @@
     "workload",
     "hardware",
     "deployment",
+    "run_conditions",
     "measurement",
     "counts",
     "bytes",
@@ -64,6 +65,9 @@
     },
     "deployment": {
       "$ref": "#/$defs/deployment"
+    },
+    "run_conditions": {
+      "$ref": "#/$defs/run_conditions"
     },
     "measurement": {
       "$ref": "#/$defs/measurement"
@@ -465,10 +469,12 @@
       ],
       "properties": {
         "persistent_data_mount": {
-          "const": true
+          "type": "boolean",
+          "description": "Re-pinned to true by the \"reference_profile\" rule in allOf, and a passing run must declare that fidelity. Relaxed from an unconditional const so a diagnostic run on a non-persistent mount is representable-and-disqualified rather than unrepresentable (contract review 2026-07-28-C)."
         },
         "tmpfs": {
-          "const": false
+          "type": "boolean",
+          "description": "Re-pinned to false by the \"reference_profile\" rule in allOf. A tmpfs run can never be a pass, because outcome \"pass\" requires reference_profile fidelity, which requires tmpfs false."
         },
         "overlay": {
           "const": false
@@ -499,6 +505,103 @@
           "type": "string",
           "minLength": 1,
           "description": "Effective attributes for the journal and segment directories, read back at startup and compared against the reference profile. Recording without verifying would let a silently copy-on-write-mounted run claim nodatacow."
+        }
+      }
+    },
+    "run_conditions": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The conditions the run was obtained under, as values a consumer can check. Contract review 2026-07-28-C: a bundle whose caveats live only in a human report reads as unconditional to everyone who receives it, and a free-text caveat field is not a condition anything can check. Every field is a closed enumeration or a boolean; there is no prose member and no catch-all value. The verification claims in $defs.verification are conditioned on these declarations, so a run that did not perform a check has no way to assert the claim that names it.",
+      "required": [
+        "initialization_path",
+        "mutation_path",
+        "checkpointing",
+        "index_maintenance",
+        "index_run_ceiling",
+        "receipt_reconciliation",
+        "objects_new_source",
+        "commit_id_uniqueness",
+        "build_profile",
+        "environment_fidelity"
+      ],
+      "properties": {
+        "initialization_path": {
+          "enum": [
+            "store_engine_open",
+            "segment_initialize_root",
+            "shard_drive_create"
+          ],
+          "description": "How the store root the run measured was created. Only \"store_engine_open\" is the production entry point, and a passing storage_primitive run must declare it. B1 landed startup state 1, so the submit path now builds its root that way and the earlier segment::initialize_root seeding is retired; \"segment_initialize_root\" is retained because a bundle emitted before that change must still be readable and must still be readable as what it was. The journal seam declares \"shard_drive_create\", which is its own creation path and not a weakening."
+        },
+        "mutation_path": {
+          "enum": [
+            "store_engine_submit",
+            "journal_drive"
+          ],
+          "description": "The entry point the measured transactions actually went through. This is the branch discriminator for the storage_primitive verification rules in allOf: \"journal_drive\" is the Wave A journal seam below engine.rs, which has no sequencer, no receipts, and no index, and may not assert what it cannot observe."
+        },
+        "checkpointing": {
+          "enum": [
+            "exercised",
+            "enabled_not_reached",
+            "unimplemented",
+            "disabled_by_configuration"
+          ],
+          "description": "Scope §7 requires that the P2 runs not have been achieved with checkpointing disabled. That clause lived only in prose until this review; it is now mechanical, because a passing storage_primitive run must declare \"exercised\". \"unimplemented\" is today's honest value: StoreEngine::checkpoint returns NotImplemented, so no checkpoint is taken."
+        },
+        "index_maintenance": {
+          "enum": [
+            "runs_sealed",
+            "deltas_retained_in_memory",
+            "no_index_in_path"
+          ],
+          "description": "Whether the index reached a steady state. \"deltas_retained_in_memory\" is a run that holds every delta layer it published and whose lookup fan-out grows for its whole duration, which is not the steady state a P2 measurement is of; a passing storage_primitive run must declare \"runs_sealed\". \"no_index_in_path\" is the journal seam, where nothing below engine.rs touches an index at all."
+        },
+        "index_run_ceiling": {
+          "enum": [
+            "store_default",
+            "raised_because_index_sealing_unimplemented"
+          ],
+          "description": "Whether StoreOptions::max_index_runs was left at the store default (64) or raised so the run could reach its measured seconds despite unimplemented index-delta sealing. Cross-checked against resources.configured_ceilings.max_index_runs by the two \"index run ceiling\" rules in allOf: \"store_default\" bounds the recorded value at 64 and the raised value floors it at 65, so a bundle that declares one and records the other is invalid. The recorded value must be the value the run configured, never a constant restated here."
+        },
+        "receipt_reconciliation": {
+          "enum": [
+            "exact_receipts_reconciled",
+            "canonical_receipt_digest_reconciled",
+            "acceptance_of_any_committed_status",
+            "no_receipts_in_path"
+          ],
+          "description": "What the run reconciled each acknowledged operation against. verification.operation_receipts_reconciled is required exactly when this is one of the first two values and forbidden under the last two. Today's harness reads back TransactionStatus and accepts any Committed(_) payload, and the receipt_digest it journals is a digest of the operation id rather than of the receipt, so it must declare \"acceptance_of_any_committed_status\" and consequently may not assert the claim. \"no_receipts_in_path\" is the journal seam, which produces no receipts to reconcile."
+        },
+        "objects_new_source": {
+          "enum": [
+            "summed_from_receipts",
+            "derived_from_transaction_count"
+          ],
+          "description": "Where counts.objects_new came from. verification.objects_new_equals_three_per_commit is forbidden under \"derived_from_transaction_count\": a harness that computes objects_new as transactions * 3 and then asserts the flag has written a tautology, not a check, and that is what the claim was originally excluded for. \"summed_from_receipts\" means each committed receipt's own objects_new was summed independently and compared against a separately counted 3 * counts.counted_commits."
+        },
+        "commit_id_uniqueness": {
+          "enum": [
+            "checked_globally_across_ack_records",
+            "inferred_from_seed_domains",
+            "not_checked"
+          ],
+          "description": "How blob, tree, and commit identifier uniqueness was established. verification.unique_blob_tree_commit_ids is forbidden under the last two values. Per-record uniqueness is not uniqueness: two acknowledgment records may each be internally distinct and still share a commit id. Distinct generator seed domains make a collision unlikely rather than absent, which is an argument and not a check, so \"inferred_from_seed_domains\" is named here rather than folded into the passing value."
+        },
+        "build_profile": {
+          "enum": [
+            "debug",
+            "release",
+            "release_with_debug_assertions"
+          ],
+          "description": "The cargo profile the measured binary was built with. \"reference_profile\" environment fidelity requires \"release\"; a debug run is recordable, and is thereby disqualified from a pass rather than silently comparable to a release number."
+        },
+        "environment_fidelity": {
+          "enum": [
+            "reference_profile",
+            "diagnostic"
+          ],
+          "description": "Whether the run met the frozen environment. \"reference_profile\" re-pins deployment.persistent_data_mount true, deployment.tmpfs false, build_profile \"release\", and a named hardware profile. \"diagnostic\" admits a non-persistent mount or a debug build and is mechanically disqualified: outcome may only be \"fail\" or \"preliminary\" and no verdict may be \"pass\". outcome \"pass\" requires \"reference_profile\" at every gate, so nothing about this relaxes what a claim costs."
         }
       }
     },
@@ -672,6 +775,16 @@
         "configured_ceilings": {
           "type": "object",
           "minProperties": 1,
+          "required": [
+            "max_index_runs"
+          ],
+          "properties": {
+            "max_index_runs": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "The StoreOptions::max_index_runs the run actually configured, read back from the options the store opened with — never the store default restated here, and never omitted. Bounded against run_conditions.index_run_ceiling by the two \"index run ceiling\" rules in allOf, so a defaulted or contradicted value is invalid rather than merely unverified. It is a ceiling this workload genuinely reaches: index-delta sealing being unimplemented makes it the limit submit refuses at."
+            }
+          },
           "additionalProperties": {
             "type": "number",
             "minimum": 0
@@ -752,11 +865,11 @@
         },
         "unique_blob_tree_commit_ids": {
           "const": true,
-          "description": "Not applicable at storage_primitive, where no object graph exists; omitted there rather than falsified, since false would claim the check was applicable and failed."
+          "description": "Every blob, tree, and commit identifier the run acknowledged is distinct, checked globally across every recovered acknowledgment record rather than within each record and never inferred from distinct generator seed domains. Earnable at storage_primitive only through StoreEngine::submit, where the transactions carry real objects; forbidden on the journal seam, which has none. Gated on run_conditions.commit_id_uniqueness (contract review 2026-07-28-C)."
         },
         "objects_new_equals_three_per_commit": {
           "const": true,
-          "description": "Counted independently of the transaction total, not derived from it. A harness that computes objects_new as transactions * 3 and then asserts this flag has written a tautology, not a check. Absent at storage_primitive, which creates no objects."
+          "description": "Receipt-reported objects_new, summed independently across every committed receipt, equals a separately counted 3 * counts.counted_commits. Both sides must be counted; deriving either from the transaction total makes the assertion unfailable, which is what this claim was originally excluded for. Earnable at storage_primitive only through StoreEngine::submit, where the store stages the canonical three objects per commit and reports them on the receipt. Gated on run_conditions.objects_new_source (contract review 2026-07-28-C)."
         },
         "blobs_recomputed": {
           "const": true,
@@ -768,7 +881,7 @@
         },
         "operation_receipts_reconciled": {
           "const": true,
-          "description": "Not applicable at storage_primitive, where no object graph exists; omitted there rather than falsified, since false would claim the check was applicable and failed."
+          "description": "Every acknowledged operation was read back and its receipt reconciled against the receipt the run recorded when it acknowledged, either exactly or through a frozen canonical receipt digest. Approved in principle for the StoreEngine::submit path and NOT EARNED by the emitter as it stands: store-bench accepts any TransactionStatus::Committed(_) payload without comparing it, and the receipt_digest it journals is a digest of the operation id rather than of the receipt, so it must declare run_conditions.receipt_reconciliation = \"acceptance_of_any_committed_status\" and is thereby forbidden from asserting this. Expressible now so that landing the reconciliation is an emitter change and not a second schema amendment (contract review 2026-07-28-C)."
         },
         "metadata_complete": {
           "const": true,
@@ -1020,22 +1133,7 @@
               "anyOf": [
                 {
                   "required": [
-                    "unique_blob_tree_commit_ids"
-                  ]
-                },
-                {
-                  "required": [
-                    "objects_new_equals_three_per_commit"
-                  ]
-                },
-                {
-                  "required": [
                     "blobs_recomputed"
-                  ]
-                },
-                {
-                  "required": [
-                    "operation_receipts_reconciled"
                   ]
                 },
                 {
@@ -1054,12 +1152,32 @@
               "commits_in_recovered_closure"
             ]
           }
-        }
+        },
+        "description": "The claims forbidden at this gate on every path, whichever entry point was measured. blobs_recomputed and metadata_complete require an object graph the store is forbidden to traverse (plan §5.1), and commits_in_recovered_closure requires the ref closure that traversal would produce, so neither path can earn them and this is not branch-conditional. The three claims that became earnable through StoreEngine::submit are ruled on by the two mutation-path rules below."
       },
       "else": {
         "properties": {
           "promotable": {
             "const": true
+          },
+          "run_conditions": {
+            "properties": {
+              "initialization_path": {
+                "const": "store_engine_open"
+              },
+              "mutation_path": {
+                "const": "store_engine_submit"
+              },
+              "checkpointing": {
+                "enum": [
+                  "exercised",
+                  "enabled_not_reached"
+                ]
+              },
+              "index_maintenance": {
+                "const": "runs_sealed"
+              }
+            }
           },
           "workload": {
             "properties": {
@@ -1136,6 +1254,501 @@
             "properties": {
               "coordinated_omission_corrected": {
                 "const": true
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "title": "the journal-drive seam may not assert what it cannot observe",
+      "description": "Contract review 2026-07-28-C. The three claims that became earnable through StoreEngine::submit stay forbidden here, and the provenance declarations are pinned to the only values the seam can truthfully make. Forbidding the claims alone would not be enough: a drive-path bundle could otherwise declare exact receipt reconciliation or a global uniqueness check it has no receipts and no objects to perform, and the pins are what make that combination invalid rather than merely unverified.",
+      "if": {
+        "properties": {
+          "gate": {
+            "const": "storage_primitive"
+          },
+          "run_conditions": {
+            "properties": {
+              "mutation_path": {
+                "const": "journal_drive"
+              }
+            },
+            "required": [
+              "mutation_path"
+            ]
+          }
+        },
+        "required": [
+          "gate",
+          "run_conditions"
+        ]
+      },
+      "then": {
+        "properties": {
+          "verification": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "unique_blob_tree_commit_ids"
+                  ]
+                },
+                {
+                  "required": [
+                    "objects_new_equals_three_per_commit"
+                  ]
+                },
+                {
+                  "required": [
+                    "operation_receipts_reconciled"
+                  ]
+                }
+              ]
+            }
+          },
+          "run_conditions": {
+            "properties": {
+              "index_maintenance": {
+                "const": "no_index_in_path"
+              },
+              "receipt_reconciliation": {
+                "const": "no_receipts_in_path"
+              },
+              "objects_new_source": {
+                "const": "derived_from_transaction_count"
+              },
+              "commit_id_uniqueness": {
+                "const": "not_checked"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "title": "the production submit path at storage_primitive earns two claims and must state them",
+      "description": "Contract review 2026-07-28-C. StoreEngine::submit stages the canonical three objects per commit and reports them on its own receipt, and the transactions carry real blob, tree, and commit identifiers, so these two claims are no longer inapplicable — they are required, with the provenance that makes each a check rather than a restatement. operation_receipts_reconciled is deliberately absent from this list: it is approved in principle and not yet earned, and the receipt-reconciliation rule below is what decides it.",
+      "if": {
+        "properties": {
+          "gate": {
+            "const": "storage_primitive"
+          },
+          "run_conditions": {
+            "properties": {
+              "mutation_path": {
+                "const": "store_engine_submit"
+              }
+            },
+            "required": [
+              "mutation_path"
+            ]
+          }
+        },
+        "required": [
+          "gate",
+          "run_conditions"
+        ]
+      },
+      "then": {
+        "properties": {
+          "verification": {
+            "properties": {
+              "unique_blob_tree_commit_ids": {
+                "const": true
+              },
+              "objects_new_equals_three_per_commit": {
+                "const": true
+              }
+            },
+            "required": [
+              "unique_blob_tree_commit_ids",
+              "objects_new_equals_three_per_commit"
+            ]
+          },
+          "run_conditions": {
+            "properties": {
+              "initialization_path": {
+                "enum": [
+                  "store_engine_open",
+                  "segment_initialize_root"
+                ]
+              },
+              "index_maintenance": {
+                "enum": [
+                  "runs_sealed",
+                  "deltas_retained_in_memory"
+                ]
+              },
+              "receipt_reconciliation": {
+                "enum": [
+                  "exact_receipts_reconciled",
+                  "canonical_receipt_digest_reconciled",
+                  "acceptance_of_any_committed_status"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "title": "objects_new_equals_three_per_commit requires an independently summed objects_new",
+      "description": "Applies at every gate, not only storage_primitive. A count derived from the transaction total makes the claim unfailable wherever it is asserted.",
+      "if": {
+        "properties": {
+          "run_conditions": {
+            "properties": {
+              "objects_new_source": {
+                "const": "derived_from_transaction_count"
+              }
+            },
+            "required": [
+              "objects_new_source"
+            ]
+          }
+        },
+        "required": [
+          "run_conditions"
+        ]
+      },
+      "then": {
+        "properties": {
+          "verification": {
+            "not": {
+              "required": [
+                "objects_new_equals_three_per_commit"
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "title": "unique_blob_tree_commit_ids requires a global uniqueness check",
+      "description": "Applies at every gate. Per-record uniqueness and distinct seed domains are both weaker than the claim: the first cannot see a collision between two records, and the second is an argument about likelihood rather than an observation.",
+      "if": {
+        "properties": {
+          "run_conditions": {
+            "properties": {
+              "commit_id_uniqueness": {
+                "enum": [
+                  "inferred_from_seed_domains",
+                  "not_checked"
+                ]
+              }
+            },
+            "required": [
+              "commit_id_uniqueness"
+            ]
+          }
+        },
+        "required": [
+          "run_conditions"
+        ]
+      },
+      "then": {
+        "properties": {
+          "verification": {
+            "not": {
+              "required": [
+                "unique_blob_tree_commit_ids"
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "title": "operation_receipts_reconciled is forbidden where no receipt was reconciled",
+      "description": "Contract review 2026-07-28-C, and the reason the claim can be landed before it is earned. Accepting any Committed status is not reconciling a receipt; it reports that something committed, which acknowledged_sequences_reconciled already says. The journal seam declares no_receipts_in_path and is covered by the same clause. Both values are named here and both earning values are named in the companion rule below, so neither rule has an else branch that would fire on a bundle with no declaration at all.",
+      "if": {
+        "properties": {
+          "run_conditions": {
+            "properties": {
+              "receipt_reconciliation": {
+                "enum": [
+                  "acceptance_of_any_committed_status",
+                  "no_receipts_in_path"
+                ]
+              }
+            },
+            "required": [
+              "receipt_reconciliation"
+            ]
+          }
+        },
+        "required": [
+          "run_conditions"
+        ]
+      },
+      "then": {
+        "properties": {
+          "verification": {
+            "not": {
+              "required": [
+                "operation_receipts_reconciled"
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "title": "operation_receipts_reconciled is required where a receipt was reconciled",
+      "description": "A run that reconciled exact receipts, or a frozen canonical receipt digest, must assert the claim rather than leave it optional: the check was performed and its result is a required part of the record. On the journal-drive path this rule and the mutation-path rule combine to make an exact-receipt declaration unsatisfiable, which is the intended reading — a seam with no receipts cannot have reconciled any. Stated as its own rule rather than as the else of the rule above so that neither fires on a bundle carrying no declaration at all: absence of run_conditions is refused by the top-level required list, and one refusal reported once is worth more than the same defect reported under a claim the run never mentioned.",
+      "if": {
+        "properties": {
+          "run_conditions": {
+            "properties": {
+              "receipt_reconciliation": {
+                "enum": [
+                  "exact_receipts_reconciled",
+                  "canonical_receipt_digest_reconciled"
+                ]
+              }
+            },
+            "required": [
+              "receipt_reconciliation"
+            ]
+          }
+        },
+        "required": [
+          "run_conditions"
+        ]
+      },
+      "then": {
+        "properties": {
+          "verification": {
+            "properties": {
+              "operation_receipts_reconciled": {
+                "const": true
+              }
+            },
+            "required": [
+              "operation_receipts_reconciled"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "index run ceiling: a declared store default bounds the recorded value",
+      "if": {
+        "properties": {
+          "run_conditions": {
+            "properties": {
+              "index_run_ceiling": {
+                "const": "store_default"
+              }
+            },
+            "required": [
+              "index_run_ceiling"
+            ]
+          }
+        },
+        "required": [
+          "run_conditions"
+        ]
+      },
+      "then": {
+        "properties": {
+          "resources": {
+            "properties": {
+              "configured_ceilings": {
+                "properties": {
+                  "max_index_runs": {
+                    "maximum": 64
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "title": "index run ceiling: a declared raise must record a raised value",
+      "if": {
+        "properties": {
+          "run_conditions": {
+            "properties": {
+              "index_run_ceiling": {
+                "const": "raised_because_index_sealing_unimplemented"
+              }
+            },
+            "required": [
+              "index_run_ceiling"
+            ]
+          }
+        },
+        "required": [
+          "run_conditions"
+        ]
+      },
+      "then": {
+        "properties": {
+          "resources": {
+            "properties": {
+              "configured_ceilings": {
+                "properties": {
+                  "max_index_runs": {
+                    "minimum": 65
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "title": "reference-profile fidelity re-pins the environment the deployment schema used to pin outright",
+      "description": "Contract review 2026-07-28-C. deployment.persistent_data_mount and deployment.tmpfs were unconditional consts, which made a diagnostic tmpfs run unrepresentable rather than disqualified. They are re-pinned here, and outcome \"pass\" requires this fidelity at every gate, so nothing a claim used to cost has changed.",
+      "if": {
+        "properties": {
+          "run_conditions": {
+            "properties": {
+              "environment_fidelity": {
+                "const": "reference_profile"
+              }
+            },
+            "required": [
+              "environment_fidelity"
+            ]
+          }
+        },
+        "required": [
+          "run_conditions"
+        ]
+      },
+      "then": {
+        "properties": {
+          "deployment": {
+            "properties": {
+              "persistent_data_mount": {
+                "const": true
+              },
+              "tmpfs": {
+                "const": false
+              }
+            }
+          },
+          "run_conditions": {
+            "properties": {
+              "build_profile": {
+                "const": "release"
+              }
+            }
+          },
+          "hardware": {
+            "properties": {
+              "profile": {
+                "enum": [
+                  "minimum-30k",
+                  "release-60k"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "title": "a diagnostic run is representable and mechanically disqualified",
+      "description": "Contract review 2026-07-28-C. The alternative was what stood before it: a debug, tmpfs diagnostic run could not be encoded at all, so its number lived on a console and in prose. Recording it is worth nothing unless the record also refuses to let it be read as a result, so the outcome is bounded and no verdict may be pass.",
+      "if": {
+        "properties": {
+          "run_conditions": {
+            "properties": {
+              "environment_fidelity": {
+                "const": "diagnostic"
+              }
+            },
+            "required": [
+              "environment_fidelity"
+            ]
+          }
+        },
+        "required": [
+          "run_conditions"
+        ]
+      },
+      "then": {
+        "properties": {
+          "outcome": {
+            "enum": [
+              "fail",
+              "preliminary"
+            ]
+          },
+          "verdicts": {
+            "additionalProperties": {
+              "enum": [
+                "fail",
+                "not-applicable"
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "title": "a passing run at any gate must have met the reference environment",
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "pass"
+          }
+        },
+        "required": [
+          "outcome"
+        ]
+      },
+      "then": {
+        "properties": {
+          "run_conditions": {
+            "properties": {
+              "environment_fidelity": {
+                "const": "reference_profile"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "title": "a passing storage_primitive run must have measured the production path in a steady state",
+      "description": "Scope §7 requires the P2 runs not to have been achieved with checkpointing disabled, and a run holding every index delta in memory for its whole duration is not the steady state a P2 number describes. Both were prose until contract review 2026-07-28-C; here they are conditions a consumer checks. A root seeded outside StoreEngine::open is disclosed rather than forbidden — but it cannot ride into a pass.",
+      "if": {
+        "properties": {
+          "gate": {
+            "const": "storage_primitive"
+          },
+          "outcome": {
+            "const": "pass"
+          }
+        },
+        "required": [
+          "gate",
+          "outcome"
+        ]
+      },
+      "then": {
+        "properties": {
+          "run_conditions": {
+            "properties": {
+              "initialization_path": {
+                "const": "store_engine_open"
+              },
+              "mutation_path": {
+                "const": "store_engine_submit"
+              },
+              "checkpointing": {
+                "const": "exercised"
+              },
+              "index_maintenance": {
+                "const": "runs_sealed"
               }
             }
           }

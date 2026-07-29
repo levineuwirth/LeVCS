@@ -1190,6 +1190,36 @@ enforced somewhere and not on the path that runs. Here, an invariant was documen
 than required. In both cases the gate reported green because nothing made the omission
 expressible as a failure.
 
+### 5.1 Resource exhaustion is indistinguishable from a concurrency flake by symptom
+
+Recorded from a Wave B incident, because the wrong diagnosis was already written down before
+the evidence arrived and only measurement caught it.
+
+Verifying a commit in a second worktree put an 11 GiB `target` directory on this machine's
+`/tmp`, which is tmpfs. The store's tests build roots under `TMPDIR`, and the engine
+preallocates per shard, so the filesystem filled. Seventeen `engine::tests` failures appeared
+at once. **Every one passed in isolation and failed under the full suite** — the exact
+signature §5's `recovery_eio` record describes, and the reason is structural rather than
+coincidental: whichever tests run last are the ones that find the filesystem full, and which
+tests run last depends on scheduling. Re-running the main tree reproduced it 5 of 5, which
+looked like confirmation of an intrinsic flake in newly added startup tests. It was not. The
+panic carried `Io(Os { code: 122, kind: QuotaExceeded })`, and after the worktree was removed
+the same suite passed 5 of 5 unchanged.
+
+**The rule this yields.** Before classifying clustered failures as a concurrency flake,
+preserve and read the **errno**, and capture free blocks, free inodes, and any quota state for
+the filesystem the test roots live on. `ENOSPC`, `EDQUOT`, and `EMFILE` all present as
+unrelated-looking failures that vanish in isolation, and all three are cheap to rule out and
+expensive to misdiagnose: the flake conclusion sends someone hunting a race that does not
+exist, and — worse — it invites the rerun-until-green habit §5 exists to forbid, which would
+have "resolved" this incident while leaving the disk full.
+
+The corollary for harnesses: an I/O error must reach a report with its errno intact. A path
+that folds one into a boolean, a count, or a generic message destroys the only evidence that
+distinguishes these two diagnoses. That is the same requirement as the emitter's
+incomplete-accounting refusal in §6.6 — a failure the harness cannot account for must be
+reported as itself, not compressed into a symptom.
+
 ## 6. Wave B work packages
 
 ### 6.0 Preconditions
@@ -1767,6 +1797,98 @@ Owns the crash driver, the benchmark, the matrix, and the recovery script.
    `commits_in_recovered_closure` and the object-graph flags forbidden at this gate should be
    re-examined. If any becomes genuinely earnable, that is a schema amendment and a contract
    review — **request it, do not emit it.** `bench/result-schema.json` is lead-owned.
+   *Requested, reviewed, and granted as contract review 2026-07-28-C; the schema and its
+   contract tests have landed and item 5 below is what B4 must emit against them.*
+
+#### Consequence of contract review 2026-07-28-C: the emitter contract
+
+`bench/result-schema.json` now requires a `run_conditions` block and a named
+`resources.configured_ceilings.max_index_runs`, and requires two verification claims on the
+submit path. The emitter does not produce any of them, so `store-bench emit-skeleton` currently
+writes a bundle that fails validation on exactly two fields:
+
+```
+[]: 'run_conditions' is a required property
+['resources', 'configured_ceilings']: 'max_index_runs' is a required property
+```
+
+`scripts/verify-store-recovery.sh --cycles 2` reports `bundle=schema-invalid`, `VERIFY_EXIT=1`
+with everything else green (`matrix=pass`, `acknowledged_loss=0`, `torn_transactions=0`).
+**`scripts/check-phase1.sh` is red as well**, which is not what landing a schema alone would
+normally do: the gate runs `store-bench`'s unit tests, and three of them validate the emitted
+bundle against the schema rather than against substrings, so schema conformance is inside the
+gate. That is the property review 2026-07-24-B was after, working. All three failures are in
+`store-bench.rs` and none is a defect in the store; they are expected collateral of landing the
+contract first and they close with item 5.
+
+5. **Emit the run conditions, the index-run ceiling, and the two earned claims.** All of it in
+   `store-bench.rs`; no other file is involved. Nothing here may be a constant this file
+   restates — every value must come from what the run configured or observed.
+
+   **a. `resources.configured_ceilings.max_index_runs`** — the `u32` from the `StoreOptions`
+   the store was opened with, not `ENGINE_MAX_INDEX_RUNS` written out a second time. Emit it as
+   an integer.
+
+   **b. A `run_conditions` object** with all ten members. The truthful values today are:
+
+   | member | submit path | drive path |
+   |---|---|---|
+   | `initialization_path` | `store_engine_open` (see **f**) | `shard_drive_create` |
+   | `mutation_path` | `store_engine_submit` | `journal_drive` |
+   | `checkpointing` | `unimplemented` | `unimplemented` |
+   | `index_maintenance` | `deltas_retained_in_memory` | `no_index_in_path` |
+   | `index_run_ceiling` | `raised_because_index_sealing_unimplemented` | `store_default` |
+   | `receipt_reconciliation` | `acceptance_of_any_committed_status` | `no_receipts_in_path` |
+   | `objects_new_source` | `summed_from_receipts` | `derived_from_transaction_count` |
+   | `commit_id_uniqueness` | `checked_globally_across_ack_records` (after **d**) | `not_checked` |
+   | `build_profile` | from `cfg!(debug_assertions)` | same |
+   | `environment_fidelity` | `diagnostic` unless every reference condition holds | same |
+
+   These are **declarations of what the run did**, not configuration. Each must be derived from
+   the `MeasuredRun` and the options rather than hardcoded per path where a derivation exists:
+   `index_run_ceiling` follows from comparing the configured ceiling to the store default,
+   `objects_new_source` is the existing `MeasuredRun::objects_new_counted`, `build_profile`
+   follows from `cfg!`, and `environment_fidelity` follows from the profile the run verified.
+   A hardcoded `run_conditions` block is the prose caveat with a different syntax.
+
+   **c. Both earned claims on the submit path**, and neither on the drive path.
+   `objects_new_equals_three_per_commit` may be emitted only when the summed
+   `receipt.objects_new` total equals a **separately counted** `3 × counted_commits` — count the
+   commits, do not reuse the summed total to produce the expected value, and refuse to emit the
+   bundle when they disagree rather than emitting the flag as `false`, which the schema does not
+   permit and which would be a different untrue statement.
+
+   **d. A global uniqueness check** over every recovered ACK record, across all records at once:
+   collect every `blob_ids`, `tree_ids`, and `commit_ids` entry from
+   `ExternalAckJournal::recover` into one set per kind and require no repeat. Per-record checking
+   and any argument from the distinctness of the generator seed domains are both explicitly
+   insufficient, and `commit_id_uniqueness` has named values for both so a harness that did
+   either has something truthful to record.
+
+   **e. Do not emit `operation_receipts_reconciled`.** The schema forbids it while
+   `receipt_reconciliation` is `acceptance_of_any_committed_status`, which is the honest
+   declaration for `store-bench.rs:2033` — it accepts any `Committed(_)` without comparing the
+   payload, and the `AckRecord.receipt_digest` it writes is `blake3(operation_id)` rather than a
+   digest of the receipt. Earning it is separate work: reconcile the exact receipt, or freeze a
+   canonical receipt digest and reconcile that, then declare the matching value and assert the
+   claim. The schema will then *require* the claim rather than permit it.
+
+   **f. Build every measured root through `StoreEngine::open`.** Added after B1 landed startup
+   state 1. The benchmark previously seeded its root with `segment::initialize_root` and
+   disclosed the fact in three places, because seeding a store off the production path in order
+   to measure the production path is the charter item 8 smell and a disclosure is not a fix.
+   With state 1 implemented the smell is closable rather than merely recordable, so it is
+   closed: the seeding helpers and the `ROOT_SEEDED_BY_NON_PRODUCTION_PATH` constant are retired,
+   and `initialization_path` is **observed** — the `FORMAT` marker is absent before the call and
+   present after — rather than asserted. Deriving it from an observation is what keeps the
+   declaration honest if the seeding ever regresses.
+
+   *Accept:* `bash scripts/verify-store-recovery.sh --cycles 2` reports `bundle=schema-valid`
+   on both `--path submit` and `--path drive`; the emitter's own
+   `the_emitted_bundle_validates_against_the_frozen_schema` passes; and
+   `the_schema_check_can_actually_fail` gains a mutation for each newly required field, since a
+   required field the negative control never removes is a field the suite cannot notice the loss
+   of.
 
 #### Carry-forward: the SIGKILL cycles still drive the journal seam
 
@@ -1781,11 +1903,17 @@ one step of a publication and not the step where the status root, the sequencer,
 acknowledgment, and the checkpoint install are at risk. Every ordering hazard that only
 exists between those is untested by this script, at any cycle count.
 
-Moving the cycles onto production submit is **blocked on `StoreEngine::open` startup state
-1**: the child process cannot create a store root through the production entry point, which
-still refuses that state by name (B1 deliverable 1). The same block is what forces
-`engine_matrix.rs` to seed roots through `segment::initialize_root`, and it is disclosed
-there as `ROOT_SEEDED_BY_NON_PRODUCTION_PATH`.
+Moving the cycles onto production submit was blocked on `StoreEngine::open` startup state 1,
+because the child process could not create a store root through the production entry point.
+**That block is gone**: B1 landed state 1, and every root B4 measures — the benchmark's and
+the Wave B rows' — is now built by `StoreEngine::open`, so `engine_matrix.rs`'s
+`ROOT_SEEDED_BY_NON_PRODUCTION_PATH` disclosure and its `segment::initialize_root` seeding
+are retired.
+
+The move is therefore **deferred, not blocked** — a separate B4 assignment that has not been
+made rather than one that cannot be done. That distinction matters here: a blocked item waits
+for someone else, and a deferred one waits only for a decision, so this is the entry that
+should be picked up first when the acknowledged-crash-recovery criterion is next worked.
 
 Consequences, stated so no later reader has to reconstruct them:
 
@@ -1913,6 +2041,24 @@ winner, multi-ref atomicity, no per-object fsync."*
 Also required before the phase closes, from §13's stop conditions: the result bundle must
 report index bytes/object and checkpoint lookup fan-out, and the P2 runs must not have been
 achieved with checkpointing disabled.
+
+**Both of those last clauses are now mechanical rather than prose** (contract review
+2026-07-28-C). A `gate="storage_primitive"` bundle with `outcome="pass"` must declare
+`run_conditions.checkpointing = "exercised"` and `run_conditions.index_maintenance =
+"runs_sealed"`, alongside `initialization_path = "store_engine_open"` and `mutation_path =
+"store_engine_submit"`. A reader no longer has to take the P2 row of the table above on trust:
+the conditions the number was obtained under travel inside the bundle as values, and a bundle
+that met none of them cannot encode a pass.
+
+The harness as it stands satisfies **two of the four**: since B1 landed startup state 1, the
+submit path both creates its root through `StoreEngine::open` and mutates it through
+`StoreEngine::submit`. It satisfies neither `checkpointing` nor `index_maintenance`, and those
+are the two that decide whether a P2 figure describes a steady state or a burst — a run holding
+every index delta in memory, with a lookup fan-out that grows for its whole duration and no
+checkpoint ever taken, is measuring a system that has not yet reached the condition the number
+is supposed to characterize. Two of four is the accurate reading of how much of the P2 exit
+criterion is currently earned, and the remaining two are the expensive ones — the same
+disclosure the SIGKILL carry-forward above makes about the crash-recovery row.
 
 ## 8. Capacity analysis for P2 on the frozen reference hardware
 

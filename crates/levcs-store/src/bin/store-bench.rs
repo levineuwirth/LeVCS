@@ -2755,6 +2755,8 @@ struct AckSink {
     journal: ExternalAckJournal,
     fault: AckJournalFault,
     appended: u64,
+    /// Whether the armed fault actually fired. See [`AckSink::unfired_arming`].
+    fired: bool,
     /// Opened when the fault is armed, not when it fires, so a host where the
     /// fault cannot be induced says so before the run rather than after it.
     full_device: Option<std::fs::File>,
@@ -2784,8 +2786,36 @@ impl AckSink {
             journal,
             fault,
             appended: 0,
+            fired: false,
             full_device,
         })
+    }
+
+    /// Why an armed fault that never fired has to refuse the run.
+    ///
+    /// `--fail-ack-append-after N` states that the run met an acknowledgment
+    /// failure at append `N`. A run that ended before reaching `N` — too short a
+    /// window, too small a group count, a store that refused every submit —
+    /// satisfies none of that, and the previous code let it emit a **normal
+    /// bundle**: the injection flag was on the command line, the failure never
+    /// happened, and nothing in the output said so. That is the same class of
+    /// defect as the ack write failure this flag exists to catch, one level up.
+    ///
+    /// So it is charter item 7 again: the arming is a claim, `fired` is the
+    /// counter, and the two are compared instead of the flag being trusted.
+    fn unfired_arming(&self) -> Option<String> {
+        match self.fault {
+            AckJournalFault::None => None,
+            AckJournalFault::EnospcOnAppend(target) if !self.fired => Some(format!(
+                "--fail-ack-append-after {target} armed an acknowledgment-journal failure that \
+                 never fired: the run issued only {} append(s), so no injected failure was \
+                 observed and this run is not evidence of the behaviour the flag claims to \
+                 exercise. Refusing rather than emitting a bundle that would read as a normal \
+                 run.",
+                self.appended
+            )),
+            AckJournalFault::EnospcOnAppend(_) => None,
+        }
     }
 
     fn append_durable(
@@ -2795,6 +2825,7 @@ impl AckSink {
         use std::io::Write as _;
 
         if self.fault == AckJournalFault::EnospcOnAppend(self.appended) {
+            self.fired = true;
             let device = self
                 .full_device
                 .as_mut()
@@ -2910,6 +2941,12 @@ fn run_skeleton(
                 })?;
             acknowledged += 1;
         }
+    }
+
+    // Before any total is read off a counter, for the reason
+    // `AckSink::unfired_arming` gives.
+    if let Some(failure) = ack.unfired_arming() {
+        return Err(failure);
     }
 
     let elapsed = started.elapsed();
@@ -3672,6 +3709,17 @@ fn run_engine(
         return Err(failure);
     }
 
+    // For the same reason, and in the same place: before any total is read.
+    // Borrowed rather than consumed — the sink is dropped later, deliberately,
+    // to close the journal before it is digested.
+    if let Some(failure) = ack
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .unfired_arming()
+    {
+        return Err(failure);
+    }
+
     let total_fences = sum_fences(&engine, shard_count)?;
 
     let latencies = latencies.into_inner().unwrap_or_else(|p| p.into_inner());
@@ -4128,7 +4176,9 @@ store-bench <precheck|emit-skeleton|run> [flags]
 bundle by construction: the Nth acknowledgment-journal append is issued against
 /dev/full so the kernel's ENOSPC drives the emitter's incomplete-accounting
 refusal. It exists so that refusal is exercised deterministically rather than
-by racing a full device.
+by racing a full device. \"Emits no bundle\" is unconditional: a run that ended
+before reaching append N is refused too, because the flag claims a failure was
+observed and that run observed none.
 
 --path submit is the default and goes through StoreEngine::submit. --path drive
 is the Wave A journal seam, kept so the two measurements can be compared rather
@@ -5540,6 +5590,53 @@ sys.exit(1 if errors else 0)
         .expect("a fenced group whose acknowledgment cannot be journaled voids the run");
         assert!(error.contains("incomplete accounting"), "{error}");
         assert!(error.contains("code: 28"), "{error}");
+    }
+
+    /// The gap between "the flag was passed" and "the failure happened".
+    ///
+    /// The target is placed far beyond any append the run can reach, so the
+    /// arming is real, the injection is never induced, and the run is otherwise
+    /// a perfectly ordinary one. Before the check this emitted a normal bundle
+    /// with nothing recording that the claimed failure never occurred.
+    ///
+    /// The negative control matters more than the refusal here: a check that
+    /// refused every armed run regardless of firing would pass the first
+    /// assertion, so the same seam is run with a reachable target and must still
+    /// produce the *injected* refusal rather than this one.
+    #[test]
+    fn an_armed_acknowledgment_fault_that_never_fires_refuses_the_run() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let error = run_skeleton(
+            &directory.path().join("root"),
+            &directory.path().join("ack-journal"),
+            AckJournalFault::EnospcOnAppend(u64::MAX),
+            4,
+            1,
+        )
+        .err()
+        .expect("an armed fault that never fired must not produce a run");
+        assert!(error.contains("never fired"), "{error}");
+        assert!(
+            !error.contains("incomplete accounting"),
+            "an unfired arming is not an accounting failure; the two refusals must stay \
+             distinguishable: {error}"
+        );
+
+        let reachable = tempfile::tempdir().expect("tempdir");
+        let injected = run_skeleton(
+            &reachable.path().join("root"),
+            &reachable.path().join("ack-journal"),
+            AckJournalFault::EnospcOnAppend(1),
+            4,
+            2,
+        )
+        .err()
+        .expect("a reachable target still refuses");
+        assert!(
+            injected.contains("incomplete accounting") && !injected.contains("never fired"),
+            "a fault that did fire must report the injected failure, not the arming check: \
+             {injected}"
+        );
     }
 
     #[test]

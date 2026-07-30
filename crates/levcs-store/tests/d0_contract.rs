@@ -315,9 +315,12 @@ const FORBIDDEN: &[&str] = &[
 /// ```
 ///
 /// the first column-zero `}` is *`shipping_code`'s*, so every line of it was
-/// skipped. A semicolon-terminated item therefore exempts only itself, and any
-/// third shape — including an item header rustfmt has split across lines — is a
-/// scanner error rather than a guess.
+/// skipped. A semicolon-terminated item therefore exempts only itself. Of the
+/// braced shapes, this crate currently needs only `mod` and `impl`, so those are
+/// the only two accepted: merely ending a line in `{` is not enough, because a
+/// semicolon-terminated `static` or `const` can begin a block initializer there
+/// and close with `};`. Any other shape — including an item header rustfmt has
+/// split across lines — is a scanner error rather than a guess.
 fn scan_for_unfunnelled_calls(text: &str) -> Result<Vec<(usize, String)>, String> {
     #[derive(PartialEq)]
     enum Exempt {
@@ -361,7 +364,9 @@ fn scan_for_unfunnelled_calls(text: &str) -> Result<Vec<(usize, String)>, String
                     index + 1
                 ));
             };
-            if item.ends_with('{') {
+            let item = item.trim_start();
+            let recognized_braced_item = item.starts_with("mod ") || item.starts_with("impl ");
+            if item.ends_with('{') && recognized_braced_item {
                 exempt = Exempt::UntilUnindentedBrace;
                 index = head + 1;
                 continue;
@@ -491,6 +496,29 @@ fn ship() {
         lines(scan_for_unfunnelled_calls(terminated).expect("a semicolon-terminated item scans")),
         vec![5],
         "a `#[cfg(test)] use ...;` must not exempt the function that follows it"
+    );
+
+    // A semicolon-terminated item can *start* with a line ending in `{`. It is
+    // not a braced item: the closure belongs to the initializer, and the item
+    // closes with `});`. Treating the first `{` as the item's delimiter latches
+    // the exemption through `ship`, exactly like the single-line `use` defect
+    // above. `static` is not one of the two braced shapes this crate needs, so
+    // the scanner refuses to guess where it ends.
+    let block_initializer = "\
+#[cfg(test)]
+static HOOK: LazyLock<()> = LazyLock::new(|| {
+    setup();
+});
+
+fn ship() {
+    std::fs::write(p, b\"\");
+}
+";
+    let reason = scan_for_unfunnelled_calls(block_initializer)
+        .expect_err("a block initializer must not be mistaken for a braced test item");
+    assert!(
+        reason.contains("cannot bound") && reason.contains("static HOOK"),
+        "the scanner must name the unsupported item rather than latch its exemption: {reason}"
     );
 
     // Stacked attributes and doc comments between the trigger and the item.

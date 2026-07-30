@@ -1284,13 +1284,16 @@ and the failure is the signal that the documented assumption changed. §3.1 reco
 the "directory holding only `LOCK` is empty" special case that startup state 1 depends on.
 
 **The funnel guard's exemption could still latch, and the fix is a scanner that refuses to guess.**
-Bounding a `#[cfg(test)]` exemption at the next column-zero `}` is right for a braced item and wrong
-for every other shape: after `#[cfg(test)] use crate::test_support;` the first such brace belongs to
-the *next* function, so all of it was skipped. The scanner now reads the shape of the attributed
-item — braced items are exempt to their closing brace, semicolon-terminated items exempt only
-themselves, and any third shape (including an item header rustfmt split across lines) **fails the
-guard** rather than being assumed safe. A shape the scanner cannot bound is not a shape it may
-treat as harmless.
+Bounding a `#[cfg(test)]` exemption at the next column-zero `}` is right for a recognized braced
+item and wrong for every other shape: after `#[cfg(test)] use crate::test_support;` the first such
+brace belongs to the *next* function, so all of it was skipped. A first repair still accepted
+anything whose first item line ended in `{`; that was the same latch in another spelling, because a
+semicolon-terminated `static` or `const` can begin a block initializer there and close with `};`.
+The scanner now accepts only the two braced top-level shapes the crate actually uses (`mod` and
+`impl`), exempts a one-line semicolon-terminated item only for that line, and **fails the guard** on
+every other shape (including a block initializer or an item header rustfmt split across lines)
+rather than assuming it is safe. A shape the scanner cannot bound is not a shape it may treat as
+harmless.
 
 It is also now a function over `&str` with synthetic tests, which is the load-bearing half. Mutating
 real sources only ever probes the shapes those sources happen to contain: no file in the crate has a

@@ -3819,6 +3819,10 @@ fn run_engine(
     // asserted about it. Asked after the reconciliation so a checkpoint the day
     // this stops refusing cannot move what the reconciliation read.
     let checkpoint = probe_checkpointing(&reopened)?;
+    // Read from the live engine, after the checkpoint probe, so it describes
+    // the state the bundle is about — and before the handle is dropped, because
+    // the reading only exists while the root is open.
+    let unsealed_delta_backlog = reopened.index_maintenance().unsealed_delta_layers;
     drop(reopened);
 
     // Per-repository sequence integrity, through the one shared checker.
@@ -3859,11 +3863,16 @@ fn run_engine(
                 validated_runs: index_scan.validated_runs,
                 unvalidatable: index_scan.unvalidatable,
                 groups: fences,
-                // Nothing seals, and `StoreEngine` exposes no reading of how
-                // many published deltas are outstanding. `None` is that
-                // absence, and it is what makes `runs_sealed` unearnable until
-                // the reading exists rather than inferable from a file count.
-                unsealed_delta_backlog: None,
+                // The reading the earlier `None` recorded the absence of.
+                // `IndexMaintenanceSnapshot` is taken from one captured
+                // committed root, so the backlog and the runs it is compared
+                // against describe the same instant — which is what makes
+                // `runs_sealed` a measurement rather than a file count.
+                //
+                // Taken from `reopened`, after the checkpoint probe, so it
+                // reports the state the bundle describes rather than the one
+                // before it.
+                unsealed_delta_backlog: Some(unsealed_delta_backlog),
             },
             configured_max_index_runs,
             default_max_index_runs,

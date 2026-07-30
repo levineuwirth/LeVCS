@@ -1629,6 +1629,53 @@ exposed it.
 turns this refusal into successful reclamation. Recorded in scope §6.5 with the checkpointing work
 that will exercise it.
 
+##### Contract review 2026-07-30-C
+
+**`StoreEngine::checkpoint` is implemented, and the ordering inside it is the correctness.** The
+frozen D0 signature returned `NotImplemented`; it now checkpoints every shard on its own writer
+thread and returns a lease.
+
+**The index run comes first, and completely.** The checkpoint format carries catalog, refs and
+receipts and **no object index**. Once `committed_shard_sequence` advances past a frame, recovery
+stops replaying it, so nothing rebuilds the entries that frame carried — if they live only in the
+root's delta layers, the objects are on disk, named by a segment, and unreachable. Every layer
+through the committed sequence is therefore sealed into a run the checkpoint's own manifest names,
+and discarded from the root, before the sequence moves. Coverage short of the committed sequence is
+refused rather than partially applied.
+
+**Real pinning.** `CheckpointLease` holds the exact `Arc<RetainedGeneration>` each shard published,
+so it pins segment and checkpoint descriptors and index-run mappings directly. Count-based retention
+cannot stand in: two further checkpoints prune the generation, and a lease that stopped being true
+after two unrelated operations would not be a lease.
+
+**The group boundary is structural.** The checkpoint travels the same channel as submissions, and
+the writer loop publishes any open group before running one. No lock, and no way to advance past
+sequenced-but-unfenced frames.
+
+**Four edge cases, each with a test.** A shard with no committed sequence is skipped rather than
+checkpointed at sequence 0 — the second is a real frame, and writing `0.checkpoint` for an empty
+shard would collide with the real one later. A repeat with no new work reuses rather than renaming
+onto its own name. A finalized but unreferenced checkpoint left by a crash between the rename and
+the manifest is validated through recovery's own reader and adopted, instead of wedging the shard on
+a permanent `EEXIST` for a file that is correct and merely unpublished. A journal holding no frame
+seals nothing: that is the state a reopen leaves when everything committed is already in segments,
+and A1 rightly refuses to seal an empty journal — the checkpoint is then a checkpoint row and
+nothing else.
+
+**Evidence.** `a_checkpoint_keeps_every_object_resolvable_through_a_reopen` writes below seal
+pressure, checkpoints, reopens, and resolves every object with the replay delta explicitly excluded
+as the answer. Both mutations the review named fail it on reachability, not on bookkeeping: dropping
+the run publication loses the genesis object, and sealing one sequence short loses the last push.
+
+**`store-bench` found the empty-journal case before any test did**, by calling the entry point that
+had always refused. It now also earns `index_maintenance` from a measurement: the emitter reads
+`index_maintenance().unsealed_delta_layers` where it previously recorded `None` for "no such reading
+exists". That was the interface request the guard itself had written down, and it is the one line of
+B4 surface this commit touches — the emitter's remaining claims are unchanged.
+
+**Next, and in this dispatch:** recovery discarding an index run whose covered identity was not
+preserved, which turns 2026-07-30-B's refusal into reclamation.
+
 ##### Contract review 2026-07-28-C
 
 B4 re-pointed `store-bench` at a real `StoreEngine::submit` and found that four verification

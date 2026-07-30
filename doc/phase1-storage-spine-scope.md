@@ -1680,6 +1680,12 @@ This is a scope consequence and not a defect: nothing here is unsound, and both 
 asserted by tests. It is written down so that "the shard seals under pressure" is not read as "the
 shard can run indefinitely under pressure", which is what checkpointing will make true.
 
+**Closed by contract review 2026-07-30-C.** `StoreEngine::checkpoint` advances the committed prefix,
+so the replay set is what lies above the newest checkpoint rather than everything the shard ever
+wrote. The ordering that makes it safe is recorded there: the checkpoint format holds no object
+index, so every delta layer through the committed sequence is sealed into a run its manifest names,
+and discarded, before the sequence moves.
+
 #### Closed: a run may cover frames the active journal still holds
 
 Recorded as a carry-forward with the index-maintenance slice and **closed** by contract review

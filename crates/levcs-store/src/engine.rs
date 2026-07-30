@@ -52,22 +52,25 @@ use crate::completion::SharedCompletion;
 use crate::failpoints::{self, Failpoint, FailpointAction};
 use crate::format::{
     frame_total_len, object_type_code, Frame, FrameHeader, FrameObjectV1, FrameObjectsV1,
-    FrameReceiptFieldsV1, RepositoryCreateV1, TransactionFramePayloadV1,
+    FrameReceiptFieldsV1, Manifest, RepositoryCreateV1, TailRange, TransactionFramePayloadV1,
 };
 use crate::index::{
     delta_pressure, DeltaPressure, IndexDelta, IndexKey, IndexLocation, IndexRun, IndexRunBuilder,
-    NamespaceLifecycle, NamespaceRecord, NamespaceStorageMode,
+    NamespaceCatalog, NamespaceLifecycle, NamespaceRecord, NamespaceStorageMode,
 };
+use std::path::{Path, PathBuf};
+
 use crate::journal::{GroupBuilder, Journal};
 use crate::options::StoreOptions;
 use crate::recovery::{RecoveredShard, RecoveryConfig, RecoverySession};
 use crate::roots::{
     CommittedRoot, GenerationId, GenerationMap, LayeredObjectIndex, OperationKey,
-    OperationStatusMetricSnapshot, OperationStatusMetrics, OperationStatusRoot, RepoMap, RepoState,
-    RetainedGeneration, RetainedIndexRun, RetainedReceipt, ShardSequenceMap, ShardSubtree,
+    OperationStatusMetricSnapshot, OperationStatusMetrics, OperationStatusRoot, PinnedFile,
+    RepoMap, RepoState, RetainedGeneration, RetainedIndexRun, RetainedReceipt,
+    RetainedSegment as RootRetainedSegment, RetainedTail, ShardSequenceMap, ShardSubtree,
     StatusEntry, StatusReservation, TerminalStatusEntry, TerminalStatusMap, TypedRefMap,
 };
-use crate::segment::{self, RootLayout};
+use crate::segment::{self, RootLayout, SegmentReader};
 use crate::snapshot::RepoSnapshot;
 use crate::staging::ProjectionStaging;
 use crate::transaction::ValidatedTransaction;
@@ -88,8 +91,19 @@ pub struct StoreEngine {
 
 /// A held checkpoint export lease. Pins the referenced generation's segments,
 /// indexes, and checkpoints against reclamation until dropped.
+///
+/// The pin is the exact `RetainedGeneration` each shard published, so it holds
+/// open file descriptors for segments and checkpoints and the mappings behind
+/// index runs — the same objects the committed root pins, kept alive
+/// independently of it. Count-based retention cannot stand in for this: two
+/// further checkpoints prune the generation this lease names, and a lease that
+/// stopped being true after two unrelated operations would not be a lease.
+///
+/// Nothing reads the field, and that is what it is for. Holding it is the whole
+/// contract; dropping it releases the pin.
 pub struct CheckpointLease {
-    _private: (),
+    #[allow(dead_code)]
+    generations: Vec<Arc<RetainedGeneration>>,
 }
 
 impl std::fmt::Debug for StoreEngine {
@@ -164,7 +178,7 @@ struct EngineShared {
 struct ShardHandle {
     /// `Option` so `Drop` can close the channel before joining. A shard thread
     /// exits on disconnect, so dropping the sender is the shutdown signal.
-    submissions: Option<Sender<Submission>>,
+    submissions: Option<Sender<Command>>,
     thread: Option<JoinHandle<()>>,
     /// **Not reachable from outside the crate yet.** The counters are the only
     /// witness for "one fence per group", and B4's harness will need them
@@ -178,6 +192,19 @@ struct ShardHandle {
 struct Submission {
     transaction: ValidatedTransaction,
     completion: SharedCompletion,
+}
+
+/// What a shard writer accepts, on the one channel that reaches it.
+///
+/// A checkpoint is a message rather than a lock taken from the caller's thread
+/// because the writer thread is the only thing that may touch the journal, the
+/// open group, or the shard's publication path. Sending it here is also what
+/// makes "at a group boundary" structural: the loop publishes any open group
+/// before it runs one, so a checkpoint cannot advance the committed sequence
+/// past frames that are still unfenced.
+enum Command {
+    Submit(Submission),
+    Checkpoint(Sender<Result<Option<Arc<RetainedGeneration>>, StoreError>>),
 }
 
 impl StoreEngine {
@@ -348,10 +375,10 @@ impl StoreEngine {
 
         let completion = SharedCompletion::new();
         let waiter = completion.subscribe();
-        let submission = Submission {
+        let submission = Command::Submit(Submission {
             transaction: txn,
             completion,
-        };
+        });
         // The queue bound is backpressure, not a wait. Blocking the caller's
         // task inside a crate that starts no runtime would hand the store a
         // scheduling decision that belongs to its embedder (plan §7).
@@ -434,10 +461,36 @@ impl StoreEngine {
     }
 
     /// Force a checkpoint and hold a lease on the resulting generation.
+    ///
+    /// Every shard, in order, each on its own writer thread at a group
+    /// boundary. Shards with nothing committed are skipped rather than
+    /// checkpointed at sequence 0 — "no committed sequence" and "committed
+    /// through the first frame" are different facts about a shard, and a
+    /// checkpoint file is a claim about frames.
+    ///
+    /// Blocking, because the frozen signature is synchronous and because a
+    /// checkpoint is an operator action rather than a request path. A shard
+    /// that fails stops the operation: the shards that already checkpointed
+    /// keep their durable state, which is sound but partial, and reporting the
+    /// error is the only honest thing to do with it.
     pub fn checkpoint(&self) -> Result<CheckpointLease, StoreError> {
-        Err(StoreError::NotImplemented(
-            "StoreEngine::checkpoint — B1 NamespaceTxn, scope 6-B1",
-        ))
+        let mut generations = Vec::with_capacity(self.shards.len());
+        for handle in &self.shards {
+            let sender = handle.submissions.as_ref().ok_or(StoreError::NotReady)?;
+            let (reply, answer) = crossbeam_channel::bounded(1);
+            sender
+                .send(Command::Checkpoint(reply))
+                .map_err(|_| StoreError::NotReady)?;
+            match answer.recv() {
+                Ok(Ok(Some(generation))) => generations.push(generation),
+                Ok(Ok(None)) => {}
+                Ok(Err(error)) => return Err(error),
+                // The writer thread died holding this request. Whatever it did
+                // before that is recorded on disk; this process cannot say what.
+                Err(_) => return Err(StoreError::NotReady),
+            }
+        }
+        Ok(CheckpointLease { generations })
     }
 
     /// Durability counters for one shard, so "one fence per group" and "no
@@ -1552,7 +1605,7 @@ struct Prepared {
     transaction: Arc<ValidatedTransaction>,
 }
 
-fn run_shard_writer(mut writer: ShardWriter, submissions: Receiver<Submission>) {
+fn run_shard_writer(mut writer: ShardWriter, submissions: Receiver<Command>) {
     let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         loop {
             // The idle bound is a receive deadline, not a timer thread: an
@@ -1565,7 +1618,18 @@ fn run_shard_writer(mut writer: ShardWriter, submissions: Receiver<Submission>) 
                     .map_err(|_| RecvTimeoutError::Disconnected),
             };
             match message {
-                Ok(submission) => writer.accept(submission),
+                Ok(Command::Submit(submission)) => writer.accept(submission),
+                // The group boundary. Publishing first is not tidiness: the
+                // checkpoint is about to declare a committed prefix durable,
+                // and an open group holds sequenced frames that are not fenced
+                // yet. A reply the caller can no longer receive is dropped, and
+                // the checkpoint still stands — it is durable state, not a
+                // response.
+                Ok(Command::Checkpoint(reply)) => {
+                    writer.publish_open_group();
+                    let outcome = writer.checkpoint();
+                    let _ = reply.send(outcome);
+                }
                 Err(RecvTimeoutError::Timeout) => writer.publish_open_group(),
                 Err(RecvTimeoutError::Disconnected) => {
                     // A transaction already accepted is already sequenced.
@@ -2837,6 +2901,437 @@ impl ShardWriter {
     /// no longer describe the device. A false poison costs an operator a
     /// recovery; a missed one lets the writer continue on an ambiguous root,
     /// which is the failure this boundary exists to prevent.
+    /// Scope 3.7: make a committed prefix durable outside the active journal
+    /// and move the replay horizon past it.
+    ///
+    /// Runs on the writer thread with no open group, which is the only place
+    /// the committed sequence means what a checkpoint needs it to mean.
+    ///
+    /// # Why an index run comes first
+    ///
+    /// The checkpoint format holds catalog, refs and receipts — **no object
+    /// index**. Once `committed_shard_sequence` advances past a frame, recovery
+    /// stops replaying it, so nothing rebuilds the `(namespace, object) ->
+    /// location` entries that frame carried. If those entries live only in the
+    /// root's delta layers, the objects vanish at the next open: still on disk,
+    /// still named by a segment, and unreachable.
+    ///
+    /// So every layer through the committed sequence is sealed into a run the
+    /// checkpoint's own manifest names, and removed from the root, before the
+    /// sequence moves. That ordering is the correctness of this function.
+    ///
+    /// `Ok(None)` is a shard with nothing committed — not sequence 0, which is
+    /// a real frame.
+    fn checkpoint(&mut self) -> Result<Option<Arc<RetainedGeneration>>, StoreError> {
+        if let Some(poison) = self.poison.clone() {
+            return Err(poison);
+        }
+        let root = self.shared.committed.load();
+        let Some(committed) = root.shard_committed_sequence(self.shard_index) else {
+            return Ok(None);
+        };
+
+        let paths = RootLayout::new(&self.shared.options.root).shard(self.shard_index);
+        let root_uuid = self.shared.root_uuid;
+        let counters = Arc::clone(self.journal.counters_handle());
+        let current_generation = self.current_manifest_generation(&root)?;
+        let manifest = read_manifest_or_empty(&paths, current_generation, &root_uuid)?;
+
+        // Already checkpointed at this sequence and nothing has been committed
+        // since. Reusing is not an optimization: `<sequence>.checkpoint` is the
+        // installed name, so writing again would collide on a rename that
+        // refuses to replace, and a second manifest generation would claim
+        // progress that did not happen.
+        if manifest.committed_shard_sequence == committed
+            && manifest
+                .checkpoints
+                .iter()
+                .any(|(sequence, _)| *sequence == committed)
+        {
+            return Ok(root
+                .retained_generations()
+                .get(&GenerationId::new(self.shard_index, current_generation))
+                .map(Arc::clone));
+        }
+
+        // --- index first, and completely ------------------------------------
+        let backlog = self.unsealed_backlog(&root);
+        if backlog.layers != 0 {
+            match self.coverable_through(&root) {
+                Some(through) if through >= committed => self.seal_index(&root, committed)?,
+                other => {
+                    return Err(StoreError::Corruption(format!(
+                        "shard {} cannot checkpoint through {committed}: index coverage reaches \
+                         {other:?}, so advancing the committed sequence would drop the objects \
+                         those frames carry",
+                        self.shard_index
+                    )))
+                }
+            }
+        }
+
+        // Re-read: sealing published a generation and discarded the layers it
+        // covered, and everything below must build on that root, not the one
+        // this function started with.
+        let root = self.shared.committed.load();
+        let current_generation = self.current_manifest_generation(&root)?;
+        let manifest = read_manifest_or_empty(&paths, current_generation, &root_uuid)?;
+        let next_generation = current_generation + 1;
+
+        let checkpoint = self.checkpoint_body(&root, committed)?;
+
+        // --- durable from here: every failure below poisons ------------------
+        let installed = match self.install_or_adopt_checkpoint(&paths, &checkpoint, &counters) {
+            Ok(installed) => installed,
+            Err(error) => return Err(self.poison_now(format!("installing a checkpoint: {error}"))),
+        };
+
+        // The manifest may not commit through a sequence no retained segment
+        // names, so the prefix in `active/` is sealed in the same publication.
+        // The segment inherits the tail's logical generation: the frames keep
+        // the identity every `IndexLocation` above already names them by
+        // (contract review 2026-07-30-A).
+        //
+        // Unless there is no prefix. A journal holding no frame is the state a
+        // reopen leaves when everything committed is already in segments — the
+        // shard is checkpointable and has nothing to seal, and A1 correctly
+        // refuses to seal an empty journal. The checkpoint is then a checkpoint
+        // row and nothing else, and the manifest must already commit exactly
+        // where the root does or the two disagree about frames neither holds.
+        let sealed = match self.journal.last_appended_shard_sequence() {
+            None if manifest.committed_shard_sequence != committed => {
+                return Err(StoreError::Corruption(format!(
+                    "shard {} commits through {committed} with an empty journal, but its                      manifest commits through {}; nothing names the difference",
+                    self.shard_index, manifest.committed_shard_sequence
+                )))
+            }
+            None => None,
+            Some(_) => {
+                let sealed_generation = self.tail_generation;
+                let first = self.journal.header().first_shard_sequence;
+                let active_path = self.journal.path().to_path_buf();
+                let segment_path = match segment::seal_journal(
+                    &mut self.journal,
+                    &paths,
+                    sealed_generation,
+                    &counters,
+                ) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        return Err(
+                            self.poison_now(format!("sealing the checkpointed prefix: {error}"))
+                        )
+                    }
+                };
+                let filename = match segment_path.file_name().and_then(|name| name.to_str()) {
+                    Some(name) => name.to_string(),
+                    None => return Err(self.poison_now("sealed segment name is not UTF-8".into())),
+                };
+                Some(SealedPrefix {
+                    generation: sealed_generation,
+                    first,
+                    filename,
+                    segment_path,
+                    active_path,
+                })
+            }
+        };
+
+        let mut retained_tail_ranges = manifest.retained_tail_ranges.clone();
+        if let Some(sealed) = &sealed {
+            retained_tail_ranges.push(TailRange {
+                generation: sealed.generation,
+                first_shard_sequence: sealed.first,
+                last_shard_sequence: committed,
+                filename: sealed.filename.clone(),
+            });
+        }
+        let mut checkpoints = manifest.checkpoints.clone();
+        checkpoints.retain(|(sequence, _)| *sequence != committed);
+        checkpoints.push((committed, checkpoint.file_name()));
+        let retain = self.shared.options.checkpoint_retain.max(2) as usize;
+        if checkpoints.len() > retain {
+            checkpoints.drain(..checkpoints.len() - retain);
+        }
+        let published = Manifest {
+            root_uuid,
+            generation: next_generation,
+            base_generation: manifest.base_generation,
+            retained_tail_ranges,
+            index_runs: manifest.index_runs.clone(),
+            checkpoints,
+            committed_shard_sequence: committed,
+        };
+        if let Err(error) = segment::install_manifest(
+            &paths,
+            &published,
+            self.shared.options.manifest_retain,
+            &counters,
+        ) {
+            return Err(self.poison_now(format!("publishing a checkpoint manifest: {error}")));
+        }
+
+        // The sealed name is now authoritative, so the active one is dead. Only
+        // a shard that sealed replaces its journal; one that had nothing to
+        // seal keeps writing into the journal it already has.
+        if let Some(sealed) = &sealed {
+            if let Err(error) =
+                segment::unlink_sealed_journal(&sealed.active_path, &paths, &counters)
+            {
+                return Err(self.poison_now(format!("unlinking the sealed journal: {error}")));
+            }
+            let journal = match Journal::create(
+                &paths.active(),
+                fresh_checkpoint_journal_id(root_uuid, self.shard_index, committed),
+                committed.saturating_add(1),
+                self.shard_index,
+                root_uuid,
+                self.shared.options.journal_preallocate_bytes,
+                now_micros(),
+                Arc::clone(&counters),
+            ) {
+                Ok(journal) => journal,
+                Err(error) => {
+                    return Err(
+                        self.poison_now(format!("opening the post-checkpoint journal: {error}"))
+                    )
+                }
+            };
+            self.journal = journal;
+            self.tail_generation = sealed.generation + 1;
+        }
+
+        let successor = match self.retain_checkpointed_generation(
+            &root,
+            current_generation,
+            next_generation,
+            sealed.as_ref(),
+            committed,
+            &installed,
+        ) {
+            Ok(successor) => successor,
+            Err(error) => return Err(self.poison_now(format!("pinning a checkpoint: {error}"))),
+        };
+
+        let mut generations = GenerationMap::new();
+        generations.insert(successor.id, Arc::clone(&successor));
+        let mut subtree = ShardSubtree::new(
+            self.shard_index,
+            committed,
+            Arc::new(IndexDelta::from_options(&self.shared.options)),
+            Some(committed),
+            Vector::new(),
+            RepoMap::new(),
+            TerminalStatusMap::new(),
+            generations,
+        );
+        subtree
+            .retained_generation_removals
+            .push_back(GenerationId::new(self.shard_index, current_generation));
+        if let Err(error) = self.publish_subtree(&subtree) {
+            return Err(self.poison_now(format!("publishing a checkpoint: {error}")));
+        }
+
+        // Only after both the checkpoint and its authoritative manifest are
+        // fenced, so every retained manifest keeps a retained referent.
+        if let Err(error) = crate::checkpoint::prune(
+            &paths.checkpoints(),
+            self.shared.options.checkpoint_retain,
+            &counters,
+        ) {
+            return Err(self.poison_now(format!("pruning checkpoints: {error}")));
+        }
+        Ok(Some(successor))
+    }
+
+    fn current_manifest_generation(&self, root: &CommittedRoot) -> Result<u64, StoreError> {
+        root.retained_generations()
+            .keys()
+            .filter(|id| id.shard_index == self.shard_index)
+            .map(|id| id.manifest_generation)
+            .max()
+            .ok_or_else(|| {
+                StoreError::Corruption(format!(
+                    "shard {} has no retained manifest generation to checkpoint against",
+                    self.shard_index
+                ))
+            })
+    }
+
+    /// Derived shard state through `committed`, read from the published root.
+    fn checkpoint_body(
+        &self,
+        root: &CommittedRoot,
+        committed: u64,
+    ) -> Result<crate::checkpoint::Checkpoint, StoreError> {
+        let shard_count = self.shared.shard_count;
+        let mut catalog = NamespaceCatalog::new();
+        let mut refs = Vec::new();
+        for (namespace, state) in root.repositories().iter() {
+            if StoreOptions::shard_of(namespace, shard_count) != self.shard_index {
+                continue;
+            }
+            catalog.bind(NamespaceRecord {
+                namespace: *namespace,
+                genesis_authority: state.genesis_authority,
+                current_authority: state.current_authority,
+                lifecycle: state.lifecycle,
+                storage_mode: state.storage_mode,
+                repo_sequence: state.repo_sequence,
+                previous_event_digest: state.previous_event_digest,
+            })?;
+            for (target, object) in state.refs.iter() {
+                refs.push(RefRecord::from_target(*namespace, target, *object));
+            }
+        }
+
+        let mut receipts = Vec::new();
+        for (key, entry) in root.terminal_statuses().iter() {
+            if StoreOptions::shard_of(&key.namespace, shard_count) != self.shard_index {
+                continue;
+            }
+            let TerminalStatusEntry::Committed(retained) = entry else {
+                continue;
+            };
+            receipts.push(ReceiptRecord {
+                namespace: key.namespace,
+                operation_id: key.operation_id,
+                operation_digest: retained.operation_digest,
+                repo_sequence: retained.receipt.repo_sequence,
+                shard_sequence: retained.shard_sequence,
+                current_authority: retained.receipt.current_authority,
+                refs: retained.receipt.refs.clone(),
+                objects_new: retained.receipt.objects_new,
+                retry_until_micros: retained.retry_until_micros,
+                first_receipt_visibility_micros: Some(retained.first_visible_at_micros),
+                receipt_visible_until_micros: retained.receipt_visible_until_micros,
+            });
+        }
+
+        Ok(crate::checkpoint::Checkpoint {
+            root_uuid: self.shared.root_uuid,
+            shard_index: self.shard_index,
+            shard_committed_sequence: committed,
+            // The resume point. `journal_id` accompanies the offset because an
+            // offset alone is meaningless once the journal has rotated, and
+            // recovery checks the identity before it trusts the offset. This
+            // checkpoint seals the current journal away, so the pair names the
+            // journal being replaced and recovery correctly declines to resume
+            // into the fresh one.
+            active_journal_id: self.journal.journal_id(),
+            active_journal_offset: self.journal.cursor(),
+            created_at_micros: now_micros(),
+            catalog,
+            refs,
+            receipts,
+        })
+    }
+
+    /// Install the checkpoint, or adopt a finalized one already at its name.
+    ///
+    /// A crash between `install`'s rename and the manifest that publishes it
+    /// leaves a complete, fenced checkpoint no manifest references. Its name is
+    /// derived from the sequence, so the next attempt at the same sequence
+    /// renames onto it — and `rename_noreplace` refuses, permanently, for a
+    /// file that is not wrong but merely unreferenced. Validating and adopting
+    /// it is what turns a wedged shard back into a checkpointed one.
+    fn install_or_adopt_checkpoint(
+        &self,
+        paths: &crate::segment::ShardPaths,
+        checkpoint: &crate::checkpoint::Checkpoint,
+        counters: &Arc<DurabilityCounters>,
+    ) -> Result<PathBuf, StoreError> {
+        let directory = paths.checkpoints();
+        let destination = directory.join(checkpoint.file_name());
+        if !destination.exists() {
+            return crate::checkpoint::install(&directory, checkpoint, counters);
+        }
+
+        // Adopted only through the reader recovery itself uses. A file at the
+        // right name that does not validate is not a checkpoint, and silently
+        // replacing it would destroy the evidence of whatever wrote it.
+        match crate::checkpoint::load_newest_valid(
+            &directory,
+            &self.shared.root_uuid,
+            self.shard_index,
+            self.shared.options.manifest_retain.max(2) as usize,
+        )? {
+            crate::checkpoint::CheckpointLoad::Loaded {
+                checkpoint: existing,
+                path,
+                ..
+            } if existing.shard_committed_sequence == checkpoint.shard_committed_sequence
+                && path == destination =>
+            {
+                Ok(destination)
+            }
+            _ => Err(StoreError::Corruption(format!(
+                "{} already exists and is not a valid checkpoint for shard {} through {}",
+                destination.display(),
+                self.shard_index,
+                checkpoint.shard_committed_sequence
+            ))),
+        }
+    }
+
+    /// The successor pin: what the predecessor held, plus the sealed segment
+    /// and the checkpoint, with the active tail replaced by the fresh journal.
+    fn retain_checkpointed_generation(
+        &self,
+        root: &CommittedRoot,
+        current_generation: u64,
+        next_generation: u64,
+        sealed: Option<&SealedPrefix>,
+        last: u64,
+        checkpoint_path: &Path,
+    ) -> Result<Arc<RetainedGeneration>, StoreError> {
+        let previous = root
+            .retained_generations()
+            .get(&GenerationId::new(self.shard_index, current_generation))
+            .map(Arc::clone)
+            .ok_or_else(|| {
+                StoreError::Corruption(format!(
+                    "generation {current_generation} vanished from the root while checkpointing"
+                ))
+            })?;
+
+        let mut segments = previous.segments.to_vec();
+        if let Some(sealed) = sealed {
+            segments.push(RootRetainedSegment::new(
+                sealed.generation,
+                self.journal_id_of_sealed_prefix(&sealed.segment_path)?,
+                sealed.first,
+                last,
+                PinnedFile::open(&sealed.segment_path)?,
+            ));
+        }
+        let mut checkpoints = previous.checkpoints.to_vec();
+        checkpoints.push(PinnedFile::open(checkpoint_path)?);
+        let active_tails = vec![RetainedTail::new(
+            self.tail_generation,
+            PinnedFile::from_shared(
+                self.journal.path().to_path_buf(),
+                Arc::new(self.journal.file().try_clone()?),
+            ),
+        )];
+
+        Ok(Arc::new(RetainedGeneration::new(
+            GenerationId::new(self.shard_index, next_generation),
+            segments.into(),
+            Arc::clone(&previous.index_runs),
+            checkpoints.into(),
+            active_tails.into(),
+            Arc::clone(&previous.projection_artifacts),
+        )))
+    }
+
+    /// Read back through the same reader recovery uses, rather than trusting
+    /// the id the writer happened to be holding.
+    fn journal_id_of_sealed_prefix(&self, segment_path: &Path) -> Result<[u8; 16], StoreError> {
+        let reader = SegmentReader::open(segment_path, &self.shared.root_uuid)?;
+        Ok(reader.footer().journal_id)
+    }
+
     fn seal_index(&mut self, root: &CommittedRoot, covered_through: u64) -> Result<(), StoreError> {
         // Both ceilings, before anything is durable, and against the *same*
         // numbers recovery enforces when it reopens the manifest (scope 3.8). A
@@ -6828,6 +7323,307 @@ mod index_maintenance_tests {
         }
     }
 
+    /// The checkpoint acceptance point: nothing acknowledged may become
+    /// unreachable by making it durable.
+    ///
+    /// Written **below** seal pressure on purpose, so no index run exists when
+    /// the checkpoint begins. The checkpoint format carries no object index, and
+    /// advancing `committed_shard_sequence` stops recovery replaying the frames
+    /// it covers — so unless the checkpoint seals the delta layers into a run
+    /// its own manifest names, every object committed here is on disk, named by
+    /// a segment, and unreachable after the reopen.
+    ///
+    /// The post-reopen lookups are guarded against being answered by a replay
+    /// delta, because a store that replayed the frames anyway would pass a bare
+    /// lookup while proving nothing about the run.
+    #[test]
+    fn a_checkpoint_keeps_every_object_resolvable_through_a_reopen() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let namespace = NamespaceId([0x51; 32]);
+        let configure = || {
+            let mut options = sealing_options(&serial, temporary.path(), 4_000_000);
+            options.max_index_runs = 8;
+            options.max_open_index_runs = 8;
+            options
+        };
+        let mut objects = vec![genesis_object().id];
+        {
+            let engine = StoreEngine::open(configure()).expect("open a fresh root");
+            block_on(engine.submit(create_transaction(namespace, 2))).expect("create");
+            objects.extend(push_groups(&engine, namespace, 0x60, 3));
+
+            let before = engine.index_maintenance();
+            assert_eq!(
+                before.sealed_runs, 0,
+                "this must checkpoint from below seal pressure, or the run it depends \
+                 on was already there and the test proves nothing"
+            );
+            assert!(
+                before.unsealed_delta_layers > 0,
+                "there must be unsealed layers for the checkpoint to have to persist"
+            );
+
+            let lease = engine.checkpoint().expect("checkpoint");
+            let after = engine.index_maintenance();
+            assert_eq!(
+                after.sealed_runs, 1,
+                "the checkpoint must seal what it is about to stop replaying"
+            );
+            assert_eq!(
+                after.unsealed_delta_layers, 0,
+                "and discard it from the root, or the layers outlive the frames"
+            );
+            drop(lease);
+        }
+
+        let engine = StoreEngine::open(configure()).expect("reopen through production recovery");
+        let root = engine.committed_root();
+        for object in &objects {
+            let key = IndexKey::new(namespace, *object);
+            assert!(
+                root.index()
+                    .delta_layers()
+                    .iter()
+                    .all(|layer| layer.delta.get(&key).is_none()),
+                "{} is answered by a replay delta, so this asserts nothing about the \
+                 checkpointed run",
+                object.to_hex()
+            );
+            let location = root.index().get(&key).unwrap_or_else(|| {
+                panic!(
+                    "{} was acknowledged before the checkpoint and is now unreachable",
+                    object.to_hex()
+                )
+            });
+            assert!(
+                root.object_source(0, location.segment_generation)
+                    .expect("resolve")
+                    .is_some(),
+                "{} resolves to a generation the reopened root does not pin",
+                object.to_hex()
+            );
+        }
+    }
+
+    fn checkpoint_files(root: &Path, shard: u16) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(shard_paths(root, shard).checkpoints())
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter_map(|entry| entry.file_name().into_string().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// A shard with nothing committed has nothing to make durable.
+    ///
+    /// "No committed sequence" is not "committed through sequence 0" — the
+    /// second is a real frame. Writing `0.checkpoint` for an empty shard would
+    /// claim a frame that does not exist, and the next checkpoint at the real
+    /// sequence 0 would then collide with it.
+    #[test]
+    fn an_empty_shard_is_skipped_rather_than_checkpointed_at_sequence_zero() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let engine = StoreEngine::open(sealing_options(&serial, temporary.path(), 4_000_000))
+            .expect("open a fresh root");
+
+        drop(
+            engine
+                .checkpoint()
+                .expect("checkpointing an empty root is not an error"),
+        );
+        assert!(
+            checkpoint_files(temporary.path(), 0).is_empty(),
+            "an empty shard must install no checkpoint at all"
+        );
+    }
+
+    /// Checkpointing twice with nothing in between must reuse, not collide.
+    ///
+    /// The installed name is derived from the committed sequence, so a second
+    /// attempt at the same sequence renames onto a name that already exists —
+    /// and `rename_noreplace` refuses. Reuse is also the honest answer: no new
+    /// frame means no new durable state to record.
+    #[test]
+    fn checkpointing_again_with_no_new_work_reuses_rather_than_collides() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let namespace = NamespaceId([0x52; 32]);
+        let engine = StoreEngine::open(sealing_options(&serial, temporary.path(), 4_000_000))
+            .expect("open a fresh root");
+        block_on(engine.submit(create_transaction(namespace, 2))).expect("create");
+        push_groups(&engine, namespace, 0x60, 2);
+
+        drop(engine.checkpoint().expect("first checkpoint"));
+        let after_first = checkpoint_files(temporary.path(), 0);
+        let runs_after_first = engine.index_maintenance().sealed_runs;
+
+        drop(
+            engine
+                .checkpoint()
+                .expect("a repeat checkpoint must not collide"),
+        );
+        assert_eq!(
+            checkpoint_files(temporary.path(), 0),
+            after_first,
+            "a repeat with no new work must install nothing new"
+        );
+        assert_eq!(
+            engine.index_maintenance().sealed_runs,
+            runs_after_first,
+            "and must not seal a run over an empty backlog either"
+        );
+    }
+
+    /// A crash between the checkpoint's rename and the manifest that publishes
+    /// it leaves a complete file no manifest references.
+    ///
+    /// Its name is the committed sequence, so the next attempt renames onto it
+    /// and is refused — permanently, for a file that is valid and merely
+    /// unreferenced. The shard would never checkpoint again. Validating and
+    /// adopting it is what makes the crash recoverable.
+    #[test]
+    fn a_finalized_but_unreferenced_checkpoint_is_adopted_rather_than_wedging() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let namespace = NamespaceId([0x53; 32]);
+        let engine = StoreEngine::open(sealing_options(&serial, temporary.path(), 4_000_000))
+            .expect("open a fresh root");
+        block_on(engine.submit(create_transaction(namespace, 2))).expect("create");
+        let objects = push_groups(&engine, namespace, 0x60, 2);
+        let committed = engine
+            .committed_root()
+            .shard_committed_sequence(0)
+            .expect("the shard has committed frames");
+
+        // Exactly what the crash leaves: a valid checkpoint at the name this
+        // checkpoint is about to use, referenced by nothing.
+        let counters = Arc::new(DurabilityCounters::default());
+        let stranded = crate::checkpoint::Checkpoint::empty(root_uuid_of(temporary.path()), 0);
+        let stranded = crate::checkpoint::Checkpoint {
+            shard_committed_sequence: committed,
+            ..stranded
+        };
+        let path = crate::checkpoint::install(
+            &shard_paths(temporary.path(), 0).checkpoints(),
+            &stranded,
+            &counters,
+        )
+        .expect("strand a finalized checkpoint");
+        assert!(path.is_file());
+
+        drop(
+            engine
+                .checkpoint()
+                .expect("a finalized but unreferenced checkpoint must be adopted"),
+        );
+        let root = engine.committed_root();
+        for object in &objects {
+            assert!(
+                root.index()
+                    .get(&IndexKey::new(namespace, *object))
+                    .is_some(),
+                "{} must survive an adopted checkpoint",
+                object.to_hex()
+            );
+        }
+    }
+
+    /// A checkpoint may not advance past an open, unfenced group.
+    ///
+    /// The frames of an open group are sequenced but not yet fenced or
+    /// published. A checkpoint that ran beside one would either commit through
+    /// a sequence no segment holds, or seal a prefix while the writer was still
+    /// appending to it. The boundary is structural rather than a lock: the
+    /// checkpoint arrives on the same channel as submissions, and the writer
+    /// loop publishes any open group before it runs one.
+    ///
+    /// Deterministic by construction. The submission is polled exactly once, so
+    /// it is inside the writer's open group and nothing has closed it, and the
+    /// checkpoint is issued from this thread while it sits there.
+    #[test]
+    fn a_checkpoint_publishes_the_open_group_it_finds_before_advancing() {
+        struct ThreadWaker(std::thread::Thread);
+        impl Wake for ThreadWaker {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let namespace = NamespaceId([0x54; 32]);
+        let configure = || {
+            let mut options = sealing_options(&serial, temporary.path(), 4_000_000);
+            // Room for the group to stay open. The idle bound is what closes a
+            // one-member group, so it is long relative to the microseconds
+            // between polling the submission and issuing the checkpoint, and
+            // short enough that the setup transaction still publishes.
+            options.max_group_transactions = 8;
+            options.max_group_idle = Duration::from_millis(250);
+            options
+        };
+        let engine = StoreEngine::open(configure()).expect("open a fresh root");
+        block_on(engine.submit(create_transaction(namespace, 2))).expect("create");
+
+        let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+        let mut context = Context::from_waker(&waker);
+        let pending = engine.submit(push_transaction(namespace, 0x61, 0x61, None));
+        let mut pending = std::pin::pin!(pending);
+        assert!(
+            pending.as_mut().poll(&mut context).is_pending(),
+            "the submission must still be in the writer's open group"
+        );
+
+        drop(
+            engine
+                .checkpoint()
+                .expect("checkpoint beside an open group"),
+        );
+
+        let start = std::time::Instant::now();
+        let receipt = loop {
+            if let Poll::Ready(output) = pending.as_mut().poll(&mut context) {
+                break output.expect("the open group publishes rather than being abandoned");
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(30),
+                "the submission the checkpoint published never completed"
+            );
+            std::thread::park_timeout(Duration::from_millis(5));
+        };
+        assert_eq!(receipt.repo_sequence, 1);
+
+        // The claim is that the group was published *into* the checkpoint, not
+        // merely allowed to finish afterwards: the manifest commits through
+        // exactly what the root does.
+        let manifest = read_manifest(
+            &shard_paths(temporary.path(), 0),
+            read_current(
+                &shard_paths(temporary.path(), 0),
+                &root_uuid_of(temporary.path()),
+            )
+            .expect("CURRENT")
+            .expect("a checkpointed root has a CURRENT")
+            .generation,
+            &root_uuid_of(temporary.path()),
+        )
+        .expect("read the checkpoint's manifest");
+        assert_eq!(
+            Some(manifest.committed_shard_sequence),
+            engine.committed_root().shard_committed_sequence(0),
+            "the checkpoint committed through the sequence the open group produced"
+        );
+    }
+
     /// The discard is scoped to the shard that sealed.
     #[test]
     fn only_the_sealing_shards_layers_are_discarded() {
@@ -7214,4 +8010,67 @@ mod index_maintenance_tests {
             "a failed seal must publish nothing"
         );
     }
+}
+
+/// What a checkpoint sealed out of `active/`, when it sealed anything.
+struct SealedPrefix {
+    generation: u64,
+    first: u64,
+    filename: String,
+    segment_path: PathBuf,
+    active_path: PathBuf,
+}
+
+/// The manifest a generation names, or the empty one a shard that has never
+/// published a manifest implies.
+///
+/// A root opened fresh has a retained generation and no manifest file: nothing
+/// has been sealed and nothing published, so there is no generation to read.
+/// The synthesized manifest says exactly that — no retained tail, no runs, a
+/// committed prefix of zero — and only **absence** synthesizes. A manifest that
+/// exists and does not decode is corrupt, and replacing it would erase the
+/// predecessor recovery falls back to.
+fn read_manifest_or_empty(
+    paths: &crate::segment::ShardPaths,
+    generation: u64,
+    root_uuid: &[u8; 16],
+) -> Result<Manifest, StoreError> {
+    match segment::read_manifest(paths, generation, root_uuid) {
+        Ok(manifest) => Ok(manifest),
+        Err(StoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(Manifest {
+                root_uuid: *root_uuid,
+                generation,
+                base_generation: 0,
+                retained_tail_ranges: Vec::new(),
+                index_runs: Vec::new(),
+                checkpoints: Vec::new(),
+                committed_shard_sequence: 0,
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// A journal identity for the journal a checkpoint opens.
+///
+/// Distinct domain from recovery's so the two cannot collide, and it carries
+/// the sequence the journal begins at so a name in a crash image says which
+/// checkpoint opened it.
+fn fresh_checkpoint_journal_id(root_uuid: [u8; 16], shard: u16, committed: u64) -> [u8; 16] {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"levcs-checkpoint-journal-id/v1\0");
+    hasher.update(&root_uuid);
+    hasher.update(&shard.to_le_bytes());
+    hasher.update(&committed.to_le_bytes());
+    hasher.update(&now_micros().to_le_bytes());
+    hasher.update(&std::process::id().to_le_bytes());
+    hasher.update(&NEXT.fetch_add(1, Ordering::Relaxed).to_le_bytes());
+    let digest = hasher.finalize();
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&digest.as_bytes()[..16]);
+    id
 }

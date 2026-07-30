@@ -1696,15 +1696,23 @@ sealed segment inherits the **tail's** logical generation, so moving frames from
 next free **manifest** generation, so an index run's manifest cannot collide with a recovery's.
 Sealing therefore covers current frames, in the session that wrote them.
 
-**Residual, one case wide.** If a `.seg` already occupies the tail's identity — an orphan from an
-interrupted seal, or a segment no manifest references — the seal cannot use that name and falls back
-to a free generation, renaming the frames. An index run holding locations against the old identity
-then resolves to nothing. Recovery must not refuse here: an orphan segment is a documented state in
-which the active journal stays the authority, and refusing would turn a recoverable root into an
-outage. The closure is for recovery to **discard index runs whose covered identity was not
-preserved**, which is a change to what recovery reclaims and belongs with the checkpointing work that
-will exercise it. Until then the hazard is confined to roots carrying an orphan segment, where it was
-previously universal.
+**Residual, one case wide, and it refuses rather than proceeds.** If a `.seg` already occupies the
+tail's identity — an orphan from an interrupted seal, or a segment no manifest references — the seal
+cannot use that name and the frames must be renamed. Contract review 2026-07-30-B splits what that
+costs:
+
+- **Nothing published names the displaced identity.** Recovery falls back to a free generation and
+  succeeds. An orphan segment is a documented state in which the active journal stays the authority,
+  and refusing here would turn a recoverable root into an outage.
+- **An index run the manifest names holds locations against it.** Recovery refuses the open with
+  `Corruption`, naming the run. Proceeding would publish a manifest whose run is authoritative and
+  resolves to nothing; the replay delta above it hides that from every lookup until the first
+  consumer that reads runs directly, which is the checkpointer.
+
+The closure is for recovery to **discard an index run whose covered identity was not preserved**,
+which turns the refusal into successful reclamation. It is a change to what recovery reclaims and
+belongs with the checkpointing work that will exercise it. Until then a root carrying both an orphan
+segment and a run against the identity it holds does not open.
 
 ### 6.5 B3 — StagingSessions
 

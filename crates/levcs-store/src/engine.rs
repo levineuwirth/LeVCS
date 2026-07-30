@@ -2686,27 +2686,33 @@ impl ShardWriter {
     ///
     /// An `IndexLocation` names a **logical generation**, and a run is the first
     /// thing in this store that persists one across a session. That is only sound
-    /// while the generation it names is stable, and exactly one kind is: a
-    /// segment, which the manifest pins by name. The active tail's generation is
-    /// assigned by recovery from a counter over existing artifacts, so it moves
-    /// whenever any artifact appears — and when recovery seals a journal holding
-    /// frames, the resulting segment takes that counter's value rather than the
-    /// generation the tail had. Locations written against the tail therefore
-    /// dangle after the next open: `object_source` returns `None` for a run the
-    /// manifest still names, and a reader going through the run rather than the
-    /// replay delta above it reads nothing.
+    /// while the generation it names is stable across an open, and since contract
+    /// review 2026-07-30-A two kinds are: a **segment**, which the manifest pins
+    /// by name, and the **active tail**, whose identity is derived from the
+    /// manifest's committed prefix rather than from a counter over artifacts, and
+    /// which the segment recovery seals it into now inherits. Moving frames from
+    /// `active/` to `segments/` changes where they are, not what they are called,
+    /// so a run may cover the frames of the session that wrote them.
     ///
-    /// So coverage stops at the first layer holding an entry that is not
-    /// segment-backed. An oldest-first prefix rather than a filter, because the
-    /// discard is expressed as "everything through sequence N": covering a later
-    /// layer while skipping an earlier one would discard the earlier one too.
+    /// Coverage therefore stops at the first layer holding an entry the root
+    /// resolves to neither — an oldest-first prefix rather than a filter, because
+    /// the discard is expressed as "everything through sequence N": covering a
+    /// later layer while skipping an earlier one would discard the earlier one
+    /// too.
     ///
-    /// The practical consequence is recorded in scope §6.5 — until a rotation or
-    /// a checkpoint moves frames out of `active/`, the coverable set is whatever
-    /// a previous session left in segments, so sealing lags one session behind.
-    /// Lifting it means separating two numbers `recovery_generation` currently
-    /// serves as at once: the new manifest's generation and the sealed segment's
-    /// logical generation.
+    /// # What still bounds this
+    ///
+    /// A tail's identity can be *occupied* by an orphan `.seg` from an
+    /// interrupted seal, and recovery must then rename the frames. Rather than
+    /// leave a published run naming a generation nothing pins, recovery refuses
+    /// the open (contract review 2026-07-30-B), so the unsound state this
+    /// function used to avoid by restricting coverage is now avoided by
+    /// refusing to produce it. The closure — recovery discarding such a run
+    /// instead of refusing — is scope §6.5, with the checkpointing work.
+    ///
+    /// Separately and unrelated to identity: sealing moves no frame out of
+    /// `active/`, so the replay ceiling below still bounds admission until
+    /// `StoreEngine::checkpoint` can advance the committed prefix.
     fn coverable_through(&self, root: &CommittedRoot) -> Option<u64> {
         let mut covered = None;
         for layer in root.index().delta_layers().iter().rev() {
@@ -6488,6 +6494,124 @@ mod index_maintenance_tests {
             "the orphan's entries must be invisible"
         );
         assert!(orphan.is_file(), "and it is left alone, not reclaimed here");
+    }
+
+    /// Link the live journal into `segments/` under `generation`.
+    ///
+    /// Scope 3.4 step 4 interrupted before step 5: the name is taken, and what
+    /// holds it is not a readable segment, so recovery learns the generation is
+    /// occupied from the name alone.
+    fn orphan_segment_at(root: &Path, shard: u16, generation: u64) {
+        let paths = shard_paths(root, shard);
+        let journal = std::fs::read_dir(paths.active())
+            .expect("active/")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.extension().and_then(|value| value.to_str()) == Some("journal"))
+            .expect("an open root has an active journal");
+        std::fs::hard_link(
+            &journal,
+            paths
+                .segments()
+                .join(crate::segment::segment_filename(generation, 0, 9)),
+        )
+        .expect("link the orphan");
+    }
+
+    /// Contract review 2026-07-30-B: the two states an occupied identity leaves.
+    ///
+    /// The tail's identity is generation 1 and a published run holds locations
+    /// against it. An orphan `.seg` occupies that name, so recovery must seal
+    /// the frames under a different one — and the run then stays authoritative
+    /// through the manifest while resolving to nothing. Recovery refuses.
+    ///
+    /// Replay masks this while a lookup goes through the delta above the run, so
+    /// the assertion is the open itself. `StoreEngine::checkpoint` is a direct
+    /// run consumer and would not be masked.
+    #[test]
+    fn an_orphan_holding_a_published_runs_identity_refuses_the_open() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let namespace = NamespaceId([0x4A; 32]);
+        let configure = || {
+            let mut options = sealing_options(&serial, temporary.path(), 4_000_000);
+            options.max_index_runs = 3;
+            options.max_open_index_runs = 3;
+            options
+        };
+        {
+            let engine = StoreEngine::open(configure()).expect("open a fresh root");
+            block_on(engine.submit(create_transaction(namespace, 2))).expect("create");
+            push_groups(&engine, namespace, 0x60, 2);
+            block_on(engine.submit(push_transaction(namespace, 0x68, 0x68, None)))
+                .expect("the group after the seal commits");
+            assert_eq!(engine.index_maintenance().sealed_runs, 1, "the seal ran");
+            orphan_segment_at(temporary.path(), 0, 1);
+        }
+
+        let runs = manifest_runs(temporary.path(), 0, root_uuid_of(temporary.path()));
+        assert_eq!(runs.len(), 1, "one published run is the whole premise");
+
+        match StoreEngine::open(configure()) {
+            Err(StoreError::Corruption(message)) => {
+                assert!(
+                    message.contains(&runs[0]),
+                    "the refusal must name the run that cannot be resolved, not just \
+                     report a generation: {message}"
+                );
+            }
+            Err(other) => panic!("expected Corruption naming the run, got {other:?}"),
+            // Not prose: the state this refuses is verified here, so removing
+            // the refusal reports what it costs rather than a bare expectation.
+            Ok(opened) => {
+                let root = opened.committed_root();
+                let pinned = root.object_source(0, 1).expect("resolve generation 1");
+                panic!(
+                    "the open succeeded with a published run naming generation 1, and the \
+                     reopened root pins {pinned:?} there — every lookup reaching the run \
+                     rather than the replay delta above it reads nothing"
+                );
+            }
+        }
+    }
+
+    /// The other half, and the reason the refusal is conditioned on the run
+    /// rather than on the orphan.
+    ///
+    /// Same occupied identity, nothing published against it. An orphan segment
+    /// is a state in which the active journal remains the authority, and
+    /// refusing here would turn a recoverable root into an outage.
+    #[test]
+    fn an_orphan_holding_no_published_identity_still_opens() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let namespace = NamespaceId([0x4B; 32]);
+        let mut objects = vec![genesis_object().id];
+        {
+            let engine = StoreEngine::open(sealing_options(&serial, temporary.path(), 4_000_000))
+                .expect("open a fresh root");
+            block_on(engine.submit(create_transaction(namespace, 2))).expect("create");
+            objects.extend(push_groups(&engine, namespace, 0x70, 2));
+            assert_eq!(
+                engine.index_maintenance().sealed_runs,
+                0,
+                "nothing is published against the identity the orphan takes"
+            );
+            orphan_segment_at(temporary.path(), 0, 1);
+        }
+
+        let engine = StoreEngine::open(sealing_options(&serial, temporary.path(), 4_000_000))
+            .expect("an orphan segment alone must not fail recovery");
+        let root = engine.committed_root();
+        for object in &objects {
+            assert!(
+                root.index()
+                    .get(&IndexKey::new(namespace, *object))
+                    .is_some(),
+                "{} was acknowledged and must survive the reopen",
+                object.to_hex()
+            );
+        }
     }
 
     /// The discard is scoped to the shard that sealed.

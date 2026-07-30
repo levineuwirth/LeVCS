@@ -1500,8 +1500,11 @@ Separated:
 
 Collision detection moved with them. The old check compared a resumable generation against a maximum
 that mixed all three namespaces, which an index run could raise on its own; only a segment can
-collide with a segment, so the check is now against segment generations alone, and claiming one that
-another journal holds is `Corruption`.
+collide with a segment, so occupancy is tracked over `.seg` names alone — and recorded from the
+parsed name even when the file does not open, because an unreadable `.seg` holds its name as firmly
+as a readable one. Two recovery artifacts for the same journal in different generations remains
+`Corruption`. An identity held by some *other* `.seg` is a different question, answered by contract
+review 2026-07-30-B below and not by this one.
 
 **What this closes.** The scope §6.5 carry-forward "a run may only cover frames a segment already
 holds" is gone, and with it the restriction in `ShardWriter::coverable_through`: a run may now cover
@@ -1517,13 +1520,66 @@ identity the tail wants may be exactly the one it holds. `frame_golden`'s
 reason, which is also the test that documents why recovery must not refuse in this state: the active
 journal is still the authority and an outage here would be the wrong answer. The seal therefore falls
 back to a free generation and renames the frames, exactly as before this review, and an index run
-against the old identity dangles. Confined to roots carrying an orphan segment, where it was
-previously universal; the closure — recovery discarding runs whose identity was not preserved — is
-recorded in scope §6.5 for the checkpointing work.
+against the old identity dangles.
+
+**That last state was disclosed here and rejected on review; 2026-07-30-B below is what landed.**
+The disclosure conflated two cases under one orphan: an orphan alone, where the fallback is right and
+recovery still succeeds, and an orphan holding an identity a *published* run names, where the
+fallback opens a store whose manifest points at a run that resolves to nothing. This review's own
+finding — that replay masks it — was the argument against leaving it, since `StoreEngine::checkpoint`
+consumes runs directly.
 
 The other §6.5 carry-forward stands: sealing still moves no frame out of `active/`, so the replay
 ceiling still bounds admission and an entry-pressure seal still lands on it. That is what
 `StoreEngine::checkpoint` is for, and it is now unblocked.
+
+##### Contract review 2026-07-30-B
+
+**A displaced identity is a refusal, not a disclosure.** Review of 2026-07-30-A declined the silent
+state it disclosed and chose `Corruption` for orphan-plus-published-run until recovery can discard
+such a run. Granted, with one frozen seam, and landed before the checkpointing dispatch it would
+otherwise have poisoned.
+
+**What the two states cost, which is why they part.** When a `.seg` occupies the logical generation
+the active tail carries, the frames cannot keep their name whatever recovery does.
+
+- *Orphan alone.* Nothing persisted names the displaced identity, so renaming the frames costs
+  nothing. Recovery falls back to a free generation and **succeeds**, which is what
+  `an_orphan_segment_leaves_the_active_journal_the_authority` requires: the active journal is still
+  the authority and an outage would be the wrong answer.
+- *Orphan plus a run the manifest names.* Recovery would publish a manifest naming a run whose every
+  location resolves to nothing — authoritative and unreadable in one step. Recovery **refuses** with
+  `Corruption`, naming the run file rather than only the generation.
+
+Refusing is not good; it is an outage on a root whose data is all present. It is chosen because the
+alternative is a store that opens and lies, and because the masking is temporary in the worst way:
+the replay delta sits above the run and answers every lookup that would otherwise expose it, so the
+first consumer to read a run directly — the checkpointer — is also the first to find out.
+
+**The frozen seam.** `IndexRun::references_segment_generation` in `index.rs` (A2), read-only, with
+recovery as its one caller. Exact rather than a range test over section headers: entries pack a
+16-bit delta from the section base, so `[base, base + u16::MAX]` says only what a section *could*
+name, and answering `true` on that alone would refuse recoveries over a generation no entry
+mentions. `index.rs` is otherwise untouched.
+
+**`coverable_through` keeps its widened coverage.** The restriction 2026-07-30-A removed does not
+come back: a run may cover locations naming the active tail, because the unsound state that
+restriction existed to avoid is now refused at the one point it can arise rather than designed
+around at every seal. Its doc comment described the pre-split world and is rewritten to this one.
+
+**Evidence.** `an_orphan_holding_a_published_runs_identity_refuses_the_open` and
+`an_orphan_holding_no_published_identity_still_opens` are the two states, and the refusing one
+asserts the damage rather than an expectation: with the guard disabled the open succeeds and the
+reopened root pins `None` at the generation the run names. The exactness test is
+`a_run_reports_only_the_segment_generations_its_entries_actually_name`, whose negative cases include
+a generation inside a section's packed span that no entry uses. A first draft of the refusing test
+passed for the wrong reason — its workload re-pushed the genesis object id as a blob, so the reopen
+failed on a duplicate-object `Conflict` whether or not the guard existed; the mutation is what
+exposed it.
+
+**Still open, unchanged.** Recovery discarding a run whose covered identity was not preserved, which
+turns this refusal into successful reclamation. Recorded in scope §6.5 with the checkpointing work
+that will exercise it.
 
 ##### Contract review 2026-07-28-C
 

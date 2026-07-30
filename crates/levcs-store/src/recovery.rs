@@ -1944,6 +1944,7 @@ fn recover_shard_under_lock(
                     &root_uuid,
                     &header.journal_id,
                     &selection,
+                    &retained_index_runs,
                     config,
                 )?;
                 let from = if checkpointed && checkpoint.active_journal_id == header.journal_id {
@@ -2615,11 +2616,22 @@ pub(crate) struct RecoveryGenerations {
 /// `.recovery-<id>-<generation>.prefix`. Either fixes the logical generation:
 /// finishing an interrupted seal must reuse the identity it already chose, not
 /// pick a fresh one and orphan the artifact.
+///
+/// # When the identity is already taken
+///
+/// A `.seg` occupies a logical generation whether or not it is readable, so the
+/// identity the tail wants can be held by an orphan. The frames must then be
+/// renamed, and `published_runs` — the runs the selected manifest names, already
+/// open at the one call site — decides what that costs. If one of them holds a
+/// location against the displaced identity, recovery refuses with `Corruption`
+/// rather than publish a run that resolves to nothing; otherwise it falls back
+/// to a free generation and succeeds (contract review 2026-07-30-B).
 fn recovery_generations_for_journal(
     paths: &ShardPaths,
     root_uuid: &[u8; 16],
     active_journal_id: &[u8; 16],
     selection: &Option<ManifestSelection>,
+    published_runs: &[RetainedIndexRun],
     config: &RecoveryConfig<'_>,
 ) -> Result<RecoveryGenerations, StoreError> {
     let per_manifest = usize::try_from(config.max_index_runs)
@@ -2780,17 +2792,40 @@ fn recovery_generations_for_journal(
     }
 
     // The identity is taken — by an orphan from an interrupted seal, or by a
-    // segment no manifest references. Recovery must still succeed: an orphan is
-    // a documented state in which the active journal remains the authority, and
-    // refusing here would turn a recoverable root into an outage.
+    // segment no manifest references. Whatever recovery does now, the frames
+    // cannot keep the name they have, and the two states part here on what that
+    // costs (contract review 2026-07-30-B).
     //
-    // So the seal falls back to a free generation, and the frames are renamed.
-    // That is the pre-2026-07-30-A behaviour and it carries its hazard with it:
-    // an index run holding locations against `preferred` no longer resolves. The
-    // closure is to drop such runs during recovery rather than let a reader find
-    // nothing through them — recorded in scope §6.5 and not attempted here,
-    // because it is a change to what recovery *discards* and belongs with the
-    // checkpointing work that will exercise it.
+    // If a published run holds locations against `preferred`, displacing the
+    // frames makes that run authoritative and unresolvable in one step: the
+    // manifest goes on naming it, `object_source` answers `None` for every
+    // location in it, and a reader that reaches the run rather than the replay
+    // delta above it reads nothing and reports nothing. Replay masks it for
+    // exactly as long as nothing consumes runs directly, which is not a property
+    // to build a checkpointer on.
+    //
+    // So recovery refuses. Not because refusing is good — it is an outage on a
+    // root whose data is all present — but because the alternative is a store
+    // that opens and lies. The closure is for recovery to discard a run whose
+    // covered identity was not preserved, at which point this becomes successful
+    // reclamation; it is a change to what recovery *reclaims* and belongs with
+    // the checkpointing work that will exercise it (scope §6.5).
+    if let Some(retained) = published_runs
+        .iter()
+        .find(|retained| retained.run().references_segment_generation(preferred))
+    {
+        return Err(StoreError::Corruption(format!(
+            "logical generation {preferred} is occupied by a segment this recovery must displace, \
+             and published index run {} names it; recovery cannot yet discard a run whose covered \
+             identity was not preserved",
+            retained.path().display()
+        )));
+    }
+
+    // Nothing published depends on the displaced identity, so the seal falls
+    // back to a free generation and the frames are renamed. An orphan segment is
+    // a documented state in which the active journal remains the authority, and
+    // recovery succeeds through it exactly as it did before the split.
     let logical = occupied_segments
         .iter()
         .copied()

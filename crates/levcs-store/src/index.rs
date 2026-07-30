@@ -1110,6 +1110,44 @@ impl IndexRun {
         None
     }
 
+    /// Does any entry in this run name `generation` as its logical segment
+    /// generation?
+    ///
+    /// Granted to recovery by contract review 2026-07-30-B, which has the one
+    /// caller: before recovery seals a journal under a generation other than
+    /// the identity its frames already carry, it must know whether a published
+    /// run holds locations against the identity it is about to displace. A run
+    /// like that stays authoritative through the manifest while resolving to
+    /// nothing, so recovery refuses instead of opening the store.
+    ///
+    /// Read-only and exact rather than a range test. A section's entries store
+    /// a 16-bit delta from its base, so `[base, base + u16::MAX]` bounds what
+    /// the section *could* name and skips the sections that could not name it
+    /// at all — but a section covering the range does not mean an entry in it
+    /// does, and answering `true` on the range alone would turn recoverable
+    /// roots into outages for a generation no entry mentions.
+    pub fn references_segment_generation(&self, generation: u64) -> bool {
+        for i in 0..self.section_count {
+            let section = self.section(i);
+            let Some(delta) = generation.checked_sub(section.base_segment_generation) else {
+                continue;
+            };
+            if delta > u64::from(u16::MAX) {
+                continue;
+            }
+            for j in 0..section.entry_count {
+                if self
+                    .entry_location(section.first_entry + j, &section)
+                    .segment_generation
+                    == generation
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     fn find_section(&self, namespace: &NamespaceId) -> Option<SectionHeader> {
         let mut lo = 0u64;
         let mut hi = self.section_count;
@@ -1681,6 +1719,49 @@ mod tests {
                 assert_eq!(limit, "index_run_segment_generation_span")
             }
             other => panic!("expected LimitExceeded on the generation width, got {other:?}"),
+        }
+    }
+
+    /// Recovery refuses an open on the answer this gives, so a `true` it does
+    /// not owe is an outage on a healthy root.
+    ///
+    /// Both directions, and the one that matters is the negative: generation 5
+    /// sits *inside* the packed span of a section based at 4, so a range test
+    /// over the section header alone would claim it. No entry names it.
+    #[test]
+    fn a_run_reports_only_the_segment_generations_its_entries_actually_name() {
+        let mut delta = IndexDelta::new(1_000, 1 << 20);
+        for (i, generation) in [4u64, 6, 40].into_iter().enumerate() {
+            delta
+                .insert(
+                    IndexKey::new(ns(1), oid(i as u8)),
+                    IndexLocation {
+                        segment_generation: generation,
+                        frame_offset: 0,
+                        frame_len: 1,
+                        object_type: 0,
+                        shard_sequence: i as u64,
+                    },
+                )
+                .expect("insert");
+        }
+        let bytes = IndexRunBuilder::new(ROOT, 1, 0xFEED)
+            .build(&delta)
+            .expect("build");
+        let run = IndexRun::from_vec(bytes, &ROOT).expect("open");
+
+        for named in [4u64, 6, 40] {
+            assert!(
+                run.references_segment_generation(named),
+                "generation {named} is named by an entry in this run"
+            );
+        }
+        for unnamed in [0u64, 3, 5, 7, 39, 41, u64::MAX] {
+            assert!(
+                !run.references_segment_generation(unnamed),
+                "no entry names generation {unnamed}; claiming it would refuse a \
+                 recovery that has nothing to lose"
+            );
         }
     }
 

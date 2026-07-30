@@ -1655,6 +1655,31 @@ criteria.
 
 **B1 must not** touch the crash harness (B4), staging (B3), or any frozen Wave A file.
 
+#### Carry-forward: index sealing does not yet bound what a reopen rebuilds
+
+Recorded with the index-maintenance slice (contract review 2026-07-29-C), because it bounds what
+that slice can claim and it is the reason checkpointing follows it immediately.
+
+Sealing moves index entries out of the delta layers and into a durable run. It moves no **frame** out
+of `active/`. A manifest's `committed_shard_sequence` advances only when a checkpoint or a segment
+rotation makes a prefix durable somewhere else, and neither exists yet — so recovery replays every
+frame the shard has ever written, into a single `IndexDelta` bounded by `max_active_index_entries`.
+
+Two consequences, both live until `StoreEngine::checkpoint` lands:
+
+1. The writer refuses admission once the replayable set reaches that ceiling. Without it a shard
+   would keep accepting work and produce a store that fails to open with `LimitExceeded` — writing
+   what it cannot read back. The hole pre-dates index maintenance: the placeholder refusal capped
+   delta *layers*, which never bounded the summed entries behind them.
+2. A seal triggered by **entry pressure** therefore lands exactly on that ceiling and the next
+   admission is refused; only a seal triggered by the **fan-out** ceiling (`max_index_runs` unsealed
+   layers) leaves the shard able to continue. Entry-pressure sealing is correct but cannot relieve
+   what it is meant to relieve until the committed prefix can advance.
+
+This is a scope consequence and not a defect: nothing here is unsound, and both behaviours are
+asserted by tests. It is written down so that "the shard seals under pressure" is not read as "the
+shard can run indefinitely under pressure", which is what checkpointing will make true.
+
 ### 6.5 B3 — StagingSessions
 
 Owns `staging.rs`. Deliverable 9: bounded invisible projection staging.

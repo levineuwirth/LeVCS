@@ -486,10 +486,33 @@ fn validate_manifest_sequence_coverage(manifest: &Manifest) -> Result<(), String
 
     let ranges = &manifest.retained_tail_ranges;
     if ranges.is_empty() {
-        return Err(
-            "Phase 1 manifests may not have an empty retained tail; an empty shard has no manifest"
-                .into(),
-        );
+        // Contract review 2026-07-29-C, amendment 4. The rule was "an empty
+        // shard has no manifest", and it held for as long as the only reason to
+        // write a manifest was to name a sealed segment. Index maintenance gives
+        // a second reason: a shard that has published an index run but has not
+        // yet rotated its journal has a manifest, no retained tail, and a
+        // committed prefix that lives entirely in `active/`.
+        //
+        // `committed_shard_sequence == 0` is what makes that distinguishable
+        // from the case the original rule was protecting against — a manifest
+        // that claims committed frames while naming nothing that holds them.
+        // Recovery replays the active journal from the beginning either way, and
+        // the two checks below are consistent with an empty range list: there is
+        // no first range to begin at 0 and no last one to end at 0.
+        if manifest.committed_shard_sequence != 0 {
+            return Err(format!(
+                "a manifest with no retained tail commits through {}; nothing names those frames",
+                manifest.committed_shard_sequence
+            ));
+        }
+        if manifest.index_runs.is_empty() && manifest.checkpoints.is_empty() {
+            return Err(
+                "Phase 1 manifests may not have an empty retained tail; an empty shard has no \
+                 manifest"
+                    .into(),
+            );
+        }
+        return Ok(());
     }
     if ranges[0].first_shard_sequence != 0 {
         return Err(format!(

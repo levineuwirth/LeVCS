@@ -60,7 +60,7 @@ mod sys;
 pub mod drive;
 
 pub use completion::{CompletionWaiter, SharedCompletion};
-pub use engine::{CheckpointLease, StoreEngine};
+pub use engine::{CheckpointLease, IndexMaintenanceSnapshot, StoreEngine};
 pub use options::{StoreDirectoryAttributes, StoreOptions};
 pub use roots::{
     CommittedRoot, GenerationId, IndexDeltaLayer, LayeredObjectIndex, OperationKey,

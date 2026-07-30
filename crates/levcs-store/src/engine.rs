@@ -55,16 +55,17 @@ use crate::format::{
     FrameReceiptFieldsV1, RepositoryCreateV1, TransactionFramePayloadV1,
 };
 use crate::index::{
-    IndexDelta, IndexKey, IndexLocation, NamespaceLifecycle, NamespaceRecord, NamespaceStorageMode,
+    delta_pressure, DeltaPressure, IndexDelta, IndexKey, IndexLocation, IndexRun, IndexRunBuilder,
+    NamespaceLifecycle, NamespaceRecord, NamespaceStorageMode,
 };
 use crate::journal::{GroupBuilder, Journal};
 use crate::options::StoreOptions;
 use crate::recovery::{RecoveredShard, RecoveryConfig, RecoverySession};
 use crate::roots::{
-    CommittedRoot, GenerationMap, LayeredObjectIndex, OperationKey, OperationStatusMetricSnapshot,
-    OperationStatusMetrics, OperationStatusRoot, RepoMap, RepoState, RetainedReceipt,
-    ShardSequenceMap, ShardSubtree, StatusEntry, StatusReservation, TerminalStatusEntry,
-    TerminalStatusMap, TypedRefMap,
+    CommittedRoot, GenerationId, GenerationMap, LayeredObjectIndex, OperationKey,
+    OperationStatusMetricSnapshot, OperationStatusMetrics, OperationStatusRoot, RepoMap, RepoState,
+    RetainedGeneration, RetainedIndexRun, RetainedReceipt, ShardSequenceMap, ShardSubtree,
+    StatusEntry, StatusReservation, TerminalStatusEntry, TerminalStatusMap, TypedRefMap,
 };
 use crate::segment::{self, RootLayout};
 use crate::snapshot::RepoSnapshot;
@@ -465,6 +466,36 @@ impl StoreEngine {
     pub fn operation_status_metrics(&self) -> OperationStatusMetricSnapshot {
         self.shared.status_metrics.snapshot()
     }
+
+    /// What index maintenance has done and what it still owes, root-wide.
+    ///
+    /// Both fields come from **one** captured `CommittedRoot`. Reading them from
+    /// two loads would let a caller see a run count from one publication beside a
+    /// backlog from another — and the pair is only meaningful together, because
+    /// the whole claim of a seal is that runs went up as the backlog went down.
+    /// Two loads could show both rising, which never happens in any single root.
+    ///
+    /// A snapshot of immutable counts, not a counter handle, for the reason
+    /// [`StoreEngine::durability_counters`] gives: the harness that reports these
+    /// numbers must not be able to write to them.
+    pub fn index_maintenance(&self) -> IndexMaintenanceSnapshot {
+        let root = self.shared.committed.load();
+        IndexMaintenanceSnapshot {
+            sealed_runs: root.index().sealed_run_count() as u64,
+            unsealed_delta_layers: root.index().delta_layer_count() as u64,
+        }
+    }
+}
+
+/// Sealed runs and unsealed backlog, as of one committed root.
+///
+/// `unsealed_delta_layers` is the count of delta layers no sealed run covers
+/// yet — the backlog a seal removes. Zero after a seal that covered everything
+/// published; nonzero whenever groups have committed since.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct IndexMaintenanceSnapshot {
+    pub sealed_runs: u64,
+    pub unsealed_delta_layers: u64,
 }
 
 /// Plan §5.1's two-root read, written once so both the engine and its test can
@@ -1451,6 +1482,17 @@ struct ShardWriter {
     poison: Option<StoreError>,
 }
 
+/// One shard's unsealed index backlog, summed from one captured root.
+#[derive(Copy, Clone, Debug, Default)]
+struct UnsealedBacklog {
+    layers: usize,
+    entries: u64,
+    encoded_bytes: u64,
+    /// The highest shard sequence any of those layers covers, which is what a
+    /// seal built from them may claim to cover.
+    through_shard_sequence: u64,
+}
+
 /// Which of scope 6.3's phases a caller is actually in.
 ///
 /// The fate of a request on an abnormal exit is a function of this and nothing
@@ -1788,18 +1830,13 @@ impl ShardWriter {
             ));
         }
 
-        // Publishing a group adds one delta layer, and nothing in this slice
-        // ever seals one into an `IndexRun`. Refusing here, before anything is
-        // reserved or sequenced, keeps lookup fan-out bounded by the same
-        // configured ceiling the sealed-run path uses, and makes the missing
-        // deliverable visible instead of turning it into a slow leak.
-        let layers = self.shared.committed.load().index().delta_layer_count() as u64;
-        if layers >= u64::from(self.shared.options.max_index_runs) {
-            return Err(StoreError::NotImplemented(
-                "sealing the in-memory index delta into an IndexRun — B1 NamespaceTxn, \
-                 scope 6-B1 deliverable 1 and scope 3.6",
-            ));
-        }
+        // Plan §5.3: at a hard ceiling the shard seals synchronously **before
+        // admitting more work**. Here, and not after publishing, because this is
+        // the last point at which a refusal has reserved and sequenced nothing —
+        // a seal that fails partway through has to poison, and poisoning a shard
+        // that has just accepted a transaction owes that caller an answer it can
+        // no longer give.
+        self.seal_index_if_required()?;
 
         // The reservation is what makes two concurrent submissions of one
         // operation ID resolvable at all. It happens before sequencing, so a
@@ -2565,6 +2602,278 @@ impl ShardWriter {
         ))
     }
 
+    /// This shard's unsealed index backlog, as one captured root reports it.
+    fn unsealed_backlog(&self, root: &CommittedRoot) -> UnsealedBacklog {
+        let mut backlog = UnsealedBacklog::default();
+        for layer in root.index().delta_layers() {
+            if layer.shard_index != self.shard_index {
+                continue;
+            }
+            backlog.layers += 1;
+            backlog.entries += layer.delta.len();
+            // Summed rather than deduplicated: two layers holding the same key
+            // are counted twice, so the total is an over-estimate and the
+            // decision it feeds can only ever seal *early*. Deduplicating would
+            // mean merging every layer on every admission.
+            backlog.encoded_bytes += layer.delta.encoded_bytes();
+            backlog.through_shard_sequence = backlog
+                .through_shard_sequence
+                .max(layer.through_shard_sequence);
+        }
+        backlog
+    }
+
+    /// Index entries a reopen of this shard would have to rebuild.
+    ///
+    /// Sealed runs plus the unsealed backlog, because with the committed prefix
+    /// unadvanced every frame is still replayed. Counted from the shard's own
+    /// retained generations rather than from the root's run vector, which is not
+    /// tagged by shard and would charge one shard for another's runs.
+    fn replayable_index_entries(&self, root: &CommittedRoot, backlog: &UnsealedBacklog) -> u64 {
+        let sealed: u64 = root
+            .retained_generations()
+            .values()
+            .filter(|generation| generation.id.shard_index == self.shard_index)
+            .flat_map(|generation| generation.index_runs.iter())
+            .map(|retained| retained.run().entry_count())
+            .sum();
+        sealed + backlog.entries
+    }
+
+    /// Seal when the accumulated delta has reached a hard ceiling (scope 3.6).
+    ///
+    /// Two ceilings, because the backlog has two costs. `delta_pressure` answers
+    /// for entries and bytes — the memory the unsealed delta occupies — through
+    /// the same function `IndexDelta::pressure` uses, so the watermark has one
+    /// implementation. The layer *count* is the other cost: every layer is a map
+    /// a lookup consults before it reaches any run, so a million single-object
+    /// groups would leave lookup fan-out unbounded while entry pressure stayed
+    /// low. `max_index_runs` bounds it, which is the ceiling the refusal this
+    /// replaced already used for exactly that reason.
+    fn seal_index_if_required(&mut self) -> Result<(), StoreError> {
+        let root = self.shared.committed.load();
+        let backlog = self.unsealed_backlog(&root);
+        if backlog.layers == 0 {
+            return Ok(());
+        }
+        let entries_or_bytes = delta_pressure(
+            backlog.entries,
+            backlog.encoded_bytes,
+            self.shared.options.max_active_index_entries,
+            self.shared.options.max_active_index_bytes,
+        ) == DeltaPressure::SealRequired;
+        let fan_out = backlog.layers as u64 >= u64::from(self.shared.options.max_index_runs);
+        if entries_or_bytes || fan_out {
+            self.seal_index(&root, backlog.through_shard_sequence)?;
+        }
+
+        // What a reopen would have to rebuild, checked **after** the seal so a
+        // seal that was due still happens.
+        //
+        // Sealing moves entries out of the delta layers and into a run, but it
+        // does not move a single *frame* out of `active/`. The manifest's
+        // `committed_shard_sequence` advances only when a checkpoint or a segment
+        // rotation makes a prefix durable elsewhere, and neither happens in this
+        // slice — so recovery replays every frame this shard ever wrote, into one
+        // delta bounded by `max_active_index_entries`. A shard that kept
+        // accepting work past that point would be writing a store it could not
+        // reopen, and would find out at the next open.
+        //
+        // Refusing makes that a refusal instead of a corrupt outcome, and it is
+        // not conservative padding: recovery's delta holds at most
+        // `max_active_index_entries`, and every admitted transaction adds at
+        // least one object.
+        //
+        // The consequence is worth stating plainly, because it bounds what this
+        // slice delivers: a seal triggered by **entry pressure** lands the shard
+        // exactly on this ceiling, so the next admission is refused. Only a seal
+        // triggered by the **fan-out** ceiling leaves the shard able to continue.
+        // Entry-pressure sealing becomes useful when `StoreEngine::checkpoint`
+        // can advance the committed prefix; until then it converts an
+        // unreopenable store into an honest refusal, which is all it can do.
+        let backlog = self.unsealed_backlog(&self.shared.committed.load());
+        let replayable = self.replayable_index_entries(&self.shared.committed.load(), &backlog);
+        if replayable >= self.shared.options.max_active_index_entries {
+            return Err(StoreError::LimitExceeded {
+                limit: "max_active_index_entries",
+                observed: replayable + 1,
+                allowed: self.shared.options.max_active_index_entries,
+            });
+        }
+        Ok(())
+    }
+
+    /// Seal this shard's covered delta layers into one durable run and publish
+    /// it, discarding exactly what the run covers in the same CAS.
+    ///
+    /// # The poison boundary
+    ///
+    /// Everything before [`segment::install_index_run`] is pre-durable: the
+    /// ceiling checks, the generation lookup, the merge and the encode all fail
+    /// without having changed a byte on the device, so they are ordinary errors
+    /// and the shard stays usable. From that call onward the shard poisons on any
+    /// failure, including a failure the call may have made *before* writing
+    /// anything — the caller cannot tell those apart, and the conservative
+    /// direction is the one that refuses to keep writing against a root that may
+    /// no longer describe the device. A false poison costs an operator a
+    /// recovery; a missed one lets the writer continue on an ambiguous root,
+    /// which is the failure this boundary exists to prevent.
+    fn seal_index(&mut self, root: &CommittedRoot, covered_through: u64) -> Result<(), StoreError> {
+        // Both ceilings, before anything is durable, and against the *same*
+        // numbers recovery enforces when it reopens the manifest (scope 3.8). A
+        // seal that passed here can always be reopened; one that bypassed them
+        // would install a manifest this store could never open again.
+        let projected = root.index().sealed_run_count() as u64 + 1;
+        for (limit, allowed) in [
+            ("max_index_runs", self.shared.options.max_index_runs),
+            (
+                "max_open_index_runs",
+                self.shared.options.max_open_index_runs,
+            ),
+        ] {
+            if projected > u64::from(allowed) {
+                return Err(StoreError::LimitExceeded {
+                    limit,
+                    observed: projected,
+                    allowed: u64::from(allowed),
+                });
+            }
+        }
+
+        // Newest-first, skipping any key a newer layer already answered: that is
+        // `LayeredObjectIndex::lookup`'s first-hit-wins rule, so the run answers
+        // every covered key exactly as the layers did. Merging oldest-first would
+        // instead meet `IndexDelta::insert`'s conflict check the moment one object
+        // had been rewritten at a new offset — a legitimate history that would
+        // then fail to seal.
+        //
+        // The merge target's ceilings are relaxed on purpose. Its contents are
+        // already resident in the layers being merged, so the bound that matters
+        // was applied when those were admitted; measuring the accumulation
+        // against the configured ceiling *here* would refuse the very seal that
+        // relieves it.
+        let mut merged = IndexDelta::new(u64::MAX, u64::MAX);
+        for layer in root.index().delta_layers() {
+            if layer.shard_index != self.shard_index
+                || layer.through_shard_sequence > covered_through
+            {
+                continue;
+            }
+            for (key, location) in layer.delta.iter() {
+                if merged.get(&key).is_none() {
+                    merged.insert(key, location)?;
+                }
+            }
+        }
+
+        let current_generation = root
+            .retained_generations()
+            .keys()
+            .filter(|id| id.shard_index == self.shard_index)
+            .map(|id| id.manifest_generation)
+            .max()
+            .ok_or_else(|| {
+                // Not a poison: nothing has been written, and wedging the shard
+                // for a condition that only recovery can have produced would
+                // turn a diagnosable state into an outage.
+                StoreError::Corruption(format!(
+                    "shard {} has no retained manifest generation to seal an index run against",
+                    self.shard_index
+                ))
+            })?;
+        let next_generation = current_generation + 1;
+
+        let root_uuid = self.shared.root_uuid;
+        let run_bytes = IndexRunBuilder::new(root_uuid, next_generation, next_generation)
+            .build(&merged)
+            .map_err(|error| {
+                StoreError::Corruption(format!("encoding index run {next_generation}: {error}"))
+            })?;
+        let paths = RootLayout::new(&self.shared.options.root).shard(self.shard_index);
+        let manifest_retain = self.shared.options.manifest_retain;
+        let counters = Arc::clone(self.journal.counters_handle());
+
+        // --- durable from here: every failure below poisons ----------------
+        let sealed = segment::install_index_run(
+            &paths,
+            &root_uuid,
+            current_generation,
+            next_generation,
+            &run_bytes,
+            manifest_retain,
+            &counters,
+        );
+        let sealed = match sealed {
+            Ok(sealed) => sealed,
+            Err(error) => return Err(self.poison_now(format!("installing index run: {error}"))),
+        };
+
+        // Reopened from the device rather than kept from the bytes just encoded.
+        // The run's checksum, header and `root_uuid` are validated by the same
+        // code recovery will use, so a run that cannot be reopened is found now —
+        // while the shard can still poison — instead of at the next open.
+        let run = match IndexRun::open(&sealed.path, &root_uuid) {
+            Ok(run) => Arc::new(run),
+            Err(error) => return Err(self.poison_now(format!("reopening a sealed run: {error}"))),
+        };
+
+        // The successor generation pins what the predecessor pinned plus the new
+        // run, and the predecessor's pin is released in the same publication.
+        // Copying rather than referencing keeps `object_source`'s rule satisfied:
+        // one logical generation may appear in several manifest generations, but
+        // every occurrence must name the same path.
+        let previous = root
+            .retained_generations()
+            .get(&GenerationId::new(self.shard_index, current_generation))
+            .map(Arc::clone);
+        let previous = match previous {
+            Some(previous) => previous,
+            None => {
+                return Err(self.poison_now(format!(
+                    "generation {current_generation} vanished from the root while sealing"
+                )))
+            }
+        };
+        let mut index_runs = previous.index_runs.to_vec();
+        index_runs.push(RetainedIndexRun::new(sealed.path.clone(), Arc::clone(&run)));
+        let successor = Arc::new(RetainedGeneration::new(
+            GenerationId::new(self.shard_index, next_generation),
+            Arc::clone(&previous.segments),
+            index_runs.into(),
+            Arc::clone(&previous.checkpoints),
+            Arc::clone(&previous.active_tails),
+            Arc::clone(&previous.projection_artifacts),
+        ));
+
+        let mut generations = GenerationMap::new();
+        generations.insert(successor.id, successor);
+        let mut sealed_runs = Vector::new();
+        sealed_runs.push_back(run);
+        let mut subtree = ShardSubtree::new(
+            self.shard_index,
+            // No frame was appended, so the shard's committed sequence is
+            // unchanged. `CommittedRoot::merge` recognizes a maintenance
+            // publication and does not treat the unchanged sequence as a
+            // duplicate group (contract review 2026-07-29-C, amendment 3).
+            root.shard_committed_sequence(self.shard_index)
+                .unwrap_or(covered_through),
+            Arc::new(IndexDelta::from_options(&self.shared.options)),
+            Some(covered_through),
+            sealed_runs,
+            RepoMap::new(),
+            TerminalStatusMap::new(),
+            generations,
+        );
+        subtree
+            .retained_generation_removals
+            .push_back(GenerationId::new(self.shard_index, current_generation));
+
+        if let Err(error) = self.publish_subtree(&subtree) {
+            return Err(self.poison_now(format!("publishing a sealed index run: {error}")));
+        }
+        Ok(())
+    }
+
     fn publish_subtree(&self, subtree: &ShardSubtree) -> Result<(), StoreError> {
         loop {
             let current = self.shared.committed.load();
@@ -2694,6 +3003,20 @@ impl ShardWriter {
             shard: self.shard_index,
             cause,
         }
+    }
+
+    /// Poison the shard **and** latch it, for a failure outside the publication
+    /// window that reaches this file's other durable sequence.
+    ///
+    /// `poison_error` only builds the error. That is right inside
+    /// `publish_window`, whose caller latches `self.poison` for the whole group;
+    /// it is wrong for an index seal, which runs at admission and whose error
+    /// otherwise returns to one caller and leaves the writer accepting the next
+    /// transaction against a root that may no longer describe the device.
+    fn poison_now(&mut self, cause: String) -> StoreError {
+        let error = self.poison_error(cause);
+        self.poison = Some(error.clone());
+        error
     }
 }
 
@@ -2984,7 +3307,7 @@ mod tests {
     ///
     /// `levcs-store` starts no runtime, so its tests must not depend on one
     /// either.
-    fn block_on<F: Future>(future: F) -> F::Output {
+    pub(super) fn block_on<F: Future>(future: F) -> F::Output {
         match block_on_until(future, Duration::from_secs(30)) {
             Some(output) => output,
             None => panic!("future did not complete within the test deadline"),
@@ -3034,11 +3357,11 @@ mod tests {
     /// consume a failpoint another test armed. A comment cannot fail a build;
     /// a parameter can.
     #[cfg(feature = "failpoints")]
-    type WriterSerial = crate::sys::FaultSerial;
+    pub(super) type WriterSerial = crate::sys::FaultSerial;
     #[cfg(not(feature = "failpoints"))]
-    type WriterSerial = ();
+    pub(super) type WriterSerial = ();
 
-    fn writer_serial() -> WriterSerial {
+    pub(super) fn writer_serial() -> WriterSerial {
         #[cfg(feature = "failpoints")]
         {
             crate::sys::serial()
@@ -3049,7 +3372,7 @@ mod tests {
         Arc::new(DurabilityCounters::default())
     }
 
-    fn options(_serial: &WriterSerial, root: &Path, shard_count: u16) -> StoreOptions {
+    pub(super) fn options(_serial: &WriterSerial, root: &Path, shard_count: u16) -> StoreOptions {
         let mut options = StoreOptions::new(root);
         options.shard_count = shard_count;
         options.max_group_transactions = 4;
@@ -3100,7 +3423,7 @@ mod tests {
         now_micros() + 600_000_000
     }
 
-    fn genesis_object() -> StagedObject {
+    pub(super) fn genesis_object() -> StagedObject {
         StagedObject {
             id: ObjectId([0xa1; 32]),
             object_type: ObjectType::Authority,
@@ -3108,7 +3431,10 @@ mod tests {
         }
     }
 
-    fn create_transaction(namespace: NamespaceId, operation: u8) -> ValidatedTransaction {
+    pub(super) fn create_transaction(
+        namespace: NamespaceId,
+        operation: u8,
+    ) -> ValidatedTransaction {
         let genesis = genesis_object();
         let id = genesis.id;
         ValidatedTransaction::builder(PrivilegedConstruction::internal())
@@ -3128,7 +3454,7 @@ mod tests {
     }
 
     /// A push carrying one blob and, optionally, one typed ref update.
-    fn push_transaction(
+    pub(super) fn push_transaction(
         namespace: NamespaceId,
         operation: u8,
         blob: u8,
@@ -5694,5 +6020,416 @@ mod tests {
                 .expect("a later append is allowed");
             assert_eq!(later.repo_sequence, 1);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Index maintenance (scope 3.6, deliverable 1)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod index_maintenance_tests {
+    use std::path::Path;
+
+    use super::tests::*;
+    use super::*;
+    use crate::index::IndexKey;
+    use crate::segment::{index_run_filename, read_current, read_manifest, RootLayout};
+
+    /// A root whose index ceilings make sealing reachable in a few groups.
+    ///
+    /// `max_active_index_entries` is the lever the acceptance point names:
+    /// crossing it is `DeltaPressure::SealRequired`. One object per transaction
+    /// means one entry per group, so the ceiling is also the layer count that
+    /// crosses it.
+    fn sealing_options(serial: &WriterSerial, root: &Path, entries: u64) -> StoreOptions {
+        let mut options = options(serial, root, 1);
+        options.max_active_index_entries = entries;
+        // Sequential submits must each close their own group, or "three groups"
+        // is one group of three and no layer accumulates.
+        options.max_group_transactions = 1;
+        options
+    }
+
+    fn shard_paths(root: &Path, shard: u16) -> crate::segment::ShardPaths {
+        RootLayout::new(root).shard(shard)
+    }
+
+    /// Every index run the manifest `CURRENT` names, which is the only list
+    /// that makes a run authoritative.
+    fn manifest_runs(root: &Path, shard: u16, root_uuid: [u8; 16]) -> Vec<String> {
+        let paths = shard_paths(root, shard);
+        let pointer = read_current(&paths, &root_uuid)
+            .expect("read CURRENT")
+            .expect("a root that has been opened has a CURRENT");
+        read_manifest(&paths, pointer.generation, &root_uuid)
+            .expect("read the current manifest")
+            .index_runs
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect()
+    }
+
+    fn root_uuid_of(root: &Path) -> [u8; 16] {
+        crate::segment::read_format(&RootLayout::new(root))
+            .expect("FORMAT")
+            .root_uuid
+    }
+
+    /// Commit `count` single-object pushes, each in its own group.
+    fn push_groups(
+        engine: &StoreEngine,
+        namespace: NamespaceId,
+        first: u8,
+        count: u8,
+    ) -> Vec<ObjectId> {
+        let mut objects = Vec::new();
+        for step in 0..count {
+            let blob = first + step;
+            block_on(engine.submit(push_transaction(namespace, blob, blob, None)))
+                .unwrap_or_else(|error| panic!("push {blob} commits: {error:?}"));
+            objects.push(ObjectId([blob; 32]));
+        }
+        objects
+    }
+
+    /// The acceptance point, and the discard it pays for.
+    ///
+    /// Three groups leave three layers and no run. The fourth submission is
+    /// admitted only after the seal, so the numbers this reads are exactly:
+    /// one run, and a backlog holding only the group that ran after it.
+    #[test]
+    fn crossing_seal_required_seals_before_admitting_more_work() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let engine = StoreEngine::open(sealing_options(&serial, temporary.path(), 3))
+            .expect("open a fresh root");
+        let namespace = NamespaceId([0x41; 32]);
+        block_on(engine.submit(create_transaction(namespace, 1))).expect("create");
+
+        // The create is itself a group carrying one object, so two pushes bring
+        // the accumulation to the ceiling.
+        push_groups(&engine, namespace, 0x60, 2);
+        let before = engine.index_maintenance();
+        assert_eq!(
+            (before.sealed_runs, before.unsealed_delta_layers),
+            (0, 3),
+            "three groups must leave three unsealed layers and no run"
+        );
+
+        // The fourth submission is refused — but only *after* the seal it
+        // triggered, and for the replay ceiling rather than for the pressure
+        // that caused the seal. An entry-pressure seal lands the shard exactly
+        // on what a reopen could rebuild, because the frames it indexed are all
+        // still in `active/`; see `seal_index_if_required`.
+        let refused = block_on(engine.submit(push_transaction(namespace, 0x70, 0x70, None)))
+            .expect_err("the shard is at the ceiling a reopen would have to rebuild");
+        assert!(
+            matches!(
+                refused,
+                StoreError::LimitExceeded {
+                    limit: "max_active_index_entries",
+                    ..
+                }
+            ),
+            "expected the replay ceiling, got {refused:?}"
+        );
+
+        let after = engine.index_maintenance();
+        assert_eq!(
+            (after.sealed_runs, after.unsealed_delta_layers),
+            (1, 0),
+            "the seal must publish one run and discard exactly the three layers it covered"
+        );
+
+        // File presence is not publication; the manifest is.
+        let uuid = root_uuid_of(temporary.path());
+        assert_eq!(
+            manifest_runs(temporary.path(), 0, uuid),
+            vec![index_run_filename(1)],
+            "the run must be named by the current manifest"
+        );
+        assert!(shard_paths(temporary.path(), 0)
+            .indexes()
+            .join(index_run_filename(1))
+            .is_file());
+    }
+
+    /// Sealing is only correct if the run answers what the layers answered.
+    ///
+    /// Checked twice: against the live root once the layers are gone, and
+    /// against a root rebuilt by production recovery after the engine is
+    /// dropped. The second half is also the "crash after publication" case —
+    /// nothing shuts the store down cleanly here.
+    #[test]
+    fn a_sealed_run_answers_every_covered_object_before_and_after_reopen() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let namespace = NamespaceId([0x42; 32]);
+        let mut covered = Vec::new();
+        let mut reopen_options = || {
+            // Sealed by the fan-out ceiling, not by entry pressure. An
+            // entry-pressure seal leaves the shard *at* the replay ceiling by
+            // construction — see `replayable_index_entries` — so a reopen test
+            // built on it would be asserting against a store that is one
+            // transaction from refusing.
+            let mut options = sealing_options(&serial, temporary.path(), 4_000_000);
+            options.max_index_runs = 3;
+            options.max_open_index_runs = 3;
+            options
+        };
+        {
+            let engine = StoreEngine::open(reopen_options()).expect("open a fresh root");
+            block_on(engine.submit(create_transaction(namespace, 2))).expect("create");
+            covered.push(genesis_object().id);
+            covered.extend(push_groups(&engine, namespace, 0x80, 2));
+            push_groups(&engine, namespace, 0x90, 1);
+            assert_eq!(engine.index_maintenance().sealed_runs, 1, "the seal ran");
+
+            let root = engine.committed_root();
+            for object in &covered {
+                let key = IndexKey::new(namespace, *object);
+                // Without this the lookup below would pass on a store that
+                // sealed nothing: a delta layer still holding the key answers
+                // it, and the run is never consulted.
+                assert!(
+                    root.index()
+                        .delta_layers()
+                        .iter()
+                        .all(|layer| layer.delta.get(&key).is_none()),
+                    "{} is still answered by a delta layer, so this asserts nothing about the run",
+                    object.to_hex()
+                );
+                let location = root
+                    .index()
+                    .get(&key)
+                    .unwrap_or_else(|| panic!("{} is not in the sealed run", object.to_hex()));
+                assert!(
+                    root.object_source(0, location.segment_generation)
+                        .expect("resolve")
+                        .is_some(),
+                    "the run's location must resolve to a file the root still pins"
+                );
+            }
+        }
+
+        let engine =
+            StoreEngine::open(reopen_options()).expect("reopen through production recovery");
+        assert_eq!(
+            engine.index_maintenance().sealed_runs,
+            1,
+            "a manifest-published run must be recovered"
+        );
+        let root = engine.committed_root();
+        for object in &covered {
+            assert!(
+                root.index()
+                    .get(&IndexKey::new(namespace, *object))
+                    .is_some(),
+                "{} did not survive the reopen",
+                object.to_hex()
+            );
+        }
+    }
+
+    /// A run that reached the device but never a manifest is not a run.
+    #[test]
+    fn a_run_no_manifest_names_is_ignored_on_reopen() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let namespace = NamespaceId([0x43; 32]);
+        {
+            let engine = StoreEngine::open(sealing_options(&serial, temporary.path(), 3))
+                .expect("open a fresh root");
+            block_on(engine.submit(create_transaction(namespace, 3))).expect("create");
+        }
+
+        // Exactly what an interrupted seal leaves: a complete, valid run at the
+        // name the next generation would have used, with no manifest naming it.
+        let uuid = root_uuid_of(temporary.path());
+        let mut delta = IndexDelta::new(16, 1 << 20);
+        delta
+            .insert(
+                IndexKey::new(namespace, ObjectId([0xEE; 32])),
+                IndexLocation {
+                    segment_generation: 1,
+                    frame_offset: 0,
+                    frame_len: 1,
+                    object_type: ObjectType::Blob as u8,
+                    shard_sequence: 1,
+                },
+            )
+            .expect("one entry");
+        let orphan = shard_paths(temporary.path(), 0)
+            .indexes()
+            .join(index_run_filename(9));
+        std::fs::write(
+            &orphan,
+            IndexRunBuilder::new(uuid, 9, 9)
+                .build(&delta)
+                .expect("encode"),
+        )
+        .expect("write the orphan");
+
+        let engine = StoreEngine::open(sealing_options(&serial, temporary.path(), 3))
+            .expect("reopen with an orphan present");
+        assert_eq!(
+            engine.index_maintenance().sealed_runs,
+            0,
+            "an index run no manifest references must not become authoritative by existing"
+        );
+        assert!(
+            engine
+                .committed_root()
+                .index()
+                .get(&IndexKey::new(namespace, ObjectId([0xEE; 32])))
+                .is_none(),
+            "the orphan's entries must be invisible"
+        );
+        assert!(orphan.is_file(), "and it is left alone, not reclaimed here");
+    }
+
+    /// The discard is scoped to the shard that sealed.
+    #[test]
+    fn only_the_sealing_shards_layers_are_discarded() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let mut options = sealing_options(&serial, temporary.path(), 4_000_000);
+        options.shard_count = 4;
+        // Sealed by fan-out so the shard can keep running afterwards.
+        options.max_index_runs = 4;
+        options.max_open_index_runs = 4;
+        let engine = StoreEngine::open(options).expect("open a fresh root");
+
+        // Two namespaces that route to different shards.
+        let mut namespaces = Vec::new();
+        for byte in 0u8..64 {
+            let candidate = NamespaceId([byte; 32]);
+            let shard = StoreOptions::shard_of(&candidate, 4);
+            if !namespaces.iter().any(|(s, _)| *s == shard) {
+                namespaces.push((shard, candidate));
+            }
+            if namespaces.len() == 2 {
+                break;
+            }
+        }
+        let (sealing_shard, sealing_namespace) = namespaces[0];
+        let (other_shard, other_namespace) = namespaces[1];
+
+        block_on(engine.submit(create_transaction(other_namespace, 0x11))).expect("create");
+        push_groups(&engine, other_namespace, 0xA0, 1);
+        let other_layers_before = engine
+            .committed_root()
+            .index()
+            .delta_layers()
+            .iter()
+            .filter(|layer| layer.shard_index == other_shard)
+            .count();
+        assert!(
+            other_layers_before > 0,
+            "the other shard must have a backlog"
+        );
+
+        block_on(engine.submit(create_transaction(sealing_namespace, 0x12))).expect("create");
+        // Four layers, then a fifth submission whose admission crosses the
+        // fan-out ceiling and seals.
+        push_groups(&engine, sealing_namespace, 0xB0, 4);
+
+        let root = engine.committed_root();
+        assert_eq!(
+            root.index()
+                .delta_layers()
+                .iter()
+                .filter(|layer| layer.shard_index == other_shard)
+                .count(),
+            other_layers_before,
+            "shard {other_shard} lost layers to a seal on shard {sealing_shard}"
+        );
+        assert_eq!(
+            root.index().sealed_run_count(),
+            1,
+            "exactly the sealing shard published a run"
+        );
+    }
+
+    /// The ceilings recovery enforces are the ceilings the writer enforces.
+    ///
+    /// With room for one run, the second seal is refused — and refused as
+    /// `LimitExceeded` naming the ceiling, not raised, not bypassed, and not the
+    /// `NotImplemented` the unimplemented path used to answer. The shard stays
+    /// usable, because nothing durable was attempted.
+    #[test]
+    fn the_run_ceilings_are_enforced_rather_than_raised() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let mut options = sealing_options(&serial, temporary.path(), 4_000_000);
+        options.max_index_runs = 1;
+        options.max_open_index_runs = 1;
+        let engine = StoreEngine::open(options).expect("open a fresh root");
+        let namespace = NamespaceId([0x44; 32]);
+
+        block_on(engine.submit(create_transaction(namespace, 4))).expect("create");
+        // One layer already crosses the fan-out ceiling, so this seals.
+        push_groups(&engine, namespace, 0xC0, 1);
+        assert_eq!(engine.index_maintenance().sealed_runs, 1);
+
+        let refused = block_on(engine.submit(push_transaction(namespace, 0xC5, 0xC5, None)))
+            .expect_err("a second run does not fit under max_index_runs = 1");
+        match refused {
+            StoreError::LimitExceeded { limit, allowed, .. } => {
+                assert_eq!(limit, "max_index_runs");
+                assert_eq!(allowed, 1);
+            }
+            other => panic!("expected LimitExceeded, got {other:?}"),
+        }
+        assert_eq!(
+            engine.index_maintenance().sealed_runs,
+            1,
+            "the refusal must not have installed a run"
+        );
+        assert_eq!(
+            manifest_runs(temporary.path(), 0, root_uuid_of(temporary.path())).len(),
+            1
+        );
+    }
+
+    /// A seal that fails after the device has moved leaves no usable writer.
+    ///
+    /// The fence inside the run's own write is made to fail. That is the first
+    /// durable step of the seal and it happens at admission, before this
+    /// transaction has appended anything — so the fault cannot be consumed by a
+    /// group append and lands where the test means it to.
+    #[cfg(feature = "failpoints")]
+    #[test]
+    fn a_failed_seal_never_lets_the_writer_continue() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let mut options = sealing_options(&serial, temporary.path(), 4_000_000);
+        options.max_index_runs = 1;
+        options.max_open_index_runs = 1;
+        let engine = StoreEngine::open(options).expect("open a fresh root");
+        let namespace = NamespaceId([0x45; 32]);
+        block_on(engine.submit(create_transaction(namespace, 5))).expect("create");
+
+        crate::sys::arm(&serial, crate::sys::Fault::FenceEio);
+        let failed = block_on(engine.submit(push_transaction(namespace, 0xD0, 0xD0, None)))
+            .expect_err("a seal whose fence fails must not report success");
+        crate::sys::disarm(&serial);
+        assert!(
+            matches!(failed, StoreError::ShardPoisoned { .. }),
+            "expected the shard to poison, got {failed:?}"
+        );
+
+        let next = block_on(engine.submit(push_transaction(namespace, 0xD1, 0xD1, None)))
+            .expect_err("a poisoned shard admits no further work");
+        assert!(
+            matches!(next, StoreError::ShardPoisoned { .. }),
+            "expected ShardPoisoned, got {next:?}"
+        );
+        assert_eq!(
+            engine.index_maintenance().sealed_runs,
+            0,
+            "a failed seal must publish nothing"
+        );
     }
 }

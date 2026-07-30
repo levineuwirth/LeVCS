@@ -409,6 +409,38 @@ pub enum DeltaPressure {
     SealRequired,
 }
 
+/// The rule of plan §5.3, over an occupancy and the ceilings it is measured
+/// against.
+///
+/// A free function because the shard writer has to ask the same question about
+/// an accumulation that is *not* one `IndexDelta`: its unsealed backlog is
+/// several delta layers in the committed root, and it decides whether to seal
+/// from their total. Restating `>= max_entries || >= max_bytes` at that call
+/// site would be two implementations of one watermark, and the one in
+/// `engine.rs` would be the one nobody thinks to change.
+/// [`IndexDelta::pressure`] is this function over its own fields.
+///
+/// Granted to B1 as contract review 2026-07-29-C, amendment 2 of 2. Read-only
+/// and introduces no new rule.
+pub fn delta_pressure(
+    entry_count: u64,
+    encoded_bytes: u64,
+    max_entries: u64,
+    max_bytes: u64,
+) -> DeltaPressure {
+    const SOFT_WATERMARK_NUMERATOR: u64 = 3;
+    const SOFT_WATERMARK_DENOMINATOR: u64 = 4;
+    if entry_count >= max_entries || encoded_bytes >= max_bytes {
+        return DeltaPressure::SealRequired;
+    }
+    let soft_entries = max_entries * SOFT_WATERMARK_NUMERATOR / SOFT_WATERMARK_DENOMINATOR;
+    let soft_bytes = max_bytes * SOFT_WATERMARK_NUMERATOR / SOFT_WATERMARK_DENOMINATOR;
+    if entry_count >= soft_entries || encoded_bytes >= soft_bytes {
+        return DeltaPressure::Backpressure;
+    }
+    DeltaPressure::Ok
+}
+
 /// Namespace-partitioned so the namespace is stored once per namespace rather
 /// than once per entry, mirroring the run's section layout.
 #[derive(Clone, Debug)]
@@ -472,18 +504,20 @@ impl IndexDelta {
     }
 
     pub fn pressure(&self) -> DeltaPressure {
-        let bytes = self.encoded_bytes();
-        if self.entry_count >= self.max_entries || bytes >= self.max_bytes {
-            return DeltaPressure::SealRequired;
-        }
-        let soft_entries =
-            self.max_entries * self.soft_watermark_numerator / self.soft_watermark_denominator;
-        let soft_bytes =
-            self.max_bytes * self.soft_watermark_numerator / self.soft_watermark_denominator;
-        if self.entry_count >= soft_entries || bytes >= soft_bytes {
-            return DeltaPressure::Backpressure;
-        }
-        DeltaPressure::Ok
+        debug_assert_eq!(
+            (
+                self.soft_watermark_numerator,
+                self.soft_watermark_denominator
+            ),
+            (3, 4),
+            "the watermark now lives in `delta_pressure`; a per-delta value has no effect"
+        );
+        delta_pressure(
+            self.entry_count,
+            self.encoded_bytes(),
+            self.max_entries,
+            self.max_bytes,
+        )
     }
 
     /// Insert, refusing rather than growing past a hard ceiling.

@@ -920,6 +920,123 @@ pub fn read_current(
     }
 }
 
+pub fn index_run_filename(generation: u64) -> String {
+    format!("{generation}.idx")
+}
+
+/// What [`install_index_run`] made durable.
+#[derive(Clone, Debug)]
+pub struct SealedIndexRun {
+    /// Where the run now is, for opening and for the generation pin that
+    /// retains it.
+    pub path: PathBuf,
+    pub filename: String,
+    /// Identifies the run inside the manifest, and is the generation the run's
+    /// own header carries. Equal to `manifest_generation` by construction.
+    pub run_generation: u64,
+    /// The manifest generation that makes the run authoritative.
+    pub manifest_generation: u64,
+}
+
+/// Install one index run and the manifest generation that publishes it.
+///
+/// Granted to B1 as contract review 2026-07-29-C, amendment 1 of 2, and it is
+/// where the whole durability sequence of an index seal lives so that `engine.rs`
+/// performs none of it directly:
+///
+/// ```text
+/// 1  write indexes/<generation>.idx.tmp, fenced
+/// 2  rename_noreplace -> indexes/<generation>.idx
+/// 3  fsync_dir indexes/
+/// 4  install_manifest with the run appended     <-- publication
+/// ```
+///
+/// # Why the file is not publication
+///
+/// Steps 1–3 leave a complete, valid run that recovery **ignores**: scope 3.8
+/// step 2 trusts only manifest-referenced files, so an interrupted seal leaves an
+/// orphan and not a half-published index. Step 4 is the only step that makes the
+/// run authoritative, and it is the existing `install_manifest`, unchanged —
+/// which is what keeps `CURRENT` the single visibility boundary for a run as it
+/// already is for a segment.
+///
+/// The predecessor manifest is read here rather than reconstructed by the caller.
+/// An engine that rebuilt a `Manifest` from its in-memory generation pins would
+/// be re-deriving `retained_tail_ranges`, `base_generation` and
+/// `committed_shard_sequence` from a lossy projection of them, and any field it
+/// got wrong would be a field recovery then trusts. `committed_shard_sequence` is
+/// carried forward **unchanged**: sealing an index run makes no journal frame
+/// more durable than it already was, and advancing it here would tell recovery
+/// to stop replaying frames that are still only in the active journal.
+///
+/// `next_generation` must be greater than `current_generation` — the manifest's
+/// index-run list is strictly ascending, and reusing a generation would either
+/// fail to encode or silently shadow a run.
+pub fn install_index_run(
+    paths: &ShardPaths,
+    root_uuid: &[u8; 16],
+    current_generation: u64,
+    next_generation: u64,
+    run_bytes: &[u8],
+    manifest_retain: u32,
+    counters: &DurabilityCounters,
+) -> Result<SealedIndexRun, StoreError> {
+    if next_generation <= current_generation {
+        return Err(StoreError::Corruption(format!(
+            "an index run cannot be installed at generation {next_generation} over current \
+             generation {current_generation}"
+        )));
+    }
+    // A shard that has never rotated its journal has a pinned generation and no
+    // manifest file: `initialize_root` writes none, and until scope 3.4 seals a
+    // segment there is nothing for one to name. Publishing an index run is the
+    // second reason to write a manifest, so this is the case where the first one
+    // is created — with no retained tail and a committed prefix of zero, which
+    // says exactly what is true: every committed frame is still in `active/`.
+    //
+    // Only absence synthesizes. A manifest that exists and does not decode is a
+    // corrupt manifest, and replacing it with a fresh one would erase the
+    // predecessor recovery is supposed to fall back to.
+    let previous = match read_manifest(paths, current_generation, root_uuid) {
+        Ok(manifest) => manifest,
+        Err(StoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Manifest {
+            root_uuid: *root_uuid,
+            generation: current_generation,
+            base_generation: 0,
+            retained_tail_ranges: Vec::new(),
+            index_runs: Vec::new(),
+            checkpoints: Vec::new(),
+            committed_shard_sequence: 0,
+        },
+        Err(error) => return Err(error),
+    };
+
+    let filename = index_run_filename(next_generation);
+    let indexes = paths.indexes();
+    let final_path = indexes.join(&filename);
+    let tmp = indexes.join(format!("{filename}.tmp"));
+    write_fenced(&tmp, run_bytes, counters)?;
+    // Never over an existing name: a run generation is used once, and a second
+    // run claiming one already published would replace bytes a live reader may
+    // hold mapped.
+    sys::rename_noreplace(&tmp, &final_path)?;
+    sys::fsync_dir(&indexes, counters)?;
+
+    let mut manifest = previous;
+    manifest.generation = next_generation;
+    manifest
+        .index_runs
+        .push((next_generation, filename.clone()));
+    install_manifest(paths, &manifest, manifest_retain, counters)?;
+
+    Ok(SealedIndexRun {
+        path: final_path,
+        filename,
+        run_generation: next_generation,
+        manifest_generation: next_generation,
+    })
+}
+
 pub fn read_manifest(
     paths: &ShardPaths,
     generation: u64,

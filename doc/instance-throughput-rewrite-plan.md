@@ -1368,6 +1368,72 @@ privilege inside a configured store root. `rename_noreplace` needed no change: `
 `RENAME_NOREPLACE` fails `EEXIST` on an occupied target name whether or not it is a link, so the
 `FORMAT.tmp` → `FORMAT` install could never have followed one.
 
+##### Contract review 2026-07-29-C
+
+**Index maintenance (scope 3.6, B1 deliverable 1) reaches production.** A shard now seals its
+accumulated delta into a durable `IndexRun`, publishes it through the manifest, and discards exactly
+the layers that run covers — in one committed-root CAS. Four frozen-surface amendments were needed;
+all are granted and recorded here.
+
+**Amendment 1, `segment.rs` (A1): `install_index_run` + `index_run_filename` + `SealedIndexRun`.**
+The whole durability sequence of a seal — fenced temp, `rename_noreplace`, `fsync_dir`, then
+`install_manifest` — lives here, so `engine.rs` performs no durability operation of its own. The
+predecessor manifest is *read* here rather than reconstructed by the caller: an engine rebuilding a
+`Manifest` from its in-memory generation pins would be re-deriving `retained_tail_ranges`,
+`base_generation` and `committed_shard_sequence` from a lossy projection, and any field it got wrong
+is a field recovery then trusts. `committed_shard_sequence` is carried forward unchanged — sealing an
+index makes no journal frame more durable than it already was.
+
+**Amendment 2, `index.rs` (A2): `delta_pressure` as a free function.** The writer's backlog is
+several delta layers, not one `IndexDelta`, so it cannot ask `IndexDelta::pressure`. Restating
+`>= max_entries || >= max_bytes` in `engine.rs` would be two implementations of one watermark, and
+the copy in `engine.rs` is the one nobody would think to change. `IndexDelta::pressure` is now this
+function over its own fields, so the rule has one implementation and gained no second definition.
+
+**Amendment 3, `roots.rs` (lead): `CommittedRoot::merge` recognizes a maintenance publication.** The
+idempotency guard discarded any subtree whose `shard_committed_sequence` was already published —
+which is *every* index seal, because a seal appends no frame. Mutation-checked: with the guard
+unamended the run reaches the device and the manifest, and the root never sees it. The snapshot reads
+`(0 runs, 3 layers)` while `CURRENT` names the run: precisely the silent divergence the seal path
+poisons to avoid, arriving quietly instead. `ShardSubtree::publishes_index_maintenance` is a question
+about the payload rather than a flag the writer sets, because a flag can disagree with the fields and
+the disagreement that matters — a seal marked as a group — drops the seal.
+
+**Amendment 4, `recovery.rs` (A2): a manifest may have an empty retained tail when it commits through
+zero.** The rule was "an empty shard has no manifest", true for as long as the only reason to write
+one was to name a sealed segment. Index maintenance is a second reason, and a shard that has
+published a run but never rotated its journal has a manifest, no retained tail, and a committed
+prefix entirely in `active/`. `committed_shard_sequence == 0` is what distinguishes that from the case
+the rule protected against — a manifest claiming committed frames while naming nothing that holds
+them — and an empty range list is additionally required to carry a run or a checkpoint, so a wholly
+empty manifest is still refused.
+
+**A finding that bounds what this slice delivers, and it is not a defect in the code.** Sealing moves
+entries out of the delta layers; it moves no *frame* out of `active/`. The manifest's committed prefix
+advances only on a checkpoint or a segment rotation, neither of which exists yet — so recovery still
+replays every frame the shard ever wrote, into one delta bounded by `max_active_index_entries`. Two
+consequences:
+
+- The writer now refuses when the replayable set reaches that ceiling, so a shard cannot write a store
+  it could not reopen. This hole **pre-dates** the change: the placeholder refusal capped delta
+  *layers* at `max_index_runs`, which never bounded the summed entries behind them. It is closed here
+  because removing the layer cap made it reachable in ordinary configurations.
+- A seal triggered by **entry pressure** therefore lands the shard exactly on that ceiling and the next
+  admission is refused. Only a seal triggered by the **fan-out** ceiling leaves the shard able to
+  continue. Entry-pressure sealing becomes useful when `StoreEngine::checkpoint` can advance the
+  committed prefix; until then it converts an unreopenable store into an honest refusal, which is all
+  it can do. Recorded in scope §6.5, and it is the reason checkpointing is the next dispatch rather
+  than a later one.
+
+`IndexMaintenanceSnapshot` is frozen as specified: two `u64`s, both read from one captured
+`CommittedRoot`, no counter handle. Mutating the discard back to "retain every delta" makes it report
+`(1 run, 3 layers)` where the test requires `(1, 0)`, so the snapshot is load-bearing rather than
+decorative. `max_index_runs` and `max_open_index_runs` are enforced against the same numbers recovery
+enforces, before anything durable happens, so a seal that passes can always be reopened.
+
+`store-bench` is untouched. Its `index_maintenance` condition stays preliminary until B4 consumes this
+after `checkpoint()` can flush the final below-watermark backlog.
+
 ##### Contract review 2026-07-28-C
 
 B4 re-pointed `store-bench` at a real `StoreEngine::submit` and found that four verification

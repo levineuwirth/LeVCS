@@ -682,10 +682,28 @@ impl CommittedRoot {
     /// no-op. This makes the CAS retry path idempotent in effect while still
     /// allowing a subtree from another shard to merge against a newer root.
     /// No object reachable through `self` is mutated.
+    ///
+    /// # Maintenance publications
+    ///
+    /// Contract review 2026-07-29-C, amendment 3. An index seal publishes a
+    /// subtree that appends **no frame**, so its `shard_committed_sequence` is
+    /// the one already published — and the guard above, which exists to make a
+    /// re-merged *group* idempotent, would discard it as a duplicate. Sealing
+    /// would then advance the manifest on disk and never reach the root, which is
+    /// exactly the ambiguity the seal path poisons to avoid; it would have been
+    /// silent instead.
+    ///
+    /// So the guard asks what the subtree carries rather than only what sequence
+    /// it names. Re-merging a maintenance subtree stays idempotent for a
+    /// different reason: the layer-discard is a `retain` (already-dropped layers
+    /// stay dropped), and the CAS loop re-merges the same subtree against a fresh
+    /// root each attempt rather than accumulating onto its own output, so a run
+    /// is pushed once into whichever root wins.
     pub fn merge(&self, subtree: &ShardSubtree) -> CommittedRoot {
         if self
             .shard_committed_sequence(subtree.shard_index)
             .is_some_and(|published| published >= subtree.shard_committed_sequence)
+            && !subtree.publishes_index_maintenance()
         {
             return self.clone();
         }
@@ -771,6 +789,21 @@ impl ShardSubtree {
             retained_generation_removals: Vector::new(),
             retained_generations,
         }
+    }
+
+    /// Whether this subtree publishes index maintenance rather than (or as well
+    /// as) a group.
+    ///
+    /// Read by [`CommittedRoot::merge`] so a publication that appends no frame is
+    /// not mistaken for a re-merged duplicate. Deliberately a question about the
+    /// payload and not a flag the writer sets: a boolean could disagree with the
+    /// fields, and the disagreement that matters — a seal marked as a group —
+    /// would drop the seal.
+    pub fn publishes_index_maintenance(&self) -> bool {
+        self.sealed_through_shard_sequence.is_some()
+            || !self.sealed_runs_newest_first.is_empty()
+            || !self.retained_generations.is_empty()
+            || !self.retained_generation_removals.is_empty()
     }
 }
 

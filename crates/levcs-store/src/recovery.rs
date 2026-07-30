@@ -2626,6 +2626,11 @@ pub(crate) struct RecoveryGenerations {
 /// location against the displaced identity, recovery refuses with `Corruption`
 /// rather than publish a run that resolves to nothing; otherwise it falls back
 /// to a free generation and succeeds (contract review 2026-07-30-B).
+///
+/// **Resumption is not exempt.** The identity a resumable artifact carries may
+/// itself be a fallback an earlier session chose, so it strands the same run one
+/// crash later. Both paths take the guard, keyed on choosing anything other than
+/// the identity the frames already have.
 fn recovery_generations_for_journal(
     paths: &ShardPaths,
     root_uuid: &[u8; 16],
@@ -2777,13 +2782,59 @@ fn recovery_generations_for_journal(
         StoreError::Corruption("no generation remains for recovery manifests".into())
     })?;
 
+    // The identity the frames already have, computed before either path can
+    // choose against it. It is what every decision below is measured from.
+    let preferred = active_tail_logical_generation(selection);
+
+    // Contract review 2026-07-30-B, and the reason it is a closure rather than
+    // two copies: displacement can be decided here or in a session that crashed,
+    // and the two paths must not drift.
+    //
+    // Naming the frames anything but `preferred` is what breaks a published run
+    // holding locations against `preferred` — the manifest goes on naming the
+    // run, `object_source` answers `None` for every location in it, and a reader
+    // that reaches the run rather than the replay delta above it reads nothing
+    // and reports nothing. Replay masks that for exactly as long as nothing
+    // consumes runs directly, which is not a property to build a checkpointer
+    // on.
+    //
+    // So recovery refuses. Not because refusing is good — it is an outage on a
+    // root whose data is all present — but because the alternative is a store
+    // that opens and lies. The closure is for recovery to discard a run whose
+    // covered identity was not preserved, at which point this becomes successful
+    // reclamation; it is a change to what recovery *reclaims* and belongs with
+    // the checkpointing work that will exercise it (scope §6.5).
+    let refuse_if_displacement_strands_a_run = |chosen: u64| -> Result<(), StoreError> {
+        if chosen == preferred {
+            return Ok(());
+        }
+        match published_runs
+            .iter()
+            .find(|retained| retained.run().references_segment_generation(preferred))
+        {
+            Some(retained) => Err(StoreError::Corruption(format!(
+                "this recovery must name its frames generation {chosen} rather than {preferred}, \
+                 and published index run {} holds locations against {preferred}; recovery cannot \
+                 yet discard a run whose covered identity was not preserved",
+                retained.path().display()
+            ))),
+            None => Ok(()),
+        }
+    };
+
     // Resuming: the identity was already chosen and the artifact carries it.
+    //
+    // The choice is not therefore safe. An interrupted recovery that had already
+    // fallen back carries the same displacement one crash later, and resuming it
+    // without the guard was how a store with an unresolvable run still opened. A
+    // resumable artifact *at* `preferred` displaces nothing and the guard is a
+    // no-op on it.
     if let Some(logical) = resumable.into_iter().next() {
+        refuse_if_displacement_strands_a_run(logical)?;
         return Ok(RecoveryGenerations { logical, manifest });
     }
 
     // Otherwise the frames keep the name they already have.
-    let preferred = active_tail_logical_generation(selection);
     if !occupied_segments.contains(&preferred) {
         return Ok(RecoveryGenerations {
             logical: preferred,
@@ -2792,40 +2843,11 @@ fn recovery_generations_for_journal(
     }
 
     // The identity is taken — by an orphan from an interrupted seal, or by a
-    // segment no manifest references. Whatever recovery does now, the frames
-    // cannot keep the name they have, and the two states part here on what that
-    // costs (contract review 2026-07-30-B).
-    //
-    // If a published run holds locations against `preferred`, displacing the
-    // frames makes that run authoritative and unresolvable in one step: the
-    // manifest goes on naming it, `object_source` answers `None` for every
-    // location in it, and a reader that reaches the run rather than the replay
-    // delta above it reads nothing and reports nothing. Replay masks it for
-    // exactly as long as nothing consumes runs directly, which is not a property
-    // to build a checkpointer on.
-    //
-    // So recovery refuses. Not because refusing is good — it is an outage on a
-    // root whose data is all present — but because the alternative is a store
-    // that opens and lies. The closure is for recovery to discard a run whose
-    // covered identity was not preserved, at which point this becomes successful
-    // reclamation; it is a change to what recovery *reclaims* and belongs with
-    // the checkpointing work that will exercise it (scope §6.5).
-    if let Some(retained) = published_runs
-        .iter()
-        .find(|retained| retained.run().references_segment_generation(preferred))
-    {
-        return Err(StoreError::Corruption(format!(
-            "logical generation {preferred} is occupied by a segment this recovery must displace, \
-             and published index run {} names it; recovery cannot yet discard a run whose covered \
-             identity was not preserved",
-            retained.path().display()
-        )));
-    }
-
-    // Nothing published depends on the displaced identity, so the seal falls
-    // back to a free generation and the frames are renamed. An orphan segment is
-    // a documented state in which the active journal remains the authority, and
-    // recovery succeeds through it exactly as it did before the split.
+    // segment no manifest references — so the frames are renamed to a free
+    // generation and the guard decides whether that is affordable. An orphan
+    // segment alone is a documented state in which the active journal remains
+    // the authority, and recovery succeeds through it exactly as it did before
+    // the split.
     let logical = occupied_segments
         .iter()
         .copied()
@@ -2836,6 +2858,7 @@ fn recovery_generations_for_journal(
         .ok_or_else(|| {
             StoreError::Corruption("no logical generation remains for a recovery segment".into())
         })?;
+    refuse_if_displacement_strands_a_run(logical)?;
     Ok(RecoveryGenerations { logical, manifest })
 }
 

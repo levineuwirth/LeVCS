@@ -1567,10 +1567,27 @@ come back: a run may cover locations naming the active tail, because the unsound
 restriction existed to avoid is now refused at the one point it can arise rather than designed
 around at every seal. Its doc comment described the pre-split world and is rewritten to this one.
 
-**Evidence.** `an_orphan_holding_a_published_runs_identity_refuses_the_open` and
-`an_orphan_holding_no_published_identity_still_opens` are the two states, and the refusing one
-asserts the damage rather than an expectation: with the guard disabled the open succeeds and the
-reopened root pins `None` at the generation the run names. The exactness test is
+**Amendment, on review of the first landing: resumption is not exempt.** The guard sat only on the
+fresh fallback, and the resumable branch returned before it. An interrupted recovery that had already
+fallen back to generation 2 resumed at 2 — correctly, since finishing an interrupted seal must not
+orphan its artifact — and stranded the run naming generation 1 exactly as a fresh fallback would,
+one crash later. Reproduced by review with a published run, an orphan at 1, and a
+`.recovery-<journal>-2.prefix`; the store opened with `object_source(0, 1) == None`.
+
+The guard is now one closure both paths call, keyed on **choosing anything other than the identity
+the frames already carry** rather than on how the choice was reached. `preferred` is computed before
+either path can return. A resumable artifact *at* `preferred` displaces nothing and the guard is a
+no-op on it — pinned by `a_resumed_seal_at_the_frames_own_identity_still_opens`, so a future guard
+that keyed on "a resumable artifact exists" would fail rather than quietly refuse every interrupted
+recovery on a root that has ever sealed. The lesson generalizes past this fix: the check belongs on
+the *outcome* — the frames are being renamed — not on the branch that produced it.
+
+**Evidence.** `an_orphan_holding_a_published_runs_identity_refuses_the_open`,
+`a_resumed_fallback_refuses_on_the_identity_it_resumes`, and
+`an_orphan_holding_no_published_identity_still_opens` are the states, and both refusing tests share
+one assertion helper so the two paths cannot drift in the tests either. It asserts the damage rather
+than an expectation: with either guard call disabled the open succeeds and the reopened root pins
+`None` at the generation the run names. The exactness test is
 `a_run_reports_only_the_segment_generations_its_entries_actually_name`, whose negative cases include
 a generation inside a section's packed span that no entry uses. A first draft of the refusing test
 passed for the wrong reason — its workload re-pushed the genesis object id as a blob, so the reopen

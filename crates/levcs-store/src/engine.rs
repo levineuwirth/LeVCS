@@ -6503,19 +6503,76 @@ mod index_maintenance_tests {
     /// occupied from the name alone.
     fn orphan_segment_at(root: &Path, shard: u16, generation: u64) {
         let paths = shard_paths(root, shard);
-        let journal = std::fs::read_dir(paths.active())
-            .expect("active/")
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .find(|path| path.extension().and_then(|value| value.to_str()) == Some("journal"))
-            .expect("an open root has an active journal");
         std::fs::hard_link(
-            &journal,
+            active_journal_path(&paths),
             paths
                 .segments()
                 .join(crate::segment::segment_filename(generation, 0, 9)),
         )
         .expect("link the orphan");
+    }
+
+    fn active_journal_path(paths: &crate::segment::ShardPaths) -> std::path::PathBuf {
+        std::fs::read_dir(paths.active())
+            .expect("active/")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.extension().and_then(|value| value.to_str()) == Some("journal"))
+            .expect("an open root has an active journal")
+    }
+
+    /// A zero-length `.recovery-<journal>-<generation>.prefix`.
+    ///
+    /// An interrupted recovery that crashed just after creating its
+    /// construction artifact, which is the state that fixes the identity a
+    /// resumed recovery must reuse. Zero-length is a valid one: the seal
+    /// compares the bytes that exist — none — and copies the rest.
+    fn resumable_prefix_at(root: &Path, shard: u16, generation: u64) {
+        use std::io::Read;
+
+        let paths = shard_paths(root, shard);
+        let mut bytes = [0u8; crate::format::JOURNAL_HEADER_LEN];
+        std::fs::File::open(active_journal_path(&paths))
+            .expect("open the journal")
+            .read_exact(&mut bytes)
+            .expect("read its header");
+        let header = crate::format::JournalHeader::decode(&bytes).expect("decode its header");
+        std::fs::write(
+            paths.segments().join(format!(
+                ".recovery-{}-{generation}.prefix",
+                hex::encode(header.journal_id)
+            )),
+            [],
+        )
+        .expect("write the interrupted artifact");
+    }
+
+    /// Every path that names the frames something other than the identity they
+    /// carry owes the same refusal, so the tests assert it through one function
+    /// rather than through copies that can drift apart the way the code did.
+    fn assert_the_open_refuses_naming_the_run(options: StoreOptions, root: &Path) {
+        let runs = manifest_runs(root, 0, root_uuid_of(root));
+        assert_eq!(runs.len(), 1, "one published run is the whole premise");
+
+        match StoreEngine::open(options) {
+            Err(StoreError::Corruption(message)) => assert!(
+                message.contains(&runs[0]),
+                "the refusal must name the run that cannot be resolved, not just \
+                 report a generation: {message}"
+            ),
+            Err(other) => panic!("expected Corruption naming the run, got {other:?}"),
+            // Not prose: the state this refuses is verified here, so removing
+            // the refusal reports what it costs rather than a bare expectation.
+            Ok(opened) => {
+                let committed = opened.committed_root();
+                let pinned = committed.object_source(0, 1).expect("resolve generation 1");
+                panic!(
+                    "the open succeeded with a published run naming generation 1, and the \
+                     reopened root pins {pinned:?} there — every lookup reaching the run \
+                     rather than the replay delta above it reads nothing"
+                );
+            }
+        }
     }
 
     /// Contract review 2026-07-30-B: the two states an occupied identity leaves.
@@ -6549,30 +6606,79 @@ mod index_maintenance_tests {
             orphan_segment_at(temporary.path(), 0, 1);
         }
 
-        let runs = manifest_runs(temporary.path(), 0, root_uuid_of(temporary.path()));
-        assert_eq!(runs.len(), 1, "one published run is the whole premise");
+        assert_the_open_refuses_naming_the_run(configure(), temporary.path());
+    }
 
-        match StoreEngine::open(configure()) {
-            Err(StoreError::Corruption(message)) => {
-                assert!(
-                    message.contains(&runs[0]),
-                    "the refusal must name the run that cannot be resolved, not just \
-                     report a generation: {message}"
-                );
-            }
-            Err(other) => panic!("expected Corruption naming the run, got {other:?}"),
-            // Not prose: the state this refuses is verified here, so removing
-            // the refusal reports what it costs rather than a bare expectation.
-            Ok(opened) => {
-                let root = opened.committed_root();
-                let pinned = root.object_source(0, 1).expect("resolve generation 1");
-                panic!(
-                    "the open succeeded with a published run naming generation 1, and the \
-                     reopened root pins {pinned:?} there — every lookup reaching the run \
-                     rather than the replay delta above it reads nothing"
-                );
-            }
+    /// The same displacement, one crash later, which is the case the first
+    /// version of this guard let through.
+    ///
+    /// A previous recovery already fell back to generation 2 and left its
+    /// construction artifact behind. Resuming reuses that identity — correctly,
+    /// since finishing an interrupted seal must not orphan the artifact — but
+    /// the identity it reuses is still not the one the frames carry, so the
+    /// published run naming generation 1 is stranded exactly as it would be by a
+    /// fresh fallback. Resumption is a reason to keep a choice, not a reason to
+    /// skip the check on it.
+    #[test]
+    fn a_resumed_fallback_refuses_on_the_identity_it_resumes() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let namespace = NamespaceId([0x4C; 32]);
+        let configure = || {
+            let mut options = sealing_options(&serial, temporary.path(), 4_000_000);
+            options.max_index_runs = 3;
+            options.max_open_index_runs = 3;
+            options
+        };
+        {
+            let engine = StoreEngine::open(configure()).expect("open a fresh root");
+            block_on(engine.submit(create_transaction(namespace, 2))).expect("create");
+            push_groups(&engine, namespace, 0x60, 2);
+            block_on(engine.submit(push_transaction(namespace, 0x68, 0x68, None)))
+                .expect("the group after the seal commits");
+            assert_eq!(engine.index_maintenance().sealed_runs, 1, "the seal ran");
+            orphan_segment_at(temporary.path(), 0, 1);
+            resumable_prefix_at(temporary.path(), 0, 2);
         }
+
+        assert_the_open_refuses_naming_the_run(configure(), temporary.path());
+    }
+
+    /// Resumption itself is not the hazard, and a guard that treated it as one
+    /// would refuse every interrupted recovery on a root that has ever sealed.
+    ///
+    /// Here the interrupted seal had chosen the identity the frames already
+    /// carry, so resuming it displaces nothing and the published run resolves
+    /// through the segment the resumed seal installs.
+    #[test]
+    fn a_resumed_seal_at_the_frames_own_identity_still_opens() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let namespace = NamespaceId([0x4D; 32]);
+        let configure = || {
+            let mut options = sealing_options(&serial, temporary.path(), 4_000_000);
+            options.max_index_runs = 3;
+            options.max_open_index_runs = 3;
+            options
+        };
+        {
+            let engine = StoreEngine::open(configure()).expect("open a fresh root");
+            block_on(engine.submit(create_transaction(namespace, 2))).expect("create");
+            push_groups(&engine, namespace, 0x60, 2);
+            block_on(engine.submit(push_transaction(namespace, 0x68, 0x68, None)))
+                .expect("the group after the seal commits");
+            assert_eq!(engine.index_maintenance().sealed_runs, 1, "the seal ran");
+            resumable_prefix_at(temporary.path(), 0, 1);
+        }
+
+        let engine = StoreEngine::open(configure()).expect("resuming its own identity must open");
+        let root = engine.committed_root();
+        assert!(
+            root.object_source(0, 1)
+                .expect("resolve generation 1")
+                .is_some(),
+            "the resumed seal kept the identity the run names, so it must resolve"
+        );
     }
 
     /// The other half, and the reason the refusal is conditioned on the run

@@ -409,6 +409,20 @@ pub enum DeltaPressure {
     SealRequired,
 }
 
+/// The encoded cost of `entries` entries spread over `namespaces` sections.
+///
+/// [`IndexDelta::encoded_bytes`] is this function over its own occupancy. Split
+/// out for the same reason as [`delta_pressure`]: the shard writer has to ask
+/// what a delta it has not built yet *would* cost — the one recovery will
+/// rebuild, including a transaction not yet admitted — and multiplying by
+/// `INDEX_ENTRY_LEN` at that call site would put the encoding's shape in a file
+/// that has no business knowing it.
+///
+/// Granted to B1 as contract review 2026-07-29-D, amendment 2 of 2.
+pub fn encoded_bytes_for(entries: u64, namespaces: u64) -> u64 {
+    entries * INDEX_ENTRY_LEN as u64 + namespaces * INDEX_SECTION_LEN as u64
+}
+
 /// The rule of plan §5.3, over an occupancy and the ceilings it is measured
 /// against.
 ///
@@ -487,8 +501,7 @@ impl IndexDelta {
     /// On-disk cost of the current contents, which is what the byte ceiling is
     /// expressed in and what scope 8.2 budgets.
     pub fn encoded_bytes(&self) -> u64 {
-        self.entry_count * INDEX_ENTRY_LEN as u64
-            + self.by_namespace.len() as u64 * INDEX_SECTION_LEN as u64
+        encoded_bytes_for(self.entry_count, self.by_namespace.len() as u64)
     }
 
     /// A deliberately honest estimate of *resident* cost, which is larger than

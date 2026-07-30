@@ -2141,17 +2141,7 @@ fn recover_shard_under_lock(
         let first_shard_sequence = last_committed
             .map(|sequence| sequence.saturating_add(1))
             .unwrap_or(0);
-        let logical_generation = selection
-            .as_ref()
-            .and_then(|selected| {
-                selected
-                    .manifest
-                    .retained_tail_ranges
-                    .last()
-                    .map(|range| range.generation)
-            })
-            .unwrap_or(0)
-            .saturating_add(1);
+        let logical_generation = active_tail_logical_generation(&selection);
         let (tail, retained) = create_fresh_active_journal(
             &paths,
             root_uuid,
@@ -2731,6 +2721,28 @@ fn recovery_generation_for_journal(
     maximum.checked_add(1).ok_or_else(|| {
         StoreError::Corruption("no generation remains for recovery artifacts".into())
     })
+}
+
+/// The logical generation of the active tail above a manifest's committed prefix.
+///
+/// One formula, called from both places that produce an active tail — the
+/// journal recovery keeps and the one it creates fresh. It is stable across
+/// opens because it depends only on the manifest's retained tail ranges, which
+/// change when a rotation seals a tail into a segment and at no other time. That
+/// stability is what lets an `IndexLocation` outlive the session that wrote it;
+/// see the note at the surviving-tail call site.
+fn active_tail_logical_generation(selection: &Option<ManifestSelection>) -> u64 {
+    selection
+        .as_ref()
+        .and_then(|selected| {
+            selected
+                .manifest
+                .retained_tail_ranges
+                .last()
+                .map(|range| range.generation)
+        })
+        .unwrap_or(0)
+        .saturating_add(1)
 }
 
 fn preserve_crash_journal(

@@ -1836,7 +1836,7 @@ impl ShardWriter {
         // a seal that fails partway through has to poison, and poisoning a shard
         // that has just accepted a transaction owes that caller an answer it can
         // no longer give.
-        self.seal_index_if_required()?;
+        self.seal_index_if_required(transaction)?;
 
         // The reservation is what makes two concurrent submissions of one
         // operation ID resolvable at all. It happens before sequencing, so a
@@ -2623,13 +2623,31 @@ impl ShardWriter {
         backlog
     }
 
-    /// Index entries a reopen of this shard would have to rebuild.
+    /// The index a reopen of this shard would have to rebuild, **including** work
+    /// that is admitted but not yet published.
     ///
-    /// Sealed runs plus the unsealed backlog, because with the committed prefix
-    /// unadvanced every frame is still replayed. Counted from the shard's own
-    /// retained generations rather than from the root's run vector, which is not
-    /// tagged by shard and would charge one shard for another's runs.
-    fn replayable_index_entries(&self, root: &CommittedRoot, backlog: &UnsealedBacklog) -> u64 {
+    /// Three sources, and leaving out any one of them was a way to overshoot:
+    ///
+    /// - sealed runs and unsealed layers, which the published root reports;
+    /// - the open group, whose members have been admitted and will publish;
+    /// - the transaction being admitted right now.
+    ///
+    /// The last two are the reason this takes an incoming shape rather than
+    /// reading the root alone. A root-only check passes on the state *before*
+    /// the transaction it is deciding about, so a two-object transaction against
+    /// a one-object ceiling committed and then failed to reopen.
+    ///
+    /// Namespaces are counted because the encoding pays a section header per
+    /// namespace and the byte ceiling is measured in encoded bytes. Both figures
+    /// over-estimate — an object rewritten in two groups is counted twice, and a
+    /// namespace already present is re-counted if it is in the open group — so
+    /// the decision can only ever refuse early.
+    fn replayable_index(
+        &self,
+        root: &CommittedRoot,
+        backlog: &UnsealedBacklog,
+        incoming: Option<&ValidatedTransaction>,
+    ) -> (u64, u64) {
         let sealed: u64 = root
             .retained_generations()
             .values()
@@ -2637,7 +2655,76 @@ impl ShardWriter {
             .flat_map(|generation| generation.index_runs.iter())
             .map(|retained| retained.run().entry_count())
             .sum();
-        sealed + backlog.entries
+        let open_group: u64 = self
+            .pending
+            .iter()
+            .map(|prepared| prepared.objects.len() as u64)
+            .sum();
+        let admitting = incoming.map_or(0, |transaction| transaction.objects.len() as u64);
+        let entries = sealed + backlog.entries + open_group + admitting;
+
+        // Every namespace this shard owns, from the published root, plus the
+        // ones only the open group and the incoming transaction know about.
+        let shard_count = self.shared.shard_count;
+        let mut namespaces: std::collections::BTreeSet<NamespaceId> = root
+            .repositories()
+            .keys()
+            .copied()
+            .filter(|namespace| StoreOptions::shard_of(namespace, shard_count) == self.shard_index)
+            .collect();
+        namespaces.extend(self.pending.iter().map(|prepared| prepared.key.namespace));
+        if let Some(transaction) = incoming {
+            namespaces.insert(transaction.namespace);
+        }
+        (
+            entries,
+            crate::index::encoded_bytes_for(entries, namespaces.len() as u64),
+        )
+    }
+
+    /// The newest shard sequence a run may claim to cover.
+    ///
+    /// An `IndexLocation` names a **logical generation**, and a run is the first
+    /// thing in this store that persists one across a session. That is only sound
+    /// while the generation it names is stable, and exactly one kind is: a
+    /// segment, which the manifest pins by name. The active tail's generation is
+    /// assigned by recovery from a counter over existing artifacts, so it moves
+    /// whenever any artifact appears — and when recovery seals a journal holding
+    /// frames, the resulting segment takes that counter's value rather than the
+    /// generation the tail had. Locations written against the tail therefore
+    /// dangle after the next open: `object_source` returns `None` for a run the
+    /// manifest still names, and a reader going through the run rather than the
+    /// replay delta above it reads nothing.
+    ///
+    /// So coverage stops at the first layer holding an entry that is not
+    /// segment-backed. An oldest-first prefix rather than a filter, because the
+    /// discard is expressed as "everything through sequence N": covering a later
+    /// layer while skipping an earlier one would discard the earlier one too.
+    ///
+    /// The practical consequence is recorded in scope §6.5 — until a rotation or
+    /// a checkpoint moves frames out of `active/`, the coverable set is whatever
+    /// a previous session left in segments, so sealing lags one session behind.
+    /// Lifting it means separating two numbers `recovery_generation` currently
+    /// serves as at once: the new manifest's generation and the sealed segment's
+    /// logical generation.
+    fn coverable_through(&self, root: &CommittedRoot) -> Option<u64> {
+        let mut covered = None;
+        for layer in root.index().delta_layers().iter().rev() {
+            if layer.shard_index != self.shard_index {
+                continue;
+            }
+            let stable = layer.delta.iter().all(|(_, location)| {
+                matches!(
+                    root.object_source(self.shard_index, location.segment_generation),
+                    Ok(Some(crate::roots::RetainedObjectSource::Segment(_)))
+                )
+            });
+            if !stable {
+                break;
+            }
+            covered = Some(layer.through_shard_sequence);
+        }
+        covered
     }
 
     /// Seal when the accumulated delta has reached a hard ceiling (scope 3.6).
@@ -2650,7 +2737,10 @@ impl ShardWriter {
     /// groups would leave lookup fan-out unbounded while entry pressure stayed
     /// low. `max_index_runs` bounds it, which is the ceiling the refusal this
     /// replaced already used for exactly that reason.
-    fn seal_index_if_required(&mut self) -> Result<(), StoreError> {
+    fn seal_index_if_required(
+        &mut self,
+        incoming: &ValidatedTransaction,
+    ) -> Result<(), StoreError> {
         let root = self.shared.committed.load();
         let backlog = self.unsealed_backlog(&root);
         if backlog.layers == 0 {
@@ -2664,7 +2754,13 @@ impl ShardWriter {
         ) == DeltaPressure::SealRequired;
         let fan_out = backlog.layers as u64 >= u64::from(self.shared.options.max_index_runs);
         if entries_or_bytes || fan_out {
-            self.seal_index(&root, backlog.through_shard_sequence)?;
+            // Only what a run may soundly persist; see `coverable_through`. When
+            // nothing is coverable the seal does not happen and the ceiling check
+            // below refuses instead, which is the honest outcome — a run over
+            // active-journal locations would be unreadable after the next open.
+            if let Some(covered_through) = self.coverable_through(&root) {
+                self.seal_index(&root, covered_through)?;
+            }
         }
 
         // What a reopen would have to rebuild, checked **after** the seal so a
@@ -2691,13 +2787,25 @@ impl ShardWriter {
         // Entry-pressure sealing becomes useful when `StoreEngine::checkpoint`
         // can advance the committed prefix; until then it converts an
         // unreopenable store into an honest refusal, which is all it can do.
-        let backlog = self.unsealed_backlog(&self.shared.committed.load());
-        let replayable = self.replayable_index_entries(&self.shared.committed.load(), &backlog);
-        if replayable >= self.shared.options.max_active_index_entries {
+        let root = self.shared.committed.load();
+        let backlog = self.unsealed_backlog(&root);
+        let (entries, bytes) = self.replayable_index(&root, &backlog, Some(incoming));
+        // Recovery rebuilds into one `IndexDelta::from_options`, which refuses on
+        // either ceiling, so both are checked here. Guarding only entries let a
+        // run of narrow frames across many namespaces pass admission and fail to
+        // reopen on `max_active_index_bytes`.
+        if entries > self.shared.options.max_active_index_entries {
             return Err(StoreError::LimitExceeded {
                 limit: "max_active_index_entries",
-                observed: replayable + 1,
+                observed: entries,
                 allowed: self.shared.options.max_active_index_entries,
+            });
+        }
+        if bytes > self.shared.options.max_active_index_bytes {
+            return Err(StoreError::LimitExceeded {
+                limit: "max_active_index_bytes",
+                observed: bytes,
+                allowed: self.shared.options.max_active_index_bytes,
             });
         }
         Ok(())
@@ -2723,7 +2831,17 @@ impl ShardWriter {
         // numbers recovery enforces when it reopens the manifest (scope 3.8). A
         // seal that passed here can always be reopened; one that bypassed them
         // would install a manifest this store could never open again.
-        let projected = root.index().sealed_run_count() as u64 + 1;
+        // This shard's runs, not the root's. Recovery enforces both ceilings
+        // against one shard's manifest, so counting every shard here refused a
+        // shard its first run because another shard already had one — a refusal
+        // recovery would never have made.
+        let owned_runs: u64 = root
+            .retained_generations()
+            .values()
+            .filter(|generation| generation.id.shard_index == self.shard_index)
+            .map(|generation| generation.index_runs.len() as u64)
+            .sum();
+        let projected = owned_runs + 1;
         for (limit, allowed) in [
             ("max_index_runs", self.shared.options.max_index_runs),
             (
@@ -3410,7 +3528,7 @@ mod tests {
     /// verification at a mirror on another instance.
     const EVIDENCE_ACTOR: [u8; 32] = [0x7e; 32];
 
-    fn evidence() -> TransactionEvidenceV1 {
+    pub(super) fn evidence() -> TransactionEvidenceV1 {
         TransactionEvidenceV1::AdministrativeV1 {
             actor: EVIDENCE_ACTOR,
             actor_key_epoch: 7,
@@ -3419,7 +3537,7 @@ mod tests {
         }
     }
 
-    fn deadline() -> i64 {
+    pub(super) fn deadline() -> i64 {
         now_micros() + 600_000_000
     }
 
@@ -6033,8 +6151,11 @@ mod index_maintenance_tests {
 
     use super::tests::*;
     use super::*;
+    use std::time::Duration;
+
     use crate::index::IndexKey;
     use crate::segment::{index_run_filename, read_current, read_manifest, RootLayout};
+    use crate::{PrivilegedConstruction, StagedObject};
 
     /// A root whose index ceilings make sealing reachable in a few groups.
     ///
@@ -6076,6 +6197,31 @@ mod index_maintenance_tests {
             .root_uuid
     }
 
+    /// A push carrying two objects, for the projection tests.
+    fn two_object_push(namespace: NamespaceId, blob: u8) -> ValidatedTransaction {
+        let authority = genesis_object().id;
+        ValidatedTransaction::builder(PrivilegedConstruction::internal())
+            .namespace(namespace)
+            .operation(OperationId([blob; 16]), ObjectId([blob; 32]), deadline())
+            .objects(vec![
+                StagedObject {
+                    id: ObjectId([blob; 32]),
+                    object_type: ObjectType::Blob,
+                    raw: vec![blob; 64],
+                },
+                StagedObject {
+                    id: ObjectId([blob.wrapping_add(1); 32]),
+                    object_type: ObjectType::Blob,
+                    raw: vec![blob.wrapping_add(1); 64],
+                },
+            ])
+            .refs(Vec::new())
+            .authority(Some(authority), Some(authority))
+            .evidence(evidence())
+            .build()
+            .expect("a two-object push")
+    }
+
     /// Commit `count` single-object pushes, each in its own group.
     fn push_groups(
         engine: &StoreEngine,
@@ -6093,35 +6239,100 @@ mod index_maintenance_tests {
         objects
     }
 
+    /// Two namespaces that route to different shards of a four-shard root.
+    fn two_shards() -> Vec<(u16, NamespaceId)> {
+        let mut namespaces = Vec::new();
+        for byte in 0u8..64 {
+            let candidate = NamespaceId([byte; 32]);
+            let shard = StoreOptions::shard_of(&candidate, 4);
+            if !namespaces.iter().any(|(s, _)| *s == shard) {
+                namespaces.push((shard, candidate));
+            }
+            if namespaces.len() == 2 {
+                break;
+            }
+        }
+        namespaces
+    }
+
+    /// Run `write` against a fresh engine, close it, and reopen.
+    ///
+    /// The reopen is what makes the previous session's frames coverable: recovery
+    /// seals a journal holding frames into a segment, and only segment-backed
+    /// locations may be persisted into a run.
+    fn write_then_reopen(
+        serial: &WriterSerial,
+        root: &Path,
+        configure: impl Fn(&mut StoreOptions),
+        write: impl FnOnce(&StoreEngine),
+    ) -> StoreEngine {
+        {
+            let mut options = sealing_options(serial, root, 4_000_000);
+            configure(&mut options);
+            write(&StoreEngine::open(options).expect("open"));
+        }
+        let mut options = sealing_options(serial, root, 4_000_000);
+        configure(&mut options);
+        StoreEngine::open(options).expect("reopen through production recovery")
+    }
+
+    /// A root whose backlog is **coverable**: frames written, then reopened, so
+    /// recovery has sealed them into a segment and the replayed layer's
+    /// locations name a generation the manifest pins.
+    ///
+    /// Sealing cannot cover frames still in `active/` — see
+    /// `ShardWriter::coverable_through` — so every test that needs a seal to
+    /// happen goes through here rather than writing and sealing in one session.
+    fn root_with_a_coverable_backlog(
+        serial: &WriterSerial,
+        root: &Path,
+        namespace: NamespaceId,
+        tag: u8,
+        pushes: u8,
+        configure: impl Fn(&mut StoreOptions),
+    ) -> (StoreEngine, Vec<ObjectId>) {
+        let mut covered = vec![genesis_object().id];
+        {
+            let mut options = sealing_options(serial, root, 4_000_000);
+            configure(&mut options);
+            let engine = StoreEngine::open(options).expect("open a fresh root");
+            block_on(engine.submit(create_transaction(namespace, tag))).expect("create");
+            covered.extend(push_groups(&engine, namespace, tag.wrapping_add(1), pushes));
+        }
+        let mut options = sealing_options(serial, root, 4_000_000);
+        configure(&mut options);
+        let engine = StoreEngine::open(options).expect("reopen through production recovery");
+        (engine, covered)
+    }
+
     /// The acceptance point, and the discard it pays for.
     ///
-    /// Three groups leave three layers and no run. The fourth submission is
-    /// admitted only after the seal, so the numbers this reads are exactly:
-    /// one run, and a backlog holding only the group that ran after it.
+    /// The backlog is one replayed layer whose locations name a sealed segment.
+    /// Its entries are at the ceiling, so the next admission seals before it is
+    /// allowed to proceed — and is then refused by the replay ceiling, which the
+    /// seal cannot relieve while the committed prefix is unchanged.
     #[test]
     fn crossing_seal_required_seals_before_admitting_more_work() {
         let serial = writer_serial();
         let temporary = tempfile::tempdir().expect("tempdir");
-        let engine = StoreEngine::open(sealing_options(&serial, temporary.path(), 3))
-            .expect("open a fresh root");
         let namespace = NamespaceId([0x41; 32]);
-        block_on(engine.submit(create_transaction(namespace, 1))).expect("create");
+        let (engine, covered) = root_with_a_coverable_backlog(
+            &serial,
+            temporary.path(),
+            namespace,
+            0x60,
+            2,
+            |options| options.max_active_index_entries = 3,
+        );
 
-        // The create is itself a group carrying one object, so two pushes bring
-        // the accumulation to the ceiling.
-        push_groups(&engine, namespace, 0x60, 2);
         let before = engine.index_maintenance();
         assert_eq!(
             (before.sealed_runs, before.unsealed_delta_layers),
-            (0, 3),
-            "three groups must leave three unsealed layers and no run"
+            (0, 1),
+            "the reopened root must carry the replayed backlog and no run"
         );
+        assert_eq!(covered.len(), 3, "three objects are in that backlog");
 
-        // The fourth submission is refused — but only *after* the seal it
-        // triggered, and for the replay ceiling rather than for the pressure
-        // that caused the seal. An entry-pressure seal lands the shard exactly
-        // on what a reopen could rebuild, because the frames it indexed are all
-        // still in `active/`; see `seal_index_if_required`.
         let refused = block_on(engine.submit(push_transaction(namespace, 0x70, 0x70, None)))
             .expect_err("the shard is at the ceiling a reopen would have to rebuild");
         assert!(
@@ -6139,51 +6350,43 @@ mod index_maintenance_tests {
         assert_eq!(
             (after.sealed_runs, after.unsealed_delta_layers),
             (1, 0),
-            "the seal must publish one run and discard exactly the three layers it covered"
+            "the seal must publish one run and discard exactly the layer it covered, even \
+             though the admission that triggered it was then refused"
         );
 
-        // File presence is not publication; the manifest is.
         let uuid = root_uuid_of(temporary.path());
         assert_eq!(
-            manifest_runs(temporary.path(), 0, uuid),
-            vec![index_run_filename(1)],
+            manifest_runs(temporary.path(), 0, uuid).len(),
+            1,
             "the run must be named by the current manifest"
         );
-        assert!(shard_paths(temporary.path(), 0)
-            .indexes()
-            .join(index_run_filename(1))
-            .is_file());
     }
 
     /// Sealing is only correct if the run answers what the layers answered.
     ///
-    /// Checked twice: against the live root once the layers are gone, and
-    /// against a root rebuilt by production recovery after the engine is
-    /// dropped. The second half is also the "crash after publication" case —
-    /// nothing shuts the store down cleanly here.
+    /// Checked against the live root once the layer is gone, and then against a
+    /// root rebuilt by production recovery — which is also the "crash after
+    /// publication" case, since nothing shuts this store down cleanly.
     #[test]
     fn a_sealed_run_answers_every_covered_object_before_and_after_reopen() {
         let serial = writer_serial();
         let temporary = tempfile::tempdir().expect("tempdir");
         let namespace = NamespaceId([0x42; 32]);
-        let mut covered = Vec::new();
-        let mut reopen_options = || {
-            // Sealed by the fan-out ceiling, not by entry pressure. An
-            // entry-pressure seal leaves the shard *at* the replay ceiling by
-            // construction — see `replayable_index_entries` — so a reopen test
-            // built on it would be asserting against a store that is one
-            // transaction from refusing.
-            let mut options = sealing_options(&serial, temporary.path(), 4_000_000);
-            options.max_index_runs = 3;
-            options.max_open_index_runs = 3;
-            options
+        let configure = |options: &mut StoreOptions| {
+            options.max_index_runs = 1;
+            options.max_open_index_runs = 1;
         };
-        {
-            let engine = StoreEngine::open(reopen_options()).expect("open a fresh root");
-            block_on(engine.submit(create_transaction(namespace, 2))).expect("create");
-            covered.push(genesis_object().id);
-            covered.extend(push_groups(&engine, namespace, 0x80, 2));
-            push_groups(&engine, namespace, 0x90, 1);
+        let covered = {
+            let (engine, covered) = root_with_a_coverable_backlog(
+                &serial,
+                temporary.path(),
+                namespace,
+                0x80,
+                2,
+                configure,
+            );
+            // One layer already crosses a fan-out ceiling of one, so this seals.
+            let _ = block_on(engine.submit(push_transaction(namespace, 0x88, 0x88, None)));
             assert_eq!(engine.index_maintenance().sealed_runs, 1, "the seal ran");
 
             let root = engine.committed_root();
@@ -6211,10 +6414,12 @@ mod index_maintenance_tests {
                     "the run's location must resolve to a file the root still pins"
                 );
             }
-        }
+            covered
+        };
 
-        let engine =
-            StoreEngine::open(reopen_options()).expect("reopen through production recovery");
+        let mut options = sealing_options(&serial, temporary.path(), 4_000_000);
+        configure(&mut options);
+        let engine = StoreEngine::open(options).expect("reopen through production recovery");
         assert_eq!(
             engine.index_maintenance().sealed_runs,
             1,
@@ -6294,30 +6499,23 @@ mod index_maintenance_tests {
     fn only_the_sealing_shards_layers_are_discarded() {
         let serial = writer_serial();
         let temporary = tempfile::tempdir().expect("tempdir");
-        let mut options = sealing_options(&serial, temporary.path(), 4_000_000);
-        options.shard_count = 4;
-        // Sealed by fan-out so the shard can keep running afterwards.
-        options.max_index_runs = 4;
-        options.max_open_index_runs = 4;
-        let engine = StoreEngine::open(options).expect("open a fresh root");
-
-        // Two namespaces that route to different shards.
-        let mut namespaces = Vec::new();
-        for byte in 0u8..64 {
-            let candidate = NamespaceId([byte; 32]);
-            let shard = StoreOptions::shard_of(&candidate, 4);
-            if !namespaces.iter().any(|(s, _)| *s == shard) {
-                namespaces.push((shard, candidate));
-            }
-            if namespaces.len() == 2 {
-                break;
-            }
-        }
+        let namespaces = two_shards();
         let (sealing_shard, sealing_namespace) = namespaces[0];
         let (other_shard, other_namespace) = namespaces[1];
+        let configure = |options: &mut StoreOptions| {
+            options.shard_count = 4;
+            options.max_index_runs = 1;
+            options.max_open_index_runs = 1;
+        };
 
-        block_on(engine.submit(create_transaction(other_namespace, 0x11))).expect("create");
-        push_groups(&engine, other_namespace, 0xA0, 1);
+        let engine = write_then_reopen(&serial, temporary.path(), configure, |engine| {
+            for (index, (_, namespace)) in namespaces.iter().enumerate() {
+                let tag = 0x11 + index as u8;
+                block_on(engine.submit(create_transaction(*namespace, tag))).expect("create");
+                push_groups(engine, *namespace, 0xA0 + index as u8 * 8, 1);
+            }
+        });
+
         let other_layers_before = engine
             .committed_root()
             .index()
@@ -6330,10 +6528,9 @@ mod index_maintenance_tests {
             "the other shard must have a backlog"
         );
 
-        block_on(engine.submit(create_transaction(sealing_namespace, 0x12))).expect("create");
-        // Four layers, then a fifth submission whose admission crosses the
-        // fan-out ceiling and seals.
-        push_groups(&engine, sealing_namespace, 0xB0, 4);
+        // One layer on the sealing shard already crosses a fan-out ceiling of
+        // one, so this submission seals before it is admitted.
+        let _ = block_on(engine.submit(push_transaction(sealing_namespace, 0xB0, 0xB0, None)));
 
         let root = engine.committed_root();
         assert_eq!(
@@ -6350,30 +6547,44 @@ mod index_maintenance_tests {
             1,
             "exactly the sealing shard published a run"
         );
+        let _ = other_namespace;
     }
 
     /// The ceilings recovery enforces are the ceilings the writer enforces.
     ///
-    /// With room for one run, the second seal is refused — and refused as
-    /// `LimitExceeded` naming the ceiling, not raised, not bypassed, and not the
-    /// `NotImplemented` the unimplemented path used to answer. The shard stays
-    /// usable, because nothing durable was attempted.
+    /// With room for one run, a second seal is refused as `LimitExceeded` naming
+    /// the ceiling — not raised, not bypassed, and not the `NotImplemented` the
+    /// unimplemented path used to answer. Nothing durable was attempted, so the
+    /// shard stays usable.
     #[test]
     fn the_run_ceilings_are_enforced_rather_than_raised() {
         let serial = writer_serial();
         let temporary = tempfile::tempdir().expect("tempdir");
-        let mut options = sealing_options(&serial, temporary.path(), 4_000_000);
-        options.max_index_runs = 1;
-        options.max_open_index_runs = 1;
-        let engine = StoreEngine::open(options).expect("open a fresh root");
         let namespace = NamespaceId([0x44; 32]);
+        let configure = |options: &mut StoreOptions| {
+            options.max_index_runs = 1;
+            options.max_open_index_runs = 1;
+        };
 
-        block_on(engine.submit(create_transaction(namespace, 4))).expect("create");
-        // One layer already crosses the fan-out ceiling, so this seals.
-        push_groups(&engine, namespace, 0xC0, 1);
-        assert_eq!(engine.index_maintenance().sealed_runs, 1);
+        // First session's frames, sealed into a run in the second session.
+        let engine = write_then_reopen(&serial, temporary.path(), configure, |engine| {
+            block_on(engine.submit(create_transaction(namespace, 4))).expect("create");
+            push_groups(engine, namespace, 0xC0, 1);
+        });
+        let _ = block_on(engine.submit(push_transaction(namespace, 0xC4, 0xC4, None)));
+        assert_eq!(
+            engine.index_maintenance().sealed_runs,
+            1,
+            "the first seal ran"
+        );
+        drop(engine);
 
-        let refused = block_on(engine.submit(push_transaction(namespace, 0xC5, 0xC5, None)))
+        // A third session: the second session's frames are now segment-backed
+        // too, so a second seal is due — and does not fit.
+        let mut options = sealing_options(&serial, temporary.path(), 4_000_000);
+        configure(&mut options);
+        let engine = StoreEngine::open(options).expect("reopen");
+        let refused = block_on(engine.submit(push_transaction(namespace, 0xC8, 0xC8, None)))
             .expect_err("a second run does not fit under max_index_runs = 1");
         match refused {
             StoreError::LimitExceeded { limit, allowed, .. } => {
@@ -6390,6 +6601,205 @@ mod index_maintenance_tests {
         assert_eq!(
             manifest_runs(temporary.path(), 0, root_uuid_of(temporary.path())).len(),
             1
+        );
+    }
+
+    /// P1: admission must project the transaction it is deciding about.
+    ///
+    /// A root-only check reads the state *before* the incoming objects, so with
+    /// room for two entries and one already present, a two-object transaction
+    /// committed and the store then failed to open. The reopen is the assertion:
+    /// a store must never be unable to read back what it accepted.
+    #[test]
+    fn admission_projects_the_incoming_transaction_into_the_replay_ceiling() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let namespace = NamespaceId([0x46; 32]);
+        {
+            let engine = StoreEngine::open(sealing_options(&serial, temporary.path(), 2))
+                .expect("open a fresh root");
+            block_on(engine.submit(create_transaction(namespace, 6))).expect("one object");
+
+            let refused = block_on(engine.submit(two_object_push(namespace, 0xE0)))
+                .expect_err("two more objects do not fit under a ceiling of two");
+            assert!(
+                matches!(
+                    refused,
+                    StoreError::LimitExceeded {
+                        limit: "max_active_index_entries",
+                        ..
+                    }
+                ),
+                "expected the replay ceiling to refuse, got {refused:?}"
+            );
+        }
+        StoreEngine::open(sealing_options(&serial, temporary.path(), 2))
+            .expect("a store must reopen whatever it accepted");
+    }
+
+    /// The same projection, for members already admitted into the open group.
+    ///
+    /// `max_group_transactions` is raised so the group stays open across both
+    /// submissions; without counting `pending`, the second is decided against a
+    /// root the first has not reached yet.
+    #[test]
+    fn admission_projects_the_open_group_into_the_replay_ceiling() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let namespace = NamespaceId([0x47; 32]);
+        let mut options = sealing_options(&serial, temporary.path(), 3);
+        options.max_group_transactions = 8;
+        options.max_group_idle = Duration::from_millis(2_000);
+        {
+            let engine = StoreEngine::open(options).expect("open a fresh root");
+            block_on(engine.submit(create_transaction(namespace, 7))).expect("one object");
+            let outcomes = [0xE4u8, 0xE6]
+                .map(|blob| block_on(engine.submit(two_object_push(namespace, blob))));
+            assert!(
+                outcomes.iter().any(|outcome| matches!(
+                    outcome,
+                    Err(StoreError::LimitExceeded {
+                        limit: "max_active_index_entries",
+                        ..
+                    })
+                )),
+                "five objects must not both be admitted under a ceiling of three: {outcomes:?}"
+            );
+        }
+        StoreEngine::open(sealing_options(&serial, temporary.path(), 3))
+            .expect("a store must reopen whatever it accepted");
+    }
+
+    /// P1: the byte ceiling is a ceiling too.
+    ///
+    /// Sized so entries stay far below their own limit and only the encoded byte
+    /// total crosses. Recovery rebuilds into one `IndexDelta::from_options`,
+    /// which refuses on either.
+    #[test]
+    fn admission_projects_the_replay_byte_ceiling() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let namespace = NamespaceId([0x48; 32]);
+        let mut options = sealing_options(&serial, temporary.path(), 4_000_000);
+        // Room for a couple of entries and their one section header, and no more.
+        options.max_active_index_bytes = crate::index::encoded_bytes_for(2, 1);
+        {
+            let engine = StoreEngine::open(options).expect("open a fresh root");
+            block_on(engine.submit(create_transaction(namespace, 8))).expect("one object");
+            block_on(engine.submit(push_transaction(namespace, 0xE8, 0xE8, None)))
+                .expect("a second object still fits");
+            let refused = block_on(engine.submit(push_transaction(namespace, 0xE9, 0xE9, None)))
+                .expect_err("a third object exceeds the encoded byte ceiling");
+            assert!(
+                matches!(
+                    refused,
+                    StoreError::LimitExceeded {
+                        limit: "max_active_index_bytes",
+                        ..
+                    }
+                ),
+                "expected the byte ceiling, got {refused:?}"
+            );
+        }
+        let mut reopen = sealing_options(&serial, temporary.path(), 4_000_000);
+        reopen.max_active_index_bytes = crate::index::encoded_bytes_for(2, 1);
+        StoreEngine::open(reopen).expect("a store must reopen whatever it accepted");
+    }
+
+    /// P1: a recovered run's locations must still resolve.
+    ///
+    /// The reopen test above cannot see this: its lookups are answered by the
+    /// replay delta, which shadows the run. This one queries the **run itself**
+    /// out of the recovered root and resolves the location it returns, which is
+    /// what a checkpoint — reading through the run rather than around it — would
+    /// do. It is the assertion that makes `coverable_through` load-bearing.
+    #[test]
+    fn a_recovered_runs_locations_still_resolve_to_a_pinned_source() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let namespace = NamespaceId([0x49; 32]);
+        // One layer is enough to cross the fan-out ceiling, which is what the
+        // reopened root carries: recovery replays the whole journal into one.
+        let configure = |options: &mut StoreOptions| {
+            options.max_index_runs = 1;
+            options.max_open_index_runs = 1;
+        };
+
+        let engine = write_then_reopen(&serial, temporary.path(), configure, |engine| {
+            block_on(engine.submit(create_transaction(namespace, 9))).expect("create");
+            push_groups(engine, namespace, 0xF0, 2);
+        });
+        let _ = block_on(engine.submit(push_transaction(namespace, 0xF8, 0xF8, None)));
+        assert_eq!(engine.index_maintenance().sealed_runs, 1, "the seal ran");
+        drop(engine);
+
+        let mut options = sealing_options(&serial, temporary.path(), 4_000_000);
+        configure(&mut options);
+        let engine = StoreEngine::open(options).expect("reopen");
+        let root = engine.committed_root();
+        let run = root
+            .index()
+            .sealed_runs()
+            .iter()
+            .next()
+            .expect("the manifest's run is recovered")
+            .clone();
+        let mut resolved = 0usize;
+        for object in [
+            genesis_object().id,
+            ObjectId([0xF0; 32]),
+            ObjectId([0xF1; 32]),
+        ] {
+            let Some(location) = run.get(&IndexKey::new(namespace, object)) else {
+                continue;
+            };
+            resolved += 1;
+            assert!(
+                root.object_source(0, location.segment_generation)
+                    .expect("resolve")
+                    .is_some(),
+                "the recovered run points at logical generation {} which nothing pins: a \
+                 reader going through the run rather than the replay delta reads nothing",
+                location.segment_generation
+            );
+        }
+        assert!(
+            resolved > 0,
+            "the run must answer for the objects it covers"
+        );
+    }
+
+    /// P2: the run ceilings are per shard, as recovery enforces them.
+    #[test]
+    fn the_run_ceilings_are_counted_per_shard() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let namespaces = two_shards();
+        let configure = |options: &mut StoreOptions| {
+            options.shard_count = 4;
+            options.max_index_runs = 1;
+            options.max_open_index_runs = 1;
+        };
+
+        let engine = write_then_reopen(&serial, temporary.path(), configure, |engine| {
+            for (index, (_, namespace)) in namespaces.iter().enumerate() {
+                let tag = 0x20 + index as u8;
+                block_on(engine.submit(create_transaction(*namespace, tag))).expect("create");
+                push_groups(engine, *namespace, 0x30 + index as u8 * 8, 1);
+            }
+        });
+        for (index, (_, namespace)) in namespaces.iter().enumerate() {
+            let _ = block_on(engine.submit(push_transaction(
+                *namespace,
+                0x50 + index as u8,
+                0x50 + index as u8,
+                None,
+            )));
+        }
+        assert_eq!(
+            engine.index_maintenance().sealed_runs,
+            2,
+            "each shard owns one run; a per-root count would refuse the second shard its first"
         );
     }
 

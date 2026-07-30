@@ -1680,6 +1680,31 @@ This is a scope consequence and not a defect: nothing here is unsound, and both 
 asserted by tests. It is written down so that "the shard seals under pressure" is not read as "the
 shard can run indefinitely under pressure", which is what checkpointing will make true.
 
+#### Carry-forward: a run may only cover frames a segment already holds
+
+The second half of the same fact, found in review (contract review 2026-07-29-D) and stated
+separately because it constrains what a seal may *contain* rather than when one happens.
+
+An `IndexLocation` names a **logical generation**, and a sealed run is the first thing in this store
+that persists one beyond the session that wrote it. That is sound only for a generation that is
+stable across opens, and exactly one kind is: a segment, pinned by name in the manifest. The active
+tail's generation is assigned by recovery from `max(manifest, .seg, .idx) + 1`, so it moves whenever
+any artifact appears — including the index run's own manifest. When recovery seals a journal holding
+frames, the resulting segment takes that counter's value and not the generation the tail had, so a
+run written against tail locations dangles at the next open: `object_source` returns `None` for a run
+the manifest still names, and a reader going *through* the run rather than around it reads nothing.
+
+Sealing therefore covers an oldest-first prefix of layers whose every entry is segment-backed, and
+stops at the first that is not. Until a rotation or checkpoint moves frames out of `active/`, that
+means a seal covers what a previous session left in segments — sealing lags one session behind.
+
+**The blocker to lift it**, and it should be lifted with checkpointing rather than after:
+`recovery_generation` currently serves as two different numbers at once — the generation of the new
+manifest recovery installs, and the logical generation of the segment it seals. Preserving a location
+across the move from `active/` to `segments/` requires the segment to inherit the tail's logical
+generation, which requires those two to be separated first. That is an A2 recovery-core change and
+was deliberately not attempted inside a B1 integration commit.
+
 ### 6.5 B3 — StagingSessions
 
 Owns `staging.rs`. Deliverable 9: bounded invisible projection staging.

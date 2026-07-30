@@ -1434,6 +1434,49 @@ enforces, before anything durable happens, so a seal that passes can always be r
 `store-bench` is untouched. Its `index_maintenance` condition stays preliminary until B4 consumes this
 after `checkpoint()` can flush the final below-watermark backlog.
 
+##### Contract review 2026-07-29-D
+
+Four findings against 2026-07-29-C, all upheld. Each fix has a regression that fails against the
+landed code, and each was mutation-checked back to the landed behaviour.
+
+**P1 — admission projected nothing.** The replay-ceiling check read the published root only, so it
+decided about a transaction it had not counted. One object present, a two-object transaction against
+a ceiling of two: committed, then failed to reopen. The open group was the same hole one step
+further along, since its members are admitted and will publish. Admission now projects sealed runs,
+unsealed layers, the open group, **and** the transaction being decided.
+
+**P1 — the byte ceiling was unguarded.** Recovery rebuilds into one `IndexDelta::from_options`,
+which refuses on either ceiling; the guard checked entries alone, so narrow frames spread over
+namespaces passed admission and failed to reopen on `max_active_index_bytes`. Both are checked now,
+and the projection counts namespaces because the encoding pays a section header per namespace.
+`index::encoded_bytes_for` (amendment 2) is that arithmetic, extracted so `engine.rs` does not carry
+a copy of the encoding's shape; `IndexDelta::encoded_bytes` is the same function over its own fields.
+
+**P1 — a recovered run's locations did not resolve, and this is the finding that reshaped the
+slice.** An `IndexLocation` names a logical generation, and a run is the first thing here that
+persists one across a session. Only a segment's generation is stable: the active tail's is assigned
+from `max(manifest, .seg, .idx) + 1`, which moves whenever any artifact appears — the run's *own*
+manifest is enough — and recovery seals a journal holding frames into a segment at that counter's
+value rather than at the generation the tail had. The landed reopen test could not see it because its
+lookups were answered by the replay delta shadowing the run.
+
+Coverage is now restricted to an oldest-first prefix of layers whose every entry is segment-backed.
+This makes the broken run unwritable rather than merely untested, and the consequence — sealing lags
+one session behind until frames leave `active/` — is recorded in scope §6.5.
+
+The alternative, preserving the tail's logical generation across the seal, was attempted and
+withdrawn: `recovery_generation` is simultaneously the new manifest's generation and the sealed
+segment's logical generation, so the fix requires separating those two numbers in A2's recovery core.
+That is the right change and it belongs with checkpointing, not inside a B1 integration commit; the
+first attempt at it also targeted the wrong branch, since a journal holding frames is *replaced*
+rather than kept, which is worth knowing before the next attempt. `active_tail_logical_generation` is
+left extracted, called from the one path that already used that formula, so the two ways of numbering
+an active tail are at least visible in one place.
+
+**P2 — the run ceilings counted every shard.** Recovery enforces them against one shard's manifest,
+so a four-shard root with `max_index_runs = 1` refused the second shard its first run. Counted per
+shard now, from the shard's own retained generations.
+
 ##### Contract review 2026-07-28-C
 
 B4 re-pointed `store-bench` at a real `StoreEngine::submit` and found that four verification

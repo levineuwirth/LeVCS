@@ -6550,8 +6550,12 @@ mod index_maintenance_tests {
     /// Every path that names the frames something other than the identity they
     /// carry owes the same refusal, so the tests assert it through one function
     /// rather than through copies that can drift apart the way the code did.
-    fn assert_the_open_refuses_naming_the_run(options: StoreOptions, root: &Path) {
-        let (run, named) = the_published_runs_generation(root);
+    fn assert_the_open_refuses_naming_the_run(
+        options: StoreOptions,
+        root: &Path,
+        covered: IndexKey,
+    ) {
+        let (run, named) = the_published_runs_generation(root, covered);
         let runs = [run];
 
         match StoreEngine::open(options) {
@@ -6576,23 +6580,34 @@ mod index_maintenance_tests {
         }
     }
 
-    /// The generation a published run's entries name — discovered, not assumed.
+    /// The generation the published run names for `covered` — read out of the
+    /// entry rather than assumed, and rather than searched for.
     ///
     /// Which identity the frames ended up with is the thing under test, so a
-    /// test that hard-codes it reports the number it expected rather than the
-    /// one the store chose. That is precisely how the fallback leaking onto a
-    /// surviving journal stayed invisible.
-    fn the_published_runs_generation(root: &Path) -> (String, u64) {
+    /// test that hard-codes it reports the number it expected instead of the one
+    /// the store chose. That is how the fallback leaking onto a surviving
+    /// journal stayed invisible.
+    ///
+    /// Probing generations in a range was the first attempt and had the same
+    /// defect one level up: it could not report an identity outside the range it
+    /// guessed, so a drift past it failed as "no generation found" before any
+    /// assertion about the identity ran. It would also pick the lowest of
+    /// several once a run spans generations. A named entry answers exactly.
+    fn the_published_runs_generation(root: &Path, covered: IndexKey) -> (String, u64) {
         let uuid = root_uuid_of(root);
         let runs = manifest_runs(root, 0, uuid);
         assert_eq!(runs.len(), 1, "one published run is the whole premise");
         let run =
             crate::index::IndexRun::open(&shard_paths(root, 0).indexes().join(&runs[0]), &uuid)
                 .expect("open the published run");
-        let named = (0..16u64)
-            .find(|generation| run.references_segment_generation(*generation))
-            .expect("a run with entries names some generation");
-        (runs[0].clone(), named)
+        let location = run.get(&covered).unwrap_or_else(|| {
+            panic!(
+                "{} is not in the published run, so this test is not measuring the identity \
+                 of anything",
+                covered.object.to_hex()
+            )
+        });
+        (runs[0].clone(), location.segment_generation)
     }
 
     /// Contract review 2026-07-30-B: the two states an occupied identity leaves.
@@ -6626,7 +6641,11 @@ mod index_maintenance_tests {
             orphan_segment_at(temporary.path(), 0, 1);
         }
 
-        assert_the_open_refuses_naming_the_run(configure(), temporary.path());
+        assert_the_open_refuses_naming_the_run(
+            configure(),
+            temporary.path(),
+            IndexKey::new(namespace, ObjectId([0x60; 32])),
+        );
     }
 
     /// The same displacement, one crash later, which is the case the first
@@ -6661,7 +6680,11 @@ mod index_maintenance_tests {
             resumable_prefix_at(temporary.path(), 0, 2);
         }
 
-        assert_the_open_refuses_naming_the_run(configure(), temporary.path());
+        assert_the_open_refuses_naming_the_run(
+            configure(),
+            temporary.path(),
+            IndexKey::new(namespace, ObjectId([0x60; 32])),
+        );
     }
 
     /// The identity a surviving journal is given must be one the next open can
@@ -6676,7 +6699,10 @@ mod index_maintenance_tests {
     ///
     /// The assertion is deliberately about what the *store* names things: the
     /// run's generation is read out of the run rather than assumed, so this
-    /// fails the same way whether the identity drifts by one or by ten.
+    /// fails the same way whether the identity drifts by one or by a hundred.
+    /// The distant orphan is there to make the difference unmistakable — a
+    /// fallback reaching the surviving journal yields 101, which cannot be read
+    /// as an off-by-one.
     #[test]
     fn a_surviving_journal_keeps_an_identity_the_next_open_can_derive() {
         let serial = writer_serial();
@@ -6689,9 +6715,11 @@ mod index_maintenance_tests {
             options
         };
 
-        // An empty tail, and an orphan on the identity it carries.
+        // An empty tail, an orphan on the identity it carries, and a second one
+        // far away so the fallback this must not take is a distinctive number.
         drop(StoreEngine::open(configure()).expect("open a fresh root"));
         orphan_segment_at(temporary.path(), 0, 1);
+        orphan_segment_at(temporary.path(), 0, 100);
 
         // The session that keeps that journal writes frames into it and seals a
         // run over them. Whatever identity it kept, the run now names it.
@@ -6704,7 +6732,10 @@ mod index_maintenance_tests {
             assert_eq!(engine.index_maintenance().sealed_runs, 1, "the seal ran");
         }
 
-        let (_, named) = the_published_runs_generation(temporary.path());
+        let (_, named) = the_published_runs_generation(
+            temporary.path(),
+            IndexKey::new(namespace, ObjectId([0x60; 32])),
+        );
         assert_eq!(
             named, 1,
             "a journal that seals nothing keeps the identity the manifest implies; \
@@ -6714,7 +6745,11 @@ mod index_maintenance_tests {
         // Now occupy the identity the frames carry, so the next open must
         // displace them — and owes the refusal for the run that names them.
         orphan_segment_at(temporary.path(), 0, 2);
-        assert_the_open_refuses_naming_the_run(configure(), temporary.path());
+        assert_the_open_refuses_naming_the_run(
+            configure(),
+            temporary.path(),
+            IndexKey::new(namespace, ObjectId([0x60; 32])),
+        );
     }
 
     /// Resumption itself is not the hazard, and a guard that treated it as one

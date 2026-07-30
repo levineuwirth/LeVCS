@@ -1611,7 +1611,14 @@ one assertion helper so the paths cannot drift in the tests either. It asserts t
 an expectation, and it **reads the generation out of the published run** rather than assuming one —
 hard-coding it is how a drifting identity would report the number the test expected instead of the
 number the store chose. With any of the three changes reverted the open succeeds and the helper
-reports the run's own generation with `None` pinned at it. The exactness test is
+reports the run's own generation with `None` pinned at it.
+
+The helper reads that generation from a **named entry**, `IndexRun::get` on a key the test knows is
+covered. Its first version probed generations `0..16` and had the original defect one level up: it
+could not report an identity outside the range it guessed, so review's drift to generation 101 failed
+as "no generation found" before any assertion about the identity ran, and a run spanning generations
+would have reported the lowest. The regression now keeps a distant orphan precisely so the fallback
+it must not take is 101 rather than a number that reads as an off-by-one. The exactness test is
 `a_run_reports_only_the_segment_generations_its_entries_actually_name`, whose negative cases include
 a generation inside a section's packed span that no entry uses. A first draft of the refusing test
 passed for the wrong reason — its workload re-pushed the genesis object id as a blob, so the reopen

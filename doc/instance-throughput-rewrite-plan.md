@@ -1582,12 +1582,36 @@ that keyed on "a resumable artifact exists" would fail rather than quietly refus
 recovery on a root that has ever sealed. The lesson generalizes past this fix: the check belongs on
 the *outcome* — the frames are being renamed — not on the branch that produced it.
 
+**Second amendment: the fallback was reaching a journal that seals nothing.** Review found the guard
+searching for the wrong generation entirely. A recovery that keeps an *empty* journal was giving it
+the sealing fallback's identity — but nothing was sealed, so no `TailRange` recorded the move, and
+the next open derived the identity the manifest still implied. The session in between had appended
+frames under the moved number and sealed a run over them. The guard looked for a run naming the
+derived generation, found none, and opened a store whose run resolved to nothing. Confirmed by
+review: empty tail plus an orphan at 1, reopen taking 2, frames and a run at 2, an orphan at 2, and
+the next open choosing 3 with `object_source(0, 2) == None`.
+
+`RecoveryGenerations` now carries **three** numbers, and the third is the point: `tail` is the
+identity a surviving journal keeps and is always the tail's own. Segment-name occupancy is a fact
+about `segments/`, and a journal that seals nothing does not go there — the fallback exists to avoid
+a name collision that path never risks. `logical` remains the sealing identity and still falls back
+under the guard. The invariant this restores is the one 2026-07-30-A was built on and did not fully
+hold: **the active tail's identity is always derivable from the manifest**, so the guard and the
+frames are always talking about the same number.
+
+What the tail keeps can be a generation an orphan already occupies, and that is correct: the
+collision is only real when frames are sealed under that name, and it is refused then, by the guard,
+with the run in hand. An identity nothing persists is not an identity.
+
 **Evidence.** `an_orphan_holding_a_published_runs_identity_refuses_the_open`,
+`a_surviving_journal_keeps_an_identity_the_next_open_can_derive`,
 `a_resumed_fallback_refuses_on_the_identity_it_resumes`, and
-`an_orphan_holding_no_published_identity_still_opens` are the states, and both refusing tests share
-one assertion helper so the two paths cannot drift in the tests either. It asserts the damage rather
-than an expectation: with either guard call disabled the open succeeds and the reopened root pins
-`None` at the generation the run names. The exactness test is
+`an_orphan_holding_no_published_identity_still_opens` are the states, and every refusing test shares
+one assertion helper so the paths cannot drift in the tests either. It asserts the damage rather than
+an expectation, and it **reads the generation out of the published run** rather than assuming one —
+hard-coding it is how a drifting identity would report the number the test expected instead of the
+number the store chose. With any of the three changes reverted the open succeeds and the helper
+reports the run's own generation with `None` pinned at it. The exactness test is
 `a_run_reports_only_the_segment_generations_its_entries_actually_name`, whose negative cases include
 a generation inside a section's packed span that no entry uses. A first draft of the refusing test
 passed for the wrong reason — its workload re-pushed the genesis object id as a blob, so the reopen

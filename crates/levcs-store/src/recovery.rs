@@ -1938,6 +1938,7 @@ fn recover_shard_under_lock(
             ActiveJournalDisposition::Replay => {
                 let RecoveryGenerations {
                     logical: logical_generation,
+                    tail: tail_generation,
                     manifest: manifest_generation,
                 } = recovery_generations_for_journal(
                     &paths,
@@ -2114,17 +2115,28 @@ fn recover_shard_under_lock(
                     complete_interrupted_seal(&path, &paths, &counters)?;
                     must_create_fresh = true;
                 } else {
+                    // This journal survives; nothing is sealed and nothing is
+                    // renamed, so it keeps the identity the manifest implies —
+                    // `tail_generation`, not the sealing fallback beside it.
+                    //
+                    // Taking `logical_generation` here was a real defect and a
+                    // quiet one: a fallback would move the tail's identity while
+                    // no `TailRange` recorded the move, so the next open derived
+                    // the old number and the guard above searched published runs
+                    // for a generation the frames no longer carried. An
+                    // identity nothing persists is not an identity (contract
+                    // review 2026-07-30-B).
                     let shared_file = Arc::new(file);
                     let retained_tail =
                         PinnedFile::from_shared(path.clone(), Arc::clone(&shared_file));
                     recovered_tail = Some(RecoveredTail {
-                        logical_generation,
+                        logical_generation: tail_generation,
                         journal_id: header.journal_id,
                         path,
                         validated_through: JOURNAL_HEADER_LEN as u64,
                         file: shared_file,
                     });
-                    retained_tails.push(RetainedTail::new(logical_generation, retained_tail));
+                    retained_tails.push(RetainedTail::new(tail_generation, retained_tail));
                 }
             }
         }
@@ -2579,21 +2591,35 @@ fn apply_recovered_refs(
     Ok(())
 }
 
-/// The two generations a recovery needs, which are not the same number.
+/// The generations a recovery needs, which are not the same number.
 ///
-/// Contract review 2026-07-30-A. They were one, and the conflation was invisible
-/// for as long as nothing outlived a session holding an `IndexLocation`.
+/// Contract review 2026-07-30-A separated the first two; 2026-07-30-B separated
+/// `tail` from `logical` after review found a fallback leaking onto a journal
+/// that seals nothing.
 pub(crate) struct RecoveryGenerations {
-    /// The **logical** generation of the frames: the identity an `IndexLocation`
-    /// names, inherited from the active tail so that sealing it into a segment
-    /// moves the bytes without changing what they are called.
+    /// The **logical** generation of frames this recovery seals into a segment:
+    /// the identity an `IndexLocation` names, inherited from the active tail so
+    /// that sealing moves the bytes without changing what they are called. It
+    /// is the tail's identity unless a `.seg` already occupies that name, in
+    /// which case the frames are renamed and the guard decides whether that is
+    /// affordable.
     logical: u64,
+    /// The identity a **surviving** journal keeps, always the tail's own.
+    ///
+    /// Always, because segment-name occupancy is a fact about `segments/` and a
+    /// journal that seals nothing does not go there. Letting the fallback reach
+    /// this number is how an unrecorded identity appeared: nothing sealed, so
+    /// no `TailRange` recorded the moved value, and the next open recomputed
+    /// the identity the manifest still implied — while the frames this session
+    /// went on to append, and the run that sealed them, carried the moved one.
+    /// The guard then searched for the wrong generation and found nothing.
+    tail: u64,
     /// The generation of the manifest this recovery installs. A counter over
     /// manifests, which an index run's manifest also advances.
     manifest: u64,
 }
 
-/// Choose both.
+/// Choose all three.
 ///
 /// # Why they had to be separated
 ///
@@ -2831,13 +2857,18 @@ fn recovery_generations_for_journal(
     // no-op on it.
     if let Some(logical) = resumable.into_iter().next() {
         refuse_if_displacement_strands_a_run(logical)?;
-        return Ok(RecoveryGenerations { logical, manifest });
+        return Ok(RecoveryGenerations {
+            logical,
+            tail: preferred,
+            manifest,
+        });
     }
 
     // Otherwise the frames keep the name they already have.
     if !occupied_segments.contains(&preferred) {
         return Ok(RecoveryGenerations {
             logical: preferred,
+            tail: preferred,
             manifest,
         });
     }
@@ -2859,7 +2890,11 @@ fn recovery_generations_for_journal(
             StoreError::Corruption("no logical generation remains for a recovery segment".into())
         })?;
     refuse_if_displacement_strands_a_run(logical)?;
-    Ok(RecoveryGenerations { logical, manifest })
+    Ok(RecoveryGenerations {
+        logical,
+        tail: preferred,
+        manifest,
+    })
 }
 
 /// The logical generation of the active tail above a manifest's committed prefix.

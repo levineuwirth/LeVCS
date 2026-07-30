@@ -6551,8 +6551,8 @@ mod index_maintenance_tests {
     /// carry owes the same refusal, so the tests assert it through one function
     /// rather than through copies that can drift apart the way the code did.
     fn assert_the_open_refuses_naming_the_run(options: StoreOptions, root: &Path) {
-        let runs = manifest_runs(root, 0, root_uuid_of(root));
-        assert_eq!(runs.len(), 1, "one published run is the whole premise");
+        let (run, named) = the_published_runs_generation(root);
+        let runs = [run];
 
         match StoreEngine::open(options) {
             Err(StoreError::Corruption(message)) => assert!(
@@ -6565,14 +6565,34 @@ mod index_maintenance_tests {
             // the refusal reports what it costs rather than a bare expectation.
             Ok(opened) => {
                 let committed = opened.committed_root();
-                let pinned = committed.object_source(0, 1).expect("resolve generation 1");
+                let pinned = committed.object_source(0, named).expect("resolve");
                 panic!(
-                    "the open succeeded with a published run naming generation 1, and the \
+                    "the open succeeded; published run {} names generation {named} and the \
                      reopened root pins {pinned:?} there — every lookup reaching the run \
-                     rather than the replay delta above it reads nothing"
+                     rather than the replay delta above it reads nothing",
+                    runs[0]
                 );
             }
         }
+    }
+
+    /// The generation a published run's entries name — discovered, not assumed.
+    ///
+    /// Which identity the frames ended up with is the thing under test, so a
+    /// test that hard-codes it reports the number it expected rather than the
+    /// one the store chose. That is precisely how the fallback leaking onto a
+    /// surviving journal stayed invisible.
+    fn the_published_runs_generation(root: &Path) -> (String, u64) {
+        let uuid = root_uuid_of(root);
+        let runs = manifest_runs(root, 0, uuid);
+        assert_eq!(runs.len(), 1, "one published run is the whole premise");
+        let run =
+            crate::index::IndexRun::open(&shard_paths(root, 0).indexes().join(&runs[0]), &uuid)
+                .expect("open the published run");
+        let named = (0..16u64)
+            .find(|generation| run.references_segment_generation(*generation))
+            .expect("a run with entries names some generation");
+        (runs[0].clone(), named)
     }
 
     /// Contract review 2026-07-30-B: the two states an occupied identity leaves.
@@ -6641,6 +6661,59 @@ mod index_maintenance_tests {
             resumable_prefix_at(temporary.path(), 0, 2);
         }
 
+        assert_the_open_refuses_naming_the_run(configure(), temporary.path());
+    }
+
+    /// The identity a surviving journal is given must be one the next open can
+    /// derive, or the guard searches for a generation nothing carries.
+    ///
+    /// Review's sequence. An empty journal seals nothing, so a fallback applied
+    /// to it moved an identity that no `TailRange` recorded — the session went
+    /// on to write frames and seal a run under the moved number while the next
+    /// open recomputed the old one. The guard then looked for the wrong
+    /// generation, found no run naming it, and let the store open with the run
+    /// unresolvable.
+    ///
+    /// The assertion is deliberately about what the *store* names things: the
+    /// run's generation is read out of the run rather than assumed, so this
+    /// fails the same way whether the identity drifts by one or by ten.
+    #[test]
+    fn a_surviving_journal_keeps_an_identity_the_next_open_can_derive() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let namespace = NamespaceId([0x4E; 32]);
+        let configure = || {
+            let mut options = sealing_options(&serial, temporary.path(), 4_000_000);
+            options.max_index_runs = 3;
+            options.max_open_index_runs = 3;
+            options
+        };
+
+        // An empty tail, and an orphan on the identity it carries.
+        drop(StoreEngine::open(configure()).expect("open a fresh root"));
+        orphan_segment_at(temporary.path(), 0, 1);
+
+        // The session that keeps that journal writes frames into it and seals a
+        // run over them. Whatever identity it kept, the run now names it.
+        {
+            let engine = StoreEngine::open(configure()).expect("a surviving empty tail opens");
+            block_on(engine.submit(create_transaction(namespace, 2))).expect("create");
+            push_groups(&engine, namespace, 0x60, 2);
+            block_on(engine.submit(push_transaction(namespace, 0x68, 0x68, None)))
+                .expect("the group after the seal commits");
+            assert_eq!(engine.index_maintenance().sealed_runs, 1, "the seal ran");
+        }
+
+        let (_, named) = the_published_runs_generation(temporary.path());
+        assert_eq!(
+            named, 1,
+            "a journal that seals nothing keeps the identity the manifest implies; \
+             a run naming anything else is an identity the next open cannot derive"
+        );
+
+        // Now occupy the identity the frames carry, so the next open must
+        // displace them — and owes the refusal for the run that names them.
+        orphan_segment_at(temporary.path(), 0, 2);
         assert_the_open_refuses_naming_the_run(configure(), temporary.path());
     }
 

@@ -1713,6 +1713,13 @@ The test is what the recovery *names its frames*, not how it got there: an inter
 resuming a fallback an earlier session chose strands the same run, and takes the same refusal. A
 resumed seal at the identity the frames already carry displaces nothing and opens normally.
 
+The fallback applies only to frames being **sealed**. A journal that survives recovery keeps the
+identity the manifest implies even when a `.seg` occupies that name, because nothing is being written
+to `segments/` and there is no collision yet. This is what keeps the active tail's identity derivable
+from the manifest across every open — the property the split rests on. Giving a surviving journal a
+fallback identity moved a number nothing recorded, and the next open, deriving the old one, searched
+published runs for a generation the frames no longer carried.
+
 The closure is for recovery to **discard an index run whose covered identity was not preserved**,
 which turns the refusal into successful reclamation. It is a change to what recovery reclaims and
 belongs with the checkpointing work that will exercise it. Until then a root carrying both an orphan

@@ -1936,10 +1936,14 @@ fn recover_shard_under_lock(
                 must_create_fresh = true;
             }
             ActiveJournalDisposition::Replay => {
-                let recovery_generation = recovery_generation_for_journal(
+                let RecoveryGenerations {
+                    logical: logical_generation,
+                    manifest: manifest_generation,
+                } = recovery_generations_for_journal(
                     &paths,
                     &root_uuid,
                     &header.journal_id,
+                    &selection,
                     config,
                 )?;
                 let from = if checkpointed && checkpoint.active_journal_id == header.journal_id {
@@ -1998,7 +2002,7 @@ fn recover_shard_under_lock(
                     replayed.push(ReplayedFrame {
                         facts,
                         payload,
-                        generation: recovery_generation,
+                        generation: logical_generation,
                         offset: scanned.offset,
                         len: scanned.len,
                     });
@@ -2029,7 +2033,7 @@ fn recover_shard_under_lock(
                             &header,
                             &full_scan,
                             &paths,
-                            recovery_generation,
+                            logical_generation,
                             &counters,
                         )?;
                         let filename = segment_path
@@ -2055,14 +2059,14 @@ fn recover_shard_under_lock(
                             })
                             .unwrap_or((Vec::new(), Vec::new(), Vec::new()));
                         retained_tail_ranges.push(TailRange {
-                            generation: recovery_generation,
+                            generation: logical_generation,
                             first_shard_sequence: first,
                             last_shard_sequence: last,
                             filename,
                         });
                         let manifest = Manifest {
                             root_uuid,
-                            generation: recovery_generation,
+                            generation: manifest_generation,
                             base_generation: 0,
                             retained_tail_ranges,
                             index_runs,
@@ -2080,29 +2084,29 @@ fn recover_shard_under_lock(
 
                         let reader = Arc::new(SegmentReader::open(&segment_path, &root_uuid)?);
                         retained_segments.push(RootRetainedSegment::new(
-                            recovery_generation,
+                            logical_generation,
                             header.journal_id,
                             first,
                             last,
                             PinnedFile::open(segment_path.clone())?,
                         ));
                         segments.push(RecoveredSegment {
-                            generation: recovery_generation,
+                            generation: logical_generation,
                             first_shard_sequence: first,
                             last_shard_sequence: last,
                             path: segment_path,
                             reader,
                         });
 
-                        let manifest_path = paths.manifest(recovery_generation);
+                        let manifest_path = paths.manifest(manifest_generation);
                         selection = Some(ManifestSelection {
                             manifest,
-                            generation: recovery_generation,
+                            generation: manifest_generation,
                             path: manifest_path,
                             source: ManifestSource::Current,
                             rejected: Vec::new(),
                         });
-                        report.manifest_generation = Some(recovery_generation);
+                        report.manifest_generation = Some(manifest_generation);
                     }
 
                     drop(file);
@@ -2113,13 +2117,13 @@ fn recover_shard_under_lock(
                     let retained_tail =
                         PinnedFile::from_shared(path.clone(), Arc::clone(&shared_file));
                     recovered_tail = Some(RecoveredTail {
-                        logical_generation: recovery_generation,
+                        logical_generation,
                         journal_id: header.journal_id,
                         path,
                         validated_through: JOURNAL_HEADER_LEN as u64,
                         file: shared_file,
                     });
-                    retained_tails.push(RetainedTail::new(recovery_generation, retained_tail));
+                    retained_tails.push(RetainedTail::new(logical_generation, retained_tail));
                 }
             }
         }
@@ -2574,12 +2578,50 @@ fn apply_recovered_refs(
     Ok(())
 }
 
-fn recovery_generation_for_journal(
+/// The two generations a recovery needs, which are not the same number.
+///
+/// Contract review 2026-07-30-A. They were one, and the conflation was invisible
+/// for as long as nothing outlived a session holding an `IndexLocation`.
+pub(crate) struct RecoveryGenerations {
+    /// The **logical** generation of the frames: the identity an `IndexLocation`
+    /// names, inherited from the active tail so that sealing it into a segment
+    /// moves the bytes without changing what they are called.
+    logical: u64,
+    /// The generation of the manifest this recovery installs. A counter over
+    /// manifests, which an index run's manifest also advances.
+    manifest: u64,
+}
+
+/// Choose both.
+///
+/// # Why they had to be separated
+///
+/// A single `max(manifest, .seg, .idx) + 1` served as the sealed segment's
+/// logical generation *and* as the new manifest's generation. Every index run
+/// publishes a manifest, so every seal moved the number — and the segment
+/// recovery then wrote took the moved value while the frames it holds were
+/// already named by the old one. Persisted index locations dangled:
+/// `object_source` returned `None` for a run the manifest still named.
+///
+/// Separated, each number answers its own question. The logical generation is
+/// [`active_tail_logical_generation`] — the identity the frames already have,
+/// derived from the manifest's committed prefix and stable across opens. The
+/// manifest generation is the next free one, so an index run's manifest cannot
+/// collide with a recovery's.
+///
+/// # Resumption
+///
+/// An interrupted recovery leaves a `.seg` whose footer names this journal, or a
+/// `.recovery-<id>-<generation>.prefix`. Either fixes the logical generation:
+/// finishing an interrupted seal must reuse the identity it already chose, not
+/// pick a fresh one and orphan the artifact.
+fn recovery_generations_for_journal(
     paths: &ShardPaths,
     root_uuid: &[u8; 16],
     active_journal_id: &[u8; 16],
+    selection: &Option<ManifestSelection>,
     config: &RecoveryConfig<'_>,
-) -> Result<u64, StoreError> {
+) -> Result<RecoveryGenerations, StoreError> {
     let per_manifest = usize::try_from(config.max_index_runs)
         .unwrap_or(usize::MAX)
         .saturating_add(config.checkpoint_retain as usize)
@@ -2590,7 +2632,13 @@ fn recovery_generation_for_journal(
         .saturating_mul(per_manifest)
         .max(64);
     let mut inspected = 0usize;
-    let mut maximum = 0u64;
+    // Two questions, two answers. A single maximum over all three namespaces —
+    // manifest generations, segment logical generations, index-run identities —
+    // is what conflated them: an index run's manifest moved a number the sealed
+    // segment's identity was read from. Only a segment can collide with a
+    // segment, and only a manifest with a manifest.
+    let maximum_manifest;
+    let mut occupied_segments: BTreeSet<u64> = BTreeSet::new();
     let mut resumable = BTreeSet::new();
 
     let manifests = segment::list_manifest_generations(paths)?;
@@ -2602,7 +2650,7 @@ fn recovery_generation_for_journal(
             allowed: budget as u64,
         });
     }
-    maximum = maximum.max(manifests.into_iter().max().unwrap_or(0));
+    maximum_manifest = manifests.into_iter().max().unwrap_or(0);
 
     for (dir, extension) in [(paths.segments(), "seg"), (paths.indexes(), "idx")] {
         let entries = match std::fs::read_dir(&dir) {
@@ -2643,6 +2691,7 @@ fn recovery_generation_for_journal(
                     if &reader.footer().journal_id == active_journal_id {
                         resumable.insert(reader.footer().generation);
                     }
+                    occupied_segments.insert(reader.footer().generation);
                     reader.footer().generation
                 })
             } else {
@@ -2665,7 +2714,13 @@ fn recovery_generation_for_journal(
                         path.display()
                     ))
                 })?;
-            maximum = maximum.max(generation);
+            // A `.seg` occupies a logical generation whether or not it opens:
+            // an interrupted seal can leave a name holding something that is not
+            // a segment at all, and that name is still taken. Recorded from the
+            // parsed name precisely because the reader above could not read it.
+            if extension == "seg" {
+                occupied_segments.insert(generation);
+            }
         }
     }
 
@@ -2696,7 +2751,6 @@ fn recovery_generation_for_journal(
                 path.display()
             ))
         })?;
-        maximum = maximum.max(generation);
         resumable.insert(generation);
     }
 
@@ -2707,20 +2761,47 @@ fn recovery_generation_for_journal(
             resumable
         )));
     }
-    if let Some(generation) = resumable.into_iter().next() {
-        if generation != maximum {
-            return Err(StoreError::Corruption(format!(
-                "recovery artifact generation {generation} for journal {} is below occupied \
-                 immutable generation {maximum}",
-                hex::encode(active_journal_id)
-            )));
-        }
-        return Ok(generation);
+    let manifest = maximum_manifest.checked_add(1).ok_or_else(|| {
+        StoreError::Corruption("no generation remains for recovery manifests".into())
+    })?;
+
+    // Resuming: the identity was already chosen and the artifact carries it.
+    if let Some(logical) = resumable.into_iter().next() {
+        return Ok(RecoveryGenerations { logical, manifest });
     }
 
-    maximum.checked_add(1).ok_or_else(|| {
-        StoreError::Corruption("no generation remains for recovery artifacts".into())
-    })
+    // Otherwise the frames keep the name they already have.
+    let preferred = active_tail_logical_generation(selection);
+    if !occupied_segments.contains(&preferred) {
+        return Ok(RecoveryGenerations {
+            logical: preferred,
+            manifest,
+        });
+    }
+
+    // The identity is taken — by an orphan from an interrupted seal, or by a
+    // segment no manifest references. Recovery must still succeed: an orphan is
+    // a documented state in which the active journal remains the authority, and
+    // refusing here would turn a recoverable root into an outage.
+    //
+    // So the seal falls back to a free generation, and the frames are renamed.
+    // That is the pre-2026-07-30-A behaviour and it carries its hazard with it:
+    // an index run holding locations against `preferred` no longer resolves. The
+    // closure is to drop such runs during recovery rather than let a reader find
+    // nothing through them — recorded in scope §6.5 and not attempted here,
+    // because it is a change to what recovery *discards* and belongs with the
+    // checkpointing work that will exercise it.
+    let logical = occupied_segments
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(preferred)
+        .max(preferred)
+        .checked_add(1)
+        .ok_or_else(|| {
+            StoreError::Corruption("no logical generation remains for a recovery segment".into())
+        })?;
+    Ok(RecoveryGenerations { logical, manifest })
 }
 
 /// The logical generation of the active tail above a manifest's committed prefix.

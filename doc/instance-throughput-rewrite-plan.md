@@ -1477,6 +1477,54 @@ an active tail are at least visible in one place.
 so a four-shard root with `max_index_runs = 1` refused the second shard its first run. Counted per
 shard now, from the shard's own retained generations.
 
+##### Contract review 2026-07-30-A
+
+**`recovery_generation` was two numbers wearing one name, and they are now separated.** Granted and
+landed in `recovery.rs` (A2) as the prerequisite the checkpointing dispatch was to open with.
+
+One `max(manifest, .seg, .idx) + 1` served as the logical generation of the segment recovery seals
+*and* as the generation of the manifest recovery installs. Every index run publishes a manifest, so
+every seal moved the number; the segment recovery later wrote took the moved value while the frames
+inside it were already named by the old one. Persisted index locations dangled — `object_source`
+returning `None` for a run the manifest still named.
+
+Separated:
+
+- **logical** — the identity of the frames, taken from `active_tail_logical_generation`, which is
+  derived from the manifest's committed prefix and moves only when a rotation seals a tail. Sealing a
+  journal into a segment now changes where the bytes are, not what they are called. An interrupted
+  recovery still resumes: a `.seg` footer naming this journal, or a `.recovery-<id>-<n>.prefix`,
+  fixes the identity that was already chosen.
+- **manifest** — the next free manifest generation, so an index run's manifest and a recovery's
+  cannot collide.
+
+Collision detection moved with them. The old check compared a resumable generation against a maximum
+that mixed all three namespaces, which an index run could raise on its own; only a segment can
+collide with a segment, so the check is now against segment generations alone, and claiming one that
+another journal holds is `Corruption`.
+
+**What this closes.** The scope §6.5 carry-forward "a run may only cover frames a segment already
+holds" is gone, and with it the restriction in `ShardWriter::coverable_through`: a run may now cover
+locations naming the active tail, because the tail's identity survives being sealed away. Sealing
+covers current frames in the session that wrote them rather than lagging one behind. Mutation-checked
+by putting the segment's identity back on the manifest counter, which reproduces the original defect
+exactly — a recovered run pointing at a logical generation nothing pins.
+
+**One case is not closed, and it was found by a test rather than predicted.** An orphan `.seg` from
+an interrupted seal occupies a logical generation whether or not it is a readable segment — and the
+identity the tail wants may be exactly the one it holds. `frame_golden`'s
+`an_orphan_segment_leaves_the_active_journal_the_authority` failed on the first attempt for that
+reason, which is also the test that documents why recovery must not refuse in this state: the active
+journal is still the authority and an outage here would be the wrong answer. The seal therefore falls
+back to a free generation and renames the frames, exactly as before this review, and an index run
+against the old identity dangles. Confined to roots carrying an orphan segment, where it was
+previously universal; the closure — recovery discarding runs whose identity was not preserved — is
+recorded in scope §6.5 for the checkpointing work.
+
+The other §6.5 carry-forward stands: sealing still moves no frame out of `active/`, so the replay
+ceiling still bounds admission and an entry-pressure seal still lands on it. That is what
+`StoreEngine::checkpoint` is for, and it is now unblocked.
+
 ##### Contract review 2026-07-28-C
 
 B4 re-pointed `store-bench` at a real `StoreEngine::submit` and found that four verification

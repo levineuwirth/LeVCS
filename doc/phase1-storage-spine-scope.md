@@ -1680,30 +1680,31 @@ This is a scope consequence and not a defect: nothing here is unsound, and both 
 asserted by tests. It is written down so that "the shard seals under pressure" is not read as "the
 shard can run indefinitely under pressure", which is what checkpointing will make true.
 
-#### Carry-forward: a run may only cover frames a segment already holds
+#### Closed: a run may cover frames the active journal still holds
 
-The second half of the same fact, found in review (contract review 2026-07-29-D) and stated
-separately because it constrains what a seal may *contain* rather than when one happens.
+Recorded as a carry-forward with the index-maintenance slice and **closed** by contract review
+2026-07-30-A, which is why the restriction it describes is no longer in the code.
 
-An `IndexLocation` names a **logical generation**, and a sealed run is the first thing in this store
-that persists one beyond the session that wrote it. That is sound only for a generation that is
-stable across opens, and exactly one kind is: a segment, pinned by name in the manifest. The active
-tail's generation is assigned by recovery from `max(manifest, .seg, .idx) + 1`, so it moves whenever
-any artifact appears — including the index run's own manifest. When recovery seals a journal holding
-frames, the resulting segment takes that counter's value and not the generation the tail had, so a
-run written against tail locations dangles at the next open: `object_source` returns `None` for a run
-the manifest still names, and a reader going *through* the run rather than around it reads nothing.
+The constraint was that an `IndexLocation` names a logical generation, and only a segment's was
+stable: the active tail's came from `max(manifest, .seg, .idx) + 1`, so it moved whenever any
+artifact appeared — an index run's own manifest was enough — and recovery then sealed the tail into
+a segment under the moved value rather than the identity the frames already had.
 
-Sealing therefore covers an oldest-first prefix of layers whose every entry is segment-backed, and
-stops at the first that is not. Until a rotation or checkpoint moves frames out of `active/`, that
-means a seal covers what a previous session left in segments — sealing lags one session behind.
+`recovery_generation` was two numbers wearing one name. Split, each answers its own question: the
+sealed segment inherits the **tail's** logical generation, so moving frames from `active/` to
+`segments/` changes where they are and not what they are called; the recovery manifest takes the
+next free **manifest** generation, so an index run's manifest cannot collide with a recovery's.
+Sealing therefore covers current frames, in the session that wrote them.
 
-**The blocker to lift it**, and it should be lifted with checkpointing rather than after:
-`recovery_generation` currently serves as two different numbers at once — the generation of the new
-manifest recovery installs, and the logical generation of the segment it seals. Preserving a location
-across the move from `active/` to `segments/` requires the segment to inherit the tail's logical
-generation, which requires those two to be separated first. That is an A2 recovery-core change and
-was deliberately not attempted inside a B1 integration commit.
+**Residual, one case wide.** If a `.seg` already occupies the tail's identity — an orphan from an
+interrupted seal, or a segment no manifest references — the seal cannot use that name and falls back
+to a free generation, renaming the frames. An index run holding locations against the old identity
+then resolves to nothing. Recovery must not refuse here: an orphan segment is a documented state in
+which the active journal stays the authority, and refusing would turn a recoverable root into an
+outage. The closure is for recovery to **discard index runs whose covered identity was not
+preserved**, which is a change to what recovery reclaims and belongs with the checkpointing work that
+will exercise it. Until then the hazard is confined to roots carrying an orphan segment, where it was
+previously universal.
 
 ### 6.5 B3 — StagingSessions
 

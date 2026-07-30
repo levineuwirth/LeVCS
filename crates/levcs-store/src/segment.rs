@@ -117,6 +117,53 @@ pub fn segment_filename(generation: u64, first: u64, last: u64) -> String {
 // Root initialization
 // ---------------------------------------------------------------------------
 
+/// `quarantine/`, `staging/`, `shards/` — the store-invented entries directly
+/// beneath a root, in the order [`planned_directories`] lists them. `opened[0]`
+/// and `opened[2]` in [`initialize_root`] are `quarantine/` and `shards/`.
+const STORE_INVENTED_ROOT_ENTRIES: usize = 3;
+
+/// `<shard>/` plus `active`, `segments`, `indexes`, `checkpoints`, `manifests`.
+const DIRS_PER_SHARD: usize = 6;
+
+/// Every directory [`initialize_root`] invents beneath the root, parents first.
+///
+/// Separated from the creation loop because the refusal rule needs the whole set
+/// before any of it is created, and because the fencing below indexes into it
+/// positionally.
+fn planned_directories(layout: &RootLayout, shard_count: u16) -> Vec<PathBuf> {
+    let mut planned =
+        Vec::with_capacity(STORE_INVENTED_ROOT_ENTRIES + shard_count as usize * DIRS_PER_SHARD);
+    planned.push(layout.quarantine_dir());
+    planned.push(layout.staging_dir());
+    planned.push(layout.shards_dir());
+    debug_assert_eq!(planned.len(), STORE_INVENTED_ROOT_ENTRIES);
+    for shard in 0..shard_count {
+        let paths = layout.shard(shard);
+        let before = planned.len();
+        planned.push(paths.dir.clone());
+        planned.push(paths.active());
+        planned.push(paths.segments());
+        planned.push(paths.indexes());
+        planned.push(paths.checkpoints());
+        planned.push(paths.manifests());
+        debug_assert_eq!(planned.len() - before, DIRS_PER_SHARD);
+    }
+    planned
+}
+
+/// A name the store must own as a directory, occupied by something else.
+///
+/// [`StoreError::UnrecognizedLayout`] rather than an `Io`: the store is being
+/// asked to build its tree through an object it did not create, which is the
+/// same judgement as any other unrecognized occupant of a root, and the same
+/// answer — refuse, modify nothing.
+fn not_a_directory(path: &Path) -> StoreError {
+    StoreError::UnrecognizedLayout(format!(
+        "{} is not a directory; refusing to build the store tree through it",
+        path.display()
+    ))
+}
+
 /// Create the v2 tree and write `FORMAT`, fsyncing every new directory and the
 /// root's parent (scope 3.1 startup state 1).
 ///
@@ -136,25 +183,49 @@ pub fn initialize_root(
             "shard_count must be nonzero".into(),
         ));
     }
+    // The root itself, and everything above it, is the caller's path. Resolving
+    // it is explicitly out of scope (§3.1): an operator who configures a root
+    // behind a symlink has said where the store goes.
     std::fs::create_dir_all(&layout.root)?;
-    std::fs::create_dir_all(layout.quarantine_dir())?;
-    std::fs::create_dir_all(layout.staging_dir())?;
-    std::fs::create_dir_all(layout.shards_dir())?;
 
-    for shard in 0..shard_count {
-        let paths = layout.shard(shard);
-        for dir in [
-            paths.dir.clone(),
-            paths.active(),
-            paths.segments(),
-            paths.indexes(),
-            paths.checkpoints(),
-            paths.manifests(),
-        ] {
-            std::fs::create_dir_all(&dir)?;
-            sys::fsync_dir(&dir, counters)?;
+    // Everything below is a name *the store invents*, and none of it may be
+    // reached through a link. Two passes, because a refusal must not leave the
+    // tree half-extended: pass one classifies every planned directory and holds
+    // a descriptor onto each that already exists, pass two creates the rest.
+    // Ordered parents-before-children so pass two never creates through a name
+    // pass one did not see.
+    let planned = planned_directories(layout, shard_count);
+    let mut found = Vec::with_capacity(planned.len());
+    for directory in &planned {
+        match sys::open_directory_nofollow(directory)? {
+            sys::NamedDirectory::Opened(handle) => found.push(Some(handle)),
+            sys::NamedDirectory::Absent => found.push(None),
+            sys::NamedDirectory::NotDirectory => return Err(not_a_directory(directory)),
         }
-        sys::fsync_dir(&paths.dir, counters)?;
+    }
+    let mut opened = Vec::with_capacity(planned.len());
+    for (directory, existing) in planned.iter().zip(found) {
+        opened.push(match existing {
+            Some(handle) => handle,
+            None => sys::create_directory_nofollow(directory)?
+                .ok_or_else(|| not_a_directory(directory))?,
+        });
+    }
+
+    // Fenced through the descriptors just established, not by reopening their
+    // names: a second lookup would hand the fence to whatever the name resolves
+    // to now rather than to the directory that was validated.
+    //
+    // The shape of this sequence is load-bearing and unchanged — six directories
+    // per shard plus the shard directory again, which `engine.rs` asserts as an
+    // exact `fsync_dir` count.
+    for shard in 0..shard_count as usize {
+        let shard_directories =
+            &opened[STORE_INVENTED_ROOT_ENTRIES + shard * DIRS_PER_SHARD..][..DIRS_PER_SHARD];
+        for directory in shard_directories {
+            sys::fsync_dir_fd(directory, counters)?;
+        }
+        sys::fsync_dir_fd(&shard_directories[0], counters)?;
     }
 
     let marker = crate::format::FormatMarker {
@@ -169,8 +240,8 @@ pub fn initialize_root(
     write_fenced(&tmp, &bytes, counters)?;
     sys::rename_noreplace(&tmp, &layout.format_path())?;
 
-    sys::fsync_dir(&layout.shards_dir(), counters)?;
-    sys::fsync_dir(&layout.quarantine_dir(), counters)?;
+    sys::fsync_dir_fd(&opened[2], counters)?;
+    sys::fsync_dir_fd(&opened[0], counters)?;
     sys::fsync_dir(&layout.root, counters)?;
     if let Some(parent) = layout.root.parent() {
         sys::fsync_dir(parent, counters)?;
@@ -179,8 +250,38 @@ pub fn initialize_root(
 }
 
 /// Read and validate `FORMAT`.
+///
+/// Three answers, kept distinct because callers act on them differently:
+///
+/// - **Absent** — `Io(NotFound)`, exactly as `File::open` reported it. An absent
+///   `FORMAT` is startup state 1 or 3, not a refusal, and `classify_root` and
+///   `drive.rs` both read it that way.
+/// - **Not a regular file** — [`StoreError::UnrecognizedLayout`]. A symlink here
+///   is the read-only member of the redirection family: following it would let a
+///   `FORMAT` outside the root decide this root's `shard_count` and `root_uuid`,
+///   and every file in the tree is then validated against a marker the store
+///   never wrote. Nothing is destroyed, which is why it was ranked lowest of the
+///   four, and it is still an authority the operator did not grant.
+/// - **A regular file that does not decode** — unchanged. `FormatMismatch` or a
+///   decode error, which is a corrupt marker and a different finding from a
+///   redirected one.
 pub fn read_format(layout: &RootLayout) -> Result<crate::format::FormatMarker, StoreError> {
-    let file = File::open(layout.format_path())?;
+    let path = layout.format_path();
+    let file = match sys::open_regular_nofollow_classified(&path)? {
+        sys::NamedRegularFile::Opened(file) => file,
+        sys::NamedRegularFile::Absent => {
+            return Err(StoreError::Io(Arc::new(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("{} not found", path.display()),
+            ))))
+        }
+        sys::NamedRegularFile::NotRegular => {
+            return Err(StoreError::UnrecognizedLayout(format!(
+                "{} is not a regular file; refusing to read a format marker through it",
+                path.display()
+            )))
+        }
+    };
     let mut bytes = [0u8; FORMAT_MARKER_LEN];
     sys::pread_exact(&file, 0, &mut bytes)?;
     Ok(crate::format::FormatMarker::decode(&bytes)?)
@@ -296,16 +397,34 @@ pub fn lock_root(layout: &RootLayout) -> Result<RootLock, StoreError> {
 
 /// Write a file and fence it. The name is not yet durable; the caller renames
 /// and syncs the directory.
+///
+/// # Why the open is not `create(true).truncate(true)`
+///
+/// Every caller passes a `.tmp` name inside the root — `FORMAT.tmp`,
+/// `<generation>.manifest.tmp`, `CURRENT.tmp` — and an `O_TRUNC` open destroys
+/// whatever the name holds before anything can look at it. Through a symlink it
+/// destroys a file *outside* the root: measured at `INITIALIZING.tmp` earlier in
+/// this wave, a 4096-byte file went to 27 bytes with the link removed and the
+/// store reporting success. These names are as reachable to an operator as that
+/// one was.
+///
+/// So the open and the truncation are separated: no flag combination truncates
+/// only regular files, which is why the type check needs the descriptor first.
+/// An existing regular file is **kept and emptied**, not refused — it is residue
+/// from an interrupted attempt at this exact write, and reusing the name is how
+/// the retry works. Anything else at the name is
+/// [`StoreError::UnrecognizedLayout`].
 fn write_fenced(
     path: &Path,
     bytes: &[u8],
     counters: &DurabilityCounters,
 ) -> Result<(), StoreError> {
-    let mut file = File::options()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(path)?;
+    let Some(mut file) = sys::open_or_create_regular_truncated_nofollow(path, counters)? else {
+        return Err(StoreError::UnrecognizedLayout(format!(
+            "{} is not a regular file; refusing to write a store metadata file through it",
+            path.display()
+        )));
+    };
     // Through the funnel, so the counters see every durable byte.
     sys::write_vectored_all(&mut file, &[IoSlice::new(bytes)], counters)?;
     sys::fdatasync(&file, counters)?;
@@ -1335,5 +1454,397 @@ mod root_lock_tests {
             failures_before,
             "a root lock failed to release in Drop"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Path-redirection tests (contract review 2026-07-29-B)
+// ---------------------------------------------------------------------------
+
+/// The three remaining redirection hazards, each exercised at the `segment`
+/// entry point that carries it.
+///
+/// Deliberately **not** through `StoreEngine::open`. Its classifier refuses a
+/// redirected root before these are reached, so a test that went in that way
+/// would pass whether or not the protection here exists — and `RecoverySession`,
+/// `drive.rs` and `store-bench` all arrive here without it. Coverage of the
+/// caller is not coverage of the callee.
+#[cfg(test)]
+mod path_redirection_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    fn counters() -> DurabilityCounters {
+        DurabilityCounters::default()
+    }
+
+    /// Every name in a tree with its bytes, for "unchanged" assertions.
+    fn tree_image(root: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(current) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&current) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("inside the tree")
+                    .to_path_buf();
+                let kind = entry.file_type().expect("file type");
+                if kind.is_dir() {
+                    stack.push(path);
+                    out.push((relative, None));
+                } else {
+                    out.push((relative, std::fs::read(&path).ok()));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    fn mkfifo_at(path: &Path) {
+        let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+            .expect("a path with no interior NUL");
+        // SAFETY: `name` is a valid NUL-terminated path for the call's duration.
+        assert_eq!(
+            unsafe { libc::mkfifo(name.as_ptr(), 0o644) },
+            0,
+            "mkfifo: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// Run `body` on another thread and fail if it does not finish.
+    ///
+    /// A blocking `open(2)` is not a slow refusal, it is an unbounded startup
+    /// hang: one `mkfifo` in a configured root, reachable by any operator. The
+    /// only assertion that distinguishes the two is a deadline.
+    fn must_not_block<T: Send + 'static>(
+        what: &str,
+        body: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(body());
+        });
+        match receiver.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(value) => value,
+            Err(_) => panic!(
+                "{what} did not return within ten seconds: the open blocked. A fifo at a store \
+                 metadata name must be refused, not waited on."
+            ),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // write_fenced
+    // -----------------------------------------------------------------------
+
+    /// A live link at a temporary name must not reach its target at all.
+    #[test]
+    fn a_linked_temporary_name_cannot_alter_the_file_it_points_at() {
+        let outside = tempfile::tempdir().expect("tempdir");
+        let victim = outside.path().join("ledger");
+        std::fs::write(&victim, b"balances\n").expect("the file outside the root");
+        let root = tempfile::tempdir().expect("temp root");
+        let tmp = root.path().join("FORMAT.tmp");
+        symlink(&victim, &tmp).expect("plant the link");
+
+        let outcome = write_fenced(&tmp, b"a store metadata marker", &counters());
+
+        // The damage first, so a regression reports what was destroyed rather
+        // than which error type came back.
+        assert_eq!(
+            std::fs::read(&victim).expect("the target still exists"),
+            b"balances\n",
+            "a fenced write through a symlink truncated and rewrote a file outside the root"
+        );
+        assert!(
+            std::fs::symlink_metadata(&tmp).is_ok(),
+            "the link itself must be left alone for the operator to find"
+        );
+        match outcome {
+            Err(StoreError::UnrecognizedLayout(reason)) => {
+                assert!(reason.contains("FORMAT.tmp"), "{reason}")
+            }
+            other => panic!("expected UnrecognizedLayout, got {other:?}"),
+        }
+    }
+
+    /// The dangling form, which creates rather than destroys.
+    #[test]
+    fn a_dangling_link_at_a_temporary_name_creates_nothing() {
+        let outside = tempfile::tempdir().expect("tempdir");
+        let absent = outside.path().join("not-there");
+        let root = tempfile::tempdir().expect("temp root");
+        let tmp = root.path().join("FORMAT.tmp");
+        symlink(&absent, &tmp).expect("plant the link");
+
+        let outcome = write_fenced(&tmp, b"a store metadata marker", &counters());
+
+        assert!(
+            !absent.exists(),
+            "a fenced write through a dangling symlink created a file outside the root"
+        );
+        match outcome {
+            Err(StoreError::UnrecognizedLayout(_)) => {}
+            other => panic!("expected UnrecognizedLayout, got {other:?}"),
+        }
+    }
+
+    /// Every non-regular occupant, and the one occupant that is legitimate.
+    #[test]
+    fn a_non_regular_temporary_name_is_refused_and_a_regular_one_is_retried() {
+        let mut wrong = Vec::new();
+        for (label, occupy) in [
+            (
+                "directory",
+                (|path: &Path| std::fs::create_dir(path).expect("mkdir")) as fn(&Path),
+            ),
+            ("unix socket", |path: &Path| {
+                std::os::unix::net::UnixListener::bind(path).expect("bind");
+            }),
+            ("fifo", mkfifo_at),
+        ] {
+            let root = tempfile::tempdir().expect("temp root");
+            let tmp = root.path().join("FORMAT.tmp");
+            occupy(&tmp);
+            let attempt = tmp.clone();
+            let outcome = must_not_block(label, move || {
+                write_fenced(
+                    &attempt,
+                    b"a store metadata marker",
+                    &DurabilityCounters::default(),
+                )
+            });
+            match outcome {
+                Err(StoreError::UnrecognizedLayout(_)) => {}
+                other => wrong.push(format!("{label}: {other:?}")),
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "a non-regular temporary name must be UnrecognizedLayout, not written through and \
+             not an untyped errno: {wrong:?}"
+        );
+
+        // Residue from an interrupted attempt at this same write. Retrying is the
+        // point of a `.tmp` name, so it is adopted — and emptied, which the
+        // stale tail proves: it is longer than the new contents, so a missing
+        // truncation leaves it visible.
+        let root = tempfile::tempdir().expect("temp root");
+        let tmp = root.path().join("FORMAT.tmp");
+        std::fs::write(
+            &tmp,
+            b"residue from an interrupted attempt, longer than what follows",
+        )
+        .expect("stale residue");
+        write_fenced(&tmp, b"the retry", &counters()).expect("an existing regular temp is retried");
+        assert_eq!(
+            std::fs::read(&tmp).expect("read the temp"),
+            b"the retry",
+            "a retried fenced write must leave exactly the new bytes"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // read_format
+    // -----------------------------------------------------------------------
+
+    /// A valid marker at the far end of a link is still not this root's marker.
+    ///
+    /// The target holds a real, decodable `FORMAT` — built by `initialize_root`,
+    /// not hand-rolled — so the refusal cannot be mistaken for the bytes being
+    /// rejected. Read as a regular file the same bytes are accepted, which the
+    /// second half asserts: without it this test would pass against an
+    /// implementation that had simply broken `read_format`.
+    #[test]
+    fn a_linked_format_marker_is_never_read_even_when_it_is_valid() {
+        let donor = tempfile::tempdir().expect("temp root");
+        let donor_layout = RootLayout::new(donor.path());
+        initialize_root(&donor_layout, 1, [0x5A; 16], 1, &counters()).expect("a real root");
+        let valid = std::fs::read(donor_layout.format_path()).expect("real FORMAT bytes");
+
+        let outside = tempfile::tempdir().expect("tempdir");
+        let target = outside.path().join("someone-elses-FORMAT");
+        std::fs::write(&target, &valid).expect("a valid marker outside the root");
+
+        let root = tempfile::tempdir().expect("temp root");
+        let layout = RootLayout::new(root.path());
+        symlink(&target, layout.format_path()).expect("plant the link");
+        match read_format(&layout) {
+            Err(StoreError::UnrecognizedLayout(reason)) => {
+                assert!(reason.contains("FORMAT"), "{reason}")
+            }
+            Ok(marker) => panic!(
+                "a FORMAT symlink was followed: this root's shard_count and root_uuid would come \
+                 from a marker outside it ({marker:?}), and every file in the tree would then be \
+                 validated against a marker the store never wrote"
+            ),
+            Err(other) => panic!("expected UnrecognizedLayout, got {other:?}"),
+        }
+
+        // The same bytes, as a regular file, are read.
+        std::fs::remove_file(layout.format_path()).expect("remove the link");
+        std::fs::write(layout.format_path(), &valid).expect("the same bytes, directly");
+        read_format(&layout).expect("a regular FORMAT holding valid bytes must still be read");
+    }
+
+    /// The other two answers, which are not refusals and must not become ones.
+    #[test]
+    fn an_absent_format_is_not_found_and_a_corrupt_one_still_fails_to_decode() {
+        let root = tempfile::tempdir().expect("temp root");
+        let layout = RootLayout::new(root.path());
+        match read_format(&layout) {
+            Err(StoreError::Io(error)) => assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::NotFound,
+                "an absent FORMAT is startup state 1 or 3 and must keep reporting NotFound"
+            ),
+            other => panic!("expected Io(NotFound), got {other:?}"),
+        }
+
+        std::fs::write(layout.format_path(), [0xAB; FORMAT_MARKER_LEN]).expect("garbage");
+        match read_format(&layout) {
+            Err(StoreError::UnrecognizedLayout(reason)) => panic!(
+                "a corrupt *regular* marker is a different finding from a redirected one and \
+                 must keep its decode error: {reason}"
+            ),
+            Err(_) => {}
+            Ok(marker) => panic!("garbage decoded as a marker: {marker:?}"),
+        }
+    }
+
+    /// A fifo at `FORMAT` is the read-side hang. `open(2)` read-only on one
+    /// blocks until a writer arrives, so this is the case `O_NONBLOCK` in the
+    /// funnel exists for.
+    #[test]
+    fn a_fifo_at_format_is_refused_rather_than_waited_on() {
+        let root = tempfile::tempdir().expect("temp root");
+        let layout = RootLayout::new(root.path());
+        mkfifo_at(&layout.format_path());
+        let probed = RootLayout::new(root.path().to_path_buf());
+        match must_not_block("read_format on a fifo", move || read_format(&probed)) {
+            Err(StoreError::UnrecognizedLayout(_)) => {}
+            other => panic!("expected UnrecognizedLayout, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // initialize_root
+    // -----------------------------------------------------------------------
+
+    /// A link where the store expects to invent a directory.
+    ///
+    /// Both positions: `shards/` itself, and one subdirectory of one shard. In
+    /// each case `create_dir_all` would have followed the link and built the
+    /// store's tree at the far end of it.
+    #[test]
+    fn a_linked_directory_name_creates_nothing_outside_the_root() {
+        for position in ["shards", "shards/00/segments"] {
+            let outside = tempfile::tempdir().expect("tempdir");
+            let elsewhere = outside.path().join("elsewhere");
+            std::fs::create_dir(&elsewhere).expect("a directory outside the root");
+
+            let root = tempfile::tempdir().expect("temp root");
+            let layout = RootLayout::new(root.path());
+            let planted = root.path().join(position);
+            if let Some(parent) = planted.parent() {
+                std::fs::create_dir_all(parent).expect("the parent the link sits in");
+            }
+            symlink(&elsewhere, &planted).expect("plant the link");
+
+            let outcome = initialize_root(&layout, 2, [0x11; 16], 1, &counters());
+
+            // The damage first: a regression here is the tree being built
+            // somewhere it must never be, not the error type.
+            assert_eq!(
+                tree_image(&elsewhere),
+                Vec::new(),
+                "initialize_root built part of the store tree outside the root, through {position}"
+            );
+            match outcome {
+                Err(StoreError::UnrecognizedLayout(reason)) => {
+                    assert!(
+                        reason.contains(position.rsplit('/').next().expect("name")),
+                        "{reason}"
+                    )
+                }
+                other => {
+                    panic!("expected UnrecognizedLayout for a link at {position}, got {other:?}")
+                }
+            }
+        }
+    }
+
+    /// The preflight, which is what stops a refusal from half-extending a tree.
+    ///
+    /// The link sits at `shards/00/segments`, and the two names created *before*
+    /// it in creation order are `shards/00` (which exists already) and
+    /// `shards/00/active` (which does not). A single pass that created as it went
+    /// would leave `active` behind; the assertion is that it does not exist, and
+    /// that the second shard was never begun.
+    #[test]
+    fn a_refusal_does_not_extend_the_tree_it_refused() {
+        let outside = tempfile::tempdir().expect("tempdir");
+        let elsewhere = outside.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).expect("a directory outside the root");
+
+        let root = tempfile::tempdir().expect("temp root");
+        let layout = RootLayout::new(root.path());
+        // A partially built tree, as an interrupted initialization leaves.
+        std::fs::create_dir_all(layout.quarantine_dir()).expect("quarantine");
+        std::fs::write(layout.quarantine_dir().join("keep"), b"forensics\n").expect("residue");
+        std::fs::create_dir_all(layout.shard(0).dir).expect("the first shard directory");
+        symlink(&elsewhere, layout.shard(0).segments()).expect("plant the link");
+
+        let before = tree_image(root.path());
+        match initialize_root(&layout, 2, [0x22; 16], 1, &counters()) {
+            Err(StoreError::UnrecognizedLayout(_)) => {}
+            other => panic!("expected UnrecognizedLayout, got {other:?}"),
+        }
+
+        assert!(
+            !layout.shard(0).active().exists(),
+            "the refusal created shards/00/active on its way to the link: every existing entry \
+             must be classified before any missing one is created"
+        );
+        assert!(
+            !layout.shard(1).dir.exists(),
+            "the refusal began a second shard"
+        );
+        assert_eq!(
+            tree_image(root.path()),
+            before,
+            "a refused initialization must leave the tree it found byte-identical"
+        );
+    }
+
+    /// A non-directory occupant, and the legitimate case beside it: an existing
+    /// partial tree is adopted rather than refused, because that is what resuming
+    /// an interrupted initialization requires.
+    #[test]
+    fn a_non_directory_occupant_is_refused_and_a_real_partial_tree_is_adopted() {
+        let root = tempfile::tempdir().expect("temp root");
+        let layout = RootLayout::new(root.path());
+        std::fs::create_dir_all(&layout.root).expect("root");
+        std::fs::write(layout.shards_dir(), b"not a directory\n").expect("occupy shards");
+        match initialize_root(&layout, 1, [0x33; 16], 1, &counters()) {
+            Err(StoreError::UnrecognizedLayout(_)) => {}
+            other => panic!("expected UnrecognizedLayout for a file at shards/, got {other:?}"),
+        }
+
+        let resumable = tempfile::tempdir().expect("temp root");
+        let layout = RootLayout::new(resumable.path());
+        std::fs::create_dir_all(layout.shard(0).active()).expect("a partial tree");
+        std::fs::create_dir_all(layout.staging_dir()).expect("staging");
+        let marker = initialize_root(&layout, 1, [0x44; 16], 1, &counters())
+            .expect("an existing partial tree is adopted, not refused");
+        assert_eq!(marker.shard_count, 1);
+        assert!(layout.shard(0).manifests().is_dir());
+        read_format(&layout).expect("the marker is installed over an adopted tree");
     }
 }

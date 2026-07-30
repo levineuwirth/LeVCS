@@ -1307,6 +1307,67 @@ with the charter's item 8 — assert against the path that runs — as its analo
 they mean here, and the socket case is now one of four occupants the test loop covers. Safety was
 never affected; the type of the refusal was.
 
+##### Contract review 2026-07-29-B
+
+**The remaining three redirection hazards of 2026-07-28-D are closed.** One commit, one owner, one
+invariant: no name the store *invents* beneath a root may be reached through a link or resolve to an
+object of the wrong type. `sys.rs` gains the mechanics — the flags and the descriptor checks are the
+safety property, so they belong in the funnel where the next author looking for how this crate opens
+files will find them.
+
+Refusal semantics, decided per name rather than uniformly, because the three names mean different
+things:
+
+- **`write_fenced`** (`FORMAT.tmp`, `<generation>.manifest.tmp`, `CURRENT.tmp`). An existing regular
+  file is **adopted and emptied**: it is residue from an interrupted attempt at this exact write, and
+  reusing the name is how a retry works. The open and the truncation had to be separated to make that
+  possible at all — no flag combination truncates only regular files, so the type check needs the
+  descriptor first, and `O_TRUNC` cannot be in the open. Any non-regular occupant is
+  `UnrecognizedLayout`. The truncation goes through the funnel's `truncate` and is counted; it is
+  skipped when the file is already empty, so the common create path moves no counter.
+- **`read_format`**. Three answers kept apart, because callers act on them differently: absent stays
+  `Io(NotFound)` — startup states 1 and 3 depend on it — non-regular is `UnrecognizedLayout`, and a
+  corrupt *regular* marker keeps its existing decode error, which is a different finding from a
+  redirected one.
+- **`initialize_root`**. The root and its ancestors stay the caller's path: an operator who configures
+  a root behind a symlink has said where the store goes, and resolving that is out of scope. Every
+  directory *beneath* it is store-invented — existing directories adopted, absent ones created,
+  symlinks and non-directory occupants `UnrecognizedLayout`. Two passes: every planned entry is
+  classified before any missing one is created, so a refusal cannot half-extend the tree it refused.
+  `O_DIRECTORY` is the type check and the kernel applies it before the descriptor exists, so there is
+  no window in which a non-directory is open; `mkdir(2)` never follows a final symlink, so the create
+  side needs no separate guard.
+
+**Directory fences now go to descriptors already validated** (`sys::fsync_dir_fd`) rather than
+re-resolving the name, which would hand the fence to whatever the name resolves to *now* instead of to
+what was checked. The fence sequence is otherwise byte-for-byte the same, deliberately: `engine.rs`
+asserts `initialize_root`'s `fsync_dir` count exactly, and that assertion is load-bearing evidence
+about initialization, not incidental.
+
+Each of the three protections was reverted independently and the witnesses observed, not predicted:
+
+- `write_fenced` — a 4096-byte file outside the root truncated and rewritten through a live link; a
+  file *created* outside the root through a dangling one; and a fifo at the name **blocked the open
+  for the full ten-second deadline**, an unbounded startup hang from one `mkfifo`.
+- `read_format` — a foreign `FORMAT` read in full and its `shard_count` and `root_uuid` returned as
+  this root's, so every file in the tree would then be validated against a marker the store never
+  wrote; and the same ten-second hang at `FORMAT` on the read side.
+- `initialize_root` — returned **`Ok(FormatMarker)`**: a successful initialization reporting a working
+  store, with the shard tree built outside the root through a link at `shards/`. The two-pass
+  preflight has its own witness, `shards/00/active` existing after a refusal that named
+  `shards/00/segments`.
+
+The witnesses sit on the `segment` entry points, not on `StoreEngine::open`. Its classifier refuses a
+redirected root before any of these are reached, so a test entering that way passes whether or not the
+protection exists — and `RecoverySession::open`, `drive.rs` and `store-bench` all arrive without it.
+Coverage of the caller is not coverage of the callee.
+
+**Disclosed.** The device-node residual from 2026-07-29-A now applies to `FORMAT.tmp` as well: one
+`O_NONBLOCK` open lands before the `fstat` refuses it. Unchanged in judgement — it needs `mknod`
+privilege inside a configured store root. `rename_noreplace` needed no change: `renameat2` with
+`RENAME_NOREPLACE` fails `EEXIST` on an occupied target name whether or not it is a link, so the
+`FORMAT.tmp` → `FORMAT` install could never have followed one.
+
 ##### Contract review 2026-07-28-C
 
 B4 re-pointed `store-bench` at a real `StoreEngine::submit` and found that four verification

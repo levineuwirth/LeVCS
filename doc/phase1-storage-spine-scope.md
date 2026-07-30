@@ -415,6 +415,11 @@ long as the name keeps resolving to the object the holder locked.
 
 Two cases follow, and only one of them is a defect the store can close:
 
+The same rule now holds for every other name the store invents beneath a root — `FORMAT`, the `.tmp`
+names a fenced write installs from, and every directory in the tree (contract review 2026-07-29-B).
+The root itself and its ancestors are excluded on purpose: an operator who configures a root behind a
+symlink has said where the store goes.
+
 1. **The name already resolves elsewhere when a process arrives.** A symlink, a fifo, a
    directory, a socket, or a device at `LOCK` — left by an operator, a restored backup, a
    symlink farm, or a previous tenant of the directory. A follow-through open takes the

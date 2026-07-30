@@ -283,6 +283,12 @@ pub(crate) fn fdatasync(file: &File, counters: &DurabilityCounters) -> io::Resul
 
 /// Make a directory entry durable. Required after every create, rename, and
 /// unlink that recovery depends on.
+///
+/// Resolves the name, so it is for directories whose path the store already
+/// trusts. A caller that has just *established* what a name is holds a
+/// descriptor onto that object and should fence it with [`fsync_dir_fd`]
+/// instead — re-resolving the name would hand the fence back to whatever the
+/// name resolves to now, which is not necessarily what was validated.
 pub(crate) fn fsync_dir(path: &Path, counters: &DurabilityCounters) -> io::Result<()> {
     if take_fault_if(|f| matches!(f, Fault::DirSyncEio)).is_some() {
         counters.fsync_dir.fetch_add(1, Relaxed);
@@ -290,6 +296,19 @@ pub(crate) fn fsync_dir(path: &Path, counters: &DurabilityCounters) -> io::Resul
     }
     counters.fsync_dir.fetch_add(1, Relaxed);
     File::open(path)?.sync_all()
+}
+
+/// [`fsync_dir`] on a directory descriptor the caller already holds.
+///
+/// Same counter and same injected fault, so the crash matrix reaches this seam
+/// exactly as it reaches the by-name one.
+pub(crate) fn fsync_dir_fd(directory: &File, counters: &DurabilityCounters) -> io::Result<()> {
+    if take_fault_if(|f| matches!(f, Fault::DirSyncEio)).is_some() {
+        counters.fsync_dir.fetch_add(1, Relaxed);
+        return Err(eio("directory fsync"));
+    }
+    counters.fsync_dir.fetch_add(1, Relaxed);
+    directory.sync_all()
 }
 
 // ---------------------------------------------------------------------------
@@ -370,6 +389,29 @@ pub(crate) fn unlink(path: &Path) -> io::Result<()> {
 /// reached by `mkfifo`, and one this function exists to be immune to because
 /// its whole job is to look at names it does not trust.
 pub(crate) fn open_regular_nofollow(path: &Path) -> io::Result<Option<File>> {
+    Ok(match open_regular_nofollow_classified(path)? {
+        NamedRegularFile::Opened(file) => Some(file),
+        NamedRegularFile::Absent | NamedRegularFile::NotRegular => None,
+    })
+}
+
+/// What a name held, for the callers that must tell "absent" from "occupied by
+/// something else".
+///
+/// [`open_regular_nofollow`] collapses the two, which is right for a caller
+/// asking "are the bytes at this name mine" — every non-regular answer means no.
+/// It is wrong for `segment::read_format`, where an absent `FORMAT` is an
+/// ordinary startup state that must keep reporting `NotFound`, and a `FORMAT`
+/// that is a symlink is a refusal. Two questions, so two answers.
+pub(crate) enum NamedRegularFile {
+    Opened(File),
+    Absent,
+    /// A symlink, a directory, a fifo, a socket, or a device.
+    NotRegular,
+}
+
+/// [`open_regular_nofollow`], keeping absence and wrong-type apart.
+pub(crate) fn open_regular_nofollow_classified(path: &Path) -> io::Result<NamedRegularFile> {
     use rustix::fs::{FileType, Mode, OFlags};
     let fd = match rustix::fs::open(
         path,
@@ -377,20 +419,29 @@ pub(crate) fn open_regular_nofollow(path: &Path) -> io::Result<Option<File>> {
         Mode::empty(),
     ) {
         Ok(fd) => fd,
-        Err(rustix::io::Errno::NOENT) | Err(rustix::io::Errno::NOTDIR) => return Ok(None),
+        Err(rustix::io::Errno::NOENT) => return Ok(NamedRegularFile::Absent),
+        // A non-directory component *within* the path, which is not this name
+        // being absent — the store cannot create through it either.
+        Err(rustix::io::Errno::NOTDIR) => return Ok(NamedRegularFile::NotRegular),
         // `O_NOFOLLOW` on a symlink is `ELOOP` on Linux and `EMLINK` on some
         // BSDs. Both mean "the final component is a symlink", which is exactly
         // the answer this function is being asked for.
-        Err(rustix::io::Errno::LOOP) | Err(rustix::io::Errno::MLINK) => return Ok(None),
+        Err(rustix::io::Errno::LOOP) | Err(rustix::io::Errno::MLINK) => {
+            return Ok(NamedRegularFile::NotRegular)
+        }
+        // A socket refuses `open(2)` outright; see
+        // [`open_or_create_regular_nofollow`] for why this is mapped rather than
+        // returned as an `Io`.
+        Err(rustix::io::Errno::NXIO) => return Ok(NamedRegularFile::NotRegular),
         Err(e) => return Err(io::Error::from_raw_os_error(e.raw_os_error())),
     };
     let file = File::from(fd);
     let stat =
         rustix::fs::fstat(&file).map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))?;
     if FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile {
-        Ok(Some(file))
+        Ok(NamedRegularFile::Opened(file))
     } else {
-        Ok(None)
+        Ok(NamedRegularFile::NotRegular)
     }
 }
 
@@ -465,6 +516,14 @@ pub(crate) fn create_new_nofollow(path: &Path) -> io::Result<Option<File>> {
 /// warrants: reaching it requires the privilege to `mknod` inside a configured
 /// store root. Recorded rather than silently accepted.
 pub(crate) fn open_or_create_regular_nofollow(path: &Path) -> io::Result<Option<File>> {
+    Ok(open_or_create_regular_nofollow_sized(path)?.map(|(file, _)| file))
+}
+
+/// [`open_or_create_regular_nofollow`], also reporting the length it found.
+///
+/// The length is what lets [`open_or_create_regular_truncated_nofollow`] leave
+/// the durability counters alone when there was nothing to truncate.
+fn open_or_create_regular_nofollow_sized(path: &Path) -> io::Result<Option<(File, u64)>> {
     use rustix::fs::{FileType, Mode, OFlags};
     let fd = match rustix::fs::open(
         path,
@@ -490,10 +549,102 @@ pub(crate) fn open_or_create_regular_nofollow(path: &Path) -> io::Result<Option<
     let stat =
         rustix::fs::fstat(&file).map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))?;
     if FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile {
-        Ok(Some(file))
+        Ok(Some((file, stat.st_size as u64)))
     } else {
         Ok(None)
     }
+}
+
+/// [`open_or_create_regular_nofollow`], left empty and ready to be rewritten.
+///
+/// For the temporary names a fenced write installs from — `FORMAT.tmp`,
+/// `<generation>.manifest.tmp`, `CURRENT.tmp`. The operation these replace is
+/// `File::options().create(true).write(true).truncate(true)`, whose `O_TRUNC`
+/// destroys whatever the name held **before** anything can look at it, and
+/// through a symlink destroys it outside the root entirely. Splitting the open
+/// from the truncation is what makes the type check possible at all: there is
+/// no flag combination that truncates only regular files.
+///
+/// An existing regular file here is legitimate — it is residue from an
+/// interrupted attempt at exactly this write, and reusing the name is how a
+/// retry works — so it is adopted and emptied rather than refused.
+///
+/// The truncation goes through [`truncate`] and is therefore counted, because a
+/// truncation is a durability-relevant mutation; it is skipped when the file is
+/// already empty, which is every freshly created one, so the common path adds no
+/// syscall and no counter movement.
+pub(crate) fn open_or_create_regular_truncated_nofollow(
+    path: &Path,
+    counters: &DurabilityCounters,
+) -> io::Result<Option<File>> {
+    let Some((file, length)) = open_or_create_regular_nofollow_sized(path)? else {
+        return Ok(None);
+    };
+    if length != 0 {
+        truncate(&file, 0, counters)?;
+    }
+    Ok(Some(file))
+}
+
+/// What a name held, for the directories the store invents beneath a root.
+pub(crate) enum NamedDirectory {
+    Opened(File),
+    Absent,
+    /// A symlink — including one that resolves to a perfectly good directory —
+    /// a regular file, or any other non-directory.
+    NotDirectory,
+}
+
+/// Open `path` as a directory, refusing to traverse a symlink at the final
+/// component.
+///
+/// `O_DIRECTORY` is the type check here and it happens in the kernel, before the
+/// descriptor exists: there is no window in which a non-directory is open. A
+/// symlink *to* a directory is refused as firmly as a symlink to anything else,
+/// which is the whole point — `create_dir_all` follows one and builds the store's
+/// tree wherever it leads.
+pub(crate) fn open_directory_nofollow(path: &Path) -> io::Result<NamedDirectory> {
+    use rustix::fs::{Mode, OFlags};
+    match rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => Ok(NamedDirectory::Opened(File::from(fd))),
+        Err(rustix::io::Errno::NOENT) => Ok(NamedDirectory::Absent),
+        // `ENOTDIR` is the name holding a non-directory, or a non-directory
+        // component within the path; `ELOOP`/`EMLINK` is a symlink at the final
+        // component. The store may build through none of them.
+        Err(rustix::io::Errno::NOTDIR)
+        | Err(rustix::io::Errno::LOOP)
+        | Err(rustix::io::Errno::MLINK) => Ok(NamedDirectory::NotDirectory),
+        Err(e) => Err(io::Error::from_raw_os_error(e.raw_os_error())),
+    }
+}
+
+/// Create `path` as a directory and open it, or report that the name is taken
+/// by something that is not one.
+///
+/// `mkdir(2)` never follows a symlink at the final component — a name occupied
+/// by one fails `EEXIST` whether or not it resolves — so this cannot create a
+/// directory outside the directory it names. `Ok(None)` is that `EEXIST` where
+/// the occupant turns out not to be a directory; an occupant that *is* one is
+/// adopted, because two callers racing to create the same tree is ordinary.
+pub(crate) fn create_directory_nofollow(path: &Path) -> io::Result<Option<File>> {
+    use rustix::fs::Mode;
+    match rustix::fs::mkdir(path, Mode::from_raw_mode(0o755)) {
+        Ok(()) => {}
+        Err(rustix::io::Errno::EXIST) => {}
+        Err(e) => return Err(io::Error::from_raw_os_error(e.raw_os_error())),
+    }
+    Ok(match open_directory_nofollow(path)? {
+        NamedDirectory::Opened(file) => Some(file),
+        NamedDirectory::NotDirectory => None,
+        // Unlinked between the `mkdir` and the open. Nothing was created that
+        // survives, and the caller's tree is not what it asked for, so this is
+        // the same answer as a name it may not use.
+        NamedDirectory::Absent => None,
+    })
 }
 
 /// Truncate a file to `len`.

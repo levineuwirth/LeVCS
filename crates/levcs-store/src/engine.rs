@@ -827,7 +827,9 @@ fn classify_root(layout: &RootLayout) -> Result<RootStartupState, StoreError> {
         // disqualify the root, and a wildcard here is the one edit that would
         // silently stop it doing so. The type is part of the name's meaning —
         // a symlink called `FORMAT.tmp` is not residue, it is an instruction to
-        // write outside the root, and `segment::write_fenced` would follow it.
+        // write outside the root. `segment::write_fenced` refuses one directly
+        // now as well; this list is why the root is disqualified rather than
+        // initialized-then-refused, which is a different and better answer.
         if !matches!(
             (name.to_str(), kind.is_file(), kind.is_dir()),
             (Some("FORMAT.tmp"), true, _)
@@ -1150,13 +1152,15 @@ fn build_root_under_lock(
 /// # Standing disclosure
 ///
 /// This began as a second copy of `segment::write_fenced`, which is private to
-/// A1's file, and the duplication was filed as an interface request. The two
-/// are no longer the same function: this one cannot truncate and cannot follow
-/// a symlink, and `segment::write_fenced` still can. The request therefore
-/// changes shape rather than going away — if one of them is hoisted, it must be
-/// this one, and `FORMAT.tmp` should be opened through it. That is an interface
-/// request against a frozen file and is recorded in this deliverable's report,
-/// not made here.
+/// A1's file, and the duplication was filed as an interface request. Neither can
+/// follow a symlink any more — contract review 2026-07-29-B routed
+/// `write_fenced` through the same funnel — so what remains is a real difference
+/// in refusal rule rather than in safety: this one refuses an existing regular
+/// file, because a marker that already exists is somebody's data and adopting it
+/// would be a decision about content; `write_fenced` adopts and empties one,
+/// because a `.tmp` name is residue from an interrupted attempt at that exact
+/// write and reusing it is how the retry works. Both are correct for their name.
+/// Any hoisting therefore has to keep two rules, not pick one.
 fn install_initializing_marker(
     tmp: &std::path::Path,
     bytes: &[u8],
@@ -3783,18 +3787,18 @@ mod tests {
     /// The same hazard at the other two names this file opens or ignores.
     ///
     /// `segment::lock_root` opens `LOCK` and `segment::write_fenced` opens
-    /// `FORMAT.tmp` with `create` + `truncate`. Both are in A1's frozen file, so
-    /// neither open was changed by this deliverable; what it changed is that a
-    /// root carrying a symlink at either name never reaches them, because the
-    /// classification that authorizes the write refuses it first.
+    /// `FORMAT.tmp`. Both are in A1's frozen file, so neither open was changed by
+    /// this deliverable; what it changed is that a root carrying a symlink at
+    /// either name never reaches them, because the classification that authorizes
+    /// the write refuses it first.
     ///
-    /// `lock_root` has since been amended by the lead (contract review
-    /// 2026-07-29-A) to open through the no-follow funnel, because
-    /// `RecoverySession::open` reaches it without any classification at all —
-    /// this test therefore no longer carries the `LOCK` guarantee alone, and the
-    /// assertion below it in `segment.rs` is the load-bearing one. `FORMAT.tmp`
-    /// is still a follow-through open for any caller that reaches
-    /// `initialize_root` by another route, and remains an open interface request.
+    /// Both have since been amended by the lead — `lock_root` in contract review
+    /// 2026-07-29-A, `write_fenced` in 2026-07-29-B — because
+    /// `RecoverySession::open`, `drive.rs` and `store-bench` all reach them with
+    /// no classification at all. This test therefore no longer carries either
+    /// guarantee on its own; it asserts that the classifier refuses first, which
+    /// is still the answer an operator wants, and the assertions in `segment.rs`
+    /// are what hold the opens themselves.
     #[test]
     fn a_symlink_at_lock_or_format_tmp_is_refused_before_anything_opens_it() {
         let serial = writer_serial();

@@ -2743,9 +2743,11 @@ impl ShardWriter {
     ) -> Result<(), StoreError> {
         let root = self.shared.committed.load();
         let backlog = self.unsealed_backlog(&root);
-        if backlog.layers == 0 {
-            return Ok(());
-        }
+        // Only the *seal* depends on there being a backlog. The replayability
+        // checks below must run on every admission: once a seal has emptied the
+        // layers, everything a reopen would rebuild lives in the run it just
+        // wrote, and returning early here admitted work against a ceiling that
+        // was already full — the store accepted it and then could not reopen.
         let entries_or_bytes = delta_pressure(
             backlog.entries,
             backlog.encoded_bytes,
@@ -2753,7 +2755,7 @@ impl ShardWriter {
             self.shared.options.max_active_index_bytes,
         ) == DeltaPressure::SealRequired;
         let fan_out = backlog.layers as u64 >= u64::from(self.shared.options.max_index_runs);
-        if entries_or_bytes || fan_out {
+        if backlog.layers != 0 && (entries_or_bytes || fan_out) {
             // Only what a run may soundly persist; see `coverable_through`. When
             // nothing is coverable the seal does not happen and the ceiling check
             // below refuses instead, which is the honest outcome — a run over
@@ -6147,12 +6149,13 @@ mod tests {
 
 #[cfg(test)]
 mod index_maintenance_tests {
+    use std::future::Future;
     use std::path::Path;
+    use std::task::{Context, Poll, Wake, Waker};
+    use std::time::Duration;
 
     use super::tests::*;
     use super::*;
-    use std::time::Duration;
-
     use crate::index::IndexKey;
     use crate::segment::{index_run_filename, read_current, read_manifest, RootLayout};
     use crate::{PrivilegedConstruction, StagedObject};
@@ -6237,6 +6240,62 @@ mod index_maintenance_tests {
             objects.push(ObjectId([blob; 32]));
         }
         objects
+    }
+
+    /// Drive two submissions with both in flight.
+    ///
+    /// The first is polled once before the second starts, which is what puts it
+    /// in the writer's open group while the second is being admitted. Then both
+    /// are polled to completion — the first cannot finish until the group
+    /// publishes, so waiting on it alone would deadlock against a group the
+    /// second submission is meant to be judged against.
+    fn submit_together<A, B>(first: A, second: B) -> (A::Output, B::Output)
+    where
+        A: Future,
+        B: Future,
+    {
+        struct ThreadWaker(std::thread::Thread);
+        impl Wake for ThreadWaker {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+        let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+        let mut context = Context::from_waker(&waker);
+        let mut first = std::pin::pin!(first);
+        let mut second = std::pin::pin!(second);
+        let (mut first_out, mut second_out) = (None, None);
+
+        // The order matters: the first submission must reach the writer before
+        // the second is polled at all.
+        if let Poll::Ready(output) = first.as_mut().poll(&mut context) {
+            first_out = Some(output);
+        }
+
+        let start = std::time::Instant::now();
+        loop {
+            if second_out.is_none() {
+                if let Poll::Ready(output) = second.as_mut().poll(&mut context) {
+                    second_out = Some(output);
+                }
+            }
+            if first_out.is_none() {
+                if let Poll::Ready(output) = first.as_mut().poll(&mut context) {
+                    first_out = Some(output);
+                }
+            }
+            if first_out.is_some() && second_out.is_some() {
+                return (first_out.expect("checked"), second_out.expect("checked"));
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(30),
+                "neither submission completed within the test deadline"
+            );
+            std::thread::park_timeout(Duration::from_millis(5));
+        }
     }
 
     /// Two namespaces that route to different shards of a four-shard root.
@@ -6639,35 +6698,94 @@ mod index_maintenance_tests {
 
     /// The same projection, for members already admitted into the open group.
     ///
-    /// `max_group_transactions` is raised so the group stays open across both
-    /// submissions; without counting `pending`, the second is decided against a
-    /// root the first has not reached yet.
+    /// Both submissions are genuinely **in flight**. `submit` is an `async fn`,
+    /// so its send happens on the first poll; awaiting one to completion before
+    /// starting the other is two groups and not one, and a test written that way
+    /// passes with the pending-group projection removed — the refusal follows
+    /// from the published root alone. Here the first submission is polled once so
+    /// that it reaches `pending`, and the second is decided while it is still
+    /// there.
     #[test]
     fn admission_projects_the_open_group_into_the_replay_ceiling() {
         let serial = writer_serial();
         let temporary = tempfile::tempdir().expect("tempdir");
         let namespace = NamespaceId([0x47; 32]);
         let mut options = sealing_options(&serial, temporary.path(), 3);
+        // The group must stay open across both submissions.
         options.max_group_transactions = 8;
-        options.max_group_idle = Duration::from_millis(2_000);
+        options.max_group_idle = Duration::from_millis(300);
         {
             let engine = StoreEngine::open(options).expect("open a fresh root");
             block_on(engine.submit(create_transaction(namespace, 7))).expect("one object");
-            let outcomes = [0xE4u8, 0xE6]
-                .map(|blob| block_on(engine.submit(two_object_push(namespace, blob))));
+
+            let (first, second) = submit_together(
+                engine.submit(two_object_push(namespace, 0xE4)),
+                engine.submit(two_object_push(namespace, 0xE6)),
+            );
             assert!(
-                outcomes.iter().any(|outcome| matches!(
+                [&first, &second].iter().any(|outcome| matches!(
                     outcome,
                     Err(StoreError::LimitExceeded {
                         limit: "max_active_index_entries",
                         ..
                     })
                 )),
-                "five objects must not both be admitted under a ceiling of three: {outcomes:?}"
+                "five objects must not both be admitted under a ceiling of three: \
+                 {first:?} / {second:?}"
             );
         }
         StoreEngine::open(sealing_options(&serial, temporary.path(), 3))
             .expect("a store must reopen whatever it accepted");
+    }
+
+    /// P1: the replayability check must not depend on there being a backlog.
+    ///
+    /// After a seal the layers are empty and everything a reopen would rebuild
+    /// lives in the run. An early return on "no layers" therefore admitted work
+    /// against a ceiling that was already full: the store accepted it and then
+    /// could not reopen.
+    #[test]
+    fn an_emptied_backlog_does_not_reopen_the_replay_ceiling() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let namespace = NamespaceId([0x4A; 32]);
+        let configure = |options: &mut StoreOptions| {
+            options.max_active_index_entries = 3;
+            options.max_index_runs = 2;
+            options.max_open_index_runs = 2;
+        };
+        {
+            let engine = write_then_reopen(&serial, temporary.path(), configure, |engine| {
+                block_on(engine.submit(create_transaction(namespace, 0x0A))).expect("create");
+                push_groups(engine, namespace, 0x2A, 2);
+            });
+
+            // Seals the three-entry backlog, then refuses this submission.
+            let _ = block_on(engine.submit(push_transaction(namespace, 0x3A, 0x3A, None)));
+            let maintenance = engine.index_maintenance();
+            assert_eq!(
+                (maintenance.sealed_runs, maintenance.unsealed_delta_layers),
+                (1, 0),
+                "the fixture must leave one run and an empty backlog"
+            );
+
+            let refused = block_on(engine.submit(push_transaction(namespace, 0x3B, 0x3B, None)))
+                .expect_err("the run already holds everything the ceiling allows");
+            assert!(
+                matches!(
+                    refused,
+                    StoreError::LimitExceeded {
+                        limit: "max_active_index_entries",
+                        ..
+                    }
+                ),
+                "expected the replay ceiling, got {refused:?}"
+            );
+        }
+
+        let mut reopen = sealing_options(&serial, temporary.path(), 4_000_000);
+        configure(&mut reopen);
+        StoreEngine::open(reopen).expect("a store must reopen whatever it accepted");
     }
 
     /// P1: the byte ceiling is a ceiling too.

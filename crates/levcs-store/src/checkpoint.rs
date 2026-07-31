@@ -956,11 +956,21 @@ pub fn install(
     let tmp_path = dir.join(format!("{}.tmp", checkpoint.file_name()));
 
     {
-        let mut file = File::options()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp_path)?;
+        // Through the no-follow funnel, not `File::options`. A checkpoint
+        // installer that was unreachable from production could afford to open
+        // its temporary by name; this one cannot. A symlink planted at
+        // `<sequence>.checkpoint.tmp` made `install` overwrite whatever it
+        // pointed at and then publish the link — the same redirection family
+        // `segment.rs` closed, reopened here the moment this path acquired a
+        // production caller (contract review 2026-07-30-D).
+        let Some(mut file) =
+            crate::sys::open_or_create_regular_truncated_nofollow(&tmp_path, counters)?
+        else {
+            return Err(StoreError::UnrecognizedLayout(format!(
+                "{} is not a regular file; refusing to build a checkpoint through it",
+                tmp_path.display()
+            )));
+        };
         let end = crate::sys::write_vectored_all(&mut file, &[IoSlice::new(&bytes)], counters)
             .map_err(|e| {
                 StoreError::from(std::io::Error::new(

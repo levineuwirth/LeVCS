@@ -1676,6 +1676,50 @@ B4 surface this commit touches — the emitter's remaining claims are unchanged.
 **Next, and in this dispatch:** recovery discarding an index run whose covered identity was not
 preserved, which turns 2026-07-30-B's refusal into reclamation.
 
+##### Contract review 2026-07-30-D
+
+Five review findings against `5462952`, all closed. The first two are the ones that mattered.
+
+**P1 — adoption was content-blind.** The guard compared the path and the committed sequence, so a
+*different* checkpoint at the right name was adopted and published. That is not a wedged shard, it is
+silent logical deletion: the manifest suppresses replay of the frames the checkpoint covers, so an
+empty catalog at the live sequence makes the namespace disappear at the next open with nothing
+reporting a fault. Adoption now requires logical equivalence to the checkpoint the call would itself
+have written, with `created_at_micros` the only field allowed to differ. Anything else at the name is
+refused — and refused **without poisoning**, since nothing durable has moved. The test is the reopen:
+catalog, ref and receipt all read back through the public surface after the refusal, and the shard
+is still writable.
+
+**P1 — checkpointing did not relieve the replay ceiling.** `replayable_index` summed every sealed-run
+entry and every namespace regardless of the horizon, so a shard at the ceiling checkpointed
+successfully and was then refused its next single-object transaction — the store telling an operator
+that checkpointing did nothing. The writer now tracks what the newest checkpoint made unreplayable,
+set at open from what recovery loaded and again by every checkpoint it takes, and subtracts it.
+Subtracting rather than dropping the accounting: runs sealed *after* a checkpoint cover frames a
+reopen does replay, and ignoring them would reopen the hole that let a store accept work it could not
+read back. Mutation-checked — removing the subtraction reproduces `observed: 4, allowed: 3`.
+
+**P1 — the installer wrote through symlinks.** `checkpoint::install` opened its temporary with
+`create + truncate` and no `O_NOFOLLOW`, which was survivable while nothing production could reach
+it and stopped being so the moment this dispatch gave it a caller. It now goes through the same
+no-follow funnel `segment.rs` uses, and an occupied final name is type-checked before adoption.
+Frozen-seam amendment to `checkpoint.rs` (A2), granted and recorded here.
+
+**P2 — pins grew without bound.** The manifest trimmed to `checkpoint_retain` while the successor
+cloned every prior pin and appended one more, so pruned inodes and their disk space stayed alive for
+the life of the process. The successor now pins exactly the rows its manifest publishes; an older
+lease's `Arc` still independently retains its own generation, which is what a lease is for.
+
+**P2 — construction was not canonical.** Refs and receipts were appended straight from randomized
+HAMT iteration. Both are sorted by their stable keys before encoding, which the equivalence guard
+above also depends on.
+
+**One gap, disclosed.** The adoption *success* path — a byte-equivalent stranded checkpoint being
+adopted — is not covered by a test. Constructing an equivalent image from outside the engine needs
+the body the engine builds, and the honest options were a new failpoint seam in the publication
+window or a test-only accessor. Neither belongs in this commit. The refusal path, which is the one
+that could lose data, is covered.
+
 ##### Contract review 2026-07-28-C
 
 B4 re-pointed `store-bench` at a real `StoreEngine::submit` and found that four verification

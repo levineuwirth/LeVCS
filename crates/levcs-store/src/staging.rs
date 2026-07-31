@@ -12,8 +12,8 @@ use levcs_protocol::v2::{
     ProjectionStageManifestV1, ProjectionStageSessionV1, StagedProjectionInstallV1,
 };
 
-use crate::index::{IndexDelta, IndexRun};
-use crate::roots::{CommittedRoot, RetainedIndexRun, RetainedProjectionArtifact};
+use crate::index::{IndexDelta, IndexKey, IndexLocation, IndexRun};
+use crate::roots::{CommittedRoot, PinnedFile, RetainedIndexRun, RetainedProjectionArtifact};
 use crate::types::{NamespaceId, StoreError};
 
 /// One immutable artifact offered for adoption.
@@ -38,7 +38,26 @@ pub struct ProjectionAdoptionResolution {
 /// The only three ways ownership of an admitted adoption pin may end.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ProjectionAdoptionOutcome {
-    Adopted,
+    /// The frame naming these artifacts committed at `committed_shard_sequence`.
+    ///
+    /// The sequence is carried because *when* an adoption happened is what makes
+    /// a later reference proof meaningful. Cleanup answers "does any committed
+    /// root still point at this directory?" against a root a caller supplies,
+    /// and a root captured **before** this adoption references none of these
+    /// artifacts for the trivial reason that it predates them — so absence
+    /// measured against it is not absence, and cleanup would delete a directory
+    /// the current root points into. Recording the position turns that into a
+    /// question staging can refuse: a root at or past this sequence necessarily
+    /// includes this adoption's effects, and an earlier one is not evidence.
+    ///
+    /// The value is B1's to supply because only B1 knows it — the append that
+    /// produced it has just returned — and staging is constructed before any
+    /// committed root exists (it is recovery's resolver), so there is no moment
+    /// at which it could observe the position itself. Frozen D0-B amendment,
+    /// contract review 2026-07-31-C.
+    Adopted {
+        committed_shard_sequence: u64,
+    },
     DefinitivePreAppendFailure,
     TransferredToRecovery,
 }
@@ -177,10 +196,25 @@ pub(crate) trait ProjectionRecoveryResolver: Send + Sync {
 
     /// Resolve a canonical committed descriptor into exact namespace-scoped
     /// membership and live physical ownership.
+    ///
+    /// `adoption_shard_sequence` is the shard sequence of the **complete
+    /// replayed adoption frame**, and is required rather than optional or
+    /// inferred. It is the identity every artifact's logical generation is
+    /// derived from, and staging cannot supply it: a transferred `Finalizing`
+    /// session has no durable position — that is exactly the state recovery is
+    /// resolving — and this frame is the sole authority that creates one.
+    ///
+    /// The recovery-direction counterpart of the D0-B
+    /// `ProjectionAdoptionOutcome::Adopted` amendment, and granted for the same
+    /// reason: an adoption's position is known only to the side that made the
+    /// frame authoritative. There it flowed B1 to B3 after a live append; here
+    /// it flows recovery to B3 after a replayed one. Contract review
+    /// 2026-07-31-D.
     fn resolve_committed(
         &self,
         namespace: NamespaceId,
         descriptor: &StagedProjectionInstallV1,
+        adoption_shard_sequence: u64,
     ) -> Result<RecoveredProjectionArtifacts, StoreError>;
 
     /// Finish one transferred session after the physical-state proof is
@@ -310,12 +344,38 @@ const STAGING_ARTIFACT_HEADER_LEN: usize = 8 + 2 + 2 + 16 + 4;
 
 const SESSION_RECORD_NAME: &str = "session";
 const MANIFEST_NAME: &str = "manifest";
+/// Deliverable 6's durable pin state.
+///
+/// One file rather than one per outcome, rewritten in place by a replacing
+/// rename, so a session never holds two markers that disagree and the per
+/// session file bound does not grow with the number of outcomes.
+const ADOPTION_NAME: &str = "adoption";
 
-/// Files a session may create: one per chunk, plus the session record and the
-/// sealed manifest. `options.rs` validates `staging_max_files_per_session >=
-/// max_projection_chunks + 2` against exactly this layout, so the constant is
-/// the shared definition of that `+ 2` rather than a second opinion about it.
-const SESSION_FIXED_FILES: u64 = 2;
+/// Files a session may hold at once: one per chunk, plus the session record, the
+/// sealed manifest, the adoption marker, and the marker's temporary. `options.rs`
+/// validates `staging_max_files_per_session >= max_projection_chunks +
+/// SESSION_FIXED_FILES` against exactly this layout.
+///
+/// It was 2 and became 4 with deliverable 6: the pin's durable marker, and the
+/// `adoption.tmp` that exists beside it for the width of the
+/// `Finalizing -> Adopted` replacement. A **peak**, not a total — the temporary
+/// is gone the moment the rename returns — and the reservation is charged
+/// against the peak because that is the instant the directory is widest.
+///
+/// The constant's doc already claimed to be "the shared definition rather than a
+/// second opinion" while `options.rs` carried a literal `+ 2`, so the claim was
+/// false in the one way that matters; adding a file is exactly the edit that
+/// finds that out. `options.rs` now reads the constant.
+///
+/// Four is the true peak, and the marker is the only reason it is not three.
+/// Every other artifact publishes through a `<name>.tmp` as well, but each of
+/// those temporaries stands in for a final name that is *absent* — a chunk or a
+/// first manifest does not yet exist — so it occupies the slot it is about to
+/// become rather than an extra one. State ordering keeps those writes from
+/// overlapping a seal or a finalize. `adoption.tmp` is the single case that
+/// coexists with a final file already on disk, because the transition it
+/// publishes replaces a marker rather than creating one.
+pub(crate) const SESSION_FIXED_FILES: u64 = 4;
 
 /// Which of the three staging artifact kinds a file is.
 ///
@@ -328,6 +388,9 @@ enum StagingArtifactKind {
     SessionRecord = 1,
     Chunk = 2,
     Manifest = 3,
+    /// The adoption marker of deliverable 6. Carries the outcome so the pin's
+    /// fate is durable, not only its existence.
+    Adoption = 4,
 }
 
 impl StagingArtifactKind {
@@ -340,6 +403,7 @@ impl StagingArtifactKind {
             1 => Some(Self::SessionRecord),
             2 => Some(Self::Chunk),
             3 => Some(Self::Manifest),
+            4 => Some(Self::Adoption),
             _ => None,
         }
     }
@@ -378,6 +442,28 @@ pub struct StagingCounters {
     pub sessions_sealed: AtomicU64,
     pub sessions_aborted: AtomicU64,
     pub sessions_expired: AtomicU64,
+    /// Sessions that took an adoption pin, and the four ways one ends. Kept
+    /// apart because they are four different physical claims: `adopted` means a
+    /// committed root references the artifacts, `released` means nothing was
+    /// appended, and both `transferred` and `dropped` mean this process cannot
+    /// say — the second being the one nobody intended.
+    pub sessions_finalized: AtomicU64,
+    pub sessions_adopted: AtomicU64,
+    pub adoption_pins_released: AtomicU64,
+    pub adoption_pins_transferred: AtomicU64,
+    pub adoption_pins_dropped: AtomicU64,
+    /// Adopted sessions whose directories cleanup reclaimed after proving no
+    /// committed root referenced them, and the times it declined for the
+    /// opposite reason. Separate counters because "nothing to do" and "there
+    /// was something and it was still referenced" are different answers, and
+    /// only one of them says the reference proof did any work.
+    pub sessions_cleaned_up: AtomicU64,
+    pub cleanup_declined_referenced: AtomicU64,
+    /// Adopted sessions cleanup skipped because the root it was given had not
+    /// reached the adoption. Counted apart from a referenced decline because
+    /// they say different things about the caller: one is a healthy store
+    /// holding its artifacts, the other is a caller asking the wrong question.
+    pub cleanup_declined_stale_root: AtomicU64,
     /// Gauge: sessions currently holding budget.
     pub sessions_live: AtomicU64,
     /// Gauge: object bytes reserved by live sessions.
@@ -433,6 +519,14 @@ impl StagingCounters {
             sessions_created: self.sessions_created.load(Relaxed),
             sessions_refused: self.sessions_refused.load(Relaxed),
             sessions_sealed: self.sessions_sealed.load(Relaxed),
+            sessions_finalized: self.sessions_finalized.load(Relaxed),
+            sessions_adopted: self.sessions_adopted.load(Relaxed),
+            adoption_pins_released: self.adoption_pins_released.load(Relaxed),
+            adoption_pins_transferred: self.adoption_pins_transferred.load(Relaxed),
+            adoption_pins_dropped: self.adoption_pins_dropped.load(Relaxed),
+            sessions_cleaned_up: self.sessions_cleaned_up.load(Relaxed),
+            cleanup_declined_referenced: self.cleanup_declined_referenced.load(Relaxed),
+            cleanup_declined_stale_root: self.cleanup_declined_stale_root.load(Relaxed),
             sessions_aborted: self.sessions_aborted.load(Relaxed),
             sessions_expired: self.sessions_expired.load(Relaxed),
             sessions_live: self.sessions_live.load(Relaxed),
@@ -461,6 +555,14 @@ pub struct StagingCounterSnapshot {
     pub sessions_created: u64,
     pub sessions_refused: u64,
     pub sessions_sealed: u64,
+    pub sessions_finalized: u64,
+    pub sessions_adopted: u64,
+    pub adoption_pins_released: u64,
+    pub adoption_pins_transferred: u64,
+    pub adoption_pins_dropped: u64,
+    pub sessions_cleaned_up: u64,
+    pub cleanup_declined_referenced: u64,
+    pub cleanup_declined_stale_root: u64,
     pub sessions_aborted: u64,
     pub sessions_expired: u64,
     pub sessions_live: u64,
@@ -488,16 +590,39 @@ pub enum ChunkPutOutcome {
     AlreadyPresent,
 }
 
-/// The two states a session can hold in this pass.
+/// Every state a session can hold, all four durable and all four
+/// reconstructable.
 ///
-/// Deliverable 6 adds `Finalizing`, which is the state that holds an adoption
-/// pin. Expiry and abort match this exhaustively rather than defaulting, so
-/// adding that variant will fail to compile at exactly the sites that must
-/// learn about a pin instead of silently reclaiming a pinned session.
+/// Reconstructability is the membership rule, and it is why `SessionBusy` is a
+/// separate private enum: a value that a restart cannot produce has no business
+/// on the wire. Each of these is decided by an artifact on disk — the session
+/// record, the sealed manifest, and the adoption marker's recorded outcome —
+/// never by a flag that only this process remembers.
+///
+/// The previous pass predicted deliverable 6 would add one variant. It adds two.
+/// `Adopted` is not in the deliverable's own text, and dropping the session on
+/// adoption instead is what forced it: the artifacts stay in `staging/` and are
+/// pinned by the committed root from then on, so removing the session record
+/// would make the next reconstruction read the directory as an abandoned
+/// materialization and reclaim committed content. Keeping the record without a
+/// state, the other way out, re-charges the whole reservation for a session that
+/// no longer occupies any staging budget — a bound that leaks a little on every
+/// restart. A durable `Adopted` says the true thing instead: this directory is
+/// store content now, and it is cleanup's business rather than staging's.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum StagedSessionState {
     Open,
     Sealed,
+    /// An adoption pin is outstanding. The artifacts may not be reclaimed by
+    /// expiry, abort, or cleanup while a session is here, and a pin that
+    /// outlives its process is resolved by recovery rather than dropped.
+    Finalizing,
+    /// The pin ended in `Adopted`: a committed transaction references these
+    /// artifacts, they are no longer staging occupancy, and the session holds no
+    /// reservation. It stays in the registry so cleanup can prove — against a
+    /// `CommittedRoot` rather than against this state — whether anything still
+    /// references them.
+    Adopted,
 }
 
 /// Read-only view of one live session. Never carries artifact bytes.
@@ -706,6 +831,9 @@ impl ChunkSlot {
 enum SessionBusy {
     Idle,
     Sealing,
+    /// Between admitting the sole finalizer and the marker being durable. The
+    /// pin does not exist yet, so this is an exclusion and not a state.
+    Finalizing,
     Reclaiming,
 }
 
@@ -737,6 +865,15 @@ struct SessionRecord {
     written_bytes: u64,
     reservation: Reservation,
     resolution: Option<Arc<ProjectionAdoptionResolution>>,
+    /// The committed shard sequence this session's adoption frame reached, for
+    /// an `Adopted` session and nothing else.
+    ///
+    /// Cleanup's reference proof is only meaningful against a root that includes
+    /// this adoption; an earlier root omits every reference the adoption created
+    /// and would "prove" an absence that is really a date. Durable in the
+    /// adoption marker, so the proof survives the restart that separates an
+    /// adoption from the compaction that eventually drops its reference.
+    adopted_at_shard_sequence: Option<u64>,
 }
 
 impl SessionRecord {
@@ -1013,6 +1150,7 @@ impl ProjectionStaging {
 
         let mut chunks: BTreeMap<u32, ChunkSlot> = BTreeMap::new();
         let mut sealed_manifest: Option<PathBuf> = None;
+        let mut adoption: Option<(AdoptionMark, u64)> = None;
         let mut written_objects = 0u64;
         let mut written_bytes = 0u64;
         for entry in std::fs::read_dir(directory)? {
@@ -1032,6 +1170,10 @@ impl ProjectionStaging {
             }
             if name == MANIFEST_NAME {
                 sealed_manifest = Some(path);
+                continue;
+            }
+            if name == ADOPTION_NAME {
+                adoption = Some(read_adoption_marker(&path, session_id, &binding.session)?);
                 continue;
             }
             let Some((ordinal, digest_from_name)) = parse_chunk_artifact_name(name) else {
@@ -1104,14 +1246,45 @@ impl ProjectionStaging {
         };
 
         // A durable manifest artifact is the seal's own commit point, so its
-        // presence — not a flag — is what makes the session `Sealed` again.
-        let (state, resolution) = match sealed_manifest {
-            None => (StagedSessionState::Open, None),
-            Some(path) => {
+        // presence — not a flag — is what makes the session `Sealed` again, and
+        // the adoption marker beside it is what carries the pin across the
+        // process boundary. A marker without a manifest is not a state this
+        // store can produce: `finalize` only admits a sealed session, and the
+        // marker is written after the manifest is durable. Refusing it is the
+        // difference between reconstructing a pin and inventing one.
+        let mut adopted_at: Option<u64> = None;
+        let (state, resolution) = match (sealed_manifest, adoption) {
+            (None, None) => (StagedSessionState::Open, None),
+            (None, Some(_)) => {
+                return Err(StoreError::Corruption(format!(
+                    "staging session {} carries an adoption marker with no sealed manifest",
+                    hex::encode(session_id)
+                )))
+            }
+            (Some(path), mark) => {
                 let resolution =
                     self.reconstruct_resolution(&path, &binding, session_id, &chunks)?;
-                (StagedSessionState::Sealed, Some(resolution))
+                let state = match mark {
+                    None => StagedSessionState::Sealed,
+                    Some((AdoptionMark::Finalizing, _)) => StagedSessionState::Finalizing,
+                    Some((AdoptionMark::Adopted, at)) => {
+                        adopted_at = Some(at);
+                        StagedSessionState::Adopted
+                    }
+                };
+                (state, Some(resolution))
             }
+        };
+
+        // An adopted session's bytes are store content, not staging occupancy.
+        // Reconstructing its reservation would re-charge, on every restart, a
+        // budget the adoption released — a ceiling that quietly shrinks each
+        // time the process comes back.
+        let reservation = match state {
+            StagedSessionState::Open
+            | StagedSessionState::Sealed
+            | StagedSessionState::Finalizing => reservation,
+            StagedSessionState::Adopted => Reservation::default(),
         };
 
         Ok(Some(SessionRecord {
@@ -1125,6 +1298,7 @@ impl ProjectionStaging {
             written_bytes,
             reservation,
             resolution,
+            adopted_at_shard_sequence: adopted_at,
         }))
     }
 
@@ -1399,15 +1573,29 @@ impl ProjectionStaging {
                 let past_expiry = now_micros > record.binding.session.expires_at_micros;
                 let idle = match record.busy {
                     SessionBusy::Idle => true,
-                    // A sealing session is mid-maintenance; the next sweep
-                    // takes it. Deliverable 6 replaces this with the pinned
-                    // case, which expiry may never reclaim at all.
-                    SessionBusy::Sealing | SessionBusy::Reclaiming => false,
+                    // Mid-maintenance; the next sweep takes it.
+                    SessionBusy::Sealing | SessionBusy::Finalizing | SessionBusy::Reclaiming => {
+                        false
+                    }
                 };
                 past_expiry
                     && idle
                     && match record.state {
                         StagedSessionState::Open | StagedSessionState::Sealed => true,
+                        // The named acceptance case of deliverable 6: expiry
+                        // prevents a *new* finalizer but must never delete
+                        // artifacts an already-admitted one holds. `finalize`
+                        // takes `require_live` under the same registry lock this
+                        // sweep uses, so the race has exactly two orderings and
+                        // both are safe — expiry first reclaims a session no
+                        // finalizer can then admit, finalize first leaves a
+                        // pinned session this arm declines.
+                        StagedSessionState::Finalizing => false,
+                        // Not staging occupancy any more, and not expiry's to
+                        // reclaim: a committed transaction may reference these
+                        // artifacts, and only a proof against a `CommittedRoot`
+                        // can say. That proof is cleanup's (deliverable 7).
+                        StagedSessionState::Adopted => false,
                     }
             })
             .map(|(id, _)| *id)
@@ -1423,19 +1611,188 @@ impl ProjectionStaging {
         Ok(reclaimed)
     }
 
-    /// Remove artifacts no committed manifest references.
+    /// Remove staged artifacts no committed root references.
     ///
-    /// Deferred: deliverable 7. The proof this owes is answered against a
-    /// `CommittedRoot`, and the state it must be able to observe — an adopted
-    /// session — cannot exist until deliverable 6 and B1's `adopt_projection`
-    /// land. A version that reclaimed everything unreferenced today would be
-    /// correct today and would silently become a reclamation of adopted
-    /// artifacts the moment adoption started working.
-    pub fn cleanup_unreferenced(&self, _root: &CommittedRoot) -> Result<u64, StoreError> {
-        Err(StoreError::NotImplemented(
-            "ProjectionStaging::cleanup_unreferenced — B3 StagingSessions, scope 6.5 \
-             deliverable 7 (reference proof against a CommittedRoot)",
-        ))
+    /// Deliverable 7. The candidate set is exactly the **adopted** sessions, and
+    /// that is the whole design rather than a filter on it:
+    ///
+    /// * `Open` and `Sealed` are live and belong to expiry and abort, which
+    ///   already own them and already know when they are dead.
+    /// * `Finalizing` holds an outstanding pin. Nothing in this process knows
+    ///   whether a frame naming its artifacts is about to be appended, so there
+    ///   is nothing to prove absence *of* yet.
+    /// * `Adopted` is the one state where the artifacts are store content and
+    ///   the question "does anything still point at them?" is both meaningful
+    ///   and answerable. A checkpoint or a compaction that stops referencing an
+    ///   adopted projection is what eventually makes its directory reclaimable,
+    ///   and this is the only path that may remove it.
+    ///
+    /// # Whole directories, not individual artifacts
+    ///
+    /// The deliverable's wording is per-artifact and the unit here is the
+    /// session, deliberately. A session's chunks are not independent files: the
+    /// manifest names all of them, and reconstruction refuses a sealed session
+    /// missing any ordinal. Removing the unreferenced half of a directory would
+    /// leave a session that no longer reconstructs — trading a bounded leak for
+    /// a root that fails to open — so a session is reclaimed only when *nothing*
+    /// in it is referenced. `reclaim_session_directory` then applies the
+    /// per-artifact rule that clause is really about: it removes only files
+    /// carrying this session's own marker, and refuses the whole directory if it
+    /// finds anything else.
+    ///
+    /// # The supplied root has to be new enough to be evidence
+    ///
+    /// A caller passes the root it holds, and a root captured **before** a
+    /// session was adopted references none of that session's artifacts — for the
+    /// trivial reason that it predates every reference the adoption created.
+    /// Absence measured against it is a date, not an absence, and acting on it
+    /// deletes a directory the *current* root points into.
+    ///
+    /// So each adopted session carries the committed shard sequence its adoption
+    /// frame reached, and is skipped unless the supplied root has reached at
+    /// least that far. A root at or past it necessarily includes the adoption's
+    /// effects, which is what makes the absence real.
+    ///
+    /// I had this backwards in review and it is worth stating plainly: the
+    /// argument "a racing newer root can only *add* references" is an argument
+    /// for the hazard, not against it. Adding references is precisely what makes
+    /// an older root omit them.
+    pub fn cleanup_unreferenced(&self, root: &CommittedRoot) -> Result<u64, StoreError> {
+        let candidates: Vec<([u8; 16], PathBuf, u16, Option<u64>)> = {
+            let mut registry = self.lock();
+            let eligible: Vec<[u8; 16]> = registry
+                .sessions
+                .iter()
+                .filter(|(_, record)| match record.state {
+                    StagedSessionState::Adopted => true,
+                    StagedSessionState::Open
+                    | StagedSessionState::Sealed
+                    | StagedSessionState::Finalizing => false,
+                })
+                .filter(|(_, record)| matches!(record.busy, SessionBusy::Idle))
+                .map(|(session_id, _)| *session_id)
+                .collect();
+            // Marked `Reclaiming` under the same acquisition that selected them,
+            // so nothing can begin operating on a session between the choice and
+            // the exclusion.
+            let mut candidates = Vec::with_capacity(eligible.len());
+            for session_id in eligible {
+                if let Some(record) = registry.sessions.get_mut(&session_id) {
+                    record.busy = SessionBusy::Reclaiming;
+                    candidates.push((
+                        session_id,
+                        record.directory.clone(),
+                        record.shard_index,
+                        record.adopted_at_shard_sequence,
+                    ));
+                }
+            }
+            candidates
+        };
+
+        let mut reclaimed = 0u64;
+        for (session_id, directory, shard_index, recorded) in candidates {
+            // The position is what makes the absence proof below evidence rather
+            // than a date. A session missing one is not reclaimable at all: an
+            // adopted session always records where it was adopted, so its
+            // absence means this store cannot say when the reference it is about
+            // to disprove came into existence.
+            let adopted_at = match recorded {
+                Some(sequence) => sequence,
+                None => {
+                    self.clear_busy(session_id);
+                    continue;
+                }
+            };
+            // `Some(0)` and `None` are different answers and only one of them is
+            // evidence. Zero is a valid committed sequence, so defaulting an
+            // absent entry to it makes a root that says *nothing* about this
+            // shard indistinguishable from one that has committed through its
+            // first frame — and an adoption at sequence 0 becomes reclaimable
+            // through a root that never mentioned the shard it lives on.
+            let reached = matches!(
+                root.shard_committed_sequence(shard_index),
+                Some(through) if through >= adopted_at
+            );
+            if !reached {
+                self.counters
+                    .cleanup_declined_stale_root
+                    .fetch_add(1, Relaxed);
+                self.clear_busy(session_id);
+                continue;
+            }
+            match self.session_is_unreferenced(root, &directory, session_id, adopted_at) {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.clear_busy(session_id);
+                    continue;
+                }
+                Err(error) => {
+                    self.clear_busy(session_id);
+                    return Err(error);
+                }
+            }
+            match self.reclaim_directory(directory, session_id) {
+                Ok(()) => {
+                    let mut registry = self.lock();
+                    // The reservation was already released at adoption, so this
+                    // only drops the record. Releasing twice is why
+                    // `release_reservation_locked` zeroes as it goes.
+                    self.release_locked(&mut registry, session_id);
+                    drop(registry);
+                    self.counters.sessions_cleaned_up.fetch_add(1, Relaxed);
+                    reclaimed += 1;
+                }
+                Err(error) => {
+                    self.clear_busy(session_id);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(reclaimed)
+    }
+
+    /// Does the committed root reference nothing in this session's directory?
+    ///
+    /// Every file is checked, not only the chunks. A root that pinned a
+    /// session's manifest and nothing else would still be holding that
+    /// directory, and answering on chunks alone would delete the file it holds.
+    fn session_is_unreferenced(
+        &self,
+        root: &CommittedRoot,
+        directory: &Path,
+        session_id: [u8; 16],
+        adopted_at: u64,
+    ) -> Result<bool, StoreError> {
+        let _ = adopted_at;
+        if !directory.exists() {
+            return Ok(true);
+        }
+        let directory = directory.to_path_buf();
+        let entries = self.run_maintenance(move || {
+            let mut paths = Vec::new();
+            for entry in std::fs::read_dir(&directory)? {
+                paths.push(entry?.path());
+            }
+            Ok(paths)
+        })?;
+        for path in entries {
+            if root.references_artifact(&path) {
+                self.counters
+                    .cleanup_declined_referenced
+                    .fetch_add(1, Relaxed);
+                let _ = session_id;
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn clear_busy(&self, session_id: [u8; 16]) {
+        let mut registry = self.lock();
+        if let Some(record) = registry.sessions.get_mut(&session_id) {
+            record.busy = SessionBusy::Idle;
+        }
     }
 
     // --- internals ------------------------------------------------------
@@ -1690,6 +2047,7 @@ impl ProjectionStaging {
                 written_bytes: 0,
                 reservation,
                 resolution: None,
+                adopted_at_shard_sequence: None,
             },
         );
 
@@ -1714,6 +2072,60 @@ impl ProjectionStaging {
     fn release(&self, session_id: [u8; 16]) {
         let mut registry = self.lock();
         self.release_locked(&mut registry, session_id);
+    }
+
+    /// Release a session's budget while leaving the record in place.
+    ///
+    /// Adoption ends staging occupancy without ending the directory: the
+    /// artifacts are store content from that point and a committed root points
+    /// into them, so charging them against staging's ceilings forever would make
+    /// every adoption permanently shrink the budget for the next one. The record
+    /// stays so cleanup can still identify the directory and prove, against a
+    /// `CommittedRoot`, whether anything references it.
+    ///
+    /// Idempotent by construction: the reservation is zeroed as it is released,
+    /// so a repeated call subtracts nothing.
+    fn release_reservation_locked(&self, registry: &mut Registry, session_id: [u8; 16]) {
+        let Some(record) = registry.sessions.get_mut(&session_id) else {
+            return;
+        };
+        let reservation = std::mem::take(&mut record.reservation);
+        let written_bytes = std::mem::take(&mut record.written_bytes);
+        let principal = record.principal();
+        if let Some(entry) = registry.principals.get_mut(&principal) {
+            entry.sessions = entry.sessions.saturating_sub(1);
+            entry.objects = entry.objects.saturating_sub(reservation.objects);
+            entry.bytes = entry.bytes.saturating_sub(reservation.bytes);
+            entry.files = entry.files.saturating_sub(reservation.files);
+            if entry.sessions == 0 {
+                registry.principals.remove(&principal);
+            }
+        }
+        registry.global.sessions = registry.global.sessions.saturating_sub(1);
+        registry.global.objects = registry.global.objects.saturating_sub(reservation.objects);
+        registry.global.bytes = registry.global.bytes.saturating_sub(reservation.bytes);
+        registry.global.files = registry.global.files.saturating_sub(reservation.files);
+        registry.debt_reserved_bytes = registry
+            .debt_reserved_bytes
+            .saturating_sub(reservation.bytes);
+
+        let counters = &self.counters;
+        counters.sessions_live.fetch_sub(1, Relaxed);
+        counters
+            .reserved_objects
+            .fetch_sub(reservation.objects, Relaxed);
+        counters
+            .reserved_bytes
+            .fetch_sub(reservation.bytes, Relaxed);
+        counters
+            .reserved_files
+            .fetch_sub(reservation.files, Relaxed);
+        counters
+            .compaction_debt_reserved_bytes
+            .fetch_sub(reservation.bytes, Relaxed);
+        counters
+            .compaction_debt_written_bytes
+            .fetch_sub(written_bytes, Relaxed);
     }
 
     fn release_locked(&self, registry: &mut Registry, session_id: [u8; 16]) {
@@ -1831,10 +2243,23 @@ impl ProjectionStaging {
                 .ok_or_else(|| unknown_session(session_id))?;
             match record.state {
                 StagedSessionState::Open | StagedSessionState::Sealed => {}
+                // Reclamation deletes the directory, so it may not run against
+                // a session whose artifacts something else is entitled to: an
+                // outstanding pin, or a committed root's reference. Both are
+                // refused here rather than filtered by every caller, because a
+                // caller that forgets is a caller that deletes committed data.
+                StagedSessionState::Finalizing | StagedSessionState::Adopted => {
+                    return Err(StoreError::Conflict(format!(
+                        "staging session {} holds an adoption outcome and may not be \
+                         reclaimed by expiry or abort; only a reference proof against a \
+                         committed root may remove it",
+                        hex::encode(session_id)
+                    )))
+                }
             }
             match record.busy {
                 SessionBusy::Idle => {}
-                SessionBusy::Sealing | SessionBusy::Reclaiming => {
+                SessionBusy::Sealing | SessionBusy::Finalizing | SessionBusy::Reclaiming => {
                     return Err(StoreError::Overloaded {
                         limit: "staging_session_maintenance_in_flight",
                         retry_after_micros: 1,
@@ -2217,7 +2642,12 @@ impl ProjectionStageSession {
             .get(&self.session_id)
             .ok_or_else(|| unknown_session(self.session_id))?;
         match record.state {
-            StagedSessionState::Sealed => {}
+            // A pinned or adopted session still has the manifest sealing wrote,
+            // and the adopting side revalidates against it. Refusing here would
+            // make a pin unusable by the caller holding it.
+            StagedSessionState::Sealed
+            | StagedSessionState::Finalizing
+            | StagedSessionState::Adopted => {}
             StagedSessionState::Open => {
                 return Err(StoreError::Conflict(format!(
                     "staging session {} is still open and has no sealed manifest to resolve",
@@ -2379,52 +2809,276 @@ impl ProjectionStageSession {
         Ok(())
     }
 
-    /// Move `Open -> Finalizing` for the sole bound operation/digest and take
+    /// Move `Sealed -> Finalizing` for the sole bound operation/digest and take
     /// the adoption pin.
     ///
-    /// Deferred: deliverable 6. This is where the `ProjectionAdoptionLifecycle`
-    /// implementation lands, and it is the live B1/B3 seam — the pin has to
-    /// survive a definitive pre-append failure, an expiry racing an admitted
-    /// finalizer, and a transfer to recovery, and none of those can be tested
-    /// against a `submit` that does not exist yet. A placeholder that returned
-    /// a handle would hand out an adoption capability with no pin behind it,
-    /// which is precisely the security property this package exists to hold.
+    /// From `Sealed`, not `Open`: the sealed manifest is what an adopter
+    /// revalidates against, so a pin on a session without one names state that
+    /// does not exist. Scope §6.5 and plan §8 both said `Open` and are amended
+    /// by contract review 2026-07-31-A.
+    ///
+    /// The pin is made durable **before** it is issued. A handle backed by an
+    /// in-memory flag is an adoption capability with nothing behind it — the
+    /// process stops, no marker is on the device, and the next open reconstructs
+    /// a plain sealed session while a committed frame may already reference its
+    /// artifacts. That is precisely the security property this package exists to
+    /// hold.
     #[allow(dead_code)] // B1's `adopt_projection` is the only legitimate caller.
-    pub(crate) fn finalize(
-        &self,
-        _now_micros: i64,
-    ) -> Result<StagedProjectionAdoption, StoreError> {
-        Err(StoreError::NotImplemented(
-            "ProjectionStageSession::finalize — B3 StagingSessions, scope 6.5 deliverable 6 \
-             (finalize and the adoption pin)",
+    pub(crate) fn finalize(&self, now_micros: i64) -> Result<StagedProjectionAdoption, StoreError> {
+        let staging = &self.staging;
+
+        // Phase 1, under the registry: admit exactly one finalizer, and do it
+        // in the same critical section that expiry evaluates. That shared lock
+        // is the whole of the expiry/finalize race: either this runs first and
+        // `expire` then declines a `Finalizing` session, or expiry runs first
+        // and `require_live` refuses here. There is no ordering in which a
+        // sweep deletes artifacts a pin already holds.
+        let (install, directory, operation, digest) = {
+            let mut registry = staging.lock();
+            let record = registry
+                .sessions
+                .get(&self.session_id)
+                .ok_or_else(|| unknown_session(self.session_id))?;
+            require_finalizable(record, self.session_id)?;
+            require_live(record, self.session_id, now_micros)?;
+            require_idle(record, self.session_id)?;
+
+            let resolution = record.resolution.clone().ok_or_else(|| {
+                StoreError::Corruption("sealed staging session lost its resolution".into())
+            })?;
+            let install = install_from_resolution(&resolution)?;
+            let directory = record.directory.clone();
+            let operation = record.binding.session.final_operation_id;
+            let digest = record.binding.session.final_operation_digest;
+            let record = registry
+                .sessions
+                .get_mut(&self.session_id)
+                .ok_or_else(|| unknown_session(self.session_id))?;
+            record.busy = SessionBusy::Finalizing;
+            (install, directory, operation, digest)
+        };
+
+        // Phase 2, on a maintenance worker: make the pin durable *before*
+        // handing it out. A handle issued against an in-memory flag is an
+        // adoption capability with nothing behind it — the process stops, the
+        // marker is not there, and the next open reconstructs a plain sealed
+        // session while a committed frame may already reference its artifacts.
+        let session_id = self.session_id;
+        let durability = Arc::clone(&staging.durability);
+        let counters = Arc::clone(&staging.counters);
+        let written = staging.run_maintenance(move || {
+            write_adoption_marker(
+                &directory,
+                session_id,
+                AdoptionMark::Finalizing,
+                operation,
+                digest,
+                &durability,
+                &counters,
+            )
+        });
+
+        // Phase 3, under the registry: publish the state the marker now proves,
+        // or clear the exclusion and hand back the reason.
+        let mut registry = staging.lock();
+        let record = registry
+            .sessions
+            .get_mut(&self.session_id)
+            .ok_or_else(|| unknown_session(self.session_id))?;
+        record.busy = SessionBusy::Idle;
+        written?;
+        record.state = StagedSessionState::Finalizing;
+        drop(registry);
+        staging.counters.sessions_finalized.fetch_add(1, Relaxed);
+
+        Ok(StagedProjectionAdoption {
+            descriptor: install,
+            handle: ProjectionAdoption::new(Arc::new(SessionAdoptionPin {
+                staging: Arc::clone(staging),
+                session_id: self.session_id,
+            })),
+        })
+    }
+}
+
+/// The lifecycle behind one issued [`ProjectionAdoption`].
+///
+/// Holds an `Arc<ProjectionStaging>` rather than a borrow because the pin is
+/// deliberately allowed to outlive the `ProjectionStageSession` that produced
+/// it: B1 carries the handle into a `ValidatedTransaction` and finishes it after
+/// the append decides, which is a different scope entirely.
+struct SessionAdoptionPin {
+    staging: Arc<ProjectionStaging>,
+    session_id: [u8; 16],
+}
+
+impl ProjectionAdoptionLifecycle for SessionAdoptionPin {
+    fn resolution(&self) -> Result<Arc<ProjectionAdoptionResolution>, StoreError> {
+        let registry = self.staging.lock();
+        let record = registry
+            .sessions
+            .get(&self.session_id)
+            .ok_or_else(|| unknown_session(self.session_id))?;
+        record.resolution.clone().ok_or_else(|| {
+            StoreError::Corruption("pinned staging session lost its resolution".into())
+        })
+    }
+
+    /// Record the one terminal outcome, durably, before the pin is released.
+    ///
+    /// Each arm is a different physical claim and none of them is a flag:
+    ///
+    /// * `Adopted` — a committed transaction references these artifacts. The
+    ///   marker is rewritten so the next reconstruction says so; the directory
+    ///   stays exactly where it is, because a committed root now points into it.
+    ///   The reservation is released: staged bytes that became store content are
+    ///   not staging occupancy, and charging them forever would make every
+    ///   adoption shrink the budget for the next one.
+    /// * `DefinitivePreAppendFailure` — nothing was appended, so the pin simply
+    ///   ends. The marker is removed and the session returns to `Sealed`, which
+    ///   is what the durable manifest already says it is. Deliverable 6's text
+    ///   says "returns the session to `Open`"; `Open` here would contradict
+    ///   reconstruction, which reads the sealed manifest's presence as the seal's
+    ///   own commit point and would hand back `Sealed` on the next restart
+    ///   regardless. Returning it to a state a restart cannot reproduce is the
+    ///   defect `SessionBusy` exists to avoid, so it returns to `Sealed` — still
+    ///   finalizable, which is the property the sentence is about. If the session
+    ///   is no longer live, the marker still goes and expiry reclaims it on the
+    ///   next sweep, which is "otherwise cleanup aborts it".
+    /// * `TransferredToRecovery` — nobody in this process knows whether the frame
+    ///   reached the journal. The marker stays, so the next open reconstructs
+    ///   `Finalizing` and `transferred_sessions` hands the question to recovery.
+    fn finish(&self, outcome: ProjectionAdoptionOutcome) -> Result<(), StoreError> {
+        match outcome {
+            ProjectionAdoptionOutcome::Adopted {
+                committed_shard_sequence,
+            } => {
+                self.adopt_mark(committed_shard_sequence)?;
+                let mut registry = self.staging.lock();
+                if let Some(record) = registry.sessions.get_mut(&self.session_id) {
+                    record.state = StagedSessionState::Adopted;
+                    record.adopted_at_shard_sequence = Some(committed_shard_sequence);
+                }
+                self.staging
+                    .release_reservation_locked(&mut registry, self.session_id);
+                drop(registry);
+                self.staging.counters.sessions_adopted.fetch_add(1, Relaxed);
+                Ok(())
+            }
+            ProjectionAdoptionOutcome::DefinitivePreAppendFailure => {
+                self.clear_mark()?;
+                let mut registry = self.staging.lock();
+                if let Some(record) = registry.sessions.get_mut(&self.session_id) {
+                    record.state = StagedSessionState::Sealed;
+                }
+                drop(registry);
+                self.staging
+                    .counters
+                    .adoption_pins_released
+                    .fetch_add(1, Relaxed);
+                Ok(())
+            }
+            ProjectionAdoptionOutcome::TransferredToRecovery => {
+                self.staging
+                    .counters
+                    .adoption_pins_transferred
+                    .fetch_add(1, Relaxed);
+                Ok(())
+            }
+        }
+    }
+
+    /// A handle dropped without an outcome is not an error to report — there is
+    /// nobody left to report it to — but it is emphatically not a release.
+    ///
+    /// The caller was somewhere between "about to append" and "knows the
+    /// answer", and unwound without saying which. That is exactly the state
+    /// `TransferredToRecovery` describes, so the marker stays and recovery
+    /// decides. Treating it as a release would let the next sweep delete
+    /// artifacts a committed frame may already reference.
+    fn dropped_without_outcome(&self) {
+        self.staging
+            .counters
+            .adoption_pins_dropped
+            .fetch_add(1, Relaxed);
+    }
+}
+
+impl SessionAdoptionPin {
+    fn adopt_mark(&self, committed_shard_sequence: u64) -> Result<(), StoreError> {
+        let (directory, session) = {
+            let registry = self.staging.lock();
+            let record = registry
+                .sessions
+                .get(&self.session_id)
+                .ok_or_else(|| unknown_session(self.session_id))?;
+            (record.directory.clone(), record.binding.session.clone())
+        };
+        let session_id = self.session_id;
+        let durability = Arc::clone(&self.staging.durability);
+        let counters = Arc::clone(&self.staging.counters);
+        self.staging.run_maintenance(move || {
+            adopt_adoption_marker(
+                &directory,
+                session_id,
+                &session,
+                committed_shard_sequence,
+                &durability,
+                &counters,
+            )
+        })
+    }
+
+    fn clear_mark(&self) -> Result<(), StoreError> {
+        let (directory, _, _) = self.pin_identity()?;
+        let durability = Arc::clone(&self.staging.durability);
+        self.staging
+            .run_maintenance(move || remove_adoption_marker(&directory, &durability))
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn pin_identity(&self) -> Result<(PathBuf, [u8; 16], ObjectId), StoreError> {
+        let registry = self.staging.lock();
+        let record = registry
+            .sessions
+            .get(&self.session_id)
+            .ok_or_else(|| unknown_session(self.session_id))?;
+        Ok((
+            record.directory.clone(),
+            record.binding.session.final_operation_id,
+            record.binding.session.final_operation_digest,
         ))
     }
 }
 
-/// Deliverable 8, one method answered and two still deferred.
+/// Deliverable 8, complete: all three methods answer.
 ///
-/// The seam is implemented rather than absent so recovery's dependency on
-/// staging is visible at the type level: a store that recovers a committed
+/// The seam existed before it was implemented so recovery's dependency on
+/// staging was visible at the type level — a store that recovers a committed
 /// staged install without resolving it would publish membership for objects it
-/// cannot locate. The two deferred methods name the deliverable rather than
-/// returning an empty result, because "nothing to resolve" and "cannot answer
-/// yet" are different answers and only one of them is true.
+/// cannot locate — and while two methods were deferred they named the
+/// deliverable rather than returning an empty result, because "nothing to
+/// resolve" and "cannot answer yet" are different answers and only one of them
+/// was true.
+///
+/// Both now answer. `resolve_committed` binds a descriptor to the bytes on disk
+/// and resolves whole or not at all; `notify_recovered` ends a transferred pin
+/// as an adoption or reclaims artifacts recovery proved no frame names. Contract
+/// review 2026-07-31-D.
 impl ProjectionRecoveryResolver for ProjectionStaging {
-    /// The transferred set, **derived rather than asserted, and provably empty
-    /// today.**
+    /// The transferred set, **derived rather than asserted.**
     ///
-    /// A pin transfers to recovery only from `Finalizing`, and `Finalizing` is
-    /// deliverable 6: `finalize` returns `NotImplemented`, so no session has
-    /// ever entered that state, and — now that reconstruction exists — the only
-    /// states a durable session directory can come back in are `Open` and
-    /// `Sealed`. The empty answer is therefore a proof about the reachable
-    /// state space, not the "no transferred sessions" guess the deferred
-    /// version would have been making.
+    /// It was provably empty while `finalize` was deferred, because no session
+    /// could enter `Finalizing` at all. Deliverable 6 landed that state and made
+    /// it durable, so this now answers the question it was written to be able to
+    /// answer: a session reconstructed in `Finalizing` held a pin when its
+    /// process stopped, and nothing in *this* process knows whether the final
+    /// frame reached the journal.
     ///
-    /// It is computed by an exhaustive match over the state rather than
-    /// returned as a constant, so adding `Finalizing` fails to compile here —
-    /// at the one place that must learn a pin can now outlive the process —
-    /// instead of silently continuing to answer "none".
+    /// Still an exhaustive match over the state rather than a filter, which is
+    /// how `Finalizing` and `Adopted` arrived here as compile errors — at the one
+    /// place that had to learn a pin can outlive the process — rather than being
+    /// swept silently into "none".
     fn transferred_sessions(&self, shard_index: u16) -> Result<Arc<[[u8; 16]]>, StoreError> {
         let registry = self.lock();
         let transferred: Vec<[u8; 16]> = registry
@@ -2433,35 +3087,435 @@ impl ProjectionRecoveryResolver for ProjectionStaging {
             .filter(|(_, record)| record.shard_index == shard_index)
             .filter(|(_, record)| match record.state {
                 StagedSessionState::Open | StagedSessionState::Sealed => false,
+                // The answer this method was written to be able to give. A
+                // session reconstructed in `Finalizing` held a pin when its
+                // process stopped, so nothing in this process knows whether the
+                // final frame reached the journal — only recovery can say.
+                StagedSessionState::Finalizing => true,
+                // Already resolved. Reporting it would ask recovery to decide a
+                // question that has a durable answer, and `notify_recovered`
+                // would then be handed a session with nothing left to notify.
+                StagedSessionState::Adopted => false,
             })
             .map(|(session_id, _)| *session_id)
             .collect();
         Ok(Arc::from(transferred))
     }
 
+    /// Resolve a committed descriptor into membership and live ownership.
+    ///
+    /// Read-only, and mechanical: this verifies the descriptor against the
+    /// session's own sealed state and hands back what it finds. Identity, graph,
+    /// policy, authority, and federation decisions are deliberately absent — the
+    /// complete frame is already the durable authority, and resolution may
+    /// inspect, open, hash, and pin its immutable artifacts but may not repair
+    /// them.
+    ///
+    /// # It can never expose a partial chunk set
+    ///
+    /// Every ordinal the manifest declares is read back, decoded, and checked
+    /// before a single location is produced, and a missing or unreadable one
+    /// fails the whole resolution. `RecoveredProjectionArtifacts::new` then
+    /// refuses unless the entry count it was given equals the descriptor's own
+    /// `object_count`. So a directory holding some of its chunks resolves to an
+    /// error rather than to a smaller projection — which is the deliverable's
+    /// central claim, and the one a "resolve what is present" implementation
+    /// would quietly violate.
+    ///
+    /// # One location per chunk
+    ///
+    /// An `IndexLocation` names the whole certified record, never the object
+    /// bytes inside it, so every object in a chunk shares that chunk's location
+    /// and a reader validates the artifact before extracting from its decoded
+    /// vector — exactly as several objects share one journal frame. This is why
+    /// no per-object byte offsets are needed and why none are computed here:
+    /// pointing at object bytes would let a reader return bytes from a record it
+    /// never proved complete.
     fn resolve_committed(
         &self,
-        _namespace: NamespaceId,
-        _descriptor: &StagedProjectionInstallV1,
+        namespace: NamespaceId,
+        descriptor: &StagedProjectionInstallV1,
+        adoption_shard_sequence: u64,
     ) -> Result<RecoveredProjectionArtifacts, StoreError> {
-        Err(StoreError::NotImplemented(
-            "ProjectionStaging::resolve_committed — B3 StagingSessions, scope 6.5 \
-             deliverable 8 (recovery treatment of unreferenced artifacts)",
-        ))
+        let session_id = descriptor.session_id;
+        let resolution = {
+            let registry = self.lock();
+            let record = registry.sessions.get(&session_id).ok_or_else(|| {
+                StoreError::Corruption(format!(
+                    "committed staged projection names session {}, which this root does not \
+                     hold; its artifacts cannot be resolved and the objects it published \
+                     would be unreadable",
+                    hex::encode(session_id)
+                ))
+            })?;
+            record.resolution.clone().ok_or_else(|| {
+                StoreError::Corruption(format!(
+                    "committed staged projection session {} has no sealed manifest to \
+                     resolve",
+                    hex::encode(session_id)
+                ))
+            })?
+        };
+
+        // The descriptor a frame carries must be the one this session would
+        // install. Anything else means the frame and the artifacts on this device
+        // describe different projections, and adopting either would publish
+        // membership the other does not support.
+        let expected = install_from_resolution(&resolution)?;
+        if &expected != descriptor {
+            return Err(StoreError::Corruption(format!(
+                "committed staged projection session {} does not reconstruct the descriptor \
+                 its frame carries",
+                hex::encode(session_id)
+            )));
+        }
+
+        let artifacts = Arc::clone(&resolution.artifacts);
+        let session = resolution.session.clone();
+        let sealed_digests = resolution.manifest.chunk_digests.clone();
+        let expected_set = descriptor.artifact_set_digest;
+        let read = self.run_maintenance(move || {
+            let mut chunks = Vec::with_capacity(artifacts.len());
+            let mut observed_set: Vec<ProjectionArtifact> = Vec::with_capacity(artifacts.len());
+            for (ordinal, artifact) in artifacts.iter().enumerate() {
+                let ordinal = u32::try_from(ordinal).map_err(|_| {
+                    StoreError::Corruption("staged chunk ordinal does not fit u32".into())
+                })?;
+                let bytes =
+                    read_staging_artifact(&artifact.path, StagingArtifactKind::Chunk, session_id)?;
+                let chunk = ProjectionStageChunkV1::decode_canonical(&bytes).map_err(|e| {
+                    StoreError::Corruption(format!(
+                        "committed staged chunk {} no longer decodes: {e}",
+                        artifact.path.display()
+                    ))
+                })?;
+                if chunk.ordinal != ordinal
+                    || chunk.session_id != session_id
+                    || chunk.chunk_count != session.chunk_count
+                {
+                    return Err(StoreError::Corruption(format!(
+                        "committed staged chunk {} no longer matches the ordinal, session, or \
+                         chunk count its manifest binds",
+                        artifact.path.display()
+                    )));
+                }
+                // Bind on the bytes just read, not on the sealed record beside
+                // them. Everything above is shape — session, ordinal, count —
+                // and a *different* valid chunk of the same shape satisfies all
+                // of it while carrying entirely different objects. What makes
+                // this artifact the one the descriptor commits to is its digest.
+                let observed = chunk.chunk_digest().map_err(|e| {
+                    StoreError::Corruption(format!(
+                        "committed staged chunk {} digest: {e}",
+                        artifact.path.display()
+                    ))
+                })?;
+                if observed != artifact.digest {
+                    return Err(StoreError::Corruption(format!(
+                        "committed staged chunk {} hashes to {} but its sealed manifest \
+                         records {}; the artifact on disk is not the one this projection \
+                         committed",
+                        artifact.path.display(),
+                        hex::encode(observed.0),
+                        hex::encode(artifact.digest.0)
+                    )));
+                }
+                // And against the manifest's own ordered list, so a resolution
+                // cannot be satisfied by a set of chunks that individually match
+                // records which were themselves swapped.
+                let sealed = sealed_digests.get(ordinal as usize).ok_or_else(|| {
+                    StoreError::Corruption(format!(
+                        "committed staged chunk {} has ordinal {ordinal}, beyond the \
+                         manifest's chunk list",
+                        artifact.path.display()
+                    ))
+                })?;
+                if &observed != sealed {
+                    return Err(StoreError::Corruption(format!(
+                        "committed staged chunk {} does not match the digest its manifest \
+                         binds at ordinal {ordinal}",
+                        artifact.path.display()
+                    )));
+                }
+                let file_bytes = std::fs::metadata(&artifact.path)?.len();
+                if file_bytes != artifact.bytes {
+                    return Err(StoreError::Corruption(format!(
+                        "committed staged chunk {} is {file_bytes} bytes but its sealed \
+                         manifest records {}; a location naming the whole record would name \
+                         a different span than the one that was certified",
+                        artifact.path.display(),
+                        artifact.bytes
+                    )));
+                }
+                let pinned = PinnedFile::open(artifact.path.clone())?;
+                observed_set.push(ProjectionArtifact {
+                    path: artifact.path.clone(),
+                    digest: observed,
+                    bytes: file_bytes,
+                });
+                chunks.push((ordinal, chunk, file_bytes, pinned));
+            }
+            // The descriptor's own binding over the whole set, recomputed from
+            // what is on disk. The per-chunk checks above prove each artifact
+            // against the sealed record; this proves the *set* against the frame,
+            // which is the only value the committed transaction actually signed.
+            let observed_digest = artifact_set_digest(&observed_set);
+            if observed_digest != expected_set {
+                return Err(StoreError::Corruption(format!(
+                    "committed staged projection session {} resolves to artifact set {} but \
+                     its frame commits to {}",
+                    hex::encode(session_id),
+                    hex::encode(observed_digest.0),
+                    hex::encode(expected_set.0)
+                )));
+            }
+            Ok(chunks)
+        })?;
+
+        if u32::try_from(read.len()).unwrap_or(u32::MAX) != session.chunk_count {
+            return Err(StoreError::Corruption(format!(
+                "committed staged projection session {} resolved {} of {} chunks; a partial \
+                 chunk set is never exposed",
+                hex::encode(session_id),
+                read.len(),
+                session.chunk_count
+            )));
+        }
+
+        // The configured active-index bounds, the same ones ordinary recovery
+        // rebuilds under. Sizing this from `max_projection_objects` and a
+        // synthetic byte limit would have let a resolution admit a projection
+        // the recovered root cannot hold: nothing requires the active-index
+        // limits to admit a maximal projection, so the two are independent
+        // configurations and only one of them governs what a reopen may rebuild.
+        let mut delta = IndexDelta::from_options(&self.options);
+        let mut retained = Vec::with_capacity(read.len());
+        for (ordinal, chunk, file_bytes, pinned) in read {
+            let generation = projection_generation(adoption_shard_sequence, ordinal, session_id)?;
+            let frame_len = u32::try_from(file_bytes).map_err(|_| {
+                StoreError::Corruption(format!(
+                    "committed staged chunk ordinal {ordinal} of session {} is {file_bytes} \
+                     bytes, beyond what a location can name",
+                    hex::encode(session_id)
+                ))
+            })?;
+            for object in &chunk.objects {
+                delta.insert(
+                    IndexKey::new(namespace, object.descriptor.object_id),
+                    IndexLocation {
+                        segment_generation: generation,
+                        // The whole artifact is the certified record.
+                        frame_offset: 0,
+                        frame_len,
+                        object_type: object.descriptor.object_type,
+                        shard_sequence: adoption_shard_sequence,
+                    },
+                )?;
+            }
+            retained.push(RetainedProjectionArtifact::new(
+                generation,
+                crate::roots::ProjectionArtifactFormat::CanonicalStageChunkV1,
+                pinned,
+            ));
+        }
+
+        // Remembered so `notify_recovered` can end the pin as an adoption at
+        // the position this frame established. It is not durable yet: only a
+        // `Committed` notification, which follows the physical-state proof, may
+        // write it into the marker.
+        {
+            let mut registry = self.lock();
+            if let Some(record) = registry.sessions.get_mut(&session_id) {
+                record.adopted_at_shard_sequence = Some(adoption_shard_sequence);
+            }
+        }
+
+        RecoveredProjectionArtifacts::new(
+            descriptor.clone(),
+            Arc::new(delta),
+            Arc::from([]),
+            retained.into(),
+        )
     }
 
+    /// Finish one transferred session once recovery has proved its physical
+    /// state.
+    ///
+    /// This is the transition `finish` could not make: the process holding the
+    /// pin stopped without knowing whether its frame reached the journal, and
+    /// recovery has now either made that frame authoritative or scanned the
+    /// complete history and proved no such frame exists.
+    ///
+    /// * `Committed` ends the pin as an adoption, at the position
+    ///   `resolve_committed` recorded for this session in the same recovery.
+    ///   Without that position cleanup could never prove absence of reference
+    ///   against a root, so a `Committed` notification for a session this
+    ///   recovery did not resolve is refused rather than adopted at a guess.
+    /// * `ProvedAbsent` means no complete frame names these artifacts and none
+    ///   ever will — recovery has read the whole authoritative history. They are
+    ///   synced-but-unreferenced garbage, which is exactly what the deliverable
+    ///   says recovery treats as invisible, so the session is aborted and its
+    ///   directory reclaimed.
+    ///
+    /// **Idempotent**, because recovery repeats every notification on the next
+    /// attempt if a later one fails: a session already in the state being asked
+    /// for, or already gone, is success and not a conflict.
     fn notify_recovered(
         &self,
-        _resolution: RecoveredProjectionResolution,
+        resolution: RecoveredProjectionResolution,
     ) -> Result<(), StoreError> {
-        Err(StoreError::NotImplemented(
-            "ProjectionStaging::notify_recovered — B3 StagingSessions, scope 6.5 \
-             deliverable 8 (recovery treatment of unreferenced artifacts)",
-        ))
+        let session_id = resolution.session_id;
+        match resolution.outcome {
+            RecoveredProjectionOutcome::Committed => {
+                let adopted_at = {
+                    let registry = self.lock();
+                    let Some(record) = registry.sessions.get(&session_id) else {
+                        return Ok(());
+                    };
+                    if matches!(record.state, StagedSessionState::Adopted) {
+                        return Ok(());
+                    }
+                    record.adopted_at_shard_sequence.ok_or_else(|| {
+                        StoreError::Corruption(format!(
+                            "staging session {} is reported committed but this recovery never \
+                             resolved it, so nothing recorded where its adoption committed",
+                            hex::encode(session_id)
+                        ))
+                    })?
+                };
+                let (directory, session) = {
+                    let registry = self.lock();
+                    let record = registry
+                        .sessions
+                        .get(&session_id)
+                        .ok_or_else(|| unknown_session(session_id))?;
+                    (record.directory.clone(), record.binding.session.clone())
+                };
+                let durability = Arc::clone(&self.durability);
+                let counters = Arc::clone(&self.counters);
+                self.run_maintenance(move || {
+                    adopt_adoption_marker(
+                        &directory,
+                        session_id,
+                        &session,
+                        adopted_at,
+                        &durability,
+                        &counters,
+                    )
+                })?;
+                let mut registry = self.lock();
+                if let Some(record) = registry.sessions.get_mut(&session_id) {
+                    record.state = StagedSessionState::Adopted;
+                }
+                self.release_reservation_locked(&mut registry, session_id);
+                drop(registry);
+                self.counters.sessions_adopted.fetch_add(1, Relaxed);
+                Ok(())
+            }
+            RecoveredProjectionOutcome::ProvedAbsent => {
+                {
+                    let mut registry = self.lock();
+                    let Some(record) = registry.sessions.get_mut(&session_id) else {
+                        return Ok(());
+                    };
+                    // The pin is over: recovery proved no frame names these
+                    // artifacts. Returning the record to a reclaimable state is
+                    // what lets `reclaim_session` — which refuses a pinned or
+                    // adopted session on purpose — take it.
+                    record.state = StagedSessionState::Sealed;
+                    record.adopted_at_shard_sequence = None;
+                }
+                let directory = {
+                    let registry = self.lock();
+                    match registry.sessions.get(&session_id) {
+                        Some(record) => record.directory.clone(),
+                        None => return Ok(()),
+                    }
+                };
+                let durability = Arc::clone(&self.durability);
+                self.run_maintenance(move || remove_adoption_marker(&directory, &durability))?;
+                self.reclaim_session(session_id)?;
+                self.counters.sessions_aborted.fetch_add(1, Relaxed);
+                Ok(())
+            }
+        }
     }
 }
 
 // --- free helpers ---------------------------------------------------------
+
+/// The band every adopted projection artifact's logical generation lives in.
+///
+/// Segments, active tails, and projection artifacts share **one** generation
+/// space — `validate_retained_object_sources` inserts all three into a single
+/// map and refuses a duplicate — so a projection generation that collided with a
+/// segment's would be a `Corruption` at open. Reserving the top bit makes the
+/// collision impossible by construction rather than unlikely: segment and tail
+/// generations are a counter that advances once per seal, and a store that
+/// reached 2^63 seals has arithmetic problems that this constant is not the
+/// right place to discover.
+///
+/// `projection_generation` refuses anything that would land outside the band,
+/// so the disjointness is enforced at the one place generations are minted
+/// rather than assumed everywhere they are read.
+const PROJECTION_GENERATION_BAND: u64 = 1 << 63;
+
+/// Bits reserved for the chunk ordinal within a band entry.
+///
+/// `max_projection_chunks` is capped at `codec::MAX_CANONICAL_ITEMS`, which is
+/// 1,000,000 and therefore fits in 20 bits; 24 leaves room for that ceiling to
+/// rise without the mapping silently starting to alias.
+const PROJECTION_ORDINAL_BITS: u32 = 24;
+
+/// The logical generation of one adopted chunk artifact.
+///
+/// **Stable and injective in `(adoption frame sequence, chunk ordinal)`**, which
+/// is the requirement rather than a convenience. Stable because a sealed index
+/// run persists `IndexLocation`s across sessions, so the generation a run names
+/// must resolve to the same artifact at the next open — the rule contract review
+/// 2026-07-30-A established for segments and the active tail, applied here.
+/// Injective because a multi-chunk session has one file per chunk and the root
+/// validator correctly refuses two projection files at one generation: deriving
+/// from the frame sequence alone would make every multi-chunk adoption
+/// unopenable.
+///
+/// Both inputs are durable — the frame's own sequence and the ordinal the
+/// manifest fixes — so this is a function of committed state and not of
+/// anything a session remembers.
+fn projection_generation(
+    adoption_shard_sequence: u64,
+    ordinal: u32,
+    session_id: [u8; 16],
+) -> Result<u64, StoreError> {
+    let ordinal_ceiling = 1u64 << PROJECTION_ORDINAL_BITS;
+    if u64::from(ordinal) >= ordinal_ceiling {
+        return Err(StoreError::Corruption(format!(
+            "staged projection session {} has chunk ordinal {ordinal}, beyond the {} the \
+             generation mapping can distinguish",
+            hex::encode(session_id),
+            ordinal_ceiling - 1
+        )));
+    }
+    // The sequence must fit *below* the band bit once shifted, not merely
+    // survive the shift. A round-trip check is not enough and the boundary is
+    // exactly one value wide: `1 << 39` shifts to `1 << 63`, which is the band
+    // bit itself, loses nothing on the way, and round-trips perfectly — and then
+    // OR-ing the band is a no-op, so it produces the same generation as sequence
+    // 0 at the same ordinal. One collision, at the one input a shift check
+    // cannot see.
+    let sequence_ceiling = 1u64 << (63 - PROJECTION_ORDINAL_BITS);
+    if adoption_shard_sequence >= sequence_ceiling {
+        return Err(StoreError::Corruption(format!(
+            "staged projection session {} was adopted at shard sequence {}, at or beyond the \
+             {sequence_ceiling} the projection generation mapping can distinguish",
+            hex::encode(session_id),
+            adoption_shard_sequence
+        )));
+    }
+    let shifted = adoption_shard_sequence << PROJECTION_ORDINAL_BITS;
+    debug_assert_eq!(shifted & PROJECTION_GENERATION_BAND, 0);
+    Ok(PROJECTION_GENERATION_BAND | shifted | u64::from(ordinal))
+}
 
 /// Create `<staging>/<shard>/<session>` and sync every directory entry the new
 /// session directory depends on, outermost first.
@@ -2499,6 +3553,264 @@ fn create_session_directory(
 /// deliverable 5 says artifacts are written by maintenance workers. Taking
 /// `&self` is what let this drift onto whatever thread happened to hold the
 /// registry lock.
+/// What an adoption marker asserts. One file, one of these, rewritten in place.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum AdoptionMark {
+    /// A pin is outstanding and this process no longer gets to decide its fate.
+    Finalizing = 1,
+    /// A committed transaction references these artifacts.
+    Adopted = 2,
+}
+
+impl AdoptionMark {
+    fn code(self) -> u8 {
+        self as u8
+    }
+
+    fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::Finalizing),
+            2 => Some(Self::Adopted),
+            _ => None,
+        }
+    }
+}
+
+/// `mark || final_operation_id || final_operation_digest || adopted_at`.
+///
+/// The operation and digest travel with the mark so a reconstruction can check
+/// them against the session record beside it. A marker naming a different
+/// operation than the session it lives in is not a pin this store issued, and
+/// the deliverable's "every different operation/digest rejects" has to survive a
+/// restart to mean anything.
+/// `adopted_at` is zero while the mark is `Finalizing` and carries the adoption's
+/// committed shard sequence once it is `Adopted`. Fixed width either way, so the
+/// two marks are the same size and a replacement never changes the file's shape.
+const ADOPTION_MARKER_LEN: usize = 1 + 16 + 32 + 8;
+
+fn write_adoption_marker(
+    directory: &Path,
+    session_id: [u8; 16],
+    mark: AdoptionMark,
+    operation: [u8; 16],
+    digest: ObjectId,
+    durability: &DurabilityCounters,
+    counters: &StagingCounters,
+) -> Result<(), StoreError> {
+    let bytes = encode_staging_artifact(
+        StagingArtifactKind::Adoption,
+        session_id,
+        &adoption_payload(mark, operation, digest, 0),
+    );
+    write_artifact(directory, ADOPTION_NAME, &bytes, durability, counters)?;
+    Ok(())
+}
+
+/// Decode a marker and prove it belongs to the session it was found in.
+fn adoption_payload(
+    mark: AdoptionMark,
+    operation: [u8; 16],
+    digest: ObjectId,
+    adopted_at: u64,
+) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(ADOPTION_MARKER_LEN);
+    payload.push(mark.code());
+    payload.extend_from_slice(&operation);
+    payload.extend_from_slice(&digest.0);
+    payload.extend_from_slice(&adopted_at.to_le_bytes());
+    debug_assert_eq!(payload.len(), ADOPTION_MARKER_LEN);
+    payload
+}
+
+fn read_adoption_marker(
+    path: &Path,
+    session_id: [u8; 16],
+    session: &ProjectionStageSessionV1,
+) -> Result<(AdoptionMark, u64), StoreError> {
+    let payload = read_staging_artifact(path, StagingArtifactKind::Adoption, session_id)?;
+    if payload.len() != ADOPTION_MARKER_LEN {
+        return Err(StoreError::Corruption(format!(
+            "staging adoption marker {} is {} bytes, not {ADOPTION_MARKER_LEN}",
+            path.display(),
+            payload.len()
+        )));
+    }
+    let mark = AdoptionMark::from_code(payload[0]).ok_or_else(|| {
+        StoreError::Corruption(format!(
+            "staging adoption marker {} carries unknown outcome {}",
+            path.display(),
+            payload[0]
+        ))
+    })?;
+    let mut operation = [0u8; 16];
+    operation.copy_from_slice(&payload[1..17]);
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(&payload[17..49]);
+    let mut adopted_at = [0u8; 8];
+    adopted_at.copy_from_slice(&payload[49..]);
+    let adopted_at = u64::from_le_bytes(adopted_at);
+    if operation != session.final_operation_id || ObjectId(digest) != session.final_operation_digest
+    {
+        return Err(StoreError::Corruption(format!(
+            "staging adoption marker {} names operation {} but its session binds {}",
+            path.display(),
+            hex::encode(operation),
+            hex::encode(session.final_operation_id)
+        )));
+    }
+    // A `Finalizing` marker carrying a position would be claiming an adoption it
+    // does not record, which is exactly the confusion the position exists to
+    // prevent.
+    if matches!(mark, AdoptionMark::Finalizing) && adopted_at != 0 {
+        return Err(StoreError::Corruption(format!(
+            "staging adoption marker {} is still finalizing but records a committed \
+             sequence of {adopted_at}",
+            path.display()
+        )));
+    }
+    Ok((mark, adopted_at))
+}
+
+/// Replace this session's `Finalizing` marker with `Adopted`, atomically.
+///
+/// A separate path from [`write_artifact`], and deliberately not a relaxation of
+/// it. That writer publishes with `rename_noreplace` because every other staging
+/// artifact is unique-by-name and must never be overwritten — a chunk or a
+/// manifest arriving twice at one name is a fault, not an update. The adoption
+/// marker is the one file in a session that legitimately changes, and routing it
+/// through a "replace if you like" flag on the shared writer would hand that
+/// permission to the artifacts the no-replace rule exists to protect.
+///
+/// So the licence to overwrite is bounded by proof rather than by a parameter,
+/// exactly once, here: the marker on disk must decode as a staging artifact of
+/// this session, carry the operation and digest this session binds, and say
+/// `Finalizing`. Anything else is refused with the file untouched.
+///
+/// Idempotent on an already-`Adopted` marker. `finish` can be reached twice —
+/// a retried outcome is not a second event — and re-adopting what is already
+/// adopted has to be a no-op rather than a refusal, or the retry wedges the
+/// session in `Finalizing` forever.
+fn adopt_adoption_marker(
+    directory: &Path,
+    session_id: [u8; 16],
+    session: &ProjectionStageSessionV1,
+    committed_shard_sequence: u64,
+    durability: &DurabilityCounters,
+    counters: &StagingCounters,
+) -> Result<(), StoreError> {
+    assert!(
+        ON_MAINTENANCE_WORKER.with(Cell::get),
+        "staging artifacts are written by maintenance workers (scope 6.5 deliverable 5); \
+         {} was offered to a caller thread",
+        directory.join(ADOPTION_NAME).display()
+    );
+    let final_path = directory.join(ADOPTION_NAME);
+    match read_adoption_marker(&final_path, session_id, session)? {
+        (AdoptionMark::Adopted, _) => return Ok(()),
+        (AdoptionMark::Finalizing, _) => {}
+    }
+
+    let bytes = encode_staging_artifact(
+        StagingArtifactKind::Adoption,
+        session_id,
+        &adoption_payload(
+            AdoptionMark::Adopted,
+            session.final_operation_id,
+            session.final_operation_digest,
+            committed_shard_sequence,
+        ),
+    );
+
+    let tmp_path = directory.join(format!("{ADOPTION_NAME}.tmp"));
+    {
+        // Through the no-follow funnel. This path publishes by *replacing*, so a
+        // symlink planted at the temporary name would redirect the write and
+        // then the rename would publish whatever it pointed at over a marker the
+        // store still believes it owns.
+        let Some(mut file) =
+            crate::sys::open_or_create_regular_truncated_nofollow(&tmp_path, durability)?
+        else {
+            return Err(StoreError::UnrecognizedLayout(format!(
+                "{} is not a regular file; refusing to record an adoption through it",
+                tmp_path.display()
+            )));
+        };
+        let end = crate::sys::write_vectored_all(&mut file, &[IoSlice::new(&bytes)], durability)?;
+        if end != bytes.len() as u64 {
+            return Err(StoreError::from(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                format!(
+                    "short write recording adoption for staging session {}: wrote {end} of {} \
+                     bytes; the temporary is left behind and never renamed",
+                    hex::encode(session_id),
+                    bytes.len()
+                ),
+            )));
+        }
+        crate::sys::fdatasync(&file, durability)?;
+    }
+    // Replacing, and only ever over the marker just proved to be this session's
+    // outstanding pin. A crash on either side of it leaves a whole, valid marker
+    // — `Finalizing` before, `Adopted` after — and never a torn one, which is
+    // why this is a rename and not a fixed-size overwrite in place.
+    crate::sys::rename_replace(&tmp_path, &final_path)?;
+    crate::sys::fsync_dir(directory, durability)?;
+    counters
+        .artifact_bytes_written
+        .fetch_add(bytes.len() as u64, Relaxed);
+    counters.maintenance_artifact_writes.fetch_add(1, Relaxed);
+    Ok(())
+}
+
+fn remove_adoption_marker(
+    directory: &Path,
+    durability: &DurabilityCounters,
+) -> Result<(), StoreError> {
+    let path = directory.join(ADOPTION_NAME);
+    match crate::sys::unlink(&path) {
+        Ok(()) => {}
+        // Already gone is the outcome this asked for. `finish` must be safe to
+        // reach twice — a retried definitive failure is not a new event.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(StoreError::from(error)),
+    }
+    crate::sys::fsync_dir(directory, durability)?;
+    Ok(())
+}
+
+/// The descriptor a sealed session installs, derived from its own resolution.
+///
+/// One derivation, used by `compose_seal` and by `finalize`, so a reconstructed
+/// session cannot produce a descriptor that differs from the one its seal
+/// returned. Two constructions of the same value is how a restart starts
+/// disagreeing with the session it restarted.
+fn install_from_resolution(
+    resolution: &ProjectionAdoptionResolution,
+) -> Result<StagedProjectionInstallV1, StoreError> {
+    let manifest_digest = resolution
+        .manifest
+        .manifest_digest()
+        .map_err(|e| StoreError::Corruption(format!("sealed staging manifest digest: {e}")))?;
+    let object_count = u64::try_from(resolution.manifest.objects.len()).map_err(|_| {
+        StoreError::Corruption("sealed staging manifest object count does not fit u64".into())
+    })?;
+    let mut object_bytes = 0u64;
+    for object in &resolution.manifest.objects {
+        object_bytes = object_bytes.checked_add(object.raw_len).ok_or_else(|| {
+            StoreError::Corruption("sealed staging manifest byte total overflowed".into())
+        })?;
+    }
+    Ok(StagedProjectionInstallV1 {
+        session_id: resolution.session.session_id,
+        manifest_digest,
+        projection: resolution.session.projection,
+        object_count,
+        object_bytes,
+        membership_root: resolution.manifest.membership_root,
+        artifact_set_digest: artifact_set_digest(&resolution.artifacts),
+    })
+}
+
 fn write_artifact(
     directory: &Path,
     name: &str,
@@ -2615,6 +3927,7 @@ fn reclaim_session_directory(
 fn is_session_artifact_name(name: &str) -> bool {
     name == SESSION_RECORD_NAME
         || name == MANIFEST_NAME
+        || name == ADOPTION_NAME
         || parse_chunk_artifact_name(name).is_some()
 }
 
@@ -2653,8 +3966,40 @@ fn unknown_session(session_id: [u8; 16]) -> StoreError {
 fn require_open(record: &SessionRecord, session_id: [u8; 16]) -> Result<(), StoreError> {
     match record.state {
         StagedSessionState::Open => Ok(()),
-        StagedSessionState::Sealed => Err(StoreError::Conflict(format!(
+        StagedSessionState::Sealed
+        | StagedSessionState::Finalizing
+        | StagedSessionState::Adopted => Err(StoreError::Conflict(format!(
             "staging session {} is sealed and immutable",
+            hex::encode(session_id)
+        ))),
+    }
+}
+
+/// Admit the sole finalizer: a session that has sealed and is not already
+/// carrying an outcome.
+///
+/// Deliverable 6 asks for "identical concurrent finalizers coalesce onto one",
+/// and at this layer that is one pin, not two handles. [`ProjectionAdoption`] is
+/// an unforgeable capability with exactly one terminal outcome and a `Drop` that
+/// reports its absence; there is no second copy to hand a second caller. So the
+/// coalescing an instance layer does across retries of one operation appears
+/// here as this refusal, which names the pin rather than pretending to issue
+/// another. The bound operation/digest half needs no test at all: the binding
+/// carries the *sole* final operation and digest, fixed at `begin`, so a
+/// different one cannot reach a session in the first place.
+fn require_finalizable(record: &SessionRecord, session_id: [u8; 16]) -> Result<(), StoreError> {
+    match record.state {
+        StagedSessionState::Sealed => Ok(()),
+        StagedSessionState::Open => Err(StoreError::Conflict(format!(
+            "staging session {} has not sealed and has no descriptor to adopt",
+            hex::encode(session_id)
+        ))),
+        StagedSessionState::Finalizing => Err(StoreError::Conflict(format!(
+            "staging session {} already holds an adoption pin",
+            hex::encode(session_id)
+        ))),
+        StagedSessionState::Adopted => Err(StoreError::Conflict(format!(
+            "staging session {} has already been adopted",
             hex::encode(session_id)
         ))),
     }
@@ -2670,6 +4015,10 @@ fn require_idle(record: &SessionRecord, session_id: [u8; 16]) -> Result<(), Stor
         SessionBusy::Idle => Ok(()),
         SessionBusy::Sealing => Err(StoreError::Conflict(format!(
             "staging session {} is sealing",
+            hex::encode(session_id)
+        ))),
+        SessionBusy::Finalizing => Err(StoreError::Conflict(format!(
+            "staging session {} is taking an adoption pin",
             hex::encode(session_id)
         ))),
         SessionBusy::Reclaiming => Err(StoreError::Conflict(format!(
@@ -2976,6 +4325,7 @@ mod tests {
             &self,
             _namespace: NamespaceId,
             descriptor: &StagedProjectionInstallV1,
+            _adoption_shard_sequence: u64,
         ) -> Result<RecoveredProjectionArtifacts, StoreError> {
             if self.artifacts.descriptor() != descriptor {
                 return Err(StoreError::Corruption(
@@ -3006,7 +4356,9 @@ mod tests {
     #[test]
     fn each_terminal_outcome_suppresses_the_drop_bug() {
         for outcome in [
-            ProjectionAdoptionOutcome::Adopted,
+            ProjectionAdoptionOutcome::Adopted {
+                committed_shard_sequence: 1,
+            },
             ProjectionAdoptionOutcome::DefinitivePreAppendFailure,
             ProjectionAdoptionOutcome::TransferredToRecovery,
         ] {
@@ -3033,7 +4385,7 @@ mod tests {
         let transferred = resolver.transferred_sessions(3).unwrap();
         assert_eq!(&*transferred, &[[20; 16], [26; 16]]);
         let recovered = resolver
-            .resolve_committed(NamespaceId([24; 32]), &install())
+            .resolve_committed(NamespaceId([24; 32]), &install(), 0)
             .unwrap();
         assert_eq!(recovered.descriptor(), &install());
         assert_eq!(recovered.index_delta().len(), 1);
@@ -3179,6 +4531,1159 @@ mod b3_tests {
         }
     }
 
+    /// A self-consistent one-chunk projection and the binding that seals to it.
+    ///
+    /// [`binding`] carries a placeholder `manifest_digest` and so can never
+    /// reach `Sealed`, which is why every sealing test lived in the integration
+    /// file. `finalize` is `pub(crate)` — B1's `adopt_projection` is its only
+    /// legitimate caller — so its regressions cannot live there, and the fixture
+    /// has to exist on this side of the wall.
+    fn sealable(session_id: [u8; 16]) -> (ProjectionStageBinding, ProjectionStageChunkV1) {
+        use levcs_protocol::v2::StagedChunkObjectV1;
+        let mut objects: Vec<StagedChunkObjectV1> = (0..2u8)
+            .map(|index| {
+                let body = [index; 24];
+                let mut raw = levcs_core::ObjectHeader {
+                    object_type: levcs_core::ObjectType::Blob,
+                    format_version: levcs_core::FORMAT_VERSION,
+                    body_len: body.len() as u64,
+                }
+                .encode()
+                .to_vec();
+                raw.extend_from_slice(&body);
+                let id = levcs_core::blake3_hash(&raw);
+                StagedChunkObjectV1 {
+                    descriptor: StagedObjectV1 {
+                        object_id: id,
+                        object_type: levcs_core::ObjectType::Blob as u8,
+                        raw_len: raw.len() as u64,
+                        raw_digest: id,
+                    },
+                    raw_bytes: raw,
+                }
+            })
+            .collect();
+        // The manifest is the ordered concatenation of the chunks and must be
+        // strictly sorted, so the sort happens before the split.
+        objects.sort_by(|left, right| left.descriptor.cmp(&right.descriptor));
+
+        let total_object_bytes = objects.iter().map(|o| o.descriptor.raw_len).sum::<u64>();
+        let descriptors: Vec<StagedObjectV1> =
+            objects.iter().map(|o| o.descriptor.clone()).collect();
+        let chunk = ProjectionStageChunkV1 {
+            session_id,
+            ordinal: 0,
+            chunk_count: 1,
+            objects,
+        };
+        let membership_root = levcs_core::blake3_hash(&session_id[..]);
+        let manifest = ProjectionStageManifestV1 {
+            session_id,
+            chunk_digests: vec![chunk.chunk_digest().expect("chunk digest")],
+            objects: descriptors,
+            membership_root,
+        };
+        let manifest_digest = manifest.manifest_digest().expect("manifest digest");
+
+        let mut session = binding(session_id, HOUR_MICROS).session;
+        session.total_object_count = 2;
+        session.total_object_bytes = total_object_bytes;
+        session.chunk_count = 1;
+        session.manifest_digest = manifest_digest;
+        (
+            ProjectionStageBinding {
+                session,
+                membership_root,
+            },
+            chunk,
+        )
+    }
+
+    /// Deliverable 6 end to end, and the one test that had to exist first.
+    ///
+    /// It catches three things that are only visible together. The pin has to be
+    /// *takeable*: `finalize` writes a marker that no marker precedes. It has to
+    /// be *finishable*: recording `Adopted` replaces that marker rather than
+    /// colliding with it — the shared artifact writer publishes with
+    /// `rename_noreplace`, so routing the second write through it wedges every
+    /// adoption in `Finalizing` with an `EEXIST` nobody sees. And the outcome has
+    /// to be *durable and accounted*: adoption releases the reservation because
+    /// the bytes are store content now, and the reopen must reconstruct that
+    /// without charging for them a second time — a budget that shrinks on every
+    /// restart is a ceiling nobody can reason about.
+    #[test]
+    fn an_adopted_pin_survives_the_reopen_without_recharging_its_budget() {
+        let directory = TempDir::new().unwrap();
+        let (options, lock) = layout(&directory);
+        let (binding, chunk) = sealable([31; 16]);
+        let session_id = binding.session.session_id;
+
+        let reserved = {
+            let staging = ProjectionStaging::open(
+                &lock,
+                options.clone(),
+                Arc::new(DurabilityCounters::default()),
+            )
+            .expect("staging opens");
+            let session = staging.begin(binding.clone(), 0).expect("begin");
+            session.put_chunk(&chunk, 0).expect("put");
+            session.seal(0).expect("seal");
+            let reserved = staging.counters().snapshot().reserved_bytes;
+            assert!(reserved > 0, "a sealed session holds budget");
+
+            let adoption = session.finalize(0).expect("a sealed session may be pinned");
+            assert_eq!(
+                staging.counters().snapshot().sessions_finalized,
+                1,
+                "the pin was taken"
+            );
+            assert_eq!(
+                describe_state(&staging, session_id),
+                StagedSessionState::Finalizing
+            );
+
+            adoption
+                .handle
+                .finish(ProjectionAdoptionOutcome::Adopted {
+                    committed_shard_sequence: 7,
+                })
+                .expect(
+                    "recording adoption must replace the pin's own marker; the shared artifact \
+                     writer refuses to replace, which would leave every adoption stuck in \
+                     Finalizing",
+                );
+            assert_eq!(
+                describe_state(&staging, session_id),
+                StagedSessionState::Adopted
+            );
+            assert_eq!(
+                staging.counters().snapshot().reserved_bytes,
+                0,
+                "adopted bytes are store content and stop being staging occupancy"
+            );
+            reserved
+        };
+
+        let staging =
+            ProjectionStaging::open(&lock, options, Arc::new(DurabilityCounters::default()))
+                .expect("staging reopens");
+        assert_eq!(
+            describe_state(&staging, session_id),
+            StagedSessionState::Adopted,
+            "the outcome is durable, or the next open would offer the pin again"
+        );
+        assert_eq!(
+            staging.counters().snapshot().reserved_bytes,
+            0,
+            "reconstructing an adopted session must not re-charge the {reserved} bytes its \
+             adoption released; a ceiling that shrinks on every restart is not a ceiling"
+        );
+
+        // The adoption's position has to survive too. A restart separates an
+        // adoption from the compaction that eventually drops its reference, so a
+        // position held only in memory would leave every reconstructed session
+        // either permanently unreclaimable or reclaimable through a stale root —
+        // the defect this records against.
+        assert_eq!(
+            staging
+                .cleanup_unreferenced(&root_at(&[], 6))
+                .expect("cleanup"),
+            0,
+            "a root short of the reconstructed adoption is still not evidence"
+        );
+        assert_eq!(staging.counters().snapshot().cleanup_declined_stale_root, 1);
+        assert_eq!(
+            staging
+                .cleanup_unreferenced(&root_at(&[], 7))
+                .expect("cleanup"),
+            1,
+            "and a root that has reached it reclaims, so the position reconstructed as \
+             itself rather than as something unreachable"
+        );
+    }
+
+    /// A sealed session, its staging, and the on-disk path of its marker.
+    ///
+    /// Returned rather than rebuilt per test because "did the marker actually
+    /// move" is the question every one of these asks, and a test that asserted
+    /// only the in-memory state would pass against a pin that never reached the
+    /// device.
+    fn sealed(
+        directory: &TempDir,
+        lock: &RecoverySession,
+        options: StoreOptions,
+        session_id: [u8; 16],
+    ) -> (
+        Arc<ProjectionStaging>,
+        ProjectionStageSession,
+        PathBuf,
+        StagedProjectionInstallV1,
+    ) {
+        let (binding, chunk) = sealable(session_id);
+        let shard = StoreOptions::shard_of(
+            &NamespaceId::from(binding.session.destination_repo),
+            options.shard_count,
+        );
+        let staging =
+            ProjectionStaging::open(lock, options, Arc::new(DurabilityCounters::default()))
+                .expect("staging opens");
+        let session = staging.begin(binding, 0).expect("begin");
+        session.put_chunk(&chunk, 0).expect("put");
+        // Returned rather than discarded: `seal` requires `Open`, so it is the
+        // only chance to observe the descriptor a later resolution must match.
+        let install = session.seal(0).expect("seal");
+        let marker = directory
+            .path()
+            .join(STAGING_DIR)
+            .join(format!("{shard:02}"))
+            .join(hex::encode(session_id))
+            .join(ADOPTION_NAME);
+        (staging, session, marker, install)
+    }
+
+    /// One pin, and the second finalizer is told so by name.
+    ///
+    /// Scope §6.5 originally promised that identical concurrent finalizers
+    /// "coalesce onto one" here. They cannot: a `ProjectionAdoption` is an
+    /// unforgeable capability with exactly one terminal outcome and a `Drop` that
+    /// reports its absence, so there is no second copy to hand a second caller.
+    /// Coalescing retries of one request belongs to whoever owns the request
+    /// (contract review 2026-07-31-A). What this layer owes is that a second
+    /// finalizer never produces a second pin and never quietly succeeds.
+    #[test]
+    fn a_second_finalizer_is_refused_rather_than_issued_a_second_pin() {
+        let directory = TempDir::new().unwrap();
+        let (options, lock) = layout(&directory);
+        let (staging, session, _marker, _install) = sealed(&directory, &lock, options, [41; 16]);
+
+        let first = session
+            .finalize(0)
+            .expect("the first finalizer takes the pin");
+        let Err(StoreError::Conflict(detail)) = session.finalize(0) else {
+            panic!("a second finalizer must be refused, not handed another pin");
+        };
+        assert!(detail.contains("already holds an adoption pin"), "{detail}");
+        assert_eq!(
+            staging.counters().snapshot().sessions_finalized,
+            1,
+            "a refused finalizer must not count as a pin"
+        );
+        first
+            .handle
+            .finish(ProjectionAdoptionOutcome::DefinitivePreAppendFailure)
+            .expect("release");
+    }
+
+    /// The named acceptance case: expiry may stop a *new* finalizer, never an
+    /// admitted one.
+    ///
+    /// Both halves matter. The sweep must decline the pinned session, and it must
+    /// leave the artifacts where they are — an expiry that reclaimed here would
+    /// delete the objects a transaction may already be appending a frame about.
+    #[test]
+    fn expiry_after_finalization_reclaims_nothing() {
+        let directory = TempDir::new().unwrap();
+        let (options, lock) = layout(&directory);
+        let (staging, session, marker, _install) = sealed(&directory, &lock, options, [42; 16]);
+        let adoption = session.finalize(0).expect("pin");
+
+        assert_eq!(
+            staging.expire(HOUR_MICROS + 1).expect("sweep"),
+            0,
+            "a pinned session is not expiry's to reclaim"
+        );
+        assert_eq!(
+            describe_state(&staging, [42; 16]),
+            StagedSessionState::Finalizing
+        );
+        assert!(
+            marker.exists() && marker.parent().expect("session directory").exists(),
+            "the sweep must leave a pinned session's artifacts on the device"
+        );
+        adoption
+            .handle
+            .finish(ProjectionAdoptionOutcome::DefinitivePreAppendFailure)
+            .expect("release");
+    }
+
+    /// The other ordering of the named race: expiry arrives while a finalizer is
+    /// mid-admission.
+    ///
+    /// `expiry_after_finalization_reclaims_nothing` covers the ordering where the
+    /// marker is already durable and the *state* says `Finalizing`. This is the
+    /// window before that — the finalizer has been admitted under the registry
+    /// lock and released it to write the marker, so the session still reads
+    /// `Sealed` with no marker on disk. An expiry sweep that looked only at state
+    /// would find an expired, sealed, unpinned session and reclaim it, deleting
+    /// the artifacts out from under a pin that is about to be issued.
+    ///
+    /// What prevents it is the `busy` exclusion, so that is what this drives
+    /// directly. The session is put in exactly the mid-flight shape rather than
+    /// raced into it, because a race that reproduces one time in a thousand is a
+    /// test that passes for the wrong reason the other nine hundred and ninety
+    /// nine.
+    ///
+    /// The second half is what makes it load-bearing: clearing `busy` and
+    /// sweeping again *does* reclaim. Without that, an assertion that nothing was
+    /// reclaimed proves only that something declined — not that the exclusion is
+    /// what declined it.
+    #[test]
+    fn expiry_during_the_finalize_admission_window_reclaims_nothing() {
+        let directory = TempDir::new().unwrap();
+        let (options, lock) = layout(&directory);
+        let (staging, _session, marker, _install) = sealed(&directory, &lock, options, [45; 16]);
+        let session_directory = marker.parent().expect("session directory").to_path_buf();
+
+        // The shape `finalize` holds between phase 1 and phase 3.
+        {
+            let mut registry = staging.lock();
+            let record = registry.sessions.get_mut(&[45; 16]).expect("session");
+            assert_eq!(record.state, StagedSessionState::Sealed);
+            record.busy = SessionBusy::Finalizing;
+        }
+        assert!(
+            !marker.exists(),
+            "the window under test is the one before the marker is durable"
+        );
+
+        assert_eq!(
+            staging.expire(HOUR_MICROS + 1).expect("sweep"),
+            0,
+            "an expiry sweep must not reclaim a session a finalizer has already been \
+             admitted to, even though its state still reads Sealed"
+        );
+        assert!(
+            session_directory.exists(),
+            "and it must leave the artifacts the pin is about to cover"
+        );
+
+        {
+            let mut registry = staging.lock();
+            registry.sessions.get_mut(&[45; 16]).expect("session").busy = SessionBusy::Idle;
+        }
+        assert_eq!(
+            staging.expire(HOUR_MICROS + 1).expect("sweep"),
+            1,
+            "with the exclusion cleared the same sweep does reclaim, so the decline above \
+             was the exclusion and not some other refusal"
+        );
+    }
+
+    /// Nothing was appended, so the pin simply ends — and the session is
+    /// finalizable again.
+    ///
+    /// Refinalization is the assertion that matters. Deliverable 6 says a
+    /// definitive pre-append failure returns a live session to a state it can be
+    /// finalized from; a repair that only cleared an in-memory flag, or that left
+    /// the marker behind, would pass a state check and still refuse the retry.
+    #[test]
+    fn a_definitive_pre_append_failure_returns_a_live_session_to_sealed() {
+        let directory = TempDir::new().unwrap();
+        let (options, lock) = layout(&directory);
+        let (staging, session, marker, _install) = sealed(&directory, &lock, options, [43; 16]);
+
+        let adoption = session.finalize(0).expect("pin");
+        assert!(marker.exists(), "the pin is durable before it is issued");
+
+        adoption
+            .handle
+            .finish(ProjectionAdoptionOutcome::DefinitivePreAppendFailure)
+            .expect("release");
+        assert!(!marker.exists(), "the marker goes with the pin");
+        assert_eq!(
+            describe_state(&staging, [43; 16]),
+            StagedSessionState::Sealed,
+            "the durable manifest is still the seal's commit point, so Sealed is the only \
+             state a restart could reproduce here"
+        );
+        assert_eq!(
+            staging.counters().snapshot().adoption_pins_released,
+            1,
+            "a release is its own event, distinct from an adoption"
+        );
+
+        session
+            .finalize(0)
+            .expect("a released session is finalizable again, or the retry has nowhere to go")
+            .handle
+            .finish(ProjectionAdoptionOutcome::DefinitivePreAppendFailure)
+            .expect("release");
+    }
+
+    /// The pin outlives the process, which is the only reason `Finalizing` is
+    /// durable at all.
+    ///
+    /// `TransferredToRecovery` means nobody in this process knows whether the
+    /// final frame reached the journal. The marker therefore stays, the next open
+    /// reconstructs `Finalizing`, and `transferred_sessions` hands the question
+    /// to recovery — the answer that method was written to be able to give and
+    /// could only prove empty while `finalize` was deferred.
+    #[test]
+    fn a_transferred_pin_reconstructs_and_is_offered_to_recovery() {
+        let directory = TempDir::new().unwrap();
+        let (options, lock) = layout(&directory);
+        let session_id = [44; 16];
+        let shard =
+            StoreOptions::shard_of(&NamespaceId::from(ObjectId([7; 32])), options.shard_count);
+        let marker = {
+            let (staging, session, marker, _install) =
+                sealed(&directory, &lock, options.clone(), session_id);
+            session
+                .finalize(0)
+                .expect("pin")
+                .handle
+                .finish(ProjectionAdoptionOutcome::TransferredToRecovery)
+                .expect("transfer");
+            assert_eq!(staging.counters().snapshot().adoption_pins_transferred, 1);
+            marker
+        };
+        assert!(
+            marker.exists(),
+            "a transferred pin leaves its marker behind"
+        );
+
+        let staging =
+            ProjectionStaging::open(&lock, options, Arc::new(DurabilityCounters::default()))
+                .expect("staging reopens");
+        assert_eq!(
+            describe_state(&staging, session_id),
+            StagedSessionState::Finalizing,
+            "the pin survived the process, or recovery is never told to resolve it"
+        );
+        assert_eq!(
+            &*staging.transferred_sessions(shard).expect("transferred"),
+            &[session_id],
+            "the session must be offered to recovery for the shard it belongs to"
+        );
+        assert!(
+            staging
+                .transferred_sessions(shard ^ 1)
+                .expect("transferred")
+                .is_empty(),
+            "and to no other shard"
+        );
+    }
+
+    /// A committed root that pins `paths` as staged projection artifacts.
+    ///
+    /// Built through the real `RetainedProjectionArtifact`, which holds an open
+    /// descriptor, so a root in a test references a file the same way a root in
+    /// production does — by owning it, not by naming it.
+    fn root_referencing(paths: &[PathBuf]) -> CommittedRoot {
+        root_at(paths, 7)
+    }
+
+    /// A root pinning `paths` that records no committed sequence for any shard.
+    ///
+    /// Not the same as one recording zero. This is the shape a root has for a
+    /// shard it knows nothing about, and cleanup must treat it as no evidence
+    /// rather than as evidence of zero.
+    fn root_without_sequences(paths: &[PathBuf]) -> CommittedRoot {
+        let mut root = root_at(paths, 0);
+        root = CommittedRoot::new(
+            root.repositories().clone(),
+            crate::roots::LayeredObjectIndex::default(),
+            root.terminal_statuses().clone(),
+            crate::roots::ShardSequenceMap::new(),
+            root.retained_generations().clone(),
+        );
+        root
+    }
+
+    /// A root pinning `paths` whose shards have committed through `through`.
+    ///
+    /// The sequence is not decoration: cleanup skips an adopted session unless
+    /// the root it is given has reached the adoption, so a root built without one
+    /// proves nothing and a test using it would assert against a skip rather than
+    /// against the reference proof.
+    fn root_at(paths: &[PathBuf], through: u64) -> CommittedRoot {
+        let artifacts: Vec<RetainedProjectionArtifact> = paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| {
+                RetainedProjectionArtifact::new(
+                    index as u64,
+                    crate::roots::ProjectionArtifactFormat::CanonicalStageChunkV1,
+                    crate::roots::PinnedFile::open(path.clone()).expect("pin the artifact"),
+                )
+            })
+            .collect();
+        let mut generations = crate::roots::GenerationMap::new();
+        generations.insert(
+            crate::roots::GenerationId::new(0, 0),
+            Arc::new(crate::roots::RetainedGeneration::new(
+                crate::roots::GenerationId::new(0, 0),
+                Vec::new().into(),
+                Vec::new().into(),
+                Vec::new().into(),
+                Vec::new().into(),
+                artifacts.into(),
+            )),
+        );
+        // Every shard, because a real committed root carries a sequence per
+        // shard and the fixture's destination does not land on shard 0. A helper
+        // that populated only one would make every test measure a stale-root
+        // skip while claiming to measure the reference proof.
+        let mut sequences = crate::roots::ShardSequenceMap::new();
+        for shard in 0..4u16 {
+            sequences.insert(shard, through);
+        }
+        CommittedRoot::new(
+            crate::roots::RepoMap::new(),
+            crate::roots::LayeredObjectIndex::default(),
+            crate::roots::TerminalStatusMap::new(),
+            sequences,
+            generations,
+        )
+    }
+
+    fn session_files(directory: &Path) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(directory)
+            .expect("session directory")
+            .map(|entry| entry.expect("entry").path())
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    /// Deliverable 7's named acceptance case, and its inverse in the same test
+    /// so neither half can pass alone.
+    ///
+    /// Cleanup declines a session a committed root still references, and the
+    /// same session against a root that references nothing is reclaimed. Running
+    /// both against one adopted session is what makes the first assertion mean
+    /// "the reference proof declined it" rather than "cleanup does nothing here";
+    /// a cleanup that reclaimed nothing ever would pass the decline half
+    /// perfectly.
+    #[test]
+    fn cleanup_declines_a_referenced_session_and_reclaims_an_unreferenced_one() {
+        let directory = TempDir::new().unwrap();
+        let (options, lock) = layout(&directory);
+        let (staging, session, marker, _install) = sealed(&directory, &lock, options, [51; 16]);
+        let session_directory = marker.parent().expect("session directory").to_path_buf();
+
+        session
+            .finalize(0)
+            .expect("pin")
+            .handle
+            .finish(ProjectionAdoptionOutcome::Adopted {
+                committed_shard_sequence: 7,
+            })
+            .expect("adopt");
+        let files = session_files(&session_directory);
+        assert!(
+            files.len() >= 3,
+            "an adopted session keeps its chunk, manifest, and marker: {files:?}"
+        );
+
+        // A root holding exactly one of the session's artifacts. That is the
+        // state immediately after adoption, and it must be enough to decline.
+        let chunk = files
+            .iter()
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| parse_chunk_artifact_name(name).is_some())
+            })
+            .expect("a chunk artifact")
+            .clone();
+        let referencing = root_referencing(&[chunk]);
+        assert_eq!(
+            staging
+                .cleanup_unreferenced(&referencing)
+                .expect("cleanup runs"),
+            0,
+            "an artifact a committed root still references is not cleanup's to remove"
+        );
+        assert_eq!(
+            session_files(&session_directory),
+            files,
+            "and it must leave every file where it found it, not only the referenced one"
+        );
+        assert_eq!(
+            describe_state(&staging, [51; 16]),
+            StagedSessionState::Adopted,
+            "a declined session stays exactly as it was"
+        );
+        assert_eq!(
+            staging.counters().snapshot().cleanup_declined_referenced,
+            1,
+            "the decline is the reference proof doing work, and is counted as such"
+        );
+
+        // Nothing points at it any more — a later checkpoint or compaction
+        // dropped the pin — so now it goes.
+        let empty = root_referencing(&[]);
+        assert_eq!(
+            staging.cleanup_unreferenced(&empty).expect("cleanup runs"),
+            1,
+            "an adopted session nothing references is exactly what cleanup exists to reclaim"
+        );
+        assert!(
+            !session_directory.exists(),
+            "the directory goes with it, or the next open reconstructs a session that was \
+             reclaimed"
+        );
+        assert_eq!(staging.counters().snapshot().sessions_cleaned_up, 1);
+    }
+
+    /// P1: a stale root proves nothing, and cleanup trusted whatever it was
+    /// handed.
+    ///
+    /// The sequence is the reviewer's. `R0` is captured before the projection is
+    /// published and therefore references none of its artifacts. `R1` is
+    /// published referencing them, and the session records `Adopted`. Cleanup is
+    /// then called with `R0` — an older root that is not wrong, merely earlier —
+    /// and every artifact in it is absent from that root's pins, so the absence
+    /// proof succeeds and the directory is deleted out from under a committed
+    /// root that still points into it.
+    ///
+    /// My review note had this backwards: I argued a racing newer root "can only
+    /// add references", and concluded the proof was safe. Adding references is
+    /// precisely the hazard — it means an older root omits references a newer one
+    /// holds, so absence measured against the older root is not absence.
+    #[test]
+    fn cleanup_will_not_delete_through_a_root_older_than_the_adoption() {
+        let directory = TempDir::new().unwrap();
+        let (options, lock) = layout(&directory);
+        let (staging, session, marker, _install) = sealed(&directory, &lock, options, [53; 16]);
+        let session_directory = marker.parent().expect("session directory").to_path_buf();
+
+        // 1. A root captured before anything adopted this projection: it holds
+        //    none of its artifacts, and its committed prefix stops short of the
+        //    sequence the adoption frame will reach.
+        let before = root_at(&[], 6);
+
+        // 2 and 3. The projection is published and the session records it.
+        let files = session_files(&session_directory);
+        let referenced = root_at(&files, 7);
+        session
+            .finalize(0)
+            .expect("pin")
+            .handle
+            .finish(ProjectionAdoptionOutcome::Adopted {
+                committed_shard_sequence: 7,
+            })
+            .expect("adopt");
+        assert!(
+            referenced.references_artifact(&files[0]),
+            "the newer root does reference the artifacts, or this proves nothing"
+        );
+
+        // 4. Cleanup with the older root.
+        let reclaimed = staging
+            .cleanup_unreferenced(&before)
+            .expect("cleanup answers");
+        assert_eq!(
+            reclaimed, 0,
+            "a root older than the adoption cannot prove absence of reference: it predates \
+             every reference the adoption created"
+        );
+        assert!(
+            session_directory.exists(),
+            "the committed root published at step 2 still points into this directory"
+        );
+        assert_eq!(
+            staging.counters().snapshot().cleanup_declined_stale_root,
+            1,
+            "and the reason must be the root's age, not an incidental refusal"
+        );
+
+        // The same session against a root that *has* reached the adoption and
+        // references nothing is reclaimable, so the skip above is the position
+        // check and not cleanup declining everything.
+        assert_eq!(
+            staging
+                .cleanup_unreferenced(&root_at(&[], 7))
+                .expect("cleanup"),
+            1
+        );
+    }
+
+    /// A committed projection resolves to complete membership, and a partial
+    /// chunk set never resolves at all.
+    ///
+    /// The second half is the deliverable's central claim and the one an
+    /// implementation drifts away from by being helpful: resolving whatever
+    /// chunks are present would publish a smaller projection than the frame
+    /// committed, and every object in the missing chunk would be unreadable
+    /// through a root that says it is there.
+    #[test]
+    fn a_committed_projection_resolves_whole_or_not_at_all() {
+        let directory = TempDir::new().unwrap();
+        let (options, lock) = layout(&directory);
+        let (staging, _session, marker, install) = sealed(&directory, &lock, options, [63; 16]);
+        let session_directory = marker.parent().expect("session directory").to_path_buf();
+        let namespace = NamespaceId::from(ObjectId([7; 32]));
+
+        let resolved = staging
+            .resolve_committed(namespace, &install, 9)
+            .expect("a sealed session resolves its own descriptor");
+        assert_eq!(resolved.descriptor(), &install);
+        assert_eq!(
+            resolved.retained_artifacts().len(),
+            1,
+            "one pinned artifact per chunk"
+        );
+        let generation = projection_generation(9, 0, [63; 16]).expect("in range");
+        assert_eq!(
+            resolved.retained_artifacts()[0].logical_generation,
+            generation,
+            "the artifact is pinned at the generation its locations name"
+        );
+        assert_eq!(
+            resolved.index_delta().len() as u64,
+            install.object_count,
+            "every object the descriptor declares is located, or the root would publish \
+             membership it cannot resolve"
+        );
+
+        // Every object in a chunk shares that chunk's location: the location
+        // names the whole certified record, and a reader validates the artifact
+        // before extracting from its decoded vector.
+        let file_bytes = std::fs::metadata(
+            &session_files(&session_directory)
+                .into_iter()
+                .find(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| parse_chunk_artifact_name(name).is_some())
+                })
+                .expect("a chunk artifact"),
+        )
+        .expect("metadata")
+        .len();
+        for (_, location) in resolved.index_delta().iter() {
+            assert_eq!(location.segment_generation, generation);
+            assert_eq!(location.frame_offset, 0);
+            assert_eq!(u64::from(location.frame_len), file_bytes);
+        }
+
+        // Now take one chunk away. Nothing partial may resolve.
+        let chunk = session_files(&session_directory)
+            .into_iter()
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| parse_chunk_artifact_name(name).is_some())
+            })
+            .expect("a chunk artifact");
+        std::fs::remove_file(&chunk).expect("remove one chunk");
+        let refused = staging
+            .resolve_committed(namespace, &install, 9)
+            .expect_err("a missing chunk must fail the whole resolution");
+        assert!(
+            matches!(refused, StoreError::Corruption(_) | StoreError::Io(_)),
+            "expected a named fault, got {refused:?}"
+        );
+    }
+
+    /// Resolution obeys the active-index ceilings, not a limit of its own.
+    ///
+    /// `max_projection_objects` bounds what a *session* may stage;
+    /// `max_active_index_entries` and `max_active_index_bytes` bound what a
+    /// reopen may rebuild. Nothing requires the second pair to admit a maximal
+    /// projection, so a resolution sized from the first would hand recovery a
+    /// delta the recovered root cannot hold — publishing an over-limit root
+    /// instead of refusing, which is the hole admission accounting exists to
+    /// keep shut.
+    ///
+    /// Both ceilings are driven separately because they are separate refusals: a
+    /// projection can be under one and over the other.
+    #[test]
+    fn resolution_refuses_a_projection_over_the_active_index_ceilings() {
+        for (limit, adjust) in [
+            (
+                "max_active_index_entries",
+                Box::new(|options: &mut StoreOptions| options.max_active_index_entries = 1)
+                    as Box<dyn Fn(&mut StoreOptions)>,
+            ),
+            (
+                "max_active_index_bytes",
+                Box::new(|options: &mut StoreOptions| {
+                    options.max_active_index_bytes = crate::index::encoded_bytes_for(1, 1)
+                }),
+            ),
+        ] {
+            let directory = TempDir::new().unwrap();
+            let (mut options, lock) = layout(&directory);
+            adjust(&mut options);
+            let (staging, _session, _marker, install) =
+                sealed(&directory, &lock, options, [68; 16]);
+            assert_eq!(
+                install.object_count, 2,
+                "the fixture must exceed a ceiling of one, or this asserts nothing"
+            );
+
+            let refused = staging
+                .resolve_committed(NamespaceId::from(ObjectId([7; 32])), &install, 9)
+                .expect_err("a projection over the active-index ceiling must not resolve");
+            match refused {
+                StoreError::LimitExceeded { limit: named, .. } => assert_eq!(
+                    named, limit,
+                    "the refusal must name the ceiling that stopped it"
+                ),
+                other => panic!("expected {limit}, got {other:?}"),
+            }
+        }
+    }
+
+    /// A swapped chunk of the same shape must not resolve.
+    ///
+    /// Shape is not identity. A replacement chunk carrying the same session ID,
+    /// ordinal, chunk count and object count satisfies every structural check a
+    /// resolution can make, and carries entirely different objects — so a
+    /// resolution that verified the descriptor against its own cached sealed
+    /// state, rather than against the bytes it just read, would index the
+    /// impostor's objects under a committed frame that never named them. That is
+    /// what this resolution did before review caught it.
+    #[test]
+    fn a_chunk_swapped_for_another_of_the_same_shape_is_refused() {
+        let directory = TempDir::new().unwrap();
+        let (options, lock) = layout(&directory);
+        let (staging, _session, marker, install) = sealed(&directory, &lock, options, [66; 16]);
+        let session_directory = marker.parent().expect("session directory").to_path_buf();
+        let namespace = NamespaceId::from(ObjectId([7; 32]));
+
+        let chunk_path = session_files(&session_directory)
+            .into_iter()
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| parse_chunk_artifact_name(name).is_some())
+            })
+            .expect("a chunk artifact");
+
+        // A chunk claiming this session's identity: same session ID, same
+        // ordinal, same chunk count, same object count. Only the object bytes
+        // differ, which is exactly the difference no structural check can see.
+        //
+        // Built inline rather than from `sealable`, because that fixture derives
+        // object bodies from the index alone — a second session produces
+        // byte-identical objects, and an "impostor" equal to the original tests
+        // nothing at all.
+        use levcs_protocol::v2::StagedChunkObjectV1;
+        let mut objects: Vec<StagedChunkObjectV1> = (0..2u8)
+            .map(|index| {
+                let body = [index.wrapping_add(0x80); 24];
+                let mut raw = levcs_core::ObjectHeader {
+                    object_type: levcs_core::ObjectType::Blob,
+                    format_version: levcs_core::FORMAT_VERSION,
+                    body_len: body.len() as u64,
+                }
+                .encode()
+                .to_vec();
+                raw.extend_from_slice(&body);
+                let id = levcs_core::blake3_hash(&raw);
+                StagedChunkObjectV1 {
+                    descriptor: StagedObjectV1 {
+                        object_id: id,
+                        object_type: levcs_core::ObjectType::Blob as u8,
+                        raw_len: raw.len() as u64,
+                        raw_digest: id,
+                    },
+                    raw_bytes: raw,
+                }
+            })
+            .collect();
+        objects.sort_by(|left, right| left.descriptor.cmp(&right.descriptor));
+        let impostor = ProjectionStageChunkV1 {
+            session_id: [66; 16],
+            ordinal: 0,
+            chunk_count: 1,
+            objects,
+        };
+        assert_ne!(
+            impostor.chunk_digest().expect("digest"),
+            ProjectionStageChunkV1::decode_canonical(
+                &read_staging_artifact(&chunk_path, StagingArtifactKind::Chunk, [66; 16])
+                    .expect("read the original")
+            )
+            .expect("decode")
+            .chunk_digest()
+            .expect("digest"),
+            "the replacement must actually differ, or this test proves nothing"
+        );
+        let bytes = encode_staging_artifact(
+            StagingArtifactKind::Chunk,
+            [66; 16],
+            &impostor.encode_canonical().expect("encode"),
+        );
+        std::fs::write(&chunk_path, &bytes).expect("swap the chunk");
+
+        let refused = staging
+            .resolve_committed(namespace, &install, 9)
+            .expect_err("a chunk of the right shape but the wrong content must not resolve");
+        let StoreError::Corruption(detail) = refused else {
+            panic!("expected a named corruption, got {refused:?}");
+        };
+        assert!(
+            detail.contains("is not the one this projection committed")
+                || detail.contains("does not match the digest its manifest binds"),
+            "the refusal must name the digest mismatch rather than some incidental \
+             difference: {detail}"
+        );
+    }
+
+    /// The two answers recovery can bring back, and both are idempotent.
+    ///
+    /// `Committed` ends a transferred pin as an adoption at the position the
+    /// resolution established. `ProvedAbsent` means recovery read the complete
+    /// authoritative history and no frame names these artifacts — they are
+    /// synced-but-unreferenced garbage, which is what the deliverable says
+    /// recovery treats as invisible, so the session goes.
+    #[test]
+    fn recovery_notifications_end_a_transferred_pin_either_way() {
+        let directory = TempDir::new().unwrap();
+        let (options, lock) = layout(&directory);
+        let namespace = NamespaceId::from(ObjectId([7; 32]));
+
+        // Committed.
+        {
+            let (staging, session, _marker, install) =
+                sealed(&directory, &lock, options.clone(), [64; 16]);
+            session
+                .finalize(0)
+                .expect("pin")
+                .handle
+                .finish(ProjectionAdoptionOutcome::TransferredToRecovery)
+                .expect("transfer");
+            staging
+                .resolve_committed(namespace, &install, 11)
+                .expect("resolve");
+            for _ in 0..2 {
+                staging
+                    .notify_recovered(RecoveredProjectionResolution {
+                        session_id: [64; 16],
+                        outcome: RecoveredProjectionOutcome::Committed,
+                    })
+                    .expect("notification is repeated when a later one fails, so it repeats");
+            }
+            assert_eq!(
+                describe_state(&staging, [64; 16]),
+                StagedSessionState::Adopted
+            );
+            // The position the resolution established is what cleanup will later
+            // measure a root against.
+            assert_eq!(
+                staging
+                    .cleanup_unreferenced(&root_at(&[], 10))
+                    .expect("cleanup"),
+                0,
+                "a root short of the adoption is not evidence"
+            );
+        }
+
+        // Proved absent.
+        {
+            let (staging, session, marker, _install) = sealed(&directory, &lock, options, [65; 16]);
+            let session_directory = marker.parent().expect("session directory").to_path_buf();
+            session
+                .finalize(0)
+                .expect("pin")
+                .handle
+                .finish(ProjectionAdoptionOutcome::TransferredToRecovery)
+                .expect("transfer");
+            for _ in 0..2 {
+                staging
+                    .notify_recovered(RecoveredProjectionResolution {
+                        session_id: [65; 16],
+                        outcome: RecoveredProjectionOutcome::ProvedAbsent,
+                    })
+                    .expect("idempotent");
+            }
+            assert!(
+                !session_directory.exists(),
+                "artifacts no complete frame names are invisible garbage and are reclaimed"
+            );
+        }
+    }
+
+    /// The generation mapping is injective and stays inside its band.
+    ///
+    /// Injectivity is the requirement a multi-chunk session imposes: one file per
+    /// chunk, and the root validator refuses two projection files at one
+    /// generation, so deriving from the adoption's frame sequence alone would
+    /// make every multi-chunk adoption fail to open. Disjointness from segments
+    /// and tails is the other half — they share one generation space, and a
+    /// collision there is a `Corruption` at open rather than a silent
+    /// misresolution, but only because something refuses it.
+    #[test]
+    fn projection_generations_are_injective_and_stay_in_their_band() {
+        let session = [61; 16];
+        let mut seen = std::collections::BTreeSet::new();
+        for sequence in [0u64, 1, 2, 4095, 1 << 32] {
+            for ordinal in [0u32, 1, 2, 999_999] {
+                let generation =
+                    projection_generation(sequence, ordinal, session).expect("in range");
+                assert!(
+                    generation >= PROJECTION_GENERATION_BAND,
+                    "generation {generation} escaped the band reserved against segment and \
+                     tail generations"
+                );
+                assert!(
+                    seen.insert(generation),
+                    "({sequence}, {ordinal}) collided with an earlier pair; two projection \
+                     files at one generation make the root unopenable"
+                );
+            }
+        }
+
+        // Stability is the other property a sealed run depends on: the same pair
+        // must map to the same number in a later session.
+        assert_eq!(
+            projection_generation(7, 3, session).expect("in range"),
+            projection_generation(7, 3, session).expect("in range"),
+        );
+
+        // And the mapping refuses rather than aliases when either input leaves
+        // the range it can distinguish.
+        assert!(projection_generation(0, 1 << PROJECTION_ORDINAL_BITS, session).is_err());
+        assert!(projection_generation(u64::MAX, 0, session).is_err());
+        assert!(projection_generation(1 << 40, 0, session).is_err());
+    }
+
+    /// The sequence boundary is one value wide, and a shift check cannot see it.
+    ///
+    /// `1 << 39` shifts left by the ordinal width onto the band bit itself. It
+    /// loses no bits, so a round-trip check accepts it — and then OR-ing the band
+    /// is a no-op, so it lands on exactly the generation sequence 0 produces at
+    /// the same ordinal. Two adopted projections at one generation make the root
+    /// unopenable, and this is the one input that reaches that state through a
+    /// check designed to prevent it.
+    ///
+    /// My first version tested `1 << 40` and believed it covered this. It does
+    /// not: that value fails because bits shift off the top, which is a different
+    /// mechanism reached from the far side of the boundary. An out-of-range case
+    /// is not a boundary case.
+    #[test]
+    fn the_sequence_boundary_refuses_the_value_that_would_alias_sequence_zero() {
+        let session = [62; 16];
+        let boundary = 1u64 << (63 - PROJECTION_ORDINAL_BITS);
+
+        for ordinal in [0u32, 1, 999_999] {
+            assert!(
+                projection_generation(boundary, ordinal, session).is_err(),
+                "sequence {boundary} shifts onto the band bit and aliases sequence 0"
+            );
+            let below = projection_generation(boundary - 1, ordinal, session)
+                .expect("the value below the boundary is still representable");
+            let zero = projection_generation(0, ordinal, session).expect("sequence zero");
+            assert_ne!(
+                below, zero,
+                "the last representable sequence must not alias sequence 0 either"
+            );
+            assert!(below >= PROJECTION_GENERATION_BAND);
+        }
+    }
+
+    /// The zero boundary: `Some(0)` is evidence and `None` is not.
+    ///
+    /// Zero is a valid committed shard sequence — a shard that has committed its
+    /// first frame and nothing since — so a root recording `Some(0)` for the
+    /// shard has genuinely reached an adoption at zero. A root recording nothing
+    /// for that shard has not said anything at all, and reading it as zero is how
+    /// the position check quietly stops being a check for exactly the adoption
+    /// that needs it most: the earliest one.
+    ///
+    /// Both halves are asserted against one session, because the failure this
+    /// guards is the two answers becoming the same. A test that only checked the
+    /// absent case would also pass against a cleanup that declined every root.
+    #[test]
+    fn an_adoption_at_sequence_zero_needs_a_root_that_says_so() {
+        let directory = TempDir::new().unwrap();
+        let (options, lock) = layout(&directory);
+        let (staging, session, marker, _install) = sealed(&directory, &lock, options, [54; 16]);
+        let session_directory = marker.parent().expect("session directory").to_path_buf();
+
+        session
+            .finalize(0)
+            .expect("pin")
+            .handle
+            .finish(ProjectionAdoptionOutcome::Adopted {
+                committed_shard_sequence: 0,
+            })
+            .expect("adopt");
+
+        assert_eq!(
+            staging
+                .cleanup_unreferenced(&root_without_sequences(&[]))
+                .expect("cleanup"),
+            0,
+            "a root holding no sequence for this shard is silent about it, not a witness \
+             that it has committed through zero"
+        );
+        assert!(session_directory.exists());
+        assert_eq!(
+            staging.counters().snapshot().cleanup_declined_stale_root,
+            1,
+            "and the decline must be the position check, not a referenced artifact"
+        );
+
+        assert_eq!(
+            staging
+                .cleanup_unreferenced(&root_at(&[], 0))
+                .expect("cleanup"),
+            1,
+            "an explicit zero has reached an adoption at zero, so the same session is \
+             reclaimable and the decline above was about the absence and not the value"
+        );
+        assert!(!session_directory.exists());
+    }
+
+    /// Cleanup is for adopted sessions and nothing else.
+    ///
+    /// A sealed session and a pinned one are both unreferenced by any root —
+    /// nothing has adopted them — so a cleanup that proved absence of reference
+    /// and stopped there would delete a session a client is still uploading to,
+    /// and one whose adoption frame may be mid-append. The reference proof is
+    /// necessary and is not sufficient.
+    #[test]
+    fn cleanup_leaves_live_and_pinned_sessions_alone() {
+        let directory = TempDir::new().unwrap();
+        let (options, lock) = layout(&directory);
+        let (staging, session, marker, _install) =
+            sealed(&directory, &lock, options.clone(), [52; 16]);
+        let sealed_directory = marker.parent().expect("session directory").to_path_buf();
+
+        let empty = root_referencing(&[]);
+        assert_eq!(
+            staging.cleanup_unreferenced(&empty).expect("cleanup runs"),
+            0,
+            "a sealed session is expiry's and abort's, not cleanup's"
+        );
+        assert!(sealed_directory.exists());
+
+        let adoption = session.finalize(0).expect("pin");
+        assert_eq!(
+            staging.cleanup_unreferenced(&empty).expect("cleanup runs"),
+            0,
+            "a pinned session has no absence to prove: the frame naming its artifacts may \
+             be mid-append"
+        );
+        assert!(sealed_directory.exists());
+        assert_eq!(
+            describe_state(&staging, [52; 16]),
+            StagedSessionState::Finalizing
+        );
+        adoption
+            .handle
+            .finish(ProjectionAdoptionOutcome::DefinitivePreAppendFailure)
+            .expect("release");
+    }
+
+    fn describe_state(
+        staging: &Arc<ProjectionStaging>,
+        session_id: [u8; 16],
+    ) -> StagedSessionState {
+        staging
+            .session(session_id)
+            .expect("the session is known")
+            .describe()
+            .expect("describe")
+            .state
+    }
+
     #[test]
     fn cross_device_staging_is_refused_at_session_creation() {
         let directory = TempDir::new().unwrap();
@@ -3303,11 +5808,18 @@ mod b3_tests {
         assert!(is_session_artifact_name(&name));
         assert!(is_session_artifact_name(SESSION_RECORD_NAME));
         assert!(is_session_artifact_name(MANIFEST_NAME));
+        assert!(is_session_artifact_name(ADOPTION_NAME));
         assert!(!is_session_artifact_name("not-ours"));
     }
 
+    /// An unsealed session has no descriptor, so there is nothing to pin.
+    ///
+    /// The first thing `finalize` must not do is issue a capability against a
+    /// session that has not reached its own commit point: the manifest is what
+    /// an adopter revalidates against, and a pin without one is an adoption
+    /// capability naming state that does not exist.
     #[test]
-    fn finalize_is_deferred_and_names_its_deliverable() {
+    fn an_unsealed_session_cannot_be_finalized() {
         let directory = TempDir::new().unwrap();
         let (options, lock) = layout(&directory);
         let staging =
@@ -3316,25 +5828,32 @@ mod b3_tests {
         let session = staging
             .begin(binding([3; 16], HOUR_MICROS), 0)
             .expect("session");
-        let result = session.finalize(0);
-        let Err(StoreError::NotImplemented(detail)) = result else {
-            panic!("finalize must be an explicit stub, not a plausible default");
+        let Err(StoreError::Conflict(detail)) = session.finalize(0) else {
+            panic!("finalizing an open session must be refused, not defaulted");
         };
-        assert!(detail.contains("deliverable 6"), "{detail}");
+        assert!(detail.contains("has not sealed"), "{detail}");
+        assert_eq!(
+            staging.counters().snapshot().sessions_finalized,
+            0,
+            "a refused finalize must not count as one"
+        );
     }
 
     #[test]
-    fn the_recovery_resolver_seam_is_deferred_and_names_its_deliverable() {
+    fn the_recovery_resolver_seam_answers_rather_than_deferring() {
         let directory = TempDir::new().unwrap();
         let (options, lock) = layout(&directory);
         let staging =
             ProjectionStaging::open(&lock, options, Arc::new(DurabilityCounters::default()))
                 .expect("staging opens");
 
-        // `transferred_sessions` *is* answered: no session can reach the
-        // transferred state until deliverable 6 exists, and a sealed session
-        // is not a transferred one. The proof that this is derived and not a
-        // constant is the exhaustive state match it is computed from.
+        // `transferred_sessions` *is* answered, and answers emptily here for the
+        // reason it always did: a session that has not been finalized has no pin
+        // to transfer. Deliverable 6 made the non-empty answer reachable — see
+        // `a_transferred_pin_reconstructs_and_is_offered_to_recovery` — so this
+        // asserts the negative case rather than an impossibility. The proof that
+        // it is derived and not a constant is the exhaustive state match it is
+        // computed from.
         let session = staging
             .begin(binding([9; 16], HOUR_MICROS), 0)
             .expect("session");
@@ -3342,6 +5861,11 @@ mod b3_tests {
         assert!(staging.transferred_sessions(shard).unwrap().is_empty());
         drop(session);
 
+        // Both methods answer now, and both refuse a session this root does not
+        // hold rather than inventing one. `Corruption` and not `NotImplemented`:
+        // a descriptor naming an unknown session means a committed frame
+        // published objects whose artifacts are not here, which is a fault about
+        // the store rather than about this build.
         let resolved = staging.resolve_committed(
             NamespaceId([1; 32]),
             &StagedProjectionInstallV1 {
@@ -3353,19 +5877,28 @@ mod b3_tests {
                 membership_root: ObjectId([6; 32]),
                 artifact_set_digest: ObjectId([7; 32]),
             },
+            3,
         );
-        let Err(StoreError::NotImplemented(detail)) = resolved else {
-            panic!("resolve_committed must not answer before deliverable 8");
+        let Err(StoreError::Corruption(detail)) = resolved else {
+            panic!("resolving an unheld session must be a named fault");
         };
-        assert!(detail.contains("deliverable 8"), "{detail}");
+        assert!(detail.contains("this root does not hold"), "{detail}");
 
-        let notified = staging.notify_recovered(RecoveredProjectionResolution {
-            session_id: [4; 16],
-            outcome: RecoveredProjectionOutcome::Committed,
-        });
-        let Err(StoreError::NotImplemented(detail)) = notified else {
-            panic!("notify_recovered must not silently succeed");
-        };
-        assert!(detail.contains("deliverable 8"), "{detail}");
+        // Notification is idempotent, and a session this root does not hold is
+        // the terminal case of that: recovery repeats every notification on the
+        // next attempt, so "already gone" has to be success rather than a
+        // conflict that would keep the shard unready forever.
+        staging
+            .notify_recovered(RecoveredProjectionResolution {
+                session_id: [4; 16],
+                outcome: RecoveredProjectionOutcome::Committed,
+            })
+            .expect("notifying an unheld session is a no-op, not a fault");
+        staging
+            .notify_recovered(RecoveredProjectionResolution {
+                session_id: [4; 16],
+                outcome: RecoveredProjectionOutcome::ProvedAbsent,
+            })
+            .expect("and so is proving one absent");
     }
 }

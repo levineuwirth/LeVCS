@@ -144,7 +144,7 @@ impl Default for StoreOptions {
             staging_max_objects_global: 800_000_000,
             staging_max_bytes_per_principal: 2 * 1024 * 1024 * 1024 * 1024,
             staging_max_bytes_global: 8 * 1024 * 1024 * 1024 * 1024,
-            staging_max_files_per_session: 1_000_002,
+            staging_max_files_per_session: 1_000_004,
             staging_max_files_per_principal: 2_000_000,
             staging_max_files_global: 8_000_000,
             // A maximal 1 TiB projection at the supported 16 MiB/s floor
@@ -314,12 +314,13 @@ impl StoreOptions {
              per-principal must be <= global"
         );
         require!(
-            self.staging_max_files_per_session >= u64::from(self.max_projection_chunks) + 2
+            self.staging_max_files_per_session
+                >= u64::from(self.max_projection_chunks) + crate::staging::SESSION_FIXED_FILES
                 && self.staging_max_files_per_session <= self.staging_max_files_per_principal
                 && self.staging_max_files_per_principal <= self.staging_max_files_global,
-            "staging file limits must admit one maximal projection's chunks, \
-             session record, and manifest, and \
-             per-session <= per-principal <= global"
+            "staging file limits must admit one maximal projection's chunks plus its \
+             peak fixed per-session files (session record, sealed manifest, adoption marker, \
+             and the marker's temporary), and per-session <= per-principal <= global"
         );
         require!(
             self.staging_session_max_age_micros > 0,
@@ -535,7 +536,8 @@ mod tests {
 
         let mut o = valid();
         o.max_projection_chunks = u32::try_from(items + 1).expect("ceiling fits u32");
-        o.staging_max_files_per_session = u64::from(o.max_projection_chunks) + 2;
+        o.staging_max_files_per_session =
+            u64::from(o.max_projection_chunks) + crate::staging::SESSION_FIXED_FILES;
         o.staging_max_files_per_principal = o.staging_max_files_per_session * 2;
         o.staging_max_files_global = o.staging_max_files_per_session * 8;
         assert!(

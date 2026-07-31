@@ -1788,16 +1788,70 @@ B3's deliverables:
 5. **Artifacts are written by maintenance workers, synced, uniquely named, and
    unreferenced.** They never enter namespace membership, object-existence answers,
    snapshots, refs, receipts, event feeds, dedupe state, or `CURRENT`.
-6. **Finalize and the adoption pin.** `Open → Finalizing` moves atomically for the sole
-   bound operation/digest; identical concurrent finalizers coalesce onto one, and every
-   different operation/digest rejects. Expiry prevents a *new* finalizer but must not delete
-   artifacts held by an already-admitted one — the expiry/finalize race is a named acceptance
-   case, not an incidental detail. A definitive pre-append failure releases the pin and
-   returns the session to `Open` only if it is still live; otherwise cleanup aborts it.
+6. **Finalize and the adoption pin.** The state machine is
+   `Open → Sealed → Finalizing → {Sealed, Adopted}`, and all four states are durable and
+   reconstructable — decided by an artifact on disk, never by a flag one process remembers.
+   Amended from `Open → Finalizing` by contract review 2026-07-31-A, which found two of the
+   three transitions in the original wording unimplementable as written:
+
+   - The pin is taken from **`Sealed`**, not `Open`. The sealed manifest is what an adopter
+     revalidates against, so a pin on a session without one names state that does not exist.
+   - A definitive pre-append failure returns the session to **`Sealed`**, not `Open`.
+     Reconstruction reads the sealed manifest's presence as the seal's own commit point and
+     would hand back `Sealed` on the next restart regardless; returning a session to a state
+     no restart can reproduce is the defect the private `SessionBusy` enum exists to avoid.
+     `Sealed` is still finalizable, which is the property the rule is about. If the session is
+     no longer live the marker still goes and expiry reclaims it, which is "otherwise cleanup
+     aborts it".
+   - **`Adopted` is durable**, and is the transition the original wording had no name for.
+     Adopted artifacts stay in `staging/` with a committed root pointing into them, so
+     dropping the session record would make the next reconstruction read the directory as an
+     abandoned materialization and reclaim committed content; keeping the record with no state
+     re-charges the whole reservation on every restart. `Adopted` releases the reservation —
+     those bytes are store content, not staging occupancy — and leaves the directory to
+     cleanup's reference proof.
+
+   The pin becomes durable **before** it is issued. A handle backed by an in-memory flag is an
+   adoption capability with nothing behind it.
+
+   Only the sole bound operation/digest may finalize, which the binding enforces by carrying
+   it from `begin`; a different one cannot reach a session at all. **Coalescing identical
+   concurrent finalizers is B1's, not B3's** — also amended by 2026-07-31-A. A
+   `ProjectionAdoption` is an unforgeable capability with exactly one terminal outcome and a
+   `Drop` that reports its absence, so there is no second copy to hand a second caller: at this
+   layer the guarantee is *one pin*, and a second finalizer is refused by name. Request-level
+   coalescing across retries of one operation belongs to whoever owns the request.
+
+   Expiry prevents a *new* finalizer but must not delete artifacts held by an already-admitted
+   one — the expiry/finalize race is a named acceptance case, not an incidental detail.
 7. **Cleanup proves absence of reference.** It removes only artifacts carrying a valid
    session marker, and only after proving no committed manifest references them, then syncs
    the affected directories. *Accept:* a test that cleanup declines to remove an artifact a
    committed manifest still references.
+
+   Two clarifications from contract review 2026-07-31-B, neither a relaxation:
+
+   - **The supplied root must have reached the adoption.** A root captured before a session was
+     adopted references none of its artifacts because it predates them, so absence measured
+     against it is a date and not an absence; acting on it deletes a directory the current root
+     points into. Each adopted session records the committed shard sequence its adoption frame
+     reached — carried on `ProjectionAdoptionOutcome::Adopted` and made durable in the adoption
+     marker — and is skipped unless the supplied root has reached at least that far. The root
+     must say so *explicitly*: a root recording no sequence for that shard is silent, not a
+     witness that the shard has committed through zero, and zero is a valid sequence. Contract
+     review 2026-07-31-C.
+   - **The candidate set is the adopted sessions, and only those.** Absence of reference is
+     necessary and is not sufficient: a `Sealed` session a client is still finalizing, and a
+     `Finalizing` one whose adoption frame may be mid-append, are both referenced by nothing,
+     and a cleanup that proved absence and stopped there would delete them. `Open` and
+     `Sealed` belong to expiry and abort; `Finalizing` has no absence to prove yet.
+   - **The unit of removal is the session directory, not the individual artifact.** A
+     session's chunks are not independent: the manifest names all of them and reconstruction
+     refuses a sealed session missing any ordinal, so removing the unreferenced half of a
+     directory trades a bounded leak for a root that fails to open. A session is reclaimed
+     only when nothing in it is referenced. The per-artifact rule this clause is really about
+     still applies inside that: reclamation removes only files carrying the session's own
+     marker and refuses the whole directory if it finds anything else.
 8. **Recovery treats synced-but-unreferenced artifacts as invisible garbage**, and a complete
    final frame as authoritative adoption. It can never expose a partial chunk set.
 

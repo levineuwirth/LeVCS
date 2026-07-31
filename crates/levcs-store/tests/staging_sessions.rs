@@ -867,15 +867,43 @@ fn abort_releases_the_budget_and_removes_every_artifact() {
         .expect("released budget is reusable");
 }
 
+/// Cleanup on a root with live sessions and nothing adopted reclaims nothing —
+/// and says so by succeeding.
+///
+/// The distinction this asserts is the one the deferred stub used to stand for:
+/// "there was nothing to do" and "I cannot answer yet" are different results,
+/// and only one of them is true now. Reaching it through the public surface also
+/// pins that a caller can run cleanup against a root that references nothing at
+/// all without it becoming a licence to delete the sessions in flight — which is
+/// exactly what a reference proof alone, unqualified by state, would do.
 #[test]
-fn cleanup_is_deferred_and_names_its_deliverable() {
+fn cleanup_reclaims_nothing_when_no_session_has_been_adopted() {
     let root = Root::new();
     let (staging, _durability) = root.open();
-    let result = staging.cleanup_unreferenced(&CommittedRoot::default());
-    let Err(StoreError::NotImplemented(detail)) = result else {
-        panic!("cleanup must be an explicit stub, not a silent success");
-    };
-    assert!(detail.contains("deliverable 7"), "{detail}");
+    let fixture = projection([26; 16], [21; 32], 1, 2, HOUR_MICROS);
+    let session = staging.begin(fixture.binding.clone(), 0).expect("begin");
+    for chunk in &fixture.chunks {
+        session.put_chunk(chunk, 0).expect("put");
+    }
+    session.seal(0).expect("seal");
+
+    assert_eq!(
+        staging
+            .cleanup_unreferenced(&CommittedRoot::default())
+            .expect("cleanup answers rather than deferring"),
+        0,
+        "no session has been adopted, so there is nothing for the reference proof to remove"
+    );
+    assert_eq!(
+        staging
+            .session(fixture.session_id())
+            .expect("still there")
+            .describe()
+            .expect("describe")
+            .state,
+        StagedSessionState::Sealed,
+        "and a sealed session survives a cleanup against a root that references nothing"
+    );
 }
 
 // ---------------------------------------------------------------------------

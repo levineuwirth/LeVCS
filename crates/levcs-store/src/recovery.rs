@@ -2317,7 +2317,14 @@ fn recover_shard_under_lock(
                 hex::encode(descriptor.session_id)
             ))
         })?;
-        let artifacts = resolver.resolve_committed(frame.facts.namespace, descriptor)?;
+        // The frame's own sequence is the adoption's identity, and the only
+        // authority that creates one: staging has no durable position for a pin
+        // that transferred across a process boundary.
+        let artifacts = resolver.resolve_committed(
+            frame.facts.namespace,
+            descriptor,
+            frame.facts.shard_sequence,
+        )?;
         if artifacts.descriptor() != descriptor {
             return Err(StoreError::Corruption(format!(
                 "staging recovery returned a different descriptor for committed session {}",
@@ -3187,6 +3194,7 @@ mod production_session_tests {
         namespace: NamespaceId,
         descriptor: StagedProjectionInstallV1,
         artifacts: RecoveredProjectionArtifacts,
+        expected_adoption_sequence: u64,
         absent_session: [u8; 16],
         notifications: Mutex<Vec<RecoveredProjectionResolution>>,
     }
@@ -3200,9 +3208,18 @@ mod production_session_tests {
             &self,
             namespace: NamespaceId,
             descriptor: &StagedProjectionInstallV1,
+            adoption_shard_sequence: u64,
         ) -> Result<RecoveredProjectionArtifacts, StoreError> {
             assert_eq!(namespace, self.namespace);
             assert_eq!(descriptor, &self.descriptor);
+            // Recovery must hand over the adopting frame's own sequence, not a
+            // placeholder: it is the sole authority that creates a position for
+            // a pin that transferred across a process boundary, and every
+            // artifact's logical generation is derived from it.
+            assert_eq!(
+                adoption_shard_sequence, self.expected_adoption_sequence,
+                "the resolver was given a sequence that is not the adoption frame's"
+            );
             Ok(self.artifacts.clone())
         }
 
@@ -3301,6 +3318,7 @@ mod production_session_tests {
             namespace,
             descriptor: descriptor.clone(),
             artifacts,
+            expected_adoption_sequence: 0,
             absent_session: [27; 16],
             notifications: Mutex::new(Vec::new()),
         };

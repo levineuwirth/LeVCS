@@ -340,7 +340,7 @@ pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
     .map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))
 }
 
-/// Plain atomic replacing rename. Two legitimate call sites, and no others:
+/// Plain atomic replacing rename. Three legitimate call sites, and no others:
 ///
 /// 1. The `CURRENT.tmp` -> `CURRENT` pointer install of scope 3.5, which by
 ///    definition replaces.
@@ -348,8 +348,14 @@ pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
 ///    install left finalized at a name the retry cannot choose again — and only
 ///    over an occupant that call has proved reconciles with its replacement.
 ///    Contract review 2026-07-30-F; see [`rename_noreplace`].
+/// 3. `staging::adopt_adoption_marker`, moving one session's adoption marker
+///    from `Finalizing` to `Adopted` — the one file in a staging session that
+///    legitimately changes — and only after proving the marker on disk is that
+///    session's own outstanding pin. Contract review 2026-07-31-A.
 ///
-/// Every other site uses `rename_noreplace`.
+/// The pattern in 2 and 3 is the same and is the only one that earns this call:
+/// the licence to overwrite is bounded by a proof about the occupant, not by a
+/// flag on a shared writer. Every other site uses `rename_noreplace`.
 pub(crate) fn rename_replace(from: &Path, to: &Path) -> io::Result<()> {
     std::fs::rename(from, to)
 }

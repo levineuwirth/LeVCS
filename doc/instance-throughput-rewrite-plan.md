@@ -557,7 +557,7 @@ The identity crate gains a repository-scoped `VerificationSession` over an objec
 
 Large initial projections use one bounded `ProjectionStageSessionV1`; `PushKindV2::Normal` never does. The initiator generates the random session ID before computing any final operation/stable digest that contains `ProjectionStageRefV1`. Session creation verifies that `<root>/staging` and its target shard are on the same `st_dev` and canonically binds that session ID, destination repo/genesis and expected empty/current state, projection, authenticated source kind and actor/key epoch, source snapshot generation or `ForkProofV2`, final operation ID/stable digest/evidence digest, total object/byte/chunk counts, ordered manifest digest, expiry, and hard per-session/principal/global staging budgets. Every numbered chunk has a canonical digest and bounded object/byte count; upload validates framing, embedded types, IDs, exact bytes, canonical order, declared manifest position, and same-session ordinal/digest idempotency before a maintenance worker writes and syncs a uniquely named unreferenced artifact. Chunks never enter namespace membership, object-existence answers, snapshots, refs, receipts, event feeds, dedupe state, or `CURRENT`; cross-device adoption and copy fallback are forbidden.
 
-Finalize atomically moves the session from `Open` to `Finalizing` for its sole bound operation/digest and takes an adoption pin; identical concurrent finalizers coalesce and every different operation/digest rejects. Expiry prevents a new finalizer but cannot delete artifacts held by an admitted bounded finalizer. Finalize requires every chunk, reconstructs the exact ordered manifest, and runs the same complete `ProjectionCore`, identity, authority, policy, source-snapshot/Fork-proof, and destination precondition validation used by inline ingestion. It builds and syncs an immutable staged object/index generation and then submits one ordinary bounded transaction with the appropriate `ClientV2`, `MirrorSnapshotV1`, or authenticated network-migration administrative evidence plus a `StagedProjectionInstallV1` descriptor. The shard owner rechecks session/operation/digest, destination lifecycle/CAS, source cursor, config/policy epoch, manifest and artifact hashes; assigns manifest-visible names; directory-syncs them; and appends a small final frame that binds the complete manifest/membership root and resulting state digest. A definitive pre-append failure releases the adoption pin and returns the session to `Open` only if it remains live; otherwise cleanup aborts it. Only the final frame's fence and committed-root swap atomically grant membership and publish refs/authority/cursor/receipt/event. Recovery treats synced-but-unreferenced artifacts as invisible garbage and a complete final frame as authoritative adoption; it can never expose a partial chunk set.
+Finalize atomically moves the session from `Sealed` to `Finalizing` for its sole bound operation/digest and takes an adoption pin; every different operation/digest rejects. **Amended by contract review 2026-07-31-A** in two places, and the superseded wording is not reachable: the pin is taken from `Sealed` rather than `Open`, because the sealed manifest is what an adopter revalidates against and a pin on a session without one names state that does not exist; and *coalescing identical concurrent finalizers is the request owner's, not the store's* — an adoption pin is an unforgeable capability with exactly one terminal outcome, so there is no second copy to hand a second caller, and the store's guarantee is one pin with a second finalizer refused by name. Expiry prevents a new finalizer but cannot delete artifacts held by an admitted bounded finalizer. Finalize requires every chunk, reconstructs the exact ordered manifest, and runs the same complete `ProjectionCore`, identity, authority, policy, source-snapshot/Fork-proof, and destination precondition validation used by inline ingestion. It builds and syncs an immutable staged object/index generation and then submits one ordinary bounded transaction with the appropriate `ClientV2`, `MirrorSnapshotV1`, or authenticated network-migration administrative evidence plus a `StagedProjectionInstallV1` descriptor. The shard owner rechecks session/operation/digest, destination lifecycle/CAS, source cursor, config/policy epoch, manifest and artifact hashes; assigns manifest-visible names; directory-syncs them; and appends a small final frame that binds the complete manifest/membership root and resulting state digest. A definitive pre-append failure releases the adoption pin and returns the session to `Sealed` only if it remains live; otherwise cleanup aborts it. **Amended by 2026-07-31-A**: `Open` is not a state a restart can reproduce for a session whose sealed manifest is durable — reconstruction reads that manifest's presence as the seal's own commit point — and returning a session to an unreconstructable state is the defect the private busy/state split exists to prevent. `Sealed` is still finalizable, which is the property the rule is about. The full state machine is `Open → Sealed → Finalizing → {Sealed, Adopted}`, all four durable. Only the final frame's fence and committed-root swap atomically grant membership and publish refs/authority/cursor/receipt/event. Recovery treats synced-but-unreferenced artifacts as invisible garbage and a complete final frame as authoritative adoption; it can never expose a partial chunk set.
 
 Sessions are restartable by ID and chunk digest, have no renewal beyond their advertised maximum, and are aborted on authentication mismatch, quota/debt/low-space breach, explicit cancellation, or expiry. A remote source reserves a corresponding bounded snapshot-export base/request lease for the signed generation; each source chunk is served from that generation, and source-lease expiry aborts the destination session rather than mixing generations. Configured maximum projection size/session age and the supported minimum transfer rate must make one complete transfer feasible; otherwise session creation rejects before pinning. Cleanup removes only artifacts carrying a valid session marker after proving that no committed manifest references them, then syncs affected directories. Compaction/GC pins a finalized session from shard adoption through root publication and otherwise may reclaim expired unreferenced sessions. Admission accounts staged bytes, objects, files, sessions, validation work, age, and compaction debt independently of ordinary receive spools. Full-fork and network-migration clients use the v2 staging routes; an in-process mirror uses the identical codecs/service API without loopback HTTP.
 
@@ -1675,6 +1675,275 @@ B4 surface this commit touches — the emitter's remaining claims are unchanged.
 
 **Next, and in this dispatch:** recovery discarding an index run whose covered identity was not
 preserved, which turns 2026-07-30-B's refusal into reclamation.
+
+##### Contract review 2026-07-31-D
+
+B3 deliverable 8 — recovery treats synced-but-unreferenced artifacts as invisible garbage and a
+complete final frame as authoritative adoption. With this, deliverables 6, 7 and 8 are complete.
+
+**Frozen-seam amendment: `ProjectionRecoveryResolver::resolve_committed` gains
+`adoption_shard_sequence`.** Recovery passes `frame.facts.shard_sequence` from the complete
+replayed adoption frame. Required, never optional or inferred: every artifact's logical generation
+derives from it, and staging cannot supply it — a transferred `Finalizing` session has no durable
+position, which is exactly the state being resolved, and that frame is the sole authority that
+creates one. This is the **recovery-direction counterpart** of the D0-B
+`ProjectionAdoptionOutcome::Adopted` amendment in 2026-07-31-C: the same value, granted for the
+same reason, flowing from whichever side made the frame authoritative. Both resolver test doubles
+are updated, and recovery's asserts that it is handed the frame's own sequence rather than a
+placeholder.
+
+**The generation mapping** is `BAND | (adoption_sequence << 24) | ordinal`, injective in the pair
+and confined to a reserved top-bit band because segments, tails and projections share one
+generation space. Its boundary is one value wide and closed by a ceiling rather than a shift
+round-trip; see 2026-07-31-C's successor note in `staging.rs`.
+
+**No per-object offsets, and none were needed.** `IndexLocation` names the whole certified record
+— its own doc says so and names adopted projections explicitly — so every object in a chunk shares
+that chunk's location with `frame_offset: 0` and `frame_len` covering header, canonical payload and
+digest. A reader validates the artifact and then selects from the decoded vector, exactly as
+several objects share one journal frame. I had raised this as a suspected protocol gap; it was a
+contract I had not read on the type I was populating. Pointing at object bytes would let a reader
+return bytes from a record it never proved complete.
+
+**Whole or not at all.** Every declared ordinal is read back, decoded, and checked against the
+manifest's session and chunk count before any location is produced, and
+`RecoveredProjectionArtifacts::new` then refuses unless the entry count equals the descriptor's
+`object_count`. A directory holding some of its chunks resolves to an error, never to a smaller
+projection — the failure a "resolve what is present" implementation reaches by being helpful.
+
+**`notify_recovered`.** `Committed` ends the pin as an adoption at the position the resolution
+recorded, and refuses a session this recovery never resolved rather than adopting at a guess —
+without a position, cleanup could never prove absence of reference. `ProvedAbsent` means recovery
+read the complete authoritative history and no frame names these artifacts, so the session returns
+to a reclaimable state and its directory goes. Both are idempotent, including for a session that is
+already gone, because recovery repeats every notification when a later one fails.
+
+**Evidence.** A committed projection resolving to complete membership at the expected generation,
+with every object in a chunk sharing that chunk's location and `frame_len` equal to the artifact's
+size on disk; the same session refusing once a chunk is removed. Both notification outcomes driven
+twice each to assert idempotence, with the `Committed` case then measured by cleanup against a root
+short of the adoption to confirm the position it established is real. The integration suite's
+"resolver seam is deferred" test is replaced by one asserting it answers.
+
+##### Contract review 2026-07-31-C
+
+P1 against 2026-07-31-B: cleanup could delete committed artifacts through a stale root. Found in
+review, reproduced, repaired. Deliverable 8 was held until the authority boundary below was
+decided, and the decision is recorded here.
+
+**The defect.** `cleanup_unreferenced` selected candidates from current staging state and then
+trusted whatever `CommittedRoot` the caller supplied. Capture `R0` before a projection is
+published; publish `R1` referencing its artifacts; record the session `Adopted`; call cleanup with
+`R0`. Every artifact is absent from `R0`'s pins — because `R0` predates them — so the absence
+proof succeeds and the directory is deleted out from under a committed root that still points into
+it. Reproduced exactly as reported: the session was reclaimed.
+
+**My reasoning in B was inverted, and that is the part worth keeping.** I wrote that a racing
+newer root "can only add references" and concluded the proof was safe. Adding references is
+precisely the hazard: it means an older root *omits* references a newer one holds. I checked the
+direction in which references change and never checked the direction in which the root travels.
+
+**The authority boundary, and why there is no purely-B3 repair.** `ProjectionStaging` is
+constructed *before* any committed root exists — it has to be, since it is recovery's
+`ProjectionRecoveryResolver` — so there is no moment at which staging can observe a root position
+on its own. Both candidate repairs need an authority minted outside B3.
+
+**Decision: a durable minimum recorded at adoption.** `ProjectionAdoptionOutcome::Adopted` now
+carries the committed shard sequence its frame reached — a **frozen D0-B amendment**, granted and
+recorded here. B1 supplies it because only B1 knows it: the append that produced it has just
+returned. Staging writes it into the adoption marker, which is already rewritten by that exact
+transition and already carries a payload, so durability costs nothing new. Cleanup then skips any
+adopted session whose recorded sequence exceeds the supplied root's, and a root at or past the
+adoption necessarily includes its effects — which is what makes the absence real.
+
+Engine-owned cleanup under the same synchronization as root publication was the alternative. It is
+the stronger property but reaches for the `StoreEngine` staging façade that §6.5 still records as a
+pending interface amendment, and it would not on its own cover a session adopted before a restart.
+The two are not exclusive; if the façade lands, this check remains the restart half.
+
+**`Some(0)` and `None` are different answers.** The first cut compared
+`shard_committed_sequence(shard).unwrap_or(0)`, which conflates them — zero is a valid committed
+sequence, so a root that says *nothing* about a shard became indistinguishable from one that has
+committed through its first frame, and an adoption at sequence 0 was reclaimable through a root
+that never mentioned the shard it lives on. The check now requires an explicit
+`Some(through) if through >= adopted_at`, so silence is treated as no evidence. The conflation
+disarmed the position check for precisely the adoption that needs it most, the earliest one.
+
+**A session missing a position is not reclaimable at all.** An adopted session always records
+where it was adopted, so the absence of one means the store cannot say when the reference it is
+about to disprove came into existence. Skipping is the only answer that cannot lose data.
+
+**Evidence.** The reviewer's R0/R1 sequence as a regression, which failed by deleting the session
+before the repair. It now asserts three things rather than one: the stale root reclaims nothing,
+the decline is attributed to the root's age rather than to some incidental refusal, and the *same*
+session against a root that has reached the adoption is reclaimed — without that last clause the
+test would pass against a cleanup that declined everything. Durability is asserted in the reopen
+test: after a restart, a root short of the reconstructed adoption still declines and one at it
+reclaims. A zero-boundary regression covers the other half against one adopted-at-zero session: a
+root with no sequence for the shard declines, and the same session against an explicit `Some(0)`
+reclaims — both halves together, because a test that only checked the absent case would pass
+against a cleanup that declined every root.
+
+Five mutations, each caught: trusting any supplied root, recording no position at adoption,
+writing no position into the marker, restoring the `unwrap_or(0)` conflation, and tightening the
+comparison to `>` so an exactly-reached root is refused. The last fails four tests rather than
+one, which is the shape an over-strict boundary should have.
+
+A test-fixture defect surfaced on the way and is worth recording because it would have hidden the
+repair: the helper root populated a sequence for shard 0 only, while the fixture's destination
+repository hashes to another shard. Every cleanup test would have measured a stale-root skip while
+claiming to measure the reference proof. The helper now populates every shard, as a real root does.
+
+##### Contract review 2026-07-31-B
+
+B3 deliverable 7 — cleanup proves absence of reference. Deliverable 8 follows separately.
+
+**Two clarifications to §6.5's wording**, both recorded in the scope and neither a relaxation.
+The deliverable reads as a per-artifact rule over everything staging owns; implementing it that
+way would have been wrong twice.
+
+*Absence of reference is necessary and not sufficient.* A `Sealed` session a client is still
+finalizing and a `Finalizing` one whose adoption frame may be mid-append are both referenced by
+nothing at all. A cleanup that proved absence and stopped there would delete them. The candidate
+set is therefore the **adopted** sessions: the one state where the artifacts are store content
+and "does anything still point at them?" is both meaningful and answerable. `Open` and `Sealed`
+belong to expiry and abort, which already own them.
+
+*The unit of removal is the session, not the artifact.* A session's chunks are not independent
+files — the manifest names all of them and reconstruction refuses a sealed session missing any
+ordinal — so removing the unreferenced half of a directory trades a bounded leak for a root that
+fails to open. A session is reclaimed only when nothing in it is referenced, and the per-artifact
+rule the clause is really about still applies inside that: `reclaim_session_directory` removes
+only files carrying the session's own marker and refuses the whole directory on anything else.
+
+**Every file is checked, not only the chunks.** A root that pinned a session's manifest and
+nothing else would still be holding that directory, and answering on chunks alone would delete
+the file it holds.
+
+**The supplied root must be new enough to be evidence — corrected by 2026-07-31-C.** The first
+version of this argued that a racing newer root "can only add references" and concluded the proof
+was safe. That is an argument *for* the hazard: adding references is exactly what makes an older
+root omit them, so absence measured against a root captured before an adoption is a date rather
+than an absence. See 2026-07-31-C for the defect and its repair.
+
+**Evidence.** The deliverable's named acceptance case and its inverse in one test, against one
+adopted session: a root holding a single chunk declines the whole directory and leaves every file
+in place, then a root holding nothing reclaims it. Both halves together are what make the first
+assertion mean "the reference proof declined it" rather than "cleanup does nothing here" — a
+cleanup that never reclaimed anything would pass the decline half perfectly. A second test pins
+that a sealed session and a pinned one both survive a cleanup against a root referencing nothing.
+Mutation-checked: skipping the reference proof fails the first, and treating every state as a
+candidate fails the second, each and only each.
+
+The integration suite's `cleanup_is_deferred_and_names_its_deliverable` is replaced rather than
+deleted — the distinction it stood for, that "nothing to do" and "cannot answer yet" are
+different results, is now asserted the other way round at the public surface.
+
+##### Contract review 2026-07-31-A
+
+B3 deliverable 6 — finalize and the adoption pin. Deliverables 7 and 8 are **not** in this
+commit; review found a blocker in 6 that had to close first. The dispatch is 6-8 only: the
+ignored sealed-invisibility test stays ignored, and its blocker list is corrected below.
+
+**Scope §6.5's state machine was unimplementable as written**, in two of three transitions, and
+is amended to `Open → Sealed → Finalizing → {Sealed, Adopted}` with all four states durable and
+reconstructable. The reasoning is recorded in the scope rather than repeated here; the short
+version is that `Open` appears twice in the original wording where only `Sealed` can be
+reconstructed, and `Adopted` is a state the wording needed and did not have. Reconstructability
+is the membership rule for this enum — a value no restart can produce has no business on the
+wire — and both amendments follow from applying it.
+
+**Coalescing moves to B1.** §6.5 promised that "identical concurrent finalizers coalesce onto
+one" at this layer. They cannot: `ProjectionAdoption` is an unforgeable capability with exactly
+one terminal outcome and a `Drop` that reports its absence, so there is no second copy to hand a
+second caller. B3's guarantee is *one pin*, and a second finalizer is refused by name.
+Request-level coalescing across retries of one operation belongs to whoever owns the request. No
+B3 coalescing regression is claimed.
+
+**The blocker, found in review.** `finalize` published the pin marker through the shared artifact
+writer, which publishes with `rename_noreplace` because every other staging artifact is
+unique-by-name. Recording `Adopted` then wrote the same pathname through the same writer and
+always failed `EEXIST`, wedging every adoption in `Finalizing` — silently, because nothing
+inspected the error. The repair is **not** a replace flag on the shared writer: that would hand
+overwrite permission to the chunk and manifest artifacts the no-replace rule exists to protect.
+It is one marker-specific path whose licence to overwrite is bounded by proof — the marker on
+disk must decode as a staging artifact of this session, carry the operation and digest the
+session binds, and say `Finalizing` — and which publishes through the no-follow temporary-open
+primitive, then a replacing rename, then a directory sync. Idempotent on an
+already-`Adopted` marker, because a retried outcome is not a second event.
+
+**`SESSION_FIXED_FILES` is 4, and it is a peak.** Deliverable 6 adds the marker and, for the
+width of the replacement, its temporary. The reservation is charged against the peak because
+that is the instant the directory is widest. Two things surfaced on the way: the constant's doc
+claimed to be "the shared definition rather than a second opinion" while `options.rs` carried a
+literal `+ 2`, and the **default `staging_max_files_per_session` was sized to the old layout
+exactly**, so every root became an invalid configuration until it was raised. Both are
+configuration-visible.
+
+Four is the *true* peak, not a conservative one. I first recorded a general residual here —
+that every artifact write peaks at `+1` because `write_artifact` also publishes through a
+`<name>.tmp` — and review corrected it: those temporaries stand in for final names that are
+absent, so each occupies the slot it is about to become rather than an extra one, and state
+ordering keeps chunk writes from overlapping a seal or a finalize. `adoption.tmp` is the only
+temporary that coexists with a final file already on disk, because its transition replaces a
+marker rather than creating one. The claim was generalised from "there is a temporary" without
+checking whether the final name was occupied.
+
+**Recorded, not fixed.** `write_artifact` opens its temporary with `File::options()` and no
+`O_NOFOLLOW` — the same redirection family closed in `checkpoint.rs` under 2026-07-30-D. The new
+marker path uses the funnel; the shared writer still does not.
+
+**Plan §8 is amended in place**, not merely superseded by this record. It still specified
+`Open -> Finalizing`, store-level coalescing, and return-to-`Open`; a contradiction left standing
+in the plan is a contradiction, and the later review being right does not make the earlier prose
+unread.
+
+**Evidence.** Six regressions, covering every transition of
+`Open -> Sealed -> Finalizing -> {Sealed, Adopted}` against both the in-memory state and the
+device. The adoption chain — pin taken, adoption recorded, reservation released, reopen
+reconstructing `Adopted` without re-charging — plus one each for: a second finalizer refused
+rather than issued a second pin; expiry declining a pinned session and leaving its artifacts in
+place; a definitive pre-append failure removing the marker, returning `Sealed`, and *permitting
+refinalization*; and a transferred pin whose marker survives, reconstructs as `Finalizing`, and
+is offered to `transferred_sessions` for its own shard and no other. Each asserts the marker on
+disk, not only the state in the registry — a test that checked the registry alone would pass
+against a pin that never reached the device.
+
+The expiry/finalize race needs **both** orderings and originally had one. The covered ordering
+was expiry meeting an already-durable pin, where the *state* reads `Finalizing`. The other is the
+admission window: the finalizer has been admitted under the registry lock and released it to
+write the marker, so the session still reads `Sealed` with nothing on disk, and a sweep that
+looked only at state would find an expired, sealed, unpinned session and delete the artifacts out
+from under a pin about to be issued. What prevents it is the `busy` exclusion, so the regression
+drives that shape directly rather than racing into it — a race reproducing one time in a thousand
+is a test that passes for the wrong reason the other nine hundred and ninety-nine. Its second
+half clears `busy` and sweeps again, which *does* reclaim: without that, "nothing was reclaimed"
+proves only that something declined, not that the exclusion is what declined it.
+
+Every one is mutation-checked: admitting a second finalizer, letting expiry reclaim a pinned
+session, skipping the marker removal on release, and hiding `Finalizing` from
+`transferred_sessions` each fail exactly one test and no others.
+
+Mutating the admission-window exclusion produced a result worth recording. The sweep does change
+behaviour and the regression fails — but on `Overloaded` from `reclaim_session`'s own `busy`
+check rather than on a deletion, because the guard is two independent layers. Removing the second
+one as well **does not compile**: that match is exhaustive, so dropping the pinned case from the
+reclamation guard is a compile error rather than an omission. Reaching artifact loss from here
+requires deliberately writing a `Finalizing => {}` arm, which is no longer something a future edit
+does by accident.
+
+And for the adoption chain, both halves:
+routing the adoption write back through the shared writer reproduces
+`Io(Os { code: 17, kind: AlreadyExists })` at the finish, and reconstructing an adopted session
+with its reservation fails the accounting assertion. The fixture had to be built inside
+`staging.rs`'s unit module: `finalize` is `pub(crate)` so its regressions cannot live in the
+integration file where all the sealing machinery is.
+
+**The ignored sealed-invisibility test remains blocked, and its stated reason is stale.** It
+names `submit` as a blocker; `submit` has been production-reachable since the B-wave work. The
+real blockers are `RepoSnapshot::locate`, `StoreEngine::snapshot`, and
+`ValidatedTransactionBuilder::adopt_projection` — all three B1 deliverable 8 — plus the staging
+accessor, which stays a pending interface amendment. Finishing 6-8 will not unblock it.
 
 ##### Contract review 2026-07-30-G
 

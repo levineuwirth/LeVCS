@@ -1676,6 +1676,60 @@ B4 surface this commit touches — the emitter's remaining claims are unchanged.
 **Next, and in this dispatch:** recovery discarding an index run whose covered identity was not
 preserved, which turns 2026-07-30-B's refusal into reclamation.
 
+##### Contract review 2026-07-30-G
+
+Recovery run-discard, which 2026-07-30-B deferred and named as the thing that would turn its refusal
+into reclamation. It is a change to what recovery *reclaims*, not an addition to it, which is why it
+is its own commit with its own mutation evidence.
+
+**The state.** A `.seg` occupies the identity the active tail's frames already carry, so recovery
+must seal them under a different generation. A published index run holding locations against the
+displaced identity then stays authoritative through the manifest while resolving to nothing. B
+refused every root in that state. Refusing is an outage on a root that has lost nothing, and B said
+so at the time.
+
+**What makes reclamation sound, and it is `preferred` itself.** `active_tail_logical_generation` is
+one past the last retained tail range, so it is the identity of the **active journal** and of nothing
+else. Frames at that identity sit above the manifest's committed prefix, therefore above any
+checkpoint horizon, therefore replayed in full. A run holding *only* locations at `preferred` is
+rebuilt entry for entry by the delta recovery is about to construct, at the generation the frames
+actually receive. Discarding it loses nothing; keeping it publishes locations that resolve to
+nothing.
+
+**What is still refused, and why that is the good outcome.** A run may name more than one identity: a
+reopen replays what the previous session sealed into a segment *and* what its journal still holds,
+and a seal over that backlog covers both. Displacing the tail strands only the tail's entries — the
+segment's may sit below a checkpoint horizon, which replay does not touch. Discarding that run would
+delete the only index those objects have, trading a diagnosable outage for silent loss, which is the
+trade B existed to prevent. So the refusal survives for mixed runs and now says why.
+
+**Frozen-seam amendment to `index.rs` (A2).** `references_only_segment_generation`, the sibling of
+B's `references_segment_generation` and the second question its one caller has to ask: the first says
+a run is *affected*, this one says it is *reclaimable*. Read-only, exact rather than a range test,
+and deliberately false for an empty run — emptiness is not something to reclaim on this evidence.
+
+**A reclamation is three removals, not one.** The manifest row is what makes a run authoritative, so
+dropping it governs the next open; but this session must also stop consulting the run and stop
+pinning it, or a direct run consumer — `StoreEngine::checkpoint` is one — reads dangling locations
+for as long as the process lives. A lookup will not reveal it, because the replay delta sits above
+the runs and answers first. The `.idx` itself is **left on the device**: nothing but a manifest makes
+a run authoritative, and unlinking during recovery would destroy the evidence for a state this store
+has only just learned to handle. `ShardRecoveryReport::reclaimed_index_runs` reports it, because a
+reclamation is otherwise invisible in the opened store.
+
+**One placement that matters.** The reclamation is applied inside the seal, not where the generation
+is chosen. `logical` is decided before the journal is scanned, so it can name a fallback for a
+journal that turns out to hold no frame — and then nothing is renamed, the surviving tail keeps
+`preferred` (2026-07-30-B amendment 2), and a run at `preferred` goes on resolving. Reclaiming there
+would discard a run that was never stranded.
+
+**Mutation evidence.** Four mutations, each caught: treating every run as reclaimable fails the mixed
+-run refusal; treating none as reclaimable fails all three reclamation regressions; leaving the
+manifest row fails them on the authority assertion; and leaving the run in this session's index and
+pins fails them on the direct-consumer assertion. That last mutation **survived the first version of
+these tests**, because the replay delta shadows the run for ordinary lookups — the assertion that
+catches it was added after the mutation showed the gap rather than before.
+
 ##### Contract review 2026-07-30-F
 
 Two P1s and a P2 against the checkpoint-equivalence half of 2026-07-30-E. The namespace and

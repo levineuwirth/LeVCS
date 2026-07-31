@@ -1431,6 +1431,15 @@ pub struct ShardRecoveryReport {
     /// copied or sealed any prefix. The inode is byte-for-byte crash evidence.
     pub preserved_journal: Option<PathBuf>,
     pub promotions: Vec<VisibilityPromotion>,
+    /// Published index runs this recovery dropped from the manifest because the
+    /// seal displaced the only identity they held (contract review
+    /// 2026-07-30-G).
+    ///
+    /// Reported rather than inferred. A reclamation is invisible in the opened
+    /// store — the objects are all still there, rebuilt by replay — so without
+    /// this an operator cannot tell a root that reclaimed a run from one that
+    /// never had it, and the `.idx` left on the device has no other explanation.
+    pub reclaimed_index_runs: Vec<PathBuf>,
     /// Scope 3.8 step 12: readiness is true only after replay and
     /// catalog/genesis validation complete. A computed field, never a default.
     pub ready: bool,
@@ -1445,6 +1454,7 @@ impl ShardRecoveryReport {
             active_journal: None,
             checkpoint_sequence: None,
             offline_rebuild_required: false,
+            reclaimed_index_runs: Vec::new(),
             adopted_shard_sequences: Vec::new(),
             tail_stop: None,
             quarantined: None,
@@ -1948,6 +1958,7 @@ fn recover_shard_under_lock(
                     logical: logical_generation,
                     tail: tail_generation,
                     manifest: manifest_generation,
+                    discarded: reclaimed_runs,
                 } = recovery_generations_for_journal(
                     &paths,
                     &root_uuid,
@@ -2058,7 +2069,42 @@ fn recover_shard_under_lock(
                         let first = full_scan.frames.first().expect("non-empty").shard_sequence;
                         let last = full_scan.frames.last().expect("non-empty").shard_sequence;
 
-                        let (mut retained_tail_ranges, index_runs, checkpoints) = selection
+                        // Inside the seal, because the seal is what displaces
+                        // the identity. `logical` is chosen before the journal
+                        // is scanned, so it can name a fallback generation for a
+                        // journal that turns out to hold no frame — and then
+                        // nothing is renamed, the surviving tail keeps
+                        // `preferred`, and a run holding locations against
+                        // `preferred` goes on resolving. Reclaiming it out there
+                        // would discard a run that was never stranded.
+                        //
+                        // A reclaimed run must stop being authoritative in the
+                        // same instant it stops resolving: dropped from what this
+                        // generation retains, from what the layered index
+                        // consults, and from the manifest published below.
+                        // Leaving it in any one of the three is the dangling-run
+                        // state the reclamation exists to end.
+                        if !reclaimed_runs.is_empty() {
+                            let reclaimed: std::collections::BTreeSet<&Path> =
+                                reclaimed_runs.iter().map(PathBuf::as_path).collect();
+                            // Matched by pointer, not by name. Both lists were
+                            // built from the same manifest rows in the same loop,
+                            // so the `Arc` identifies the run exactly; re-deriving
+                            // a name here would be a second way of saying which
+                            // run this is, and the two could disagree.
+                            let dropped: Vec<Arc<IndexRun>> = retained_index_runs
+                                .iter()
+                                .filter(|retained| reclaimed.contains(retained.path()))
+                                .map(|retained| Arc::clone(retained.run()))
+                                .collect();
+                            retained_index_runs
+                                .retain(|retained| !reclaimed.contains(retained.path()));
+                            sealed_runs_newest_first
+                                .retain(|run| !dropped.iter().any(|gone| Arc::ptr_eq(gone, run)));
+                            report.reclaimed_index_runs = reclaimed_runs.clone();
+                        }
+
+                        let (mut retained_tail_ranges, mut index_runs, checkpoints) = selection
                             .as_ref()
                             .map(|selected| {
                                 (
@@ -2068,6 +2114,20 @@ fn recover_shard_under_lock(
                                 )
                             })
                             .unwrap_or((Vec::new(), Vec::new(), Vec::new()));
+                        // The row is what makes a run authoritative, so this is
+                        // where a reclamation actually takes effect: every
+                        // earlier step only stopped *this* session consulting
+                        // the run, and a row left here would hand it back to the
+                        // next open.
+                        if !reclaimed_runs.is_empty() {
+                            let gone: std::collections::BTreeSet<&std::ffi::OsStr> = reclaimed_runs
+                                .iter()
+                                .filter_map(|path| path.file_name())
+                                .collect();
+                            index_runs.retain(|(_, filename)| {
+                                !gone.contains(std::ffi::OsStr::new(filename))
+                            });
+                        }
                         retained_tail_ranges.push(TailRange {
                             generation: logical_generation,
                             first_shard_sequence: first,
@@ -2633,6 +2693,17 @@ pub(crate) struct RecoveryGenerations {
     /// The generation of the manifest this recovery installs. A counter over
     /// manifests, which an index run's manifest also advances.
     manifest: u64,
+    /// Published index runs this recovery **reclaims**: paths whose every
+    /// location named the identity the seal below is displacing.
+    ///
+    /// Empty unless the frames are being renamed, which is the only thing that
+    /// can strand a run. A path here is dropped from the manifest this recovery
+    /// installs, from the retained generation, and from the layered index — all
+    /// three, or a run that is no longer authoritative goes on answering
+    /// lookups. The file itself is left on the device: nothing but a manifest
+    /// makes a run authoritative, and unlinking it during recovery would destroy
+    /// the evidence for a state this store has only just learned to handle.
+    discarded: Vec<PathBuf>,
 }
 
 /// Choose all three.
@@ -2828,40 +2899,52 @@ fn recovery_generations_for_journal(
     // choose against it. It is what every decision below is measured from.
     let preferred = active_tail_logical_generation(selection);
 
-    // Contract review 2026-07-30-B, and the reason it is a closure rather than
-    // two copies: displacement can be decided here or in a session that crashed,
-    // and the two paths must not drift.
+    // Contract reviews 2026-07-30-B and 2026-07-30-G, and the reason it is a
+    // closure rather than two copies: displacement can be decided here or in a
+    // session that crashed, and the two paths must not drift.
     //
     // Naming the frames anything but `preferred` is what breaks a published run
     // holding locations against `preferred` — the manifest goes on naming the
     // run, `object_source` answers `None` for every location in it, and a reader
     // that reaches the run rather than the replay delta above it reads nothing
-    // and reports nothing. Replay masks that for exactly as long as nothing
-    // consumes runs directly, which is not a property to build a checkpointer
-    // on.
+    // and reports nothing.
     //
-    // So recovery refuses. Not because refusing is good — it is an outage on a
-    // root whose data is all present — but because the alternative is a store
-    // that opens and lies. The closure is for recovery to discard a run whose
-    // covered identity was not preserved, at which point this becomes successful
-    // reclamation; it is a change to what recovery *reclaims* and belongs with
-    // the checkpointing work that will exercise it (scope §6.5).
-    let refuse_if_displacement_strands_a_run = |chosen: u64| -> Result<(), StoreError> {
+    // B refused every such root. G reclaims the ones it can prove, and the proof
+    // is what `preferred` *is*: one past the last retained tail range, which is
+    // the identity of the **active journal** and of nothing else. Frames at that
+    // identity are above the manifest's committed prefix, therefore above any
+    // checkpoint horizon, therefore replayed in full — so a run holding only
+    // locations at `preferred` is rebuilt entry for entry by the delta this
+    // recovery is about to construct, at the generation the frames actually
+    // receive. Discarding it loses nothing; keeping it publishes locations that
+    // resolve to nothing.
+    //
+    // A run that mixes `preferred` with any other identity is still refused, and
+    // that is not conservatism. Its other entries may name a segment below the
+    // checkpoint horizon, which replay does not touch, so discarding the run
+    // would delete the only index those objects have — trading a diagnosable
+    // outage for silent loss, which is the trade B was written to prevent.
+    let mut discarded: Vec<PathBuf> = Vec::new();
+    let mut reclaim_or_refuse_displaced_runs = |chosen: u64| -> Result<(), StoreError> {
         if chosen == preferred {
             return Ok(());
         }
-        match published_runs
+        for retained in published_runs
             .iter()
-            .find(|retained| retained.run().references_segment_generation(preferred))
+            .filter(|retained| retained.run().references_segment_generation(preferred))
         {
-            Some(retained) => Err(StoreError::Corruption(format!(
-                "this recovery must name its frames generation {chosen} rather than {preferred}, \
-                 and published index run {} holds locations against {preferred}; recovery cannot \
-                 yet discard a run whose covered identity was not preserved",
-                retained.path().display()
-            ))),
-            None => Ok(()),
+            if !retained.run().references_only_segment_generation(preferred) {
+                return Err(StoreError::Corruption(format!(
+                    "this recovery must name its frames generation {chosen} rather than \
+                     {preferred}, and published index run {} holds locations against {preferred} \
+                     alongside locations against other generations; discarding it would drop \
+                     entries replay does not rebuild",
+                    retained.path().display()
+                )));
+            }
+            discarded.push(retained.path().to_path_buf());
         }
+        Ok(())
     };
 
     // Resuming: the identity was already chosen and the artifact carries it.
@@ -2872,11 +2955,12 @@ fn recovery_generations_for_journal(
     // resumable artifact *at* `preferred` displaces nothing and the guard is a
     // no-op on it.
     if let Some(logical) = resumable.into_iter().next() {
-        refuse_if_displacement_strands_a_run(logical)?;
+        reclaim_or_refuse_displaced_runs(logical)?;
         return Ok(RecoveryGenerations {
             logical,
             tail: preferred,
             manifest,
+            discarded,
         });
     }
 
@@ -2886,6 +2970,7 @@ fn recovery_generations_for_journal(
             logical: preferred,
             tail: preferred,
             manifest,
+            discarded,
         });
     }
 
@@ -2905,11 +2990,12 @@ fn recovery_generations_for_journal(
         .ok_or_else(|| {
             StoreError::Corruption("no logical generation remains for a recovery segment".into())
         })?;
-    refuse_if_displacement_strands_a_run(logical)?;
+    reclaim_or_refuse_displaced_runs(logical)?;
     Ok(RecoveryGenerations {
         logical,
         tail: preferred,
         manifest,
+        discarded,
     })
 }
 

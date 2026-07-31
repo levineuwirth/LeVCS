@@ -1148,6 +1148,41 @@ impl IndexRun {
         false
     }
 
+    /// Does every entry in this run name `generation`, and is there at least
+    /// one?
+    ///
+    /// Granted to recovery by contract review 2026-07-30-G, the sibling of
+    /// [`IndexRun::references_segment_generation`] and its one caller's second
+    /// question. Knowing a run holds locations against the identity recovery is
+    /// about to displace says the run is *affected*; knowing it holds nothing
+    /// else says the run is **reclaimable**, because replay rebuilds every
+    /// location it held and the run is redundant rather than lost.
+    ///
+    /// The distinction is the whole safety argument for discarding one. A run
+    /// mixing the displaced identity with an older one covers frames replay may
+    /// not rebuild — anything below the checkpoint horizon is not replayed at
+    /// all — and discarding that run would delete the only index those objects
+    /// have. So this is deliberately not `!references_some_other_generation`
+    /// with an empty run counting as reclaimable: emptiness is answered here
+    /// too, and an empty run is not something to reclaim on this evidence.
+    pub fn references_only_segment_generation(&self, generation: u64) -> bool {
+        let mut seen = false;
+        for i in 0..self.section_count {
+            let section = self.section(i);
+            for j in 0..section.entry_count {
+                if self
+                    .entry_location(section.first_entry + j, &section)
+                    .segment_generation
+                    != generation
+                {
+                    return false;
+                }
+                seen = true;
+            }
+        }
+        seen
+    }
+
     fn find_section(&self, namespace: &NamespaceId) -> Option<SectionHeader> {
         let mut lo = 0u64;
         let mut hi = self.section_count;

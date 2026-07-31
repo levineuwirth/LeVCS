@@ -1710,13 +1710,21 @@ costs:
 - **Nothing published names the displaced identity.** Recovery falls back to a free generation and
   succeeds. An orphan segment is a documented state in which the active journal stays the authority,
   and refusing here would turn a recoverable root into an outage.
-- **An index run the manifest names holds locations against it.** Recovery refuses the open with
-  `Corruption`, naming the run. Proceeding would publish a manifest whose run is authoritative and
-  resolves to nothing; the replay delta above it hides that from every lookup until the first
-  consumer that reads runs directly, which is the checkpointer.
+- **An index run the manifest names holds locations against it, and against nothing else.** Recovery
+  **reclaims** it: the row leaves the manifest it installs, the run leaves the retained generation
+  and the layered index, and the open succeeds. Sound because the displaced identity is the active
+  journal's — one past the last retained tail range, and nothing else can carry it — so its frames
+  are above every checkpoint horizon and replay rebuilds each entry the run held. The `.idx` stays
+  on the device and `ShardRecoveryReport::reclaimed_index_runs` records what happened.
+- **The run also holds locations against some other identity.** Recovery still refuses the open with
+  `Corruption`, naming the run. Its other entries may name a segment below the checkpoint horizon,
+  which replay does not touch, so discarding the run would delete the only index those objects have.
+  A diagnosable outage on a root that has lost nothing is the right outcome; publishing a manifest
+  whose run is authoritative and resolves to nothing is not — the replay delta above it hides that
+  from every lookup until the first consumer that reads runs directly, which is the checkpointer.
 
 The test is what the recovery *names its frames*, not how it got there: an interrupted recovery
-resuming a fallback an earlier session chose strands the same run, and takes the same refusal. A
+resuming a fallback an earlier session chose strands the same run, and takes the same treatment. A
 resumed seal at the identity the frames already carry displaces nothing and opens normally.
 
 The fallback applies only to frames being **sealed**. A journal that survives recovery keeps the
@@ -1726,10 +1734,11 @@ from the manifest across every open — the property the split rests on. Giving 
 fallback identity moved a number nothing recorded, and the next open, deriving the old one, searched
 published runs for a generation the frames no longer carried.
 
-The closure is for recovery to **discard an index run whose covered identity was not preserved**,
-which turns the refusal into successful reclamation. It is a change to what recovery reclaims and
-belongs with the checkpointing work that will exercise it. Until then a root carrying both an orphan
-segment and a run against the identity it holds does not open.
+**Closed by contract review 2026-07-30-G.** Recovery discards an index run whose covered identity was
+not preserved, which turned the refusal into successful reclamation for every run it can prove
+redundant. The refusal survives only where the proof does not hold — a run naming more than the
+displaced identity — and it is no longer a placeholder for missing capability but the correct answer
+for a run whose other entries replay would not rebuild.
 
 ### 6.5 B3 — StagingSessions
 

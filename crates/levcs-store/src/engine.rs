@@ -7285,36 +7285,101 @@ mod index_maintenance_tests {
     }
 
     /// Every path that names the frames something other than the identity they
-    /// carry owes the same refusal, so the tests assert it through one function
-    /// rather than through copies that can drift apart the way the code did.
-    fn assert_the_open_refuses_naming_the_run(
+    /// carry owes the same reclamation, so the tests assert it through one
+    /// function rather than through copies that can drift apart the way the code
+    /// did.
+    ///
+    /// Contract review 2026-07-30-B refused these roots; 2026-07-30-G reclaims
+    /// them. "Reclaimed" is four claims and the test is worth nothing without
+    /// all four: the open succeeds, the manifest stops naming the run, every
+    /// object the run covered still resolves, and the `.idx` is still on the
+    /// device. A store that merely opened would be indistinguishable from one
+    /// that dropped the objects on the floor.
+    fn assert_the_open_reclaims_the_run(
         options: StoreOptions,
         root: &Path,
         covered: IndexKey,
+        resolvable: &[ObjectId],
     ) {
-        let (run, named) = the_published_runs_generation(root, covered);
-        let runs = [run];
+        let (run, displaced) = the_published_runs_generation(root, covered);
+        let root_uuid = segment::read_format(&RootLayout::new(root))
+            .expect("FORMAT")
+            .root_uuid;
 
-        match StoreEngine::open(options) {
-            Err(StoreError::Corruption(message)) => assert!(
-                message.contains(&runs[0]),
-                "the refusal must name the run that cannot be resolved, not just \
-                 report a generation: {message}"
-            ),
-            Err(other) => panic!("expected Corruption naming the run, got {other:?}"),
-            // Not prose: the state this refuses is verified here, so removing
-            // the refusal reports what it costs rather than a bare expectation.
-            Ok(opened) => {
-                let committed = opened.committed_root();
-                let pinned = committed.object_source(0, named).expect("resolve");
+        let opened = StoreEngine::open(options).unwrap_or_else(|error| {
+            panic!(
+                "the displaced run {run} covers only the identity being displaced, so replay \
+                 rebuilds every entry it held; refusing is an outage on a root that has lost \
+                 nothing: {error:?}"
+            )
+        });
+
+        assert!(
+            !manifest_runs(root, 0, root_uuid).contains(&run),
+            "the manifest still names {run}; a row is what makes a run authoritative, so \
+             leaving it hands the unresolvable run to the next open"
+        );
+        assert_eq!(
+            opened.shared.recovery_reports[0]
+                .reclaimed_index_runs
+                .iter()
+                .filter_map(|path| path.file_name())
+                .filter_map(|name| name.to_str())
+                .collect::<Vec<_>>(),
+            vec![run.as_str()],
+            "a reclamation is invisible in the opened store, so it has to be reported"
+        );
+
+        let committed = opened.committed_root();
+        for object in resolvable {
+            let key = IndexKey::new(covered.namespace, *object);
+            let location = committed.index().get(&key).unwrap_or_else(|| {
                 panic!(
-                    "the open succeeded; published run {} names generation {named} and the \
-                     reopened root pins {pinned:?} there — every lookup reaching the run \
-                     rather than the replay delta above it reads nothing",
-                    runs[0]
-                );
-            }
+                    "{} was covered by the reclaimed run and is now in no index at all",
+                    object.to_hex()
+                )
+            });
+            assert!(
+                committed
+                    .object_source(0, location.segment_generation)
+                    .expect("resolve the source of a reclaimed run's entry")
+                    .is_some(),
+                "{} resolves to generation {} and nothing pins it",
+                object.to_hex(),
+                location.segment_generation
+            );
         }
+
+        // The manifest governs the *next* open. This session must stop consulting
+        // and stop pinning the run in the same breath, or a direct run consumer
+        // — `StoreEngine::checkpoint` is one — reads locations that resolve to
+        // nothing for as long as the process lives. A lookup would not show it:
+        // the replay delta sits above the runs and answers first.
+        assert!(
+            committed
+                .index()
+                .sealed_runs()
+                .iter()
+                .all(|sealed| !sealed.references_segment_generation(displaced)),
+            "a run this session still consults holds locations against the displaced \
+             generation {displaced}, which now resolves to nothing"
+        );
+        assert!(
+            committed
+                .retained_generations()
+                .values()
+                .filter(|generation| generation.id.shard_index == 0)
+                .flat_map(|generation| generation.index_runs.iter())
+                .all(|retained| retained.path().file_name() != Some(std::ffi::OsStr::new(&run))),
+            "{run} is still pinned by the retained generation, so it is still part of \
+             what this generation claims to hold"
+        );
+
+        assert!(
+            root.join("shards/00/indexes").join(&run).exists(),
+            "the reclaimed {run} must be left on the device; recovery unlinking it would \
+             destroy the evidence for a state this store has only just learned to handle"
+        );
     }
 
     /// The generation the published run names for `covered` — read out of the
@@ -7347,18 +7412,23 @@ mod index_maintenance_tests {
         (runs[0].clone(), location.segment_generation)
     }
 
-    /// Contract review 2026-07-30-B: the two states an occupied identity leaves.
+    /// Contract reviews 2026-07-30-B and 2026-07-30-G: what an occupied identity
+    /// costs.
     ///
     /// The tail's identity is generation 1 and a published run holds locations
     /// against it. An orphan `.seg` occupies that name, so recovery must seal
-    /// the frames under a different one — and the run then stays authoritative
-    /// through the manifest while resolving to nothing. Recovery refuses.
+    /// the frames under a different one — and the run would then stay
+    /// authoritative through the manifest while resolving to nothing. B refused
+    /// the open. G reclaims the run instead, which is sound here and only here:
+    /// every location it holds names the tail, and the tail's frames are above
+    /// any checkpoint horizon, so replay rebuilds all of them.
     ///
-    /// Replay masks this while a lookup goes through the delta above the run, so
-    /// the assertion is the open itself. `StoreEngine::checkpoint` is a direct
+    /// Replay masks the dangling state while a lookup goes through the delta
+    /// above the run, which is why the assertion is what the *manifest* names
+    /// rather than what a lookup answers. `StoreEngine::checkpoint` is a direct
     /// run consumer and would not be masked.
     #[test]
-    fn an_orphan_holding_a_published_runs_identity_refuses_the_open() {
+    fn an_orphan_holding_a_published_runs_identity_reclaims_it() {
         let serial = writer_serial();
         let temporary = tempfile::tempdir().expect("tempdir");
         let namespace = NamespaceId([0x4A; 32]);
@@ -7378,10 +7448,11 @@ mod index_maintenance_tests {
             orphan_segment_at(temporary.path(), 0, 1);
         }
 
-        assert_the_open_refuses_naming_the_run(
+        assert_the_open_reclaims_the_run(
             configure(),
             temporary.path(),
             IndexKey::new(namespace, ObjectId([0x60; 32])),
+            &[ObjectId([0x60; 32]), ObjectId([0x61; 32])],
         );
     }
 
@@ -7394,9 +7465,10 @@ mod index_maintenance_tests {
     /// the identity it reuses is still not the one the frames carry, so the
     /// published run naming generation 1 is stranded exactly as it would be by a
     /// fresh fallback. Resumption is a reason to keep a choice, not a reason to
-    /// skip the check on it.
+    /// skip the check on it — and under 2026-07-30-G the check reclaims rather
+    /// than refuses, on the resumed path exactly as on the fresh one.
     #[test]
-    fn a_resumed_fallback_refuses_on_the_identity_it_resumes() {
+    fn a_resumed_fallback_reclaims_on_the_identity_it_resumes() {
         let serial = writer_serial();
         let temporary = tempfile::tempdir().expect("tempdir");
         let namespace = NamespaceId([0x4C; 32]);
@@ -7417,10 +7489,11 @@ mod index_maintenance_tests {
             resumable_prefix_at(temporary.path(), 0, 2);
         }
 
-        assert_the_open_refuses_naming_the_run(
+        assert_the_open_reclaims_the_run(
             configure(),
             temporary.path(),
             IndexKey::new(namespace, ObjectId([0x60; 32])),
+            &[ObjectId([0x60; 32]), ObjectId([0x61; 32])],
         );
     }
 
@@ -7480,13 +7553,96 @@ mod index_maintenance_tests {
         );
 
         // Now occupy the identity the frames carry, so the next open must
-        // displace them — and owes the refusal for the run that names them.
+        // displace them — and owes the reclamation for the run that names them.
         orphan_segment_at(temporary.path(), 0, 2);
-        assert_the_open_refuses_naming_the_run(
+        assert_the_open_reclaims_the_run(
             configure(),
             temporary.path(),
             IndexKey::new(namespace, ObjectId([0x60; 32])),
+            &[ObjectId([0x60; 32]), ObjectId([0x61; 32])],
         );
+    }
+
+    /// The case reclamation must *not* reach, which is the whole reason it is
+    /// conditional.
+    ///
+    /// A run may hold locations against more than one identity: a reopen replays
+    /// what the previous session sealed into a segment and what its journal
+    /// still holds, and a seal over that backlog covers both. Displacing the
+    /// tail's identity strands only the entries naming the tail — the ones
+    /// naming the segment are fine, and they may sit below a checkpoint horizon,
+    /// which replay does not touch. Discarding a run like that would delete the
+    /// only index those objects have.
+    ///
+    /// So recovery still refuses here, and the refusal is the good outcome: an
+    /// operator gets a diagnosable outage on a root that has lost nothing,
+    /// rather than a store that opens and has silently dropped an index. The
+    /// precondition — that the run really does name two generations — is
+    /// asserted, or this test would pass while proving only that something
+    /// refused.
+    #[test]
+    fn a_run_naming_more_than_the_displaced_identity_is_refused_not_discarded() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let namespace = NamespaceId([0x4F; 32]);
+        let configure = || {
+            let mut options = sealing_options(&serial, temporary.path(), 4_000_000);
+            // Fan-out, not entry pressure: the seal has to land once the replay
+            // delta and a fresh layer are both present, so the run it writes
+            // spans the segment recovery sealed and the journal above it.
+            options.max_index_runs = 2;
+            options.max_open_index_runs = 2;
+            options
+        };
+        {
+            let engine = StoreEngine::open(configure()).expect("open a fresh root");
+            block_on(engine.submit(create_transaction(namespace, 2))).expect("create");
+            block_on(engine.submit(push_transaction(namespace, 0x60, 0x60, None)))
+                .expect("a first object, which the next open seals into a segment");
+        }
+        {
+            let engine = StoreEngine::open(configure()).expect("reopen over the sealed prefix");
+            block_on(engine.submit(push_transaction(namespace, 0x61, 0x61, None)))
+                .expect("a second layer above the replayed one");
+            block_on(engine.submit(push_transaction(namespace, 0x62, 0x62, None)))
+                .expect("crossing the fan-out ceiling, which seals across both");
+            assert_eq!(engine.index_maintenance().sealed_runs, 1, "the seal ran");
+        }
+
+        let (run, older) = the_published_runs_generation(
+            temporary.path(),
+            IndexKey::new(namespace, ObjectId([0x60; 32])),
+        );
+        let (_, displaced) = the_published_runs_generation(
+            temporary.path(),
+            IndexKey::new(namespace, ObjectId([0x61; 32])),
+        );
+        assert_ne!(
+            older, displaced,
+            "{run} names one identity, so it is the reclaimable case and this test is not \
+             exercising the refusal it claims to"
+        );
+
+        // Occupy the identity the journal's frames carry, so the next open must
+        // displace it — and finds a run it cannot discard.
+        orphan_segment_at(temporary.path(), 0, displaced);
+        match StoreEngine::open(configure()) {
+            Err(StoreError::Corruption(message)) => {
+                assert!(
+                    message.contains(&run) && message.contains("other generations"),
+                    "the refusal must name the run and why it cannot be discarded: {message}"
+                );
+            }
+            Err(other) => panic!("expected Corruption naming the run, got {other:?}"),
+            Ok(opened) => {
+                let committed = opened.committed_root();
+                panic!(
+                    "the open succeeded; {run} also names generation {older}, whose frames \
+                     replay need not rebuild, and generation {older} now pins {:?}",
+                    committed.object_source(0, older)
+                );
+            }
+        }
     }
 
     /// Resumption itself is not the hazard, and a guard that treated it as one

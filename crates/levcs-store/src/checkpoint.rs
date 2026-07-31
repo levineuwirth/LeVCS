@@ -25,7 +25,6 @@
 //! and digest domain. This is recorded as an interface note rather than worked
 //! around silently.
 
-use std::fs::File;
 use std::io::IoSlice;
 use std::path::{Path, PathBuf};
 
@@ -950,6 +949,159 @@ pub fn install(
     checkpoint: &Checkpoint,
     counters: &DurabilityCounters,
 ) -> Result<PathBuf, StoreError> {
+    install_at(dir, checkpoint, counters, false)
+}
+
+/// A checkpoint reduced to what it durably *claims*, with the values a crash and
+/// the recovery after it are entitled to move erased.
+///
+/// This is a comparison aid, never a description of what may be published.
+/// Three things come out, and `reconciles_with` re-imposes a rule on two of
+/// them rather than letting them go:
+///
+/// * `created_at_micros` — when the image was built, not what it says. This one
+///   really is free.
+/// * The resume point, which the found image records against the journal that
+///   was active before the crash.
+/// * Per-receipt visibility, which recovery re-derives and extends.
+///
+/// Everything left is a claim about the state below the horizon: catalog, refs,
+/// and every durable field of every receipt. `receipt_for_recovery` rebuilds all
+/// of those from the frame's own facts, so a faithful pre-crash image and a
+/// post-recovery rebuild agree on them exactly, and anything that does not agree
+/// is describing something else.
+pub(crate) fn durable_claims(checkpoint: &Checkpoint) -> Checkpoint {
+    let mut claims = checkpoint.clone();
+    claims.created_at_micros = 0;
+    claims.active_journal_id = [0u8; 16];
+    claims.active_journal_offset = 0;
+    for receipt in claims.receipts.iter_mut() {
+        receipt.first_receipt_visibility_micros = None;
+        receipt.receipt_visible_until_micros = 0;
+    }
+    claims
+}
+
+/// Whether `candidate` may replace the finalized `existing` at their shared
+/// name — the whole safety argument for overwriting a checkpoint.
+///
+/// `Err` carries the clause for the refusal message. Three tests, and the last
+/// two exist because erasing a field from [`durable_claims`] is not the same as
+/// deciding it does not matter.
+///
+/// 1. **Same durable claims.** Otherwise the file describes state this shard
+///    cannot produce, and overwriting it would destroy the only evidence of
+///    however that happened.
+/// 2. **The resume point may differ only by naming a different journal.** A
+///    checkpoint whose `active_journal_id` matches the surviving journal is
+///    trusted for its *offset* by recovery, without a derivation of its own, so
+///    a matching identity at a disagreeing offset is a claim about live state
+///    that this shard did not make — it reopens as `recovered through sequence
+///    N but its active journal resumes at N+1`. The ordinary strand passes
+///    freely: it names the journal the crash left behind, recovery sealed that
+///    journal away, and the candidate names the fresh one.
+/// 3. **The replacement may not shorten retention.** Recovery may extend a
+///    receipt's first-visibility and deadline and never reduce them (plan
+///    invariant 7), so the candidate — built after that recovery — must be at or
+///    beyond the found image on both. A `None` first-visibility is the weakest
+///    value there is and is therefore always allowed on the found side; on the
+///    candidate's side it means the promotion this rule exists to preserve never
+///    happened.
+///
+/// Receipts are compared pairwise by position, which is sound only because rule
+/// 1 has already established that both sides carry the same receipts in the same
+/// canonical order.
+pub(crate) fn reconciles_with(existing: &Checkpoint, candidate: &Checkpoint) -> Result<(), String> {
+    if durable_claims(existing) != durable_claims(candidate) {
+        return Err(format!(
+            "describes different state than this shard would checkpoint at {}; publishing it \
+             would suppress replay of frames it does not describe",
+            candidate.shard_committed_sequence
+        ));
+    }
+
+    if existing.active_journal_id == candidate.active_journal_id
+        && existing.active_journal_offset != candidate.active_journal_offset
+    {
+        return Err(format!(
+            "resumes the journal this shard is still writing at offset {}, which is not where \
+             this shard would resume it ({}); recovery trusts that offset without deriving it",
+            existing.active_journal_offset, candidate.active_journal_offset
+        ));
+    }
+
+    for (found, ours) in existing.receipts.iter().zip(candidate.receipts.iter()) {
+        let regressed = match (
+            found.first_receipt_visibility_micros,
+            ours.first_receipt_visibility_micros,
+        ) {
+            (Some(found_first), Some(our_first)) => our_first < found_first,
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        if regressed || ours.receipt_visible_until_micros < found.receipt_visible_until_micros {
+            return Err(format!(
+                "holds receipt retention for operation {} that this shard's image would \
+                 shorten; recovery may extend a receipt's visibility and never reduce it",
+                found.operation_id.to_hex()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// [`install`] over a name a crash already finalized, and only over one this
+/// call has just proved out.
+///
+/// A directory fence failure lands *after* the rename, so an interrupted
+/// checkpoint leaves a whole, validating file at its published name that no
+/// manifest references. Its name comes from the committed sequence, so the
+/// retry cannot choose another one, and `rename_noreplace` refuses forever.
+///
+/// The retry cannot simply publish what it finds, either: it happens after the
+/// recovery the crash forced, and recovery legitimately moves values the found
+/// image still holds at their pre-crash settings — the resume point, and receipt
+/// visibility, which recovery may only ever extend. Publishing the older image
+/// would walk those backwards. So the shard writes its own and replaces.
+///
+/// **This is the one name in the store that may be overwritten**, and the proof
+/// that licenses it is [`reconciles_with`], which is why the two are one
+/// operation rather than two. Exposing the replacement separately would put an
+/// unproved checkpoint overwrite on this module's surface, and the proof is the
+/// entire safety argument: the occupant must read back as a valid checkpoint for
+/// this shard, agree on every durable claim, and be no *stronger* than the image
+/// replacing it. Because the two then differ only where the replacement is the
+/// better of the pair, and because the rename is atomic, a manifest that names
+/// this file holds a valid referent at every instant — before, during, and
+/// after.
+///
+/// `existing` is the occupant as *this store* read it back, not as the caller
+/// wishes it were; the caller is responsible for having loaded it through
+/// [`load_newest_valid`] at this exact path. Frozen-seam amendment recorded as
+/// contract review 2026-07-30-F; the `rename_noreplace` rule stands everywhere
+/// else, including for a checkpoint name no such proof covers.
+pub(crate) fn replace_reconciled(
+    dir: &Path,
+    existing: &Checkpoint,
+    checkpoint: &Checkpoint,
+    counters: &DurabilityCounters,
+) -> Result<PathBuf, StoreError> {
+    reconciles_with(existing, checkpoint).map_err(|reason| {
+        StoreError::Corruption(format!(
+            "{} already exists and {reason}; it is left untouched",
+            dir.join(checkpoint.file_name()).display()
+        ))
+    })?;
+    install_at(dir, checkpoint, counters, true)
+}
+
+fn install_at(
+    dir: &Path,
+    checkpoint: &Checkpoint,
+    counters: &DurabilityCounters,
+    replace: bool,
+) -> Result<PathBuf, StoreError> {
     std::fs::create_dir_all(dir)?;
     let bytes = checkpoint.encode()?;
     let final_path = dir.join(checkpoint.file_name());
@@ -990,7 +1142,12 @@ pub fn install(
         }
         crate::sys::fdatasync(&file, counters)?;
     }
-    crate::sys::rename_noreplace(&tmp_path, &final_path).map_err(|e| {
+    let renamed = if replace {
+        crate::sys::rename_replace(&tmp_path, &final_path)
+    } else {
+        crate::sys::rename_noreplace(&tmp_path, &final_path)
+    };
+    renamed.map_err(|e| {
         // Leave the temporary behind for forensics rather than unlinking it
         // on a path that already surprised us.
         StoreError::from(e)

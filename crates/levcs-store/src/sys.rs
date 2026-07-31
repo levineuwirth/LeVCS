@@ -318,6 +318,17 @@ pub(crate) fn fsync_dir_fd(directory: &File, counters: &DurabilityCounters) -> i
 /// `renameat2(RENAME_NOREPLACE)`. For every name that must never overwrite:
 /// new manifests, segments, checkpoints, index runs, and migration/restore
 /// siblings. Plan §9 forbids a copy fallback.
+///
+/// One exception, and it is narrow. A checkpoint whose install was interrupted
+/// after this rename and before the manifest that publishes it leaves a
+/// finalized file at a name derived from the committed sequence, so the retry
+/// can never choose another one and this call would refuse forever. The retry
+/// may use [`rename_replace`] over **that** name, and only through
+/// `checkpoint::replace_reconciled`, whose own `reconciles_with` proof
+/// establishes before the rename that the occupant is a valid
+/// checkpoint for the shard agreeing on every durable claim and no stronger
+/// than its replacement. Contract review 2026-07-30-F; the rule stands for
+/// every other name and for any checkpoint name not proved out that way.
 pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
     rustix::fs::renameat_with(
         rustix::fs::CWD,
@@ -329,9 +340,16 @@ pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
     .map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))
 }
 
-/// Plain atomic replacing rename. Exactly one legitimate call site: the
-/// `CURRENT.tmp` -> `CURRENT` pointer install of scope 3.5, which by
-/// definition replaces. Every other site uses `rename_noreplace`.
+/// Plain atomic replacing rename. Two legitimate call sites, and no others:
+///
+/// 1. The `CURRENT.tmp` -> `CURRENT` pointer install of scope 3.5, which by
+///    definition replaces.
+/// 2. `checkpoint::replace_reconciled`, repairing a checkpoint an interrupted
+///    install left finalized at a name the retry cannot choose again — and only
+///    over an occupant that call has proved reconciles with its replacement.
+///    Contract review 2026-07-30-F; see [`rename_noreplace`].
+///
+/// Every other site uses `rename_noreplace`.
 pub(crate) fn rename_replace(from: &Path, to: &Path) -> io::Result<()> {
     std::fs::rename(from, to)
 }

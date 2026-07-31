@@ -1437,24 +1437,42 @@ fn spawn_shard_writer(
         )));
     }
 
-    // What recovery already made unreplayable. A checkpoint moved the replay
-    // start, so everything the manifest's runs hold and every namespace the
-    // checkpoint's catalog carries is below the horizon and is not rebuilt by
-    // replaying anything. Without a checkpoint there is no horizon and the
-    // whole journal is replayable, which is the pre-checkpoint accounting.
-    let checkpointed = if recovered.report.checkpoint_sequence.is_some() {
-        (
-            recovered
-                .retained_generation
-                .index_runs
-                .iter()
-                .map(|retained| retained.run().entry_count())
-                .sum::<u64>(),
-            recovered.catalog.len() as u64,
-        )
-    } else {
-        (0, 0)
-    };
+    // Two corrections to replay accounting that are deliberately *not* the same
+    // idea, however similar they look here.
+    //
+    // `run_entry_baseline` cancels **duplicate representation**; it is not a
+    // claim that these particular runs lie below the checkpoint horizon.
+    // Recovery both retains every run it finds and rebuilds every replayed frame
+    // into the delta, so a frame a retained run already covers is counted twice.
+    // Subtracting the run total *as it stood at open* removes one copy, and it
+    // has to stay that open-time total: a later seal moves entries out of the
+    // backlog and into runs above this fixed baseline, leaving the sum
+    // unchanged. Restricting the subtraction to runs below the horizon would
+    // double-count every post-checkpoint entry instead.
+    //
+    // `checkpoint_namespaces` really is a horizon claim, because namespaces have
+    // no backlog term to cancel against. It must therefore come from the
+    // checkpoint's own catalog rather than from `recovered.catalog`, which also
+    // carries every namespace replay just rebuilt — and will rebuild again.
+    //
+    // Without a checkpoint both terms are zero, so a run's entries are counted
+    // once in the run and once in the replayed backlog. That over-states the
+    // pressure and can only refuse early, never admit work a reopen cannot
+    // rebuild, so it stays as it is rather than widening this change.
+    let (run_entry_baseline, checkpoint_namespaces) =
+        if recovered.report.checkpoint_sequence.is_some() {
+            (
+                recovered
+                    .retained_generation
+                    .index_runs
+                    .iter()
+                    .map(|retained| retained.run().entry_count())
+                    .sum::<u64>(),
+                recovered.checkpoint_namespaces,
+            )
+        } else {
+            (0, 0)
+        };
 
     let mut repositories = BTreeMap::new();
     for (namespace, record) in recovered.catalog.iter() {
@@ -1472,8 +1490,8 @@ fn spawn_shard_writer(
         in_flight_reservation: None,
         repositories,
         tail_generation: tail.logical_generation,
-        checkpointed_run_entries: checkpointed.0,
-        checkpointed_namespaces: checkpointed.1,
+        run_entry_baseline,
+        checkpoint_namespaces,
         journal,
         shard_index,
         poison: None,
@@ -1553,15 +1571,25 @@ struct ShardWriter {
     /// Logical index generation of the active journal, so an index location
     /// built here resolves to the same pinned file after a reopen.
     tail_generation: u64,
-    /// What the newest checkpoint already made unreplayable, so the replay
-    /// ceiling measures what a reopen would actually rebuild.
+    /// Sealed-run entries that some other term of the replay ceiling already
+    /// accounts for — a **duplicate-representation baseline**, not a horizon.
     ///
-    /// Set at open from the state recovery loaded, and again by every
-    /// checkpoint this writer takes. Both are the same statement: everything
-    /// sealed and every namespace catalogued as of the checkpoint is below its
-    /// horizon, and a reopen starts above it.
-    checkpointed_run_entries: u64,
-    checkpointed_namespaces: u64,
+    /// Recovery retains every run it finds *and* rebuilds every replayed frame
+    /// into the delta, so frames a retained run covers arrive in the ceiling
+    /// twice. This cancels one copy. It is the run total as of the moment it was
+    /// set, and it stays fixed while the shard runs: a seal moves entries from
+    /// the backlog into runs *above* it, which is exactly why the total does not
+    /// move. It says nothing about which side of the checkpoint those runs sit
+    /// on, and must not be narrowed to the ones below it.
+    run_entry_baseline: u64,
+    /// Namespaces the newest checkpoint's own catalog carries, and therefore the
+    /// ones a reopen does not rebuild by replaying.
+    ///
+    /// This one *is* a horizon claim: namespaces have no backlog term to cancel
+    /// against, so it must count the checkpoint's catalog rather than the live
+    /// or fully replayed one, which also holds namespaces created above the
+    /// horizon that every replay rebuilds.
+    checkpoint_namespaces: u64,
     poison: Option<StoreError>,
 }
 
@@ -2742,15 +2770,15 @@ impl ShardWriter {
         backlog: &UnsealedBacklog,
         incoming: Option<&ValidatedTransaction>,
     ) -> (u64, u64) {
-        // Sealed-run entries **above the checkpoint horizon**. A reopen rebuilds
-        // what it replays, and it replays nothing at or below the newest
-        // checkpoint — so counting every run entry made checkpointing unable to
-        // relieve the pressure it exists to relieve: a shard at the ceiling
-        // checkpointed successfully and was then refused its next single-object
-        // transaction. Subtracting rather than dropping the accounting: runs
-        // sealed *after* the checkpoint cover frames a reopen does replay, and
-        // ignoring them would reopen the hole that made a store accept work it
-        // could not read back.
+        // Sealed-run entries, less the entries some other term here already
+        // stands for. Counting every run entry outright made checkpointing
+        // unable to relieve the pressure it exists to relieve: a shard at the
+        // ceiling checkpointed successfully and was then refused its next
+        // single-object transaction. Dropping run accounting instead would
+        // reopen the hole that let a store accept work it could not read back,
+        // because runs sealed after the checkpoint do cover frames a reopen
+        // replays. Subtracting the baseline is what leaves each replayable
+        // entry counted exactly once — see `run_entry_baseline`.
         let sealed: u64 = root
             .retained_generations()
             .values()
@@ -2758,7 +2786,7 @@ impl ShardWriter {
             .flat_map(|generation| generation.index_runs.iter())
             .map(|retained| retained.run().entry_count())
             .sum::<u64>()
-            .saturating_sub(self.checkpointed_run_entries);
+            .saturating_sub(self.run_entry_baseline);
         let open_group: u64 = self
             .pending
             .iter()
@@ -2780,10 +2808,12 @@ impl ShardWriter {
         if let Some(transaction) = incoming {
             namespaces.insert(transaction.namespace);
         }
-        // Namespaces the checkpoint's catalog already carries are not rebuilt
-        // by replay either, and the byte ceiling is measured over what replay
-        // rebuilds.
-        let namespaces = (namespaces.len() as u64).saturating_sub(self.checkpointed_namespaces);
+        // Namespaces the checkpoint's own catalog carries are not rebuilt by
+        // replay either, and the byte ceiling is measured over what replay
+        // rebuilds. Only the checkpoint's count may be subtracted here: a
+        // namespace created *above* the horizon is rebuilt by every replay, so
+        // subtracting it would let the shard admit a section it cannot reopen.
+        let namespaces = (namespaces.len() as u64).saturating_sub(self.checkpoint_namespaces);
         (
             entries,
             crate::index::encoded_bytes_for(entries, namespaces),
@@ -3030,7 +3060,8 @@ impl ShardWriter {
         // describe other state, and the manifest, the journal and the root are
         // all untouched. Wedging the shard for a condition it can still refuse
         // cleanly would turn a diagnosable state into an outage.
-        let installed = self.install_or_adopt_checkpoint(&paths, &checkpoint, &counters)?;
+        let installed =
+            self.install_or_replace_checkpoint(&paths, &manifest, &checkpoint, &counters)?;
 
         // The manifest may not commit through a sequence no retained segment
         // names, so the prefix in `active/` is sealed in the same publication.
@@ -3179,16 +3210,19 @@ impl ShardWriter {
             return Err(self.poison_now(format!("publishing a checkpoint: {error}")));
         }
 
-        // The horizon moved. Everything now sealed, and every namespace this
-        // checkpoint catalogued, is below it and is not rebuilt by replay —
-        // which is what makes the next admission measure the work a reopen
-        // would actually do rather than the whole history of the shard.
-        self.checkpointed_run_entries = successor
+        // The horizon moved, so both terms are re-taken against the state this
+        // checkpoint just published. The journal is fresh and the backlog is
+        // empty, so re-baselining the runs to their current total leaves the
+        // ceiling measuring only work taken after this point — the same
+        // one-copy-per-entry rule the open-time baseline enforces. The
+        // namespace term comes from the checkpoint's own catalog, which here is
+        // also the live one: nothing has been written above the horizon yet.
+        self.run_entry_baseline = successor
             .index_runs
             .iter()
             .map(|retained| retained.run().entry_count())
             .sum();
-        self.checkpointed_namespaces = checkpoint.catalog.len() as u64;
+        self.checkpoint_namespaces = checkpoint.catalog.len() as u64;
 
         // Only after both the checkpoint and its authoritative manifest are
         // fenced, so every retained manifest keeps a retained referent.
@@ -3300,33 +3334,59 @@ impl ShardWriter {
         })
     }
 
-    /// Install the checkpoint, or adopt a finalized one already at its name.
+    /// Install the checkpoint, or replace a finalized one already at its name.
     ///
     /// A crash between `install`'s rename and the manifest that publishes it
     /// leaves a complete, fenced checkpoint no manifest references. Its name is
     /// derived from the sequence, so the next attempt at the same sequence
     /// renames onto it — and `rename_noreplace` refuses, permanently, for a
-    /// file that is not wrong but merely unreferenced. Validating and adopting
-    /// it is what turns a wedged shard back into a checkpointed one.
+    /// file that is not wrong but merely unreferenced.
     ///
-    /// # What "the same checkpoint" has to mean
+    /// # Why the retry replaces rather than adopts
     ///
-    /// Matching the name and the committed sequence is not enough, and the gap
-    /// is not theoretical: publishing a *different* checkpoint at the right
-    /// sequence suppresses replay of exactly the frames it fails to describe,
-    /// so a checkpoint with an empty catalog makes a namespace disappear at the
-    /// next open with nothing anywhere reporting a fault. Adoption therefore
-    /// requires logical equivalence to the checkpoint this call would have
-    /// written — catalog, refs, receipts, resume point and all — and
-    /// `created_at_micros` is the only field allowed to differ, being when the
-    /// image was built rather than what it says.
+    /// Adopting it — publishing the bytes already on the device — was the
+    /// obvious repair and is wrong twice, because the retry necessarily happens
+    /// *after* the recovery the crash forced, and the found image still holds
+    /// values from before it:
     ///
-    /// Anything else at the name is refused. The file may be perfectly valid
-    /// and simply describe another state; overwriting it would destroy the
-    /// evidence, and adopting it would publish a claim this shard cannot make.
-    fn install_or_adopt_checkpoint(
+    /// * **Receipt visibility.** Recovery re-derives first-visibility and the
+    ///   retention deadline and may only ever *extend* them (plan invariant 7).
+    ///   The found image carries the pre-crash pair; publishing it puts an
+    ///   earlier `Some(first_visibility)` on the device, and the *next* open
+    ///   anchors on that value instead of re-promoting — so retention regresses,
+    ///   which the invariant forbids.
+    /// * **The resume point.** Recovery does not independently re-derive this.
+    ///   When a checkpoint's `active_journal_id` matches the surviving journal it
+    ///   trusts the recorded offset outright, so a found image naming that
+    ///   journal at the wrong offset is adopted straight into a store that
+    ///   cannot reopen.
+    ///
+    /// So the shard writes its own image and replaces. Both hazards disappear
+    /// with the same stroke: what reaches the device is what this call built,
+    /// carrying the promoted deadlines and a resume point describing the journal
+    /// this checkpoint is about to seal.
+    ///
+    /// # What the occupant still has to prove
+    ///
+    /// Replacement is not licence to overwrite. Publishing a *different*
+    /// checkpoint at the right sequence suppresses replay of exactly the frames
+    /// it fails to describe — an empty catalog at the live sequence makes a
+    /// namespace disappear at the next open with nothing reporting a fault — and
+    /// a file describing other state is evidence of something this shard does not
+    /// understand. So the occupant must read back as a valid checkpoint for this
+    /// shard, and then satisfy [`crate::checkpoint::reconciles_with`] — which
+    /// [`crate::checkpoint::replace_reconciled`] applies itself, so the proof
+    /// and the overwrite cannot come apart — before a single byte moves.
+    /// Otherwise it is left exactly where it is and the checkpoint refuses,
+    /// without poisoning: nothing durable has moved.
+    ///
+    /// A published name is never a candidate. If the current manifest already
+    /// references this file the shard is not recovering from a strand at all, and
+    /// overwriting a referenced checkpoint is not a repair.
+    fn install_or_replace_checkpoint(
         &self,
         paths: &crate::segment::ShardPaths,
+        manifest: &Manifest,
         checkpoint: &crate::checkpoint::Checkpoint,
         counters: &Arc<DurabilityCounters>,
     ) -> Result<PathBuf, StoreError> {
@@ -3337,16 +3397,30 @@ impl ShardWriter {
                 return crate::checkpoint::install(&directory, checkpoint, counters)
             }
             // A symlink or a device at the published name is refused for the
-            // same reason the temporary is opened through the funnel: adopting
-            // it would publish a manifest row pointing at something the store
-            // never wrote.
+            // same reason the temporary is opened through the funnel: writing
+            // through it would put the store's bytes somewhere it never chose,
+            // and a manifest row would then point at something it never wrote.
             crate::sys::NamedRegularFile::NotRegular => {
                 return Err(StoreError::UnrecognizedLayout(format!(
-                    "{} is not a regular file; refusing to adopt a checkpoint through it",
+                    "{} is not a regular file; refusing to install a checkpoint through it",
                     destination.display()
                 )))
             }
             crate::sys::NamedRegularFile::Opened(_) => {}
+        }
+
+        let name = checkpoint.file_name();
+        if manifest
+            .checkpoints
+            .iter()
+            .any(|(_, published)| *published == name)
+        {
+            return Err(StoreError::Corruption(format!(
+                "{} is referenced by the current manifest of shard {}, so it is published \
+                 rather than stranded; a checkpoint at this sequence has already been taken",
+                destination.display(),
+                self.shard_index
+            )));
         }
 
         // Read back through the reader recovery itself uses, so a file that
@@ -3371,18 +3445,10 @@ impl ShardWriter {
             }
         };
 
-        let equivalent = crate::checkpoint::Checkpoint {
-            created_at_micros: checkpoint.created_at_micros,
-            ..existing
-        };
-        if &equivalent != checkpoint {
-            return Err(StoreError::Corruption(format!(
-                "{} already exists and describes different state than this shard would                  checkpoint at {}; adopting it would publish a manifest that suppresses                  replay of frames it does not describe",
-                destination.display(),
-                checkpoint.shard_committed_sequence
-            )));
-        }
-        Ok(destination)
+        // Proof and replacement are one call: there is no way to overwrite a
+        // checkpoint in this crate that does not first establish the occupant
+        // reconciles with what is about to replace it.
+        crate::checkpoint::replace_reconciled(&directory, &existing, checkpoint, counters)
     }
 
     /// The successor pin: what the predecessor held, plus the sealed segment
@@ -6818,6 +6884,47 @@ mod index_maintenance_tests {
         RootLayout::new(root).shard(shard)
     }
 
+    /// The checkpoint rows the manifest `CURRENT` names — the only list that
+    /// makes a checkpoint on the device authoritative rather than residue.
+    /// The checkpoint on the device at one sequence, read back through the
+    /// reader recovery uses.
+    #[cfg(feature = "failpoints")]
+    fn load_checkpoint_at(root: &Path, shard: u16, sequence: u64) -> crate::checkpoint::Checkpoint {
+        let directory = shard_paths(root, shard).checkpoints();
+        let root_uuid = segment::read_format(&RootLayout::new(root))
+            .expect("FORMAT")
+            .root_uuid;
+        match crate::checkpoint::load_newest_valid(&directory, &root_uuid, shard, 8)
+            .expect("load the newest valid checkpoint")
+        {
+            crate::checkpoint::CheckpointLoad::Loaded {
+                checkpoint, path, ..
+            } => {
+                assert_eq!(
+                    path.file_name().and_then(|name| name.to_str()),
+                    Some(format!("{sequence}.checkpoint").as_str()),
+                    "the newest valid checkpoint is not the one under test"
+                );
+                *checkpoint
+            }
+            other => panic!("expected a loadable checkpoint at {sequence}, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "failpoints")]
+    fn manifest_checkpoints(root: &Path, shard: u16) -> Vec<(u64, String)> {
+        let paths = shard_paths(root, shard);
+        let root_uuid = segment::read_format(&RootLayout::new(root))
+            .expect("FORMAT")
+            .root_uuid;
+        let Some(pointer) = read_current(&paths, &root_uuid).expect("read CURRENT") else {
+            return Vec::new();
+        };
+        read_manifest(&paths, pointer.generation, &root_uuid)
+            .expect("read the current manifest")
+            .checkpoints
+    }
+
     /// Every index run the manifest `CURRENT` names, which is the only list
     /// that makes a run authoritative.
     fn manifest_runs(root: &Path, shard: u16, root_uuid: [u8; 16]) -> Vec<String> {
@@ -7736,6 +7843,67 @@ mod index_maintenance_tests {
         );
     }
 
+    /// A namespace created *above* the checkpoint horizon is replayed, so the
+    /// ceiling has to keep counting it.
+    ///
+    /// The writer took its "already durable" namespace count from the fully
+    /// recovered catalog, which is the checkpoint's catalog with every replayed
+    /// frame applied on top. A namespace born after the checkpoint therefore
+    /// subtracted itself out of the accounting: admission measured a section
+    /// that was not there, accepted a transaction on that basis, and the next
+    /// reopen — rebuilding the section for real — refused the store it had just
+    /// written. Unlike the run-entry baseline there is no backlog term to
+    /// cancel against here, so the count must come from the checkpoint itself.
+    #[test]
+    fn replay_accounting_keeps_a_namespace_the_checkpoint_never_saw() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let below = NamespaceId([0x57; 32]);
+        let above = NamespaceId([0x58; 32]);
+        {
+            let engine = StoreEngine::open(sealing_options(&serial, temporary.path(), 4_000_000))
+                .expect("open a fresh root");
+            block_on(engine.submit(create_transaction(below, 2))).expect("create the first");
+            drop(
+                engine
+                    .checkpoint()
+                    .expect("checkpoint, catalogue only the first"),
+            );
+            block_on(engine.submit(create_transaction(above, 3)))
+                .expect("create the second above the horizon");
+        }
+
+        // Room for exactly the one entry replay rebuilds and the one section it
+        // needs — so anything the accounting drops here shows up as a store that
+        // accepts what it cannot reopen.
+        let configure = || {
+            let mut options = sealing_options(&serial, temporary.path(), 4_000_000);
+            options.max_active_index_bytes = crate::index::encoded_bytes_for(1, 1);
+            options
+        };
+        {
+            let engine =
+                StoreEngine::open(configure()).expect("reopen over the replayed namespace");
+            let refused = block_on(engine.submit(push_transaction(above, 0x71, 0x71, None)))
+                .expect_err(
+                    "a second entry in the replayed namespace needs two entries and a section \
+                     after the next reopen, which does not fit; accepting it writes a store \
+                     that cannot be opened",
+                );
+            assert!(
+                matches!(
+                    refused,
+                    StoreError::LimitExceeded {
+                        limit: "max_active_index_bytes",
+                        ..
+                    }
+                ),
+                "expected the byte ceiling, got {refused:?}"
+            );
+        }
+        StoreEngine::open(configure()).expect("a store must reopen whatever it accepted");
+    }
+
     /// The pins a generation holds must be the rows its manifest publishes.
     ///
     /// The manifest trims to `checkpoint_retain`, so pruning unlinks the older
@@ -7772,6 +7940,278 @@ mod index_maintenance_tests {
              anything more is a pruned inode this process is keeping alive"
         );
         assert_eq!(newest.checkpoints.len(), 2, "and retention is honoured");
+    }
+
+    /// The crash the replacement path exists for, produced by the fault that
+    /// actually produces it.
+    ///
+    /// `checkpoint::install` fences the directory *after* the rename, so a
+    /// failure there leaves the checkpoint at its published name — whole,
+    /// validating, and referenced by no manifest. The name is derived from the
+    /// committed sequence, so every later attempt at that sequence renames onto
+    /// it, and at the replay ceiling no write can move the shard to a different
+    /// sequence. Without a repair this is a permanent wedge.
+    ///
+    /// What the repair may not be is *adoption*. The retry runs after the
+    /// recovery the crash forced, and the file on the device still carries
+    /// pre-recovery receipt visibility and a resume point for the journal that
+    /// recovery replaced. Publishing those walks retention backwards. So the
+    /// assertions below are not only "the checkpoint succeeded" but "what is on
+    /// the device afterwards is the image this shard built".
+    ///
+    /// Sealing the run first is load-bearing. With no unsealed backlog the
+    /// checkpoint skips `seal_index`, so the first directory fsync it issues is
+    /// `install`'s — which is what makes the one-shot fault land after the
+    /// rename rather than somewhere harmless before it. The assertion below
+    /// fails the test rather than silently proving nothing if that stops being
+    /// true.
+    #[cfg(feature = "failpoints")]
+    #[test]
+    fn a_checkpoint_stranded_by_a_crash_is_replaced_after_recovery() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let namespace = NamespaceId([0x59; 32]);
+        let configure = || sealing_options(&serial, temporary.path(), 2);
+
+        let committed;
+        {
+            let engine = StoreEngine::open(configure()).expect("open a fresh root");
+            block_on(engine.submit(create_transaction(namespace, 2))).expect("create");
+            block_on(engine.submit(push_transaction(namespace, 0x62, 0x62, None)))
+                .expect("a second object, which fills the entry ceiling");
+            // Admission seals a due backlog *before* it checks the ceiling, so
+            // this refusal leaves the run written and the layers discarded
+            // without committing anything further — the one state that is
+            // checkpointable, not yet checkpointed, and carries no backlog.
+            block_on(engine.submit(push_transaction(namespace, 0x63, 0x63, None)))
+                .expect_err("a third entry is over the replay ceiling");
+            assert_eq!(
+                engine.index_maintenance().unsealed_delta_layers,
+                0,
+                "entry pressure must have sealed the backlog already; with layers left the \
+                 checkpoint seals first and the fault lands there instead of after the rename"
+            );
+            committed = engine
+                .committed_root()
+                .shard_committed_sequence(0)
+                .expect("a shard that has committed work has a sequence");
+
+            crate::sys::arm(&serial, crate::sys::Fault::DirSyncEio);
+            let interrupted = engine.checkpoint();
+            crate::sys::disarm(&serial);
+            interrupted
+                .err()
+                .expect("the injected directory fsync failure did not stop the checkpoint");
+        }
+
+        let name = format!("{committed}.checkpoint");
+        assert!(
+            checkpoint_files(temporary.path(), 0).contains(&name),
+            "the crash must leave a finalized checkpoint at its published name, or this \
+             test exercises installation rather than the repair: {:?}",
+            checkpoint_files(temporary.path(), 0)
+        );
+        assert!(
+            !manifest_checkpoints(temporary.path(), 0)
+                .iter()
+                .any(|(sequence, _)| *sequence == committed),
+            "and no manifest may reference it, or it is published rather than stranded"
+        );
+        let stranded = load_checkpoint_at(temporary.path(), 0, committed);
+        assert!(
+            !stranded.receipts.is_empty(),
+            "the stranded image must carry receipts, or the retention assertions below \
+             range over nothing"
+        );
+
+        {
+            let engine =
+                StoreEngine::open(configure()).expect("reopen over the stranded checkpoint");
+            drop(engine.checkpoint().expect(
+                "the stranded file describes exactly what this shard would checkpoint at this \
+                 sequence; refusing it wedges the shard at a name it can never write again",
+            ));
+            assert!(
+                manifest_checkpoints(temporary.path(), 0)
+                    .iter()
+                    .any(|(sequence, _)| *sequence == committed),
+                "the repair must publish the checkpoint it wrote"
+            );
+        }
+
+        // The heart of it. Recovery promoted these receipts on the way through,
+        // and plan invariant 7 lets recovery extend a receipt's visibility and
+        // never reduce it. Publishing the bytes the crash left behind would put
+        // the pre-promotion deadline back on the device, and the *next* open
+        // would anchor on it rather than re-promote.
+        let published = load_checkpoint_at(temporary.path(), 0, committed);
+        assert_ne!(
+            published.active_journal_id, stranded.active_journal_id,
+            "the published resume point must name the journal this checkpoint sealed, not \
+             the one recovery already replaced"
+        );
+        let mut advanced = false;
+        for (before, after) in stranded.receipts.iter().zip(published.receipts.iter()) {
+            assert_eq!(
+                before.operation_id, after.operation_id,
+                "canonical ordering must hold, or these comparisons pair unrelated receipts"
+            );
+            assert!(
+                after.receipt_visible_until_micros >= before.receipt_visible_until_micros,
+                "operation {} lost retention: {} is earlier than the {} already on the device",
+                before.operation_id.to_hex(),
+                after.receipt_visible_until_micros,
+                before.receipt_visible_until_micros
+            );
+            match (
+                before.first_receipt_visibility_micros,
+                after.first_receipt_visibility_micros,
+            ) {
+                (Some(before_first), Some(after_first)) => {
+                    assert!(
+                        after_first >= before_first,
+                        "operation {} regressed its first-visibility anchor",
+                        before.operation_id.to_hex()
+                    );
+                    advanced |= after_first > before_first;
+                }
+                (Some(_), None) => panic!(
+                    "operation {} lost a durable first-visibility anchor",
+                    before.operation_id.to_hex()
+                ),
+                (None, _) => {}
+            }
+            advanced |= after.receipt_visible_until_micros > before.receipt_visible_until_micros;
+        }
+        assert!(
+            advanced,
+            "no receipt moved across the recovery, so publishing the stranded bytes would \
+             have passed these assertions too and they prove nothing"
+        );
+
+        // And what was published has to be the truth: the manifest now
+        // suppresses replay of everything through this sequence, so anything the
+        // published image failed to describe is gone.
+        let engine = StoreEngine::open(configure()).expect("reopen after the repair");
+        let root = engine.committed_root();
+        for object in [genesis_object().id, ObjectId([0x62; 32])] {
+            let key = IndexKey::new(namespace, object);
+            assert!(
+                root.index().get(&key).is_some(),
+                "{} was acknowledged before the crash and is unreachable after the repair",
+                object.to_hex()
+            );
+        }
+        assert!(
+            root.repositories().contains_key(&namespace),
+            "the published checkpoint must still carry the namespace it catalogued"
+        );
+    }
+
+    /// A receipt for a checkpoint under reconciliation, at a stated visibility.
+    fn receipt_at(
+        operation: u8,
+        first: Option<i64>,
+        until: i64,
+    ) -> crate::checkpoint::ReceiptRecord {
+        crate::checkpoint::ReceiptRecord {
+            namespace: NamespaceId([0x5a; 32]),
+            operation_id: OperationId([operation; 16]),
+            operation_digest: ObjectId([operation; 32]),
+            repo_sequence: 1,
+            shard_sequence: 1,
+            current_authority: genesis_object().id,
+            refs: Vec::new(),
+            objects_new: 1,
+            retry_until_micros: 10_000,
+            first_receipt_visibility_micros: first,
+            receipt_visible_until_micros: until,
+        }
+    }
+
+    fn checkpoint_carrying(
+        journal: [u8; 16],
+        offset: u64,
+        receipts: Vec<crate::checkpoint::ReceiptRecord>,
+    ) -> crate::checkpoint::Checkpoint {
+        crate::checkpoint::Checkpoint {
+            shard_committed_sequence: 7,
+            active_journal_id: journal,
+            active_journal_offset: offset,
+            created_at_micros: 1_000,
+            receipts,
+            ..crate::checkpoint::Checkpoint::empty([7u8; 16], 0)
+        }
+    }
+
+    /// The ordinary strand, which is the whole point of the path: the found
+    /// image names the journal recovery replaced, and its receipts predate the
+    /// promotion recovery performed.
+    #[test]
+    fn a_stranded_checkpoint_reconciles_across_the_recovery_that_follows_it() {
+        let found = checkpoint_carrying([1u8; 16], 4_096, vec![receipt_at(0x71, None, 10_000)]);
+        let ours =
+            checkpoint_carrying([2u8; 16], 512, vec![receipt_at(0x71, Some(50_000), 90_000)]);
+        crate::checkpoint::reconciles_with(&found, &ours)
+            .expect("this is exactly what a crash leaves behind");
+    }
+
+    /// P1: the resume pair cannot be waved through unconditionally.
+    ///
+    /// Recovery does not re-derive the offset. When a checkpoint names the
+    /// journal that is still live it trusts the recorded offset outright, so an
+    /// image claiming the *surviving* journal at a different offset is making a
+    /// claim about live state that this shard did not make. Publishing it
+    /// reopens as `recovered through sequence N but its active journal resumes
+    /// at N+1` — and at that point no write can move the shard to another name.
+    #[test]
+    fn a_found_checkpoint_may_not_redirect_the_journal_this_shard_is_writing() {
+        let live = [3u8; 16];
+        let ours = checkpoint_carrying(live, 512, vec![receipt_at(0x71, Some(50_000), 90_000)]);
+
+        let forged = checkpoint_carrying(live, 8_192, vec![receipt_at(0x71, Some(50_000), 90_000)]);
+        let refusal = crate::checkpoint::reconciles_with(&forged, &ours)
+            .expect_err("a disagreeing offset on the live journal must not reconcile");
+        assert!(
+            refusal.contains("recovery trusts that offset without deriving it"),
+            "the refusal must name why the offset matters: {refusal}"
+        );
+
+        let agreeing = checkpoint_carrying(live, 512, vec![receipt_at(0x71, Some(50_000), 90_000)]);
+        crate::checkpoint::reconciles_with(&agreeing, &ours)
+            .expect("naming the live journal is fine when the offset agrees");
+    }
+
+    /// P1: replacement may not walk receipt retention backwards.
+    ///
+    /// Plan invariant 7 lets recovery extend a receipt's first-visibility and
+    /// deadline and never reduce them. A found image that is *ahead* of the
+    /// candidate on either would be shortened by the replacement, so the
+    /// checkpoint refuses rather than publishing the weaker pair.
+    #[test]
+    fn a_replacement_that_would_shorten_receipt_retention_is_refused() {
+        let ours =
+            checkpoint_carrying([2u8; 16], 512, vec![receipt_at(0x71, Some(50_000), 90_000)]);
+
+        for ahead in [
+            receipt_at(0x71, Some(60_000), 90_000),
+            receipt_at(0x71, Some(50_000), 120_000),
+        ] {
+            let found = checkpoint_carrying([1u8; 16], 4_096, vec![ahead]);
+            let refusal = crate::checkpoint::reconciles_with(&found, &ours)
+                .expect_err("the found image is ahead, so replacing it shortens retention");
+            assert!(
+                refusal.contains("recovery may extend a receipt's visibility and never reduce it"),
+                "the refusal must name the invariant it protects: {refusal}"
+            );
+        }
+
+        // Losing a durable anchor altogether is the same regression in its
+        // strongest form.
+        let found = checkpoint_carrying([1u8; 16], 4_096, vec![receipt_at(0x71, Some(1), 0)]);
+        let unpromoted = checkpoint_carrying([2u8; 16], 512, vec![receipt_at(0x71, None, 90_000)]);
+        crate::checkpoint::reconciles_with(&found, &unpromoted)
+            .expect_err("an unpromoted candidate must not replace a durably anchored receipt");
     }
 
     /// The installer became production-reachable, and with it the redirection

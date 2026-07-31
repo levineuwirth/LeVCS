@@ -1676,6 +1676,131 @@ B4 surface this commit touches — the emitter's remaining claims are unchanged.
 **Next, and in this dispatch:** recovery discarding an index run whose covered identity was not
 preserved, which turns 2026-07-30-B's refusal into reclamation.
 
+##### Contract review 2026-07-30-F
+
+Two P1s and a P2 against the checkpoint-equivalence half of 2026-07-30-E. The namespace and
+run-baseline halves of E passed review and are untouched. Run-discard remains held.
+
+**The mistake underneath both P1s.** E loosened the adoption predicate so the crash path could
+succeed, and stopped there. It should have asked what *gets published* once the predicate passes.
+Adoption publishes the bytes the crash left behind — an image written **before** the recovery that
+the crash forced — so every field recovery is entitled to move was published at its pre-recovery
+value. Erasing a field from a comparison is not the same as deciding it does not matter, and E
+treated the two as one.
+
+**P1 — adoption shortened receipt retention.** Plan invariant 7: recovery re-derives a receipt's
+first-visibility and deadline and "therefore only extends retention". The stranded image carries the
+pre-promotion pair, so publishing it puts an earlier `Some(first_visibility)` on the device — and
+the next open anchors on that value instead of re-promoting, because a durable anchor is exactly
+what suppresses promotion. Retention regresses across a repair. Confirmed by the reviewer against an
+isolated `DirSyncEio` run: both timestamps advanced during recovery and then went backwards after
+adoption.
+
+**P1 — the resume pair could not be erased.** E claimed recovery independently verifies the offset.
+It does not. When a checkpoint's `active_journal_id` matches the surviving journal, recovery trusts
+the recorded offset outright. The reviewer changed only a valid orphan's resume pair to the
+surviving journal's ID plus its preallocation end; adoption accepted it, a frame committed, and the
+next open failed `Corruption("shard 0 recovered through sequence 2 but its active journal resumes at
+3")`.
+
+**The repair is replacement, not adoption.** The shard writes its own image and installs it over the
+found name. Both hazards close with one stroke: what reaches the device is what this call built,
+carrying the promoted deadlines and a resume point naming the journal this checkpoint is about to
+seal. `durable_claims` survives as what it always was — a comparison aid — and `reconciles_with` now
+states the whole safety argument as three tests:
+
+1. **Same durable claims**, or the file describes state this shard cannot produce and overwriting it
+   would destroy the only evidence of however that happened. This is 2026-07-30-D's rule, unchanged.
+2. **The resume point may differ only by naming a different journal.** The ordinary strand passes
+   freely — it names the journal the crash left behind, which recovery sealed away. A matching
+   identity at a disagreeing offset is refused, which is the reviewer's attack.
+3. **The replacement may not shorten retention.** The candidate must be at or beyond the found image
+   on both visibility fields, which is the direction recovery guarantees. If it is not, something
+   other than the expected crash produced that file and the checkpoint refuses.
+
+**Frozen-seam amendment to `checkpoint.rs` (A2), and a narrow exception to a funnel rule.**
+`replace_reconciled` is added beside `install`, sharing one body. `sys::rename_noreplace`'s contract
+lists checkpoints among the names that must never be overwritten; **a checkpoint name this shard has
+proved out under `reconciles_with` is now the one exception**, and the rule stands everywhere else,
+including for any name the shard has not proved out. The safety argument is that the two images
+agree on every durable claim and differ only where the replacement is the better of the pair, and
+that `rename` is atomic — so a manifest naming that file holds a valid referent at every instant,
+before, during and after. An unlink-then-install repair would not have this property, which is why
+it was not used. A published name is refused outright as a further guard: if the current manifest
+already references the file, the shard is not recovering from a strand.
+
+**Evidence.** The `DirSyncEio` regression now asserts what is on the device after the repair, not
+only that the checkpoint succeeded: the published resume point must not name the journal recovery
+replaced, no receipt may lose retention, and at least one must have *advanced* — that last one
+exists so the retention assertions cannot pass vacuously. Reverting replacement to adoption fails
+both halves independently. The three reconciliation rules also have direct unit coverage, including
+the ordinary strand, which must keep reconciling.
+
+**P2 — the contracts contradicted the code and each other.** The method documentation still required
+the resume point to match; E claimed both exclusions were safe. Both are rewritten here against what
+the code now does.
+
+**P2, second round — an unproved overwrite was on the module's public surface.** The first cut put
+`install_replacing` beside `install` as `pub`, while `reconciles_with` — the proof that licenses
+overwriting anything — was private to `engine.rs`. Any caller reaching `checkpoint` could therefore
+replace a checkpoint without the proof, which is precisely the operation the exception above was
+granted for and only for. The predicate and its replacement are now **one operation**:
+`durable_claims` and `reconciles_with` move to `checkpoint.rs`, which owns the type they reason
+about; `install_replacing` is gone; and `pub(crate) replace_reconciled` performs the proof and the
+rename together, so no path in the crate — let alone outside it — can overwrite a checkpoint without
+first establishing that the occupant reconciles with what replaces it. `install` remains the only
+public installer and remains no-replace. `sys::rename_replace`'s "exactly one legitimate call site"
+sentence is amended to name both.
+
+##### Contract review 2026-07-30-E
+
+Two P1s against `bff8e8a`, one terminology correction, and the gap 2026-07-30-D disclosed. All
+closed. Everything is in `engine.rs` except one addition to `RecoveredShard`: a new
+`checkpoint_namespaces` field and the line that captures it. That is a **frozen-seam amendment to
+`recovery.rs` (A2)**, directed by the lead in this dispatch, read-only in effect — it introduces no
+rule and changes no existing value — and recorded here rather than assumed.
+
+**Not a bug, and the distinction is the point.** The reviewer's first correction was aimed at me:
+the two subtractions in `replayable_index` look like one idea and are not. The **entry** term is a
+*duplicate-representation* baseline. Recovery both retains every run it finds and rebuilds every
+replayed frame into the delta, so `current run entries − pre-open run total + backlog` counts each
+replayable entry exactly once, and a later seal merely moves entries from the backlog into runs
+*above* that fixed baseline. Narrowing it to runs below the horizon — which I had proposed — would
+double-count every post-checkpoint entry and refuse early. No entry accessor and no per-run horizon
+seam is being added. What was wrong there was the name and the comment claiming a proof the term
+does not make: it is now `run_entry_baseline`, documented as what it is. The reviewer's own
+regression (four-entry ceiling, three replayed plus one incoming accepted, reopen succeeds, fifth
+refused `observed: 5, allowed: 4`) pins the boundary from both sides.
+
+**P1 — replayed namespaces were subtracted away.** The **namespace** term has no backlog term to
+cancel against, so it is a genuine horizon claim, and it was reading `recovered.catalog` — the
+checkpoint's catalog with every replayed frame already applied. A namespace created above the
+horizon therefore subtracted itself out: admission measured a section that was not there, accepted
+on that basis, and the next reopen refused the store it had just written. Recovery now carries
+`RecoveredShard::checkpoint_namespaces`, captured before replay applies anything, and the writer
+counts that. Mutation-checked both ways — with the old count the regression's submit is accepted
+and the reopen fails `observed: 158, allowed: 111`, which is the reviewer's reproduction exactly.
+
+**P1 — the advertised adoption path could not succeed.** Equality was the wrong predicate. The only
+state that produces an unreferenced checkpoint is a crash, and the retry necessarily happens after
+the recovery that follows it — so the stranded image and the rebuilt one always differed, and at the
+replay ceiling no write could move the shard to another filename. The refusal was the original wedge
+with a better error message. **Superseded in part by 2026-07-30-F**: the first attempt at this
+loosened the predicate and then *adopted* the found bytes, which was wrong for reasons recorded
+there. The repair is replacement, not adoption.
+
+**The disclosed gap is closed.** `DirSyncEio` produces the state deterministically, and no new
+seam was needed. `checkpoint::install` fences the directory *after* the rename, so a failure there
+strands a finalized, validating, unreferenced checkpoint. Reaching it needs the checkpoint to skip
+`seal_index`, which is why the test first drives an admission that seals the due backlog and is
+*then* refused by the ceiling — the one state that is checkpointable, uncheckpointed, and carries no
+layers. The test asserts that precondition rather than assuming it.
+
+**One asymmetry left deliberately.** With no checkpoint at all both terms are zero, so a run's
+entries are counted once in the run and again in the replayed backlog. That over-states pressure and
+can only refuse early, never admit work a reopen cannot rebuild, so it is documented rather than
+changed here.
+
 ##### Contract review 2026-07-30-D
 
 Five review findings against `5462952`, all closed. The first two are the ones that mattered.
@@ -1685,7 +1810,10 @@ Five review findings against `5462952`, all closed. The first two are the ones t
 silent logical deletion: the manifest suppresses replay of the frames the checkpoint covers, so an
 empty catalog at the live sequence makes the namespace disappear at the next open with nothing
 reporting a fault. Adoption now requires logical equivalence to the checkpoint the call would itself
-have written, with `created_at_micros` the only field allowed to differ. Anything else at the name is
+have written, with `created_at_micros` the only field allowed to differ — **narrowed by
+2026-07-30-E** and again by **2026-07-30-F**, which reaches the same place by replacing the stranded
+artifact rather than adopting it.
+Anything else at the name is
 refused — and refused **without poisoning**, since nothing durable has moved. The test is the reopen:
 catalog, ref and receipt all read back through the public surface after the refusal, and the shard
 is still writable.
@@ -1719,6 +1847,12 @@ adopted — is not covered by a test. Constructing an equivalent image from outs
 the body the engine builds, and the honest options were a new failpoint seam in the publication
 window or a test-only accessor. Neither belongs in this commit. The refusal path, which is the one
 that could lose data, is covered.
+
+**Closed by 2026-07-30-E and 2026-07-30-F**, and the gap turned out to be hiding a defect rather
+than only a missing test: writing the success path proved the equivalence predicate could never hold
+across the recovery that separates a crash from its retry, and then that loosening it was not enough
+either. Neither of the options considered here was needed — `DirSyncEio` reaches the state on its
+own.
 
 ##### Contract review 2026-07-28-C
 

@@ -1646,6 +1646,14 @@ impl Eq for RecoveredTail {}
 pub struct RecoveredShard {
     pub shard_index: u16,
     pub catalog: NamespaceCatalog,
+    /// How many namespaces the authoritative checkpoint's own catalog carried,
+    /// before replay applied anything on top of it.
+    ///
+    /// [`RecoveredShard::catalog`] is the fully replayed state and cannot answer
+    /// this: replay may add namespaces above the checkpoint horizon, and those
+    /// are rebuilt by the *next* replay too. Zero when no checkpoint was
+    /// adopted, which is also the count an empty checkpoint carries.
+    pub checkpoint_namespaces: u64,
     pub refs: Vec<RefRecord>,
     pub receipts: Vec<ReceiptRecord>,
     pub index: LayeredObjectIndex,
@@ -2175,6 +2183,13 @@ fn recover_shard_under_lock(
     let replayed_facts: Vec<FrameFacts> =
         replayed.iter().map(|frame| frame.facts.clone()).collect();
     let mut catalog = checkpoint.catalog.clone();
+    // Captured before replay applies anything. The two counts diverge exactly
+    // when replay introduces a namespace the checkpoint never saw, and a
+    // consumer that needs "what a reopen does not have to rebuild" must read
+    // this one: the finished `catalog` also carries every namespace replay
+    // just rebuilt, and treating those as already-durable understates the
+    // work the *next* reopen faces.
+    let checkpoint_namespaces = catalog.len() as u64;
     verify_and_apply_catalog(
         &replayed_facts,
         checkpointed.then(|| committed.saturating_add(1)),
@@ -2360,6 +2375,7 @@ fn recover_shard_under_lock(
     let recovered = RecoveredShard {
         shard_index: shard,
         catalog,
+        checkpoint_namespaces,
         refs,
         receipts,
         index,

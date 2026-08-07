@@ -352,10 +352,16 @@ impl StoreEngine {
     /// Acquire exactly one committed root and derive a repository view from
     /// it. Readers never observe an index entry newer than their captured
     /// root (plan §5.3).
-    pub fn snapshot(&self, _repo: NamespaceId) -> Result<RepoSnapshot, StoreError> {
-        Err(StoreError::NotImplemented(
-            "StoreEngine::snapshot — B1 NamespaceTxn, scope 6-B1 deliverable 8",
-        ))
+    pub fn snapshot(&self, repo: NamespaceId) -> Result<RepoSnapshot, StoreError> {
+        // `load_full` and not `load`: the snapshot outlives this call, so it
+        // must own the generation it read rather than borrow the slot. That
+        // ownership is the whole retention guarantee -- see the note on
+        // `RepoSnapshot`.
+        //
+        // One load, so the snapshot is a single point in the publication
+        // order. Resolving the repository from a second load could pair one
+        // generation's `RepoState` with another's index.
+        RepoSnapshot::capture(self.shared.committed.load_full(), repo)
     }
 
     /// Submit a validated transaction for sequencing, group append, fence, and

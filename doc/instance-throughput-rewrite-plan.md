@@ -1839,6 +1839,51 @@ The integration suite's `cleanup_is_deferred_and_names_its_deliverable` is repla
 deleted — the distinction it stood for, that "nothing to do" and "cannot answer yet" are
 different results, is now asserted the other way round at the public surface.
 
+##### Contract review 2026-08-07-A
+
+B1 deliverable 8 — `RepoSnapshot` and `StoreEngine::snapshot`. Requested by B1 before any body
+was written, because the frozen D0 signatures could not express the answer to a question the
+deliverable cannot avoid. Two lead-owned files move; both are amendments, neither is a
+redefinition.
+
+**`StoreEngine::snapshot` had no way to say "that namespace is not bound".** The frozen
+signature returns `Result<RepoSnapshot, StoreError>`, and no `StoreError` variant covered an
+absent repository. The alternatives were all worse than an amendment: `Conflict`, `NotReady`
+and `UnrecognizedLayout` each name a different condition, so reusing one would make the error
+a false statement about what happened, and a caller could not distinguish it from a genuine
+instance of that condition. **`StoreError::NoSuchRepository { namespace }` is added to
+`types.rs`.** It carries the typed `NamespaceId` rather than a rendered string so a caller
+matches on the identity it asked for instead of parsing a message.
+
+**It is an inability to answer and not a lifecycle state**, which is the distinction the
+taxonomy's own doc comment turns on. A namespace that was never bound has no `RepoState`, so
+there is no `genesis_authority` to report and no sequence to report it at, and `snapshot`
+cannot manufacture either without fabricating a trust root. A namespace that *is* bound and
+retired is the opposite: `Deleted` is a lifecycle, it has a state, and it answers every other
+question. Refusing both would erase a difference the store knows.
+
+**`RepoSnapshot` therefore gains `lifecycle()` and `storage_mode()`.** `RepoState` already
+carries both; without accessors a reader holding a snapshot could not tell an `Active`
+repository from a `ReadOnly` or `Deleted` one, and §4 makes that distinction observable. Both
+read straight off the pinned state and allocate nothing. `lib.rs` re-exports `ObjectLocation`
+and the two namespace enums, which name the return types of the frozen `locate` and of these
+two accessors — a caller cannot use the re-exported `RepoSnapshot` without them.
+
+**Deliverable 8's acceptance is amended, and the reason is that the design already
+succeeded.** "A test that fails if someone clones" assumes a clone is a copy; `CommittedRoot`
+is built entirely from `im` persistent structures, so cloning it allocates zero bytes and a
+byte figure cannot fail on a clone anywhere in this crate. The scope records the full finding.
+The test carries a measured no-materialization figure *and* an `Arc::ptr_eq` structural proof,
+with a live control, rather than the single measured assertion the wording asked for.
+
+**One observation, recorded and not acted on.** `ObjectLocation::segment_generation` is
+per-shard, not global, so the same `(generation, offset)` pair occurs in every shard's journal.
+This is not ambiguity — a location is only ever read through a snapshot, and the snapshot's
+namespace determines the shard — but it means any test comparing locations across shards
+asserts nothing. `tests/namespace_snapshot.rs` co-locates its two repositories for that reason
+and for the stronger one: only a shared shard makes the namespace component of the index key
+load-bearing.
+
 ##### Contract review 2026-07-31-A
 
 B3 deliverable 6 — finalize and the adoption pin. Deliverables 7 and 8 are **not** in this

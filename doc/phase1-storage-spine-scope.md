@@ -1653,6 +1653,27 @@ criteria.
    taking a snapshot allocates no index copy — a count or a byte figure, not a comment. §5.3
    makes this a correctness property, so it needs a test that fails if someone clones.
 
+   **Amended 2026-08-07: the acceptance as written cannot be met, and the reason is that the
+   design already succeeded.** "A test that fails if someone clones" assumes a clone is a copy.
+   `CommittedRoot` is built entirely from `im` persistent structures — `im::HashMap` for the
+   repositories, terminal statuses and shard sequences, `im::Vector` for the index layers and
+   sealed runs, `im::OrdMap` for typed refs — and every one of them clones in O(1) without
+   allocating. `(*root).clone()` therefore allocates **zero bytes**, and so does cloning
+   `LayeredObjectIndex`. Both were tried as the negative control and both read zero.
+
+   A byte figure alone consequently cannot fail on a clone anywhere in this crate. It is still
+   worth having and is still asserted at exactly zero, because it does catch the other
+   regression — *materializing* the index, collecting entries into a `Vec` or a `std` map,
+   which is what an index copy would actually cost and which the control now demonstrates
+   allocates. What the byte figure cannot catch, `Arc::ptr_eq` does: the test asserts the
+   snapshot retained **the caller's own root allocation**, so no traversal happened behind the
+   capture whatever the allocator saw.
+
+   `snapshot_capture_allocates_nothing` therefore carries both assertions and a live control.
+   Read the acceptance as *"a measured no-materialization figure plus a structural
+   no-copy proof"*; the single measured assertion the wording asks for does not exist here,
+   and recording that is more useful than a test that passes for a reason it does not state.
+
 **B1 must not** touch the crash harness (B4), staging (B3), or any frozen Wave A file.
 
 #### Carry-forward: index sealing does not yet bound what a reopen rebuilds

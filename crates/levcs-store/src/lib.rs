@@ -69,7 +69,11 @@ pub use roots::{
     RetainedObjectSource, RetainedProjectionArtifact, RetainedReceipt, RetainedSegment,
     RetainedTail, ShardSubtree, StatusEntry, StatusPhase, StatusReservation, TerminalStatusEntry,
 };
-pub use snapshot::RepoSnapshot;
+// `ObjectLocation` names `RepoSnapshot::locate`'s success value, and the two
+// namespace enums name the accessors contract review 2026-08-07-A added, so a
+// caller cannot use the re-exported `RepoSnapshot` without them.
+pub use index::{NamespaceLifecycle, NamespaceStorageMode};
+pub use snapshot::{ObjectLocation, RepoSnapshot};
 pub use staging::{
     ProjectionAdoption, ProjectionAdoptionOutcome, ProjectionAdoptionResolution,
     ProjectionArtifact, RecoveredProjectionOutcome, RecoveredProjectionResolution,

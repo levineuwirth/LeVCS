@@ -2109,20 +2109,40 @@ before:
    `index_maintenance = runs_sealed` is therefore true and narrower than it reads, and a P2 run
    at this ceiling is not measuring the fan-out steady state the ceiling exists to impose.
 
-**This is a decision, not an edit, and it is not B4's to make alone.** Two ways close it and
-they are not equivalent:
+**This was a decision, not an edit, and it is not B4's to make alone.** Two ways could close it
+and they were not equivalent:
 
 - **Drop the raise** — set the bench to the store default, and `index_run_ceiling` emits
-  `store_default` with no schema change at all. This is the outcome to prefer if the measured
-  run survives the real ceiling, because it is the configuration the exit criterion is about.
-  It is a change to what the benchmark measures and must be demonstrated, not assumed: the run
-  may now seal on fan-out, and that is the point of making it.
-- **Amend the enum** — if some raise is still genuinely required, the value needs a name that
-  states the surviving reason. `bench/result-schema.json` is lead-owned; per item 4 above,
-  **request it, do not emit it**, which makes this a contract review rather than a commit.
+  `store_default` with no schema change at all. The outcome to prefer *if the measured run
+  survives the real ceiling*, because it is the configuration the exit criterion is about. A
+  change to what the benchmark measures, to be demonstrated rather than assumed.
+- **Amend the enum** — if some raise were still genuinely required, the value would need a name
+  stating the surviving reason. `bench/result-schema.json` is lead-owned; per item 4 above,
+  **request it, do not emit it**, which would make it a contract review rather than a commit.
 
-Until one of them lands, §7's run-conditions count stands at three of four with this recorded
-against it.
+**Closed 2026-08-07 by dropping the raise, ruled by the lead and demonstrated rather than
+assumed.** The store is opened at its own default and `ENGINE_MAX_INDEX_RUNS` is retired; the
+schema enum is untouched, so no contract review was needed.
+
+The demonstration is the part that mattered, because the whole question was whether a run
+survives the ceiling it had been raised to escape. A 45-second submit-path run at
+`max_index_runs = 64` published **5,192 groups** — 81× the ceiling — with no `NotImplemented`
+refusal, and its rate was flat against a 5-second run at the same ceiling (113.2/s vs 117.7/s,
+debug build, diagnostic hardware; the figures are for survival, not for throughput). The
+emitted bundle declares `index_run_ceiling: store_default` against
+`resources.configured_ceilings.max_index_runs = 64`, with `index_maintenance: runs_sealed`
+alongside. `check-phase1.sh` reports `GATE_EXIT=0` and `verify-store-recovery.sh --cycles 2`
+reports `matrix=pass`, `bundle=schema-valid`, `VERIFY_EXIT=0`.
+
+`runs_sealed` now means what it reads: seals come from fan-out pressure as well as entry
+pressure, which is the steady state the ceiling exists to impose. §7's count is unchanged at
+three of four — this was never one of the four — but the third of them is now earned under the
+ceiling a deployment would actually run.
+
+The raised branch of the derivation has not become dead: `bench`'s
+`a_run_at_the_store_default_declares_store_default` covers the branch a real run now takes, and
+the existing fixture keeps the raised branch covered, because a comparison needs both sides
+exercised.
 
 #### Carry-forward: the SIGKILL cycles still drive the journal seam
 
@@ -2300,15 +2320,15 @@ decides whether a P2 figure describes a steady state or a burst — a run with a
 that grows for its whole duration and no checkpoint ever taken is measuring a system that has
 not yet reached the condition the number is supposed to characterize.
 
-**A fourth condition is not on the exit list and bears on the same question.** The submit path
-still declares `index_run_ceiling = raised_because_index_sealing_unimplemented`, because
-`store-bench.rs` opens its store with `ENGINE_MAX_INDEX_RUNS = 1_000_000` against a store
-default of 64. The derivation is honest — it compares the configured ceiling to the default and
-reports the raise — but the *reason* the enum names is no longer true, and the raise itself now
-has a consequence it did not have when sealing was unimplemented: at an effectively infinite
-fan-out ceiling, no seal in the measured run is ever triggered by fan-out pressure, so
-`runs_sealed` above is earned by entry pressure alone. Resolving it is a decision, not an
-edit — see the carry-forward under §6.6 item 5.
+**A fourth condition is not on the exit list and bore on the same question, and it is now
+closed.** The submit path used to declare `index_run_ceiling =
+raised_because_index_sealing_unimplemented`, because `store-bench.rs` opened its store with
+`ENGINE_MAX_INDEX_RUNS = 1_000_000` against a store default of 64 — so no seal in a measured
+run was ever triggered by fan-out pressure and `index_maintenance = runs_sealed` was earned by
+entry pressure alone. The raise was dropped on 2026-08-07 after a run demonstrated survival at
+the real ceiling; the path now declares `store_default`, and `runs_sealed` above is earned
+under the ceiling a deployment would run. The carry-forward under §6.6 item 5 records the
+evidence.
 
 Three of four is the accurate reading of how much of the P2 exit criterion is currently earned,
 and the remainder is the expensive one — the same disclosure the SIGKILL carry-forward above

@@ -3056,20 +3056,30 @@ fn skeleton_ack_record(sequence: u64) -> AckRecord {
 //
 // # What this run can and cannot claim, stated before the code
 //
-// Two of B1's unimplemented deliverables bound it, and both are a bound on the
-// *bundle*, not merely on this file:
+// One condition still bounds it, and it is a bound on the *bundle*, not merely
+// on this file:
 //
-//   * `submit` refuses `NotImplemented` after `max_index_runs` group
-//     publications, because sealing the in-memory index delta into an
-//     `IndexRun` is unimplemented. The ceiling is raised here so the run can
-//     reach its measured seconds at all, which means the run holds every delta
-//     layer it ever published in memory and its lookup fan-out grows for the
-//     whole run. A P2 measurement is of a steady state; this is not one, and
-//     the bundle says so through `outcome` and its verdicts.
-//   * `StoreEngine::checkpoint` is unimplemented, so no checkpoint is taken.
-//     Section 7 requires that a P2 run not have been achieved with
-//     checkpointing disabled. This one was. That alone makes the
-//     `storage_primitive` gate unearnable today, whatever the rate says.
+//   * `StoreEngine::checkpoint` exists but this run never accumulates enough
+//     work to trip it, so the bundle declares `enabled_not_reached`. Section 7
+//     requires that a P2 run not have been achieved with checkpointing
+//     disabled, and `exercised` is the value it wants. Until a run reaches
+//     that, the `storage_primitive` gate stays unearnable whatever the rate
+//     says.
+//
+// One bound that stood here is gone, and the ceiling below is the evidence.
+// `submit` used to refuse `NotImplemented` after `max_index_runs` group
+// publications because sealing the in-memory delta into an `IndexRun` was
+// unimplemented, so this file raised the ceiling to a million to reach its
+// measured seconds at all — which meant the run held every delta layer it ever
+// published and its lookup fan-out grew for the whole run. Sealing landed, so
+// the raise outlived its reason and was dropped: the store opens at its own
+// default and the bundle declares `index_run_ceiling: store_default`.
+//
+// Dropping it is what makes `index_maintenance: runs_sealed` mean what it
+// reads. At a ceiling of a million the fan-out trigger never fired and every
+// seal in a measured run came from entry pressure; at the default the run seals
+// on fan-out as well, which is the steady state the ceiling exists to impose
+// and the one a P2 number has to be of.
 //
 // A third bound stood here until B1 landed startup state 1: `StoreEngine::open`
 // refused to build an absent root, so this run seeded one with
@@ -3087,8 +3097,18 @@ fn skeleton_ack_record(sequence: u64) -> AckRecord {
 // `transaction_status` on a reopened engine rather than comparing sequence
 // sets.
 
-/// Raised because index-delta sealing is unimplemented; see the note above.
-const ENGINE_MAX_INDEX_RUNS: u32 = 1_000_000;
+/// A ceiling above the store default, used **only** by the derivation's unit
+/// tests so the `raised_*` branch stays covered after the measured run stopped
+/// producing it.
+///
+/// No measured run configures this. It is not the value the old
+/// `ENGINE_MAX_INDEX_RUNS` had a right to: that one was applied to the store,
+/// and this one exists so a test can hand `RunConditions::derive` a raised
+/// observation and check it says so. Deleting it would leave the branch
+/// reachable only from a configuration nothing here produces, which is how a
+/// derivation quietly stops being a derivation.
+#[cfg(test)]
+const RAISED_MAX_INDEX_RUNS_FOR_DERIVATION_TESTS: u32 = 1_000_000;
 
 /// One commit's objects, matching the frozen workload: one 1 KiB blob, one
 /// tree, one commit.
@@ -3358,7 +3378,7 @@ fn run_engine(
         options.max_group_bytes = 8 * 1024 * 1024;
         options.max_group_idle = Duration::from_millis(1);
         options.journal_preallocate_bytes = 64 * 1024 * 1024;
-        options.max_index_runs = ENGINE_MAX_INDEX_RUNS;
+        // Deliberately left at the store default. See the note above.
         options.signer = Some(signer.clone());
         options
     };
@@ -5128,8 +5148,11 @@ sys.exit(1 if errors else 0)
         assert_eq!(submit.mutation_path, "store_engine_submit");
         assert_eq!(
             submit.index_run_ceiling, "raised_because_index_sealing_unimplemented",
-            "the submit run raises max_index_runs above the store default, and the \
-             declaration must follow from that comparison rather than from the path"
+            "this fixture configures max_index_runs above the store default, and the \
+             declaration must follow from that comparison rather than from the path. \
+             The measured submit run no longer raises it -- see \
+             `a_run_at_the_store_default_declares_store_default` -- so this is the \
+             only remaining cover for the raised branch"
         );
         assert_eq!(submit.index_maintenance, "deltas_retained_in_memory");
         assert_eq!(
@@ -5178,6 +5201,31 @@ sys.exit(1 if errors else 0)
             "diagnostic",
             "a run that skipped the store-directory attribute precheck has not met the \
              reference environment, whatever else it met"
+        );
+    }
+
+    /// The measured submit run stopped raising `max_index_runs` once index
+    /// sealing landed, so the value it now declares is `store_default`. This
+    /// asserts the derivation follows the observation to that value rather
+    /// than to the path it came from.
+    ///
+    /// It is the other half of the pair: the fixture in
+    /// `the_ten_run_conditions_are_derived_from_what_the_run_observed` keeps
+    /// the raised branch covered, and this covers the branch a real run now
+    /// takes. Neither is redundant, because the derivation is a comparison and
+    /// a comparison needs both sides exercised.
+    #[test]
+    fn a_run_at_the_store_default_declares_store_default() {
+        let mut at_default = submit_observations();
+        at_default.configured_max_index_runs = at_default.default_max_index_runs;
+
+        let conditions = RunConditions::derive(&at_default, true, "diagnostic")
+            .expect("a store-default ceiling declares");
+
+        assert_eq!(
+            conditions.index_run_ceiling, "store_default",
+            "a run that configured exactly the store default must declare it, \
+             whatever path it ran"
         );
     }
 
@@ -6235,7 +6283,7 @@ sys.exit(1 if errors else 0)
                     groups: 1,
                     unsealed_delta_backlog: None,
                 },
-                configured_max_index_runs: ENGINE_MAX_INDEX_RUNS,
+                configured_max_index_runs: RAISED_MAX_INDEX_RUNS_FOR_DERIVATION_TESTS,
                 default_max_index_runs: default_max_index_runs(),
                 receipts: ReceiptComparison::AnyCommittedStatusAccepted,
                 objects_new_counted: true,

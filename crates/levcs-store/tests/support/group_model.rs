@@ -143,6 +143,128 @@ impl PhysicalStateClass {
             PhysicalStateClass::WholeFrameFencedAndPublished => true,
         }
     }
+
+    /// Which terminal outcome a `StagedProjection` payload's adoption pin must
+    /// carry when this class is produced (scope 6.2 item 9).
+    ///
+    /// This is the class-derived half of the adoption expectation, and the
+    /// fixture's stated `adoption_outcome` is the other. The matrix requires
+    /// them to agree, exactly as it already does for `required_outcome`.
+    ///
+    /// The rule is the physical one and nothing else: **whether a frame
+    /// binding these artifacts exists on the device.**
+    ///
+    /// * No bytes reached the file, so no frame names the artifacts. They are
+    ///   unreferenced and reclaiming them is correct, which is what
+    ///   `DefinitivePreAppendFailure` licenses.
+    /// * A torn or unfenced frame is `AbsentRetriable` for the transaction,
+    ///   but it is **not** `DefinitivePreAppendFailure` for the pin. Bytes are
+    ///   on the device and recovery decides what they mean; telling staging to
+    ///   reclaim now would race that decision. Only recovery can resolve it.
+    /// * A fenced frame is durable and binds the manifest, so the pin outlives
+    ///   the process and recovery notifies staging of the resolution.
+    /// * Fenced *and* published means the committed root already references
+    ///   the artifacts and the shard sequence is known, so the writer settled
+    ///   `Adopted` before this failpoint could fire. A failure after that
+    ///   point cannot un-adopt what a published root points into.
+    ///
+    /// Note the asymmetry against `required_outcome`: `PartialFrame` and
+    /// `WholeFrameUnfenced` are `AbsentRetriable` there and
+    /// `TransferredToRecovery` here. A transaction that will not commit and a
+    /// pin whose artifacts may be referenced are different questions, and
+    /// collapsing them is how a retriable refusal would come to delete
+    /// content.
+    pub const fn adoption_outcome(self) -> AdoptionOutcomeExpectation {
+        match self {
+            PhysicalStateClass::NoBytes => AdoptionOutcomeExpectation::DefinitivePreAppendFailure,
+            PhysicalStateClass::PartialFrame => AdoptionOutcomeExpectation::TransferredToRecovery,
+            PhysicalStateClass::WholeFrameUnfenced => {
+                AdoptionOutcomeExpectation::TransferredToRecovery
+            }
+            PhysicalStateClass::WholeFrameFenced => {
+                AdoptionOutcomeExpectation::TransferredToRecovery
+            }
+            PhysicalStateClass::WholeFrameFencedAndPublished => AdoptionOutcomeExpectation::Adopted,
+        }
+    }
+}
+
+/// The terminal outcome expected of an adoption pin, as the matrix names it.
+///
+/// A test-side mirror of `ProjectionAdoptionOutcome` without the payload:
+/// `Adopted` carries a committed shard sequence the matrix cannot predict, and
+/// an expectation that had to guess it would assert less, not more.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AdoptionOutcomeExpectation {
+    Adopted,
+    DefinitivePreAppendFailure,
+    TransferredToRecovery,
+}
+
+impl AdoptionOutcomeExpectation {
+    pub const ALL: &'static [AdoptionOutcomeExpectation] = &[
+        AdoptionOutcomeExpectation::Adopted,
+        AdoptionOutcomeExpectation::DefinitivePreAppendFailure,
+        AdoptionOutcomeExpectation::TransferredToRecovery,
+    ];
+
+    /// Name as it appears in `tests/fixtures/phase1-failpoints.json`.
+    pub const fn name(self) -> &'static str {
+        match self {
+            AdoptionOutcomeExpectation::Adopted => "Adopted",
+            AdoptionOutcomeExpectation::DefinitivePreAppendFailure => "DefinitivePreAppendFailure",
+            AdoptionOutcomeExpectation::TransferredToRecovery => "TransferredToRecovery",
+        }
+    }
+
+    /// Parsed by linear search over `ALL`, for the reason
+    /// `PhysicalStateClass::from_name` is: adding a variant must not silently
+    /// acquire a default.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|o| o.name() == name)
+    }
+}
+
+/// Which payload a Wave B row drives the failpoint's location with.
+///
+/// The third independent axis of a submit row, alongside the location the
+/// failpoint names and the action the driver chooses. It is an axis rather
+/// than a second list of failpoints because the locations do not change: a
+/// staged-projection adoption reaches every one of the eight Wave B locations,
+/// and giving it its own rows would produce a parallel list that drifts from
+/// this one the first time a location is added to either.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PayloadKind {
+    /// Objects carried in the frame, which is every Wave B row today.
+    Inline,
+    /// A `StagedProjectionInstallV1` descriptor adopting sealed artifacts,
+    /// with an adoption pin whose terminal outcome is asserted.
+    StagedProjection,
+}
+
+impl PayloadKind {
+    pub const ALL: &'static [PayloadKind] = &[PayloadKind::Inline, PayloadKind::StagedProjection];
+
+    /// Name as it appears in `tests/fixtures/phase1-failpoints.json`.
+    pub const fn name(self) -> &'static str {
+        match self {
+            PayloadKind::Inline => "inline",
+            PayloadKind::StagedProjection => "staged_projection",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|k| k.name() == name)
+    }
+
+    /// Whether driving this kind requires an adoption pin whose outcome the
+    /// row must assert.
+    pub const fn carries_adoption(self) -> bool {
+        match self {
+            PayloadKind::Inline => false,
+            PayloadKind::StagedProjection => true,
+        }
+    }
 }
 
 /// The physical state class each failpoint produces.

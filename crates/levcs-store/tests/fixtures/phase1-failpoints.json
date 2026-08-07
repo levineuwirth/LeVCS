@@ -50,7 +50,11 @@
         "actions": [
           "fail"
         ],
-        "requires_root_cas_contention": false
+        "requires_root_cas_contention": false,
+        "payload_kinds": [
+          "inline"
+        ],
+        "adoption_outcome": "DefinitivePreAppendFailure"
       },
       "rationale": "Marking Resolving writes no journal byte, so the physical state is identical to BeforeAppend. The row is distinguished only by immediate_status and shard_poisoned, which is why it needed an engine: the status root is the only place the difference exists."
     },
@@ -89,7 +93,11 @@
         "actions": [
           "fail"
         ],
-        "requires_root_cas_contention": false
+        "requires_root_cas_contention": false,
+        "payload_kinds": [
+          "inline"
+        ],
+        "adoption_outcome": "DefinitivePreAppendFailure"
       },
       "rationale": "Fires at scope 6.3 step 2, before the group is marked Resolving and before any byte is written. Contract review 2026-07-26-A gave it the BeforeAppend shape: a routine SignerError::Unavailable is an availability event, and poisoning the shard for it would trade a real availability property for a safety property that was never at risk."
     },
@@ -153,7 +161,11 @@
           "fail",
           "panic"
         ],
-        "requires_root_cas_contention": false
+        "requires_root_cas_contention": false,
+        "payload_kinds": [
+          "inline"
+        ],
+        "adoption_outcome": "TransferredToRecovery"
       },
       "rationale": "The fence returned before the subtree build begins, so the frame is durable and the transaction is committed on the device while the publication that would make it visible never happens. Recovery replays the fenced frame and publishes the receipt."
     },
@@ -168,7 +180,11 @@
         "actions": [
           "fail"
         ],
-        "requires_root_cas_contention": false
+        "requires_root_cas_contention": false,
+        "payload_kinds": [
+          "inline"
+        ],
+        "adoption_outcome": "TransferredToRecovery"
       },
       "rationale": "Same physical state as DuringCommittedRootBuild and reached one step later: the group is fenced, the subtree is built, and the allocation that would carry it into the root fails. Poisoning, because it is inside steps 4-8."
     },
@@ -184,7 +200,11 @@
           "fail",
           "panic"
         ],
-        "requires_root_cas_contention": false
+        "requires_root_cas_contention": false,
+        "payload_kinds": [
+          "inline"
+        ],
+        "adoption_outcome": "TransferredToRecovery"
       },
       "rationale": "The last instant at which a fenced group is still unpublished. Everything before the compare-and-swap has succeeded, so the transaction is durable; the shard is poisoned because a group that fenced and did not publish leaves the status root claiming Resolving for a committed transaction."
     },
@@ -200,7 +220,11 @@
           "fail",
           "panic"
         ],
-        "requires_root_cas_contention": true
+        "requires_root_cas_contention": true,
+        "payload_kinds": [
+          "inline"
+        ],
+        "adoption_outcome": "TransferredToRecovery"
       },
       "rationale": "Reached only after a lost compare-and-swap: another shard published between this shard's load of the committed root and its swap. The re-merge is against a newer root and the subtree is unchanged, so the outcome is identical to BeforeRootCas - which is the point, because a retry that resolved differently from a first attempt would make publication order observable."
     },
@@ -239,7 +263,11 @@
         "actions": [
           "fail"
         ],
-        "requires_root_cas_contention": false
+        "requires_root_cas_contention": false,
+        "payload_kinds": [
+          "inline"
+        ],
+        "adoption_outcome": "Adopted"
       },
       "rationale": "Post-publication. The fence succeeded and the root published, so the transaction is committed; a waiter that never wakes is a hung request, not an absent transaction, and the receipt stays queryable through transaction_status."
     },
@@ -254,7 +282,11 @@
         "actions": [
           "fail"
         ],
-        "requires_root_cas_contention": false
+        "requires_root_cas_contention": false,
+        "payload_kinds": [
+          "inline"
+        ],
+        "adoption_outcome": "Adopted"
       },
       "rationale": "Post-publication and pre-response: the receipt is already durable and idempotently retrievable by status or retry, and no reappend is required."
     }

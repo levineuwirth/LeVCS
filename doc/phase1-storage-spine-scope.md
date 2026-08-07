@@ -2003,22 +2003,23 @@ Owns the crash driver, the benchmark, the matrix, and the recovery script.
 
 `bench/result-schema.json` now requires a `run_conditions` block and a named
 `resources.configured_ceilings.max_index_runs`, and requires two verification claims on the
-submit path. The emitter does not produce any of them, so `store-bench emit-skeleton` currently
-writes a bundle that fails validation on exactly two fields:
+submit path.
 
-```
-[]: 'run_conditions' is a required property
-['resources', 'configured_ceilings']: 'max_index_runs' is a required property
-```
+**Closed by `062797d`, "Condition benchmark claims on the run that produced them".** The
+state this section recorded — the emitter producing none of them, so `store-bench
+emit-skeleton` wrote a bundle failing validation on `run_conditions` and
+`resources.configured_ceilings.max_index_runs`, with `bundle=schema-invalid`, `VERIFY_EXIT=1`
+and `check-phase1.sh` red alongside — is history, and is kept here because the *mechanism* is
+the point: the gate was red for a schema the store satisfied, because it runs `store-bench`'s
+unit tests and three of them validate the emitted bundle against the schema rather than
+against substrings. Schema conformance is inside the gate. That is the property review
+2026-07-24-B was after, working, and it is the reason landing a contract first is allowed to
+turn the gate red.
 
-`scripts/verify-store-recovery.sh --cycles 2` reports `bundle=schema-invalid`, `VERIFY_EXIT=1`
-with everything else green (`matrix=pass`, `acknowledged_loss=0`, `torn_transactions=0`).
-**`scripts/check-phase1.sh` is red as well**, which is not what landing a schema alone would
-normally do: the gate runs `store-bench`'s unit tests, and three of them validate the emitted
-bundle against the schema rather than against substrings, so schema conformance is inside the
-gate. That is the property review 2026-07-24-B was after, working. All three failures are in
-`store-bench.rs` and none is a defect in the store; they are expected collateral of landing the
-contract first and they close with item 5.
+Verified green on 2026-08-07 at `b4e4c7e`: `scripts/check-phase1.sh` reports `GATE_EXIT=0`,
+and `scripts/verify-store-recovery.sh --cycles 2` reports `bundle=schema-valid` on both
+`--path submit` and `--path drive`, `matrix=pass`, `acknowledged_loss=0`,
+`torn_transactions=0`, `VERIFY_EXIT=0`.
 
 5. **Emit the run conditions, the index-run ceiling, and the two earned claims.** All of it in
    `store-bench.rs`; no other file is involved. Nothing here may be a constant this file
@@ -2088,6 +2089,40 @@ contract first and they close with item 5.
    `the_schema_check_can_actually_fail` gains a mutation for each newly required field, since a
    required field the negative control never removes is a field the suite cannot notice the loss
    of.
+
+   *Met* at `062797d`, verified 2026-08-07 at `b4e4c7e`.
+
+#### Carry-forward: `ENGINE_MAX_INDEX_RUNS` outlived its reason
+
+Recorded 2026-08-07. `store-bench.rs` opens its measured store with
+`ENGINE_MAX_INDEX_RUNS = 1_000_000` against a store default of 64, carrying the comment
+"Raised because index-delta sealing is unimplemented". Sealing landed in `fef8520` and was
+bounded by `e03ca2b`, so that reason has lapsed, and two things follow that did not follow
+before:
+
+1. **The emitted `run_conditions.index_run_ceiling` names a reason that is no longer true.**
+   The derivation is correct — it compares the configured ceiling to the store default and
+   reports a raise, so it cannot drift from what the run configured — but the only enum value
+   the schema offers for a raise is `raised_because_index_sealing_unimplemented`.
+2. **The raise now suppresses a behaviour the store has.** At a ceiling of a million, the
+   fan-out trigger never fires, so every seal in a measured run is triggered by entry pressure.
+   `index_maintenance = runs_sealed` is therefore true and narrower than it reads, and a P2 run
+   at this ceiling is not measuring the fan-out steady state the ceiling exists to impose.
+
+**This is a decision, not an edit, and it is not B4's to make alone.** Two ways close it and
+they are not equivalent:
+
+- **Drop the raise** — set the bench to the store default, and `index_run_ceiling` emits
+  `store_default` with no schema change at all. This is the outcome to prefer if the measured
+  run survives the real ceiling, because it is the configuration the exit criterion is about.
+  It is a change to what the benchmark measures and must be demonstrated, not assumed: the run
+  may now seal on fan-out, and that is the point of making it.
+- **Amend the enum** — if some raise is still genuinely required, the value needs a name that
+  states the surviving reason. `bench/result-schema.json` is lead-owned; per item 4 above,
+  **request it, do not emit it**, which makes this a contract review rather than a commit.
+
+Until one of them lands, §7's run-conditions count stands at three of four with this recorded
+against it.
 
 #### Carry-forward: the SIGKILL cycles still drive the journal seam
 
@@ -2249,15 +2284,35 @@ achieved with checkpointing disabled.
 the conditions the number was obtained under travel inside the bundle as values, and a bundle
 that met none of them cannot encode a pass.
 
-The harness as it stands satisfies **two of the four**: since B1 landed startup state 1, the
-submit path both creates its root through `StoreEngine::open` and mutates it through
-`StoreEngine::submit`. It satisfies neither `checkpointing` nor `index_maintenance`, and those
-are the two that decide whether a P2 figure describes a steady state or a burst — a run holding
-every index delta in memory, with a lookup fan-out that grows for its whole duration and no
-checkpoint ever taken, is measuring a system that has not yet reached the condition the number
-is supposed to characterize. Two of four is the accurate reading of how much of the P2 exit
-criterion is currently earned, and the remaining two are the expensive ones — the same
-disclosure the SIGKILL carry-forward above makes about the crash-recovery row.
+The harness as it stands satisfies **three of the four**, measured on 2026-08-07 at `b4e4c7e`.
+Since B1 landed startup state 1, the submit path both creates its root through
+`StoreEngine::open` and mutates it through `StoreEngine::submit`. Index sealing (`fef8520`,
+bounded by `e03ca2b`) earned the third: the submit path now declares
+`index_maintenance = runs_sealed`, derived from the `IndexRun` files read back off the device
+rather than from a label.
+
+`checkpointing` is the one outstanding, and it has moved from `unimplemented` to
+**`enabled_not_reached`** — `StoreEngine::checkpoint` exists and answers (`5462952`, corrected
+by `bff8e8a`), and the short verification runs simply never accumulate enough work to trip it.
+That distinction matters for planning: what remains is a *run long enough to take a
+checkpoint*, not a mechanism to build. It is the last of the four, and it is the one that
+decides whether a P2 figure describes a steady state or a burst — a run with a lookup fan-out
+that grows for its whole duration and no checkpoint ever taken is measuring a system that has
+not yet reached the condition the number is supposed to characterize.
+
+**A fourth condition is not on the exit list and bears on the same question.** The submit path
+still declares `index_run_ceiling = raised_because_index_sealing_unimplemented`, because
+`store-bench.rs` opens its store with `ENGINE_MAX_INDEX_RUNS = 1_000_000` against a store
+default of 64. The derivation is honest — it compares the configured ceiling to the default and
+reports the raise — but the *reason* the enum names is no longer true, and the raise itself now
+has a consequence it did not have when sealing was unimplemented: at an effectively infinite
+fan-out ceiling, no seal in the measured run is ever triggered by fan-out pressure, so
+`runs_sealed` above is earned by entry pressure alone. Resolving it is a decision, not an
+edit — see the carry-forward under §6.6 item 5.
+
+Three of four is the accurate reading of how much of the P2 exit criterion is currently earned,
+and the remainder is the expensive one — the same disclosure the SIGKILL carry-forward above
+makes about the crash-recovery row.
 
 ## 8. Capacity analysis for P2 on the frozen reference hardware
 

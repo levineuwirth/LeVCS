@@ -2394,7 +2394,7 @@ there.
 
 **`max_index_runs` is now a named required member of `resources.configured_ceilings`.** It was
 reachable only through that block's free-form `additionalProperties`, so an emitter could omit
-the one ceiling this workload actually reaches — `submit` refuses `NotImplemented` at it — and
+the one ceiling this workload actually reaches — the run seals against it — and
 the bundle stayed valid. It must be the value the run configured, read back from the options the
 store opened with. The schema cannot see the process's options, so the bite is a cross-check:
 `index_run_ceiling: "store_default"` bounds the recorded value at 64 and

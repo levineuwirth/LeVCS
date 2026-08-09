@@ -2455,7 +2455,9 @@ pub fn assemble_bundle(
                 // The `u32` from the `StoreOptions` the store was opened with,
                 // carried through the run rather than `ENGINE_MAX_INDEX_RUNS`
                 // written out a second time. It is the ceiling this workload
-                // genuinely reaches: `submit` refuses `NotImplemented` at it.
+                // genuinely reaches -- the fan-out trigger fires on it and the
+                // run seals against it, which is the steady state a P2 number
+                // has to be measured in.
                 (
                     "max_index_runs".into(),
                     jint(i128::from(inputs.observations.configured_max_index_runs)),

@@ -133,28 +133,21 @@ impl CommitEvidenceSigner for CountingSigner {
     }
 }
 
-/// `StoreOptions::max_index_runs`, the ceiling this slice reaches soonest.
+/// `StoreOptions::max_index_runs`, at the value a deployment runs.
 ///
-/// Publishing a group adds one in-memory index delta layer, and B1's slice
-/// seals none of them into an `IndexRun` — deliverable 1 refuses by name. So
-/// `submit` refuses `NotImplemented` after exactly `max_index_runs` group
-/// publications for the life of an engine, root-wide, whatever the workload.
-/// At the shipping default of 64 that is 64 commits.
+/// **The weakening this note used to disclose is gone.** It said that B1's
+/// slice sealed no delta layer into an `IndexRun`, so `submit` refused
+/// `NotImplemented` after exactly `max_index_runs` group publications and a
+/// driver needing more had to raise the ceiling to run at all. Sealing is
+/// implemented: the ceiling is drained by sealing rather than reached by
+/// refusing, no `NotImplemented` refusal remains in the engine's production
+/// paths, and a 45-second soak at this value published 5,192 groups — 81× the
+/// ceiling — at a flat rate.
 ///
-/// The single-row driver leaves the default alone: three submits per row is
-/// nowhere near it, and a row driven under a non-default ceiling would be a row
-/// driven against a store nobody ships. The contention driver raises it,
-/// because it must publish groups until two of them collide and the collision
-/// is not on a schedule. **That is a disclosed weakening**: the raised value is
-/// a real configuration, not a bypass, but it configures around a missing
-/// deliverable rather than around a tuning choice, and it is the same
-/// unimplemented seal that caps the benchmark.
+/// So the default is what every driver here uses, which is the point: a row
+/// driven under a non-default ceiling is a row driven against a store nobody
+/// ships.
 pub const DEFAULT_MAX_INDEX_RUNS: u32 = 64;
-
-/// Enough that the collision search is never the thing that ends the run.
-/// Measured: the failpoint fires within 6 to 64 group publications, and the
-/// eight repository creations consume eight of them.
-pub const CONTENTION_MAX_INDEX_RUNS: u32 = 4096;
 
 pub fn options(root: &Path, shard_count: u16) -> StoreOptions {
     options_with_index_runs(root, shard_count, DEFAULT_MAX_INDEX_RUNS)
@@ -1045,7 +1038,7 @@ pub fn drive_root_cas_retry_row(
         .map(|shard| namespace_on_shard(shard, CONTENTION_SHARDS, 0x0CA5_0000 + shard as u64))
         .collect();
 
-    let engine = open_absent_root(&root, CONTENTION_SHARDS, CONTENTION_MAX_INDEX_RUNS);
+    let engine = open_absent_root(&root, CONTENTION_SHARDS, DEFAULT_MAX_INDEX_RUNS);
     for (index, namespace) in namespaces.iter().enumerate() {
         let created = submit_plain(&engine, create_transaction(*namespace, 0x40 + index as u8));
         assert!(
@@ -1160,7 +1153,7 @@ pub fn drive_root_cas_retry_row(
     disarm(serial);
     drop(engine);
 
-    let reopened = reopen_after_close(&root, CONTENTION_SHARDS, CONTENTION_MAX_INDEX_RUNS);
+    let reopened = reopen_after_close(&root, CONTENTION_SHARDS, DEFAULT_MAX_INDEX_RUNS);
     let recovered = reopened
         .transaction_status(namespace, victim_operation)
         .expect("status read");

@@ -75,12 +75,15 @@ else
 fi
 
 echo "== crash matrix has no pending rows at Phase 1 exit =="
-# During Waves A and B the fixture legitimately carries pending-wave-b rows.
-# This check only fires once B1 has landed engine.rs, at which point a pending
-# row means a forgotten failpoint rather than a sequenced one.
+# During Waves A and B the fixture legitimately carried pending-wave-b rows, so
+# this check was gated on B1 having landed engine.rs -- proxied by engine.rs no
+# longer mentioning `NotImplemented`. That proxy stopped holding: B1 landed, and
+# the only mentions left are a module doc and two tests asserting an error is
+# *not* one, so the grep matched and the check silently stopped running. B1's
+# deliverables are complete, so the transitional guard is gone and a pending row
+# is now always a forgotten failpoint.
 matrix=crates/levcs-store/tests/fixtures/phase1-failpoints.json
-if [ -f "$matrix" ] && grep -q 'fn submit' crates/levcs-store/src/engine.rs \
-   && ! grep -q 'NotImplemented' crates/levcs-store/src/engine.rs; then
+if [ -f "$matrix" ]; then
   if grep -q 'pending-wave-b' "$matrix"; then
     echo "engine.rs is implemented but the crash matrix still has pending rows:" >&2
     grep -n 'pending-wave-b' "$matrix" >&2

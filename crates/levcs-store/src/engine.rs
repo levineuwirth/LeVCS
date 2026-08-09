@@ -2863,12 +2863,25 @@ impl ShardWriter {
             if layer.shard_index != self.shard_index {
                 continue;
             }
+            // What "stable" asks is whether these entries still resolve after
+            // the frames behind them are pruned. A sealed segment and an active
+            // tail do; so does an adopted projection artifact, which is not in
+            // the journal at all and which every successor generation carries
+            // forward by construction. Leaving `ProjectionArtifact` out of this
+            // list stopped coverage at the first adopting group and made the
+            // shard permanently uncheckpointable — the entries were the most
+            // durable kind in the index, and were read as the least.
+            //
+            // Enumerated and not a catch-all: a source kind added later must
+            // fail this compile and be decided, because the wrong answer here
+            // prunes frames whose objects nothing else can find.
             let stable = layer.delta.iter().all(|(_, location)| {
                 matches!(
                     root.object_source(self.shard_index, location.segment_generation),
                     Ok(Some(
                         crate::roots::RetainedObjectSource::Segment(_)
                             | crate::roots::RetainedObjectSource::ActiveTail(_)
+                            | crate::roots::RetainedObjectSource::ProjectionArtifact(_)
                     ))
                 )
             });

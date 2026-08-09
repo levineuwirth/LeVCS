@@ -183,7 +183,13 @@ pub fn options_with_index_runs(root: &Path, shard_count: u16, max_index_runs: u3
 /// The client principal, deliberately not the signer's public key.
 const EVIDENCE_ACTOR: [u8; 32] = [0x7e; 32];
 
-fn evidence() -> TransactionEvidenceV1 {
+/// Public because an adopting transaction cannot be assembled from
+/// [`create_transaction`] or [`push_transaction`]: it carries no inline
+/// objects, so B1's projection-adoption tests build their own and need the same
+/// evidence, deadline, and genesis authority these two produce. Two independent
+/// notions of "the authority for this namespace" in one test binary would make
+/// a mismatched-authority refusal look like a harness bug.
+pub fn evidence() -> TransactionEvidenceV1 {
     TransactionEvidenceV1::AdministrativeV1 {
         actor: EVIDENCE_ACTOR,
         actor_key_epoch: 11,
@@ -192,18 +198,20 @@ fn evidence() -> TransactionEvidenceV1 {
     }
 }
 
-fn now_micros() -> i64 {
+/// Public for the same reason as [`evidence`]: staging's `begin`, `put_chunk`,
+/// `seal`, and `finalize` all take a caller-supplied clock reading.
+pub fn now_micros() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_micros() as i64)
         .unwrap_or(0)
 }
 
-fn deadline() -> i64 {
+pub fn deadline() -> i64 {
     now_micros() + 600_000_000
 }
 
-fn genesis_id(namespace: &NamespaceId) -> ObjectId {
+pub fn genesis_id(namespace: &NamespaceId) -> ObjectId {
     let mut bytes = [0u8; 32];
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"levcs-store/b4/genesis-authority/v1\0");

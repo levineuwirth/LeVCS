@@ -383,6 +383,19 @@ impl RetainedGeneration {
 /// shard and upper sequence so installing a sealed run can discard exactly
 /// the layers that run covers instead of allowing lookup fan-out to grow once
 /// per committed group forever.
+///
+/// # A layer is coverage, not content
+///
+/// `through_shard_sequence` says "every frame from this shard through here is
+/// accounted for in the index". It is not a claim that this layer holds an
+/// entry for any of them, and a layer with an empty delta is a well-formed
+/// statement rather than a degenerate one: a group whose transactions
+/// introduced no objects — an adopting transaction, whose objects live in
+/// staging's artifacts, or a ref-only transaction — has genuinely nothing to
+/// index and still has a sequence that must be represented. Checkpointing
+/// reads these stamps to decide whether pruning would strand objects, so a
+/// committed sequence that no layer reaches reads as a gap in the index rather
+/// than as an absence of work.
 #[derive(Clone, Debug)]
 pub struct IndexDeltaLayer {
     pub shard_index: u16,
@@ -483,7 +496,29 @@ impl LayeredObjectIndex {
         self.lookup(key).location
     }
 
-    fn with_subtree(&self, subtree: &ShardSubtree) -> Self {
+    /// Compose one publication onto this index.
+    ///
+    /// `advances_committed_sequence` is what decides whether a layer with no
+    /// entries is still installed. A layer records **publication coverage**,
+    /// not the presence of entries: it is the statement "every frame from this
+    /// shard through `through_shard_sequence` is accounted for in the index",
+    /// and a group that introduced no objects makes that statement truthfully
+    /// with nothing in it.
+    ///
+    /// Skipping empty deltas — the earlier behaviour — left the committed
+    /// sequence advancing while coverage did not, so the next checkpoint
+    /// refused: it read the highest layer stamp as the reach of the index and
+    /// concluded that pruning would drop objects that never existed. Any
+    /// transaction introducing no objects reached it, and an adopting
+    /// transaction reaches it as the ordinary case, because its frame carries a
+    /// descriptor rather than object bytes and its membership may resolve
+    /// entirely into sealed runs.
+    ///
+    /// The empty layer counts toward layer fan-out and may later seal into a
+    /// zero-entry run. That is the bounded-run model working as designed, and
+    /// it is the failure-safe direction: a stamped empty layer costs a run
+    /// slot, while an unstamped one costs the ability to checkpoint at all.
+    fn with_subtree(&self, subtree: &ShardSubtree, advances_committed_sequence: bool) -> Self {
         let mut next = self.clone();
         if let Some(sealed_through) = subtree.sealed_through_shard_sequence {
             next.delta_layers_newest_first.retain(|layer| {
@@ -494,7 +529,7 @@ impl LayeredObjectIndex {
         let delta_is_sealed = subtree
             .sealed_through_shard_sequence
             .is_some_and(|sealed_through| sealed_through >= subtree.shard_committed_sequence);
-        if !delta_is_sealed && !subtree.index_delta.is_empty() {
+        if !delta_is_sealed && (!subtree.index_delta.is_empty() || advances_committed_sequence) {
             next.delta_layers_newest_first
                 .push_front(IndexDeltaLayer::new(
                     subtree.shard_index,
@@ -732,9 +767,19 @@ impl CommittedRoot {
             retained_generations.insert(*id, Arc::clone(generation));
         }
 
+        // Whether this publication moves the shard's committed frame sequence
+        // forward, which is what obliges it to record coverage. A maintenance
+        // publication appends no frame and republishes the sequence it found,
+        // so it owes nothing.
+        let advances_committed_sequence = self
+            .shard_committed_sequence(subtree.shard_index)
+            .is_none_or(|published| subtree.shard_committed_sequence > published);
+
         Self {
             repositories,
-            index: self.index.with_subtree(subtree),
+            index: self
+                .index
+                .with_subtree(subtree, advances_committed_sequence),
             terminal_statuses,
             shard_committed_sequences,
             retained_generations,

@@ -2035,9 +2035,9 @@ and `scripts/verify-store-recovery.sh --cycles 2` reports `bundle=schema-valid` 
    |---|---|---|
    | `initialization_path` | `store_engine_open` (see **f**) | `shard_drive_create` |
    | `mutation_path` | `store_engine_submit` | `journal_drive` |
-   | `checkpointing` | `unimplemented` | `unimplemented` |
+   | `checkpointing` | `enabled_not_reached` (see §7) | `unimplemented` |
    | `index_maintenance` | `deltas_retained_in_memory` | `no_index_in_path` |
-   | `index_run_ceiling` | `raised_because_index_sealing_unimplemented` | `store_default` |
+   | `index_run_ceiling` | `store_default` (see the carry-forward below) | `store_default` |
    | `receipt_reconciliation` | `acceptance_of_any_committed_status` | `no_receipts_in_path` |
    | `objects_new_source` | `summed_from_receipts` | `derived_from_transaction_count` |
    | `commit_id_uniqueness` | `checked_globally_across_ack_records` (after **d**) | `not_checked` |
@@ -2103,7 +2103,9 @@ before:
 1. **The emitted `run_conditions.index_run_ceiling` names a reason that is no longer true.**
    The derivation is correct — it compares the configured ceiling to the store default and
    reports a raise, so it cannot drift from what the run configured — but the only enum value
-   the schema offers for a raise is `raised_because_index_sealing_unimplemented`.
+   the schema offers for a raise is `raised_because_index_sealing_unimplemented`. (Amended
+   2026-08-09-B: the schema now also offers `raised_above_store_default`, which is what a
+   comparison can honestly report.)
 2. **The raise now suppresses a behaviour the store has.** At a ceiling of a million, the
    fan-out trigger never fires, so every seal in a measured run is triggered by entry pressure.
    `index_maintenance = runs_sealed` is therefore true and narrower than it reads, and a P2 run
@@ -2123,6 +2125,15 @@ and they were not equivalent:
 **Closed 2026-08-07 by dropping the raise, ruled by the lead and demonstrated rather than
 assumed.** The store is opened at its own default and `ENGINE_MAX_INDEX_RUNS` is retired; the
 schema enum is untouched, so no contract review was needed.
+
+**Amended 2026-08-09 by contract review 2026-08-09-B, for the other reason.** Finding 1 above
+was closed by no longer *emitting* the raised value, which left the value itself still naming a
+lapsed cause — harmless while nothing raised the ceiling, and a false explanation the moment
+anything did, since the emitter derives the declaration from a comparison and cannot know why
+two numbers differ. `raised_above_store_default` is added and is what the emitter writes;
+`raised_because_index_sealing_unimplemented` is retained, deprecated, and still cross-checked,
+solely so archived v1 bundles validate. That is an enum amendment, so it *was* a contract
+review — requested rather than emitted, per item 4.
 
 The demonstration is the part that mattered, because the whole question was whether a run
 survives the ceiling it had been raised to escape. A 45-second submit-path run at

@@ -1839,6 +1839,42 @@ The integration suite's `cleanup_is_deferred_and_names_its_deliverable` is repla
 deleted — the distinction it stood for, that "nothing to do" and "cannot answer yet" are
 different results, is now asserted the other way round at the public surface.
 
+##### Contract review 2026-08-09-B
+
+`bench/result-schema.json` — `run_conditions.index_run_ceiling`. Requested after index-delta
+sealing landed, because the enum's only raised value names a cause that is no longer true and
+that nothing ever verified. One value is added, none is removed.
+
+**The declaration was never a claim about *why*.** `store-bench.rs` derives it by comparing the
+configured ceiling with the store default; that comparison cannot know what motivated a raise.
+It nevertheless emitted `raised_because_index_sealing_unimplemented`, so the bundle asserted a
+cause on the strength of a subtraction. That was accurate while the only reason to raise the
+ceiling was the unimplemented seal. It is not accurate now, and a future run raising the ceiling
+for any other reason — deliberately measuring fan-out, say — would have emitted a false
+explanation that the schema called valid.
+
+**`raised_above_store_default` is added and is what the emitter now writes.** It states the fact
+the comparison establishes and stops there.
+
+**The old value is retained and deprecated, not removed.** `schema_version` is `const: 1`, so
+there is no later version to move archived bundles to, and this repository has never held a
+bundle to check against — the reference machine may hold ones that declare it. Removing it would
+invalidate evidence already produced, which is a worse outcome than carrying a spelling nothing
+emits. It is retained **solely so archived v1 bundles validate, and is not a current causal
+claim**; the enum's description says so.
+
+**Deprecated does not mean unchecked.** The `allOf` rule that floors a declared raise at 65
+accepts either spelling, so a bundle using the old string is still cross-checked against
+`resources.configured_ceilings.max_index_runs`.
+`both_raised_spellings_are_accepted_and_bound_the_same_way` asserts both halves — that each
+validates, and that each is refused when it records the store default. Verified by mutation:
+narrowing the rule to the new spelling alone makes the deprecated one silently unchecked and
+fails that test.
+
+The `configured_ceilings.max_index_runs` description carried the same causal claim and now
+records what is true — the run seals against that ceiling, and its fan-out trigger is what
+imposes the steady state a P2 number must be measured in.
+
 ##### Contract review 2026-08-09-A
 
 B1 deliverable 3 — `adopt_projection` through submit. Requested by B1 on starting the wiring,

@@ -1176,7 +1176,14 @@ impl RunConditions {
             if observations.configured_max_index_runs == observations.default_max_index_runs {
                 "store_default"
             } else if observations.configured_max_index_runs > observations.default_max_index_runs {
-                "raised_because_index_sealing_unimplemented"
+                // The fact, and only the fact. This branch is reached by
+                // comparing two numbers and knows nothing about *why* the
+                // ceiling was raised, so it may not name a reason.
+                // `raised_because_index_sealing_unimplemented` did, and the
+                // reason it named is no longer true; the schema keeps accepting
+                // it for archived bundles and this emitter never writes it
+                // again. Contract review 2026-08-09-B.
+                "raised_above_store_default"
             } else {
                 return Err(format!(
                     "refusing to emit a bundle: the run configured max_index_runs = {} below \
@@ -5149,12 +5156,14 @@ sys.exit(1 if errors else 0)
         assert_eq!(submit.initialization_path, "store_engine_open");
         assert_eq!(submit.mutation_path, "store_engine_submit");
         assert_eq!(
-            submit.index_run_ceiling, "raised_because_index_sealing_unimplemented",
+            submit.index_run_ceiling, "raised_above_store_default",
             "this fixture configures max_index_runs above the store default, and the \
              declaration must follow from that comparison rather than from the path. \
              The measured submit run no longer raises it -- see \
              `a_run_at_the_store_default_declares_store_default` -- so this is the \
-             only remaining cover for the raised branch"
+             only remaining cover for the raised branch. It must be the reason-free \
+             value: this branch compares two numbers and cannot know why they differ \
+             (contract review 2026-08-09-B)"
         );
         assert_eq!(submit.index_maintenance, "deltas_retained_in_memory");
         assert_eq!(
@@ -6063,7 +6072,7 @@ sys.exit(1 if errors else 0)
         refuses(
             &submit,
             submit.replace(
-                "\"index_run_ceiling\": \"raised_because_index_sealing_unimplemented\"",
+                "\"index_run_ceiling\": \"raised_above_store_default\"",
                 "\"index_run_ceiling\": \"store_default\"",
             ),
             "declaring the store default while recording a raised ceiling must be \
@@ -6074,7 +6083,7 @@ sys.exit(1 if errors else 0)
             &bundle,
             bundle.replace(
                 "\"index_run_ceiling\": \"store_default\"",
-                "\"index_run_ceiling\": \"raised_because_index_sealing_unimplemented\"",
+                "\"index_run_ceiling\": \"raised_above_store_default\"",
             ),
             "declaring a raise while recording the default must be rejected in the \
              other direction",

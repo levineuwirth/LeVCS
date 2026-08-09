@@ -206,3 +206,126 @@ fn one_operation_id_with_a_second_digest_is_refused() {
         )
     });
 }
+
+/// A same-digest resubmit that arrives while the first is still in flight.
+///
+/// The durable path above cannot answer this one: nothing is committed yet, so
+/// there is no receipt to return and no terminal entry to read. The second
+/// submit has to attach to the first and receive whatever the first receives —
+/// one frame, one sequence, two callers answered.
+///
+/// The leader is held in flight by a group that will not close on its own: the
+/// transaction ceiling is high and the idle delay long, so the writer accepts
+/// the leader and waits. The follower is submitted from this thread while the
+/// leader's own submit is still blocked, which is the only arrangement where
+/// `StatusReservation::Attached` is reachable at all.
+#[test]
+fn a_same_digest_resubmit_attaches_to_an_in_flight_leader() {
+    let directory = tempfile::TempDir::new().expect("a temporary root");
+    let namespace = namespace_on_shard(0, SHARD_COUNT, 1);
+
+    let mut options = engine_matrix::options_with_index_runs(
+        directory.path(),
+        SHARD_COUNT,
+        DEFAULT_MAX_INDEX_RUNS,
+    );
+    // Wide enough that the leader's group stays open until the follower has
+    // been accepted, and short enough that the test does not depend on the
+    // wall clock for correctness -- only for how long it waits.
+    options.max_group_transactions = 8;
+    options.max_group_idle = std::time::Duration::from_millis(250);
+
+    // Held for the whole test though nothing is armed here. The failpoint
+    // registry is a one-shot global, so a sibling test that arms one would
+    // otherwise fire it inside this engine and take the leader down -- which is
+    // a different test's property and this test's spurious failure.
+    let _serial = engine_matrix::serial();
+
+    let engine = levcs_store::StoreEngine::open(options).expect("the root initializes");
+    submit(&engine, create_transaction(namespace, 1))
+        .receipt()
+        .expect("the repository is created");
+
+    let (leader, follower) = std::thread::scope(|scope| {
+        let leading = scope.spawn(|| submit(&engine, transaction(namespace, 0xd1, 0xb1)));
+        // The leader has to be accepted before the follower is submitted, or
+        // the follower becomes the leader and the test asserts nothing.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let follower = submit(&engine, transaction(namespace, 0xd1, 0xb1));
+        (leading.join().expect("the leader's thread"), follower)
+    });
+
+    let leader = leader
+        .receipt()
+        .unwrap_or_else(|| panic!("the leader must commit: {:?}", leader.error()))
+        .clone();
+    let follower = follower
+        .receipt()
+        .unwrap_or_else(|| panic!("the follower must be answered: {:?}", follower.error()));
+
+    assert_eq!(
+        follower.repo_sequence, leader.repo_sequence,
+        "a follower must receive the leader's outcome; a second repo_sequence means the store \
+         appended a second frame for one operation"
+    );
+    assert_eq!(follower.objects_new, leader.objects_new);
+}
+
+/// A follower is answered when its leader fails, not only when it commits.
+///
+/// This is the half of coalescing that is easy to get wrong and impossible to
+/// notice: a follower whose completion is never resolved does not fail, it
+/// *hangs*, with no receipt and no error. There are eight places a waiter is
+/// resolved and only one of them is the happy path, so the property worth
+/// asserting is that a leader taken down inside the poison window takes its
+/// followers' answers with it.
+///
+/// `AfterMarkedResolving` is armed to fail, which poisons the shard during
+/// publication -- after the follower has attached and before any receipt
+/// exists.
+#[test]
+fn a_follower_is_answered_when_its_leader_is_poisoned() {
+    let directory = tempfile::TempDir::new().expect("a temporary root");
+    let namespace = namespace_on_shard(0, SHARD_COUNT, 1);
+
+    let mut options = engine_matrix::options_with_index_runs(
+        directory.path(),
+        SHARD_COUNT,
+        DEFAULT_MAX_INDEX_RUNS,
+    );
+    options.max_group_transactions = 8;
+    options.max_group_idle = std::time::Duration::from_millis(250);
+
+    let engine = levcs_store::StoreEngine::open(options).expect("the root initializes");
+    submit(&engine, create_transaction(namespace, 1))
+        .receipt()
+        .expect("the repository is created");
+
+    let serial = engine_matrix::serial();
+    engine_matrix::arm(
+        &serial,
+        levcs_store::failpoints::Failpoint::AfterMarkedResolving,
+        engine_matrix::action_from_name("fail").expect("the fail action"),
+    );
+
+    let (leader, follower) = std::thread::scope(|scope| {
+        let leading = scope.spawn(|| submit(&engine, transaction(namespace, 0xd1, 0xb1)));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let follower = submit(&engine, transaction(namespace, 0xd1, 0xb1));
+        (leading.join().expect("the leader's thread"), follower)
+    });
+    engine_matrix::disarm(&serial);
+
+    assert!(
+        leader.receipt().is_none(),
+        "the armed failpoint must take the leader down, or this asserts nothing"
+    );
+    // The specific error matters less than its existence: what must not happen
+    // is the follower waiting forever on a leader that is never going to
+    // resolve it.
+    assert!(
+        follower.error().is_some(),
+        "the follower must be told its leader failed; a follower with neither receipt nor \
+         error is a hung request, which is the outcome this coalescing exists not to create"
+    );
+}

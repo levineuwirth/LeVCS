@@ -1544,6 +1544,7 @@ fn spawn_shard_writer(
         tail_generation: tail.logical_generation,
         rotation_wanted: false,
         durable_answer: None,
+        attached_to: None,
         run_entry_baseline,
         checkpoint_namespaces,
         journal,
@@ -1625,6 +1626,10 @@ struct ShardWriter {
     /// Logical index generation of the active journal, so an index location
     /// built here resolves to the same pinned file after a reopen.
     tail_generation: u64,
+    /// Set by `prepare` when this submission's operation ID is already in
+    /// flight under the same stable digest. Names the leader whose waiter the
+    /// follower's completion is moved onto.
+    attached_to: Option<OperationKey>,
     /// Set by `prepare` when the operation already committed and the caller is
     /// retrying. Carries the durable receipt out to `accept`, which completes
     /// the waiter with it -- a retry is answered, not refused.
@@ -1691,6 +1696,15 @@ struct Waiter {
     /// The status-root reservation this waiter owns while it is `PreAppend`.
     /// Taken over by step 8 once the group publishes.
     reservation: Option<OperationKey>,
+    /// Callers that submitted the same operation ID with the same stable digest
+    /// while this one was in flight. They appended nothing and hold no
+    /// reservation; they exist only to be told what this waiter is told.
+    ///
+    /// Kept on the waiter rather than in a side table keyed by operation, so
+    /// that a follower cannot outlive the request it is following: every path
+    /// that resolves a waiter drops it, and the followers go with it whether
+    /// they were answered by a receipt, an error, a poison, or an unwind.
+    followers: Vec<SharedCompletion>,
 }
 
 impl Waiter {
@@ -1699,7 +1713,24 @@ impl Waiter {
             completion,
             phase: WaiterPhase::PreAppend,
             reservation: None,
+            followers: Vec::new(),
         }
+    }
+
+    /// Answer this request and everyone coalesced onto it, with one outcome.
+    ///
+    /// The single place a waiter is completed. There are eight sites that
+    /// resolve one -- commit, pre-append refusal, poison drain, deadline drop,
+    /// panic unwind, and the durable-retry answer among them -- and a follower
+    /// that any one of them forgot would hang forever with no error and no
+    /// receipt, which is the failure mode hardest to notice and hardest to
+    /// diagnose. Routing all of them through here makes "a follower is answered
+    /// exactly when its leader is" true by construction.
+    fn resolve(self, outcome: Result<CommitReceipt, StoreError>) {
+        for follower in &self.followers {
+            follower.complete(outcome.clone());
+        }
+        self.completion.complete(outcome);
     }
 }
 
@@ -1788,14 +1819,15 @@ fn run_shard_writer(mut writer: ShardWriter, submissions: Receiver<Command>) {
                     if let Some(key) = waiter.reservation {
                         writer.release_reservation(&key);
                     }
-                    waiter.completion.complete(Err(pre_append_panic_error()));
+                    waiter.resolve(Err(pre_append_panic_error()));
                 }
                 WaiterPhase::Publishing => {
                     poisoned_any = true;
-                    waiter.completion.complete(Err(poison.clone()));
+                    waiter.resolve(Err(poison.clone()));
                 }
-                WaiterPhase::Committed(receipt) => {
-                    waiter.completion.complete(Ok(receipt));
+                WaiterPhase::Committed(ref receipt) => {
+                    let receipt = receipt.clone();
+                    waiter.resolve(Ok(receipt));
                 }
             }
         }
@@ -1876,6 +1908,36 @@ impl ShardWriter {
         let (mut prepared, frame) = match self.prepare_caught(&transaction) {
             Ok(pair) => pair,
             Err(error) => {
+                // A second copy of a request already in flight. Its own
+                // waiter is removed and its completion moved onto the leader,
+                // so from here it is answered by whatever resolves the leader
+                // and by nothing else.
+                if let Some(key) = self.attached_to.take() {
+                    drop(adoption);
+                    if let Some(follower) = self.waiters.pop() {
+                        match self
+                            .waiters
+                            .iter_mut()
+                            .find(|waiter| waiter.reservation == Some(key))
+                        {
+                            Some(leader) => leader.followers.push(follower.completion),
+                            // The leader vanished between reserving and this
+                            // lookup. It cannot: `reserve` answered `Attached`
+                            // against the status root, this writer owns every
+                            // transition of that entry, and nothing else runs
+                            // between the two points on this thread. Answering
+                            // the follower with a definitive refusal is still
+                            // better than dropping its completion, which would
+                            // hang the caller with no outcome at all.
+                            None => follower.resolve(Err(self.poison_error(format!(
+                                "operation {} attached to a leader this shard is not holding",
+                                key.operation_id.to_hex()
+                            )))),
+                        }
+                    }
+                    return;
+                }
+
                 // A retry of an operation that already committed. The receipt
                 // is the durable one, so nothing is sequenced and no frame is
                 // appended for it.
@@ -1885,7 +1947,7 @@ impl ShardWriter {
                         if let Some(key) = waiter.reservation {
                             self.release_reservation(&key);
                         }
-                        waiter.completion.complete(Ok(receipt));
+                        waiter.resolve(Ok(receipt));
                     }
                     return;
                 }
@@ -2096,7 +2158,7 @@ impl ShardWriter {
             if let Some(key) = waiter.reservation {
                 self.release_reservation(&key);
             }
-            waiter.completion.complete(Err(error));
+            waiter.resolve(Err(error));
         }
     }
 
@@ -2714,7 +2776,7 @@ impl ShardWriter {
                 // reopen through recovery.
                 self.poison = Some(error.clone());
                 for waiter in self.waiters.drain(..pending.len()) {
-                    waiter.completion.complete(Err(error.clone()));
+                    waiter.resolve(Err(error.clone()));
                 }
             }
         }
@@ -2752,9 +2814,10 @@ impl ShardWriter {
         let deliver = !matches!(hung, Ok(true));
         for waiter in self.waiters.drain(..members) {
             match waiter.phase {
-                WaiterPhase::Committed(receipt) => {
+                WaiterPhase::Committed(ref receipt) => {
                     if deliver {
-                        waiter.completion.complete(Ok(receipt));
+                        let receipt = receipt.clone();
+                        waiter.resolve(Ok(receipt));
                     }
                 }
                 WaiterPhase::PreAppend | WaiterPhase::Publishing => unreachable!(
@@ -2839,7 +2902,7 @@ impl ShardWriter {
                     // be written.
                     self.release_reservation(&key);
                     let waiter = self.waiters.remove(cursor);
-                    waiter.completion.complete(Err(error));
+                    waiter.resolve(Err(error));
                 }
             }
         }
@@ -4537,11 +4600,17 @@ impl ShardWriter {
             // bound is enforced atomically with the insert by retrying this
             // whole reconsideration on CAS failure.
             match current.reserve(key, entry) {
+                // Same ID, same stable digest, already in flight: one
+                // request that arrived twice. It reserves nothing and
+                // sequences nothing -- `accept` moves its completion onto the
+                // leader's waiter and it is answered with whatever the leader
+                // is answered with.
                 StatusReservation::Attached(_) => {
-                    return Err(StoreError::NotImplemented(
-                        "same-ID/same-digest coalescing onto an in-flight leader — B1 \
-                         NamespaceTxn, scope 6-B1 deliverable 7",
-                    ))
+                    self.attached_to = Some(key);
+                    return Err(StoreError::Overloaded {
+                        limit: "coalesced_follower",
+                        retry_after_micros: 0,
+                    });
                 }
                 StatusReservation::OperationIdMismatch { .. } => {
                     return Err(StoreError::Conflict(format!(

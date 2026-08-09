@@ -933,11 +933,19 @@ pub enum CheckpointProbe {
     /// `StoreEngine::checkpoint` refused `NotImplemented`, so no checkpoint was
     /// taken and none could have been.
     RefusedNotImplemented,
-    /// `StoreEngine::checkpoint` returned a lease. The measured window still
-    /// contains no checkpoint — the harness takes none inside it — so the
-    /// truthful value is `enabled_not_reached`, and reaching one is the
-    /// emitter's next change rather than a relabelling of this one.
+    /// `StoreEngine::checkpoint` returned a lease, but no checkpoint was taken
+    /// inside the measured window. The value is honest and cannot pass: a run
+    /// whose lookup fan-out grows for its whole duration and which never
+    /// checkpoints is not measuring the steady state a P2 number is supposed to
+    /// characterize.
     EnabledNotReached,
+    /// At least one checkpoint completed **inside the measured interval**.
+    ///
+    /// Counted from checkpoints the run actually took, never from the ability
+    /// to take one -- that is what `EnabledNotReached` already records, and the
+    /// distinction between "the store can checkpoint" and "this measurement
+    /// contains one" is the whole reason scope §7 requires this field.
+    Exercised,
 }
 
 /// Whether the index reached a steady state, from what is on the device.
@@ -1235,6 +1243,7 @@ impl RunConditions {
             checkpointing: match observations.checkpoint {
                 CheckpointProbe::RefusedNotImplemented => "unimplemented",
                 CheckpointProbe::EnabledNotReached => "enabled_not_reached",
+                CheckpointProbe::Exercised => "exercised",
             },
             index_maintenance,
             index_run_ceiling,
@@ -3318,6 +3327,17 @@ struct EngineRun {
     /// Group publications, counted as fences: `journal::append_group_and_fence`
     /// performs exactly one per group and A1's acceptance pins that.
     groups: u64,
+    /// Checkpoints that completed inside the measured interval. Zero is a
+    /// truthful answer for a run too short to reach the interval, and it is
+    /// what keeps `checkpointing` at `enabled_not_reached` rather than
+    /// promoting a run that never checkpointed.
+    checkpoints_taken: u64,
+    /// Commits in each whole one-minute window of the measured interval.
+    ///
+    /// Whole windows only: a trailing partial minute is not a one-minute window
+    /// and including it would report a rate over less than a minute as though
+    /// it were one, which §3's rule is specifically about.
+    window_commits: Vec<u64>,
     signing_micros_p50: f64,
     /// Signing samples taken inside the measured interval, on the same basis.
     signings: u64,
@@ -3344,6 +3364,7 @@ fn run_engine(
     seconds: u64,
     shard_count: u16,
     submitters_per_shard: usize,
+    checkpoint_interval: Duration,
 ) -> Result<EngineRun, String> {
     use levcs_store::segment::RootLayout;
     use levcs_store::transaction::StagedObject;
@@ -3517,7 +3538,64 @@ fn run_engine(
     let started = Instant::now();
     let deadline = started + Duration::from_secs(seconds.max(1));
 
+    // Checkpoints taken inside the measured interval, by a thread that lives
+    // exactly as long as the submitters do.
+    //
+    // Inside the window on purpose. A checkpoint taken before or after it would
+    // leave the measured seconds describing a store that never compacted its
+    // index -- fan-out growing for the whole run -- which is the condition
+    // scope §7's stop clause exists to exclude. Its cost is therefore *in* the
+    // reported rate, which is the honest place for it: a P2 number that
+    // excluded checkpoint cost would not describe a steady state either.
+    // Commits per one-minute window, indexed by whole minutes since the window
+    // opened. Counted here rather than reconstructed from per-transaction
+    // timestamps: the §3 rule needs a rate per minute, and a counter per minute
+    // is bounded by the run's length while a timestamp per commit is bounded by
+    // its throughput -- 22 million of them at the P2 target.
+    let window_commits: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+    let checkpoints_taken = AtomicU64::new(0);
+    let checkpoint_failure: Mutex<Option<String>> = Mutex::new(None);
+
     std::thread::scope(|scope| {
+        {
+            let engine = &engine;
+            let stop = &stop;
+            let checkpoints_taken = &checkpoints_taken;
+            let checkpoint_failure = &checkpoint_failure;
+            scope.spawn(move || {
+                // Polled rather than slept in one block, so the thread leaves
+                // promptly when the window closes instead of holding the scope
+                // open for a whole interval past it.
+                let mut next = Instant::now() + checkpoint_interval;
+                while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+                    if Instant::now() < next {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    match engine.checkpoint() {
+                        Ok(_) => {
+                            checkpoints_taken.fetch_add(1, Ordering::Relaxed);
+                        }
+                        // Recorded and fatal to the run rather than retried. A
+                        // checkpoint that fails mid-measurement leaves the
+                        // store in a state the bundle would have to describe,
+                        // and continuing would report a rate for a run whose
+                        // index maintenance stopped working partway.
+                        Err(error) => {
+                            let mut slot =
+                                checkpoint_failure.lock().unwrap_or_else(|e| e.into_inner());
+                            if slot.is_none() {
+                                *slot = Some(format!("{error:?}"));
+                            }
+                            stop.store(true, Ordering::Relaxed);
+                            return;
+                        }
+                    }
+                    next = Instant::now() + checkpoint_interval;
+                }
+            });
+        }
+
         for shard in 0..shard_count {
             for submitter in 0..submitters_per_shard {
                 let namespace = namespaces[shard as usize];
@@ -3530,6 +3608,7 @@ fn run_engine(
                 let unaccounted = &unaccounted;
                 let results = &results;
                 let latencies = &latencies;
+                let window_commits = &window_commits;
                 let objects_new = &objects_new;
                 let raw_bytes = &raw_bytes;
                 scope.spawn(move || {
@@ -3691,6 +3770,19 @@ fn run_engine(
                                     .lock()
                                     .unwrap_or_else(|p| p.into_inner())
                                     .push(micros);
+                                {
+                                    // The window this commit landed in, from the
+                                    // same clock the deadline uses. A commit is
+                                    // counted when it is acknowledged, which is
+                                    // what the rate is a rate of.
+                                    let minute = started.elapsed().as_secs() / 60;
+                                    let mut windows =
+                                        window_commits.lock().unwrap_or_else(|p| p.into_inner());
+                                    if windows.len() <= minute as usize {
+                                        windows.resize(minute as usize + 1, 0);
+                                    }
+                                    windows[minute as usize] += 1;
+                                }
                                 results.lock().unwrap_or_else(|p| p.into_inner()).push((
                                     namespace,
                                     operation,
@@ -3792,6 +3884,26 @@ fn run_engine(
     signing.sort_unstable();
     let signing_p50 = percentile(&signing, 0.50) as f64;
 
+    // One last checkpoint, **after** the measured window has closed.
+    //
+    // A steady-state run is publishing deltas continuously and sealing them
+    // periodically, so at the instant the window closes there is essentially
+    // always a partial backlog -- it is an artifact of where the clock stopped,
+    // not a statement about whether maintenance kept pace. `index_maintenance`
+    // requires a drained backlog to declare `runs_sealed`, and that check is
+    // worth keeping strict: the alternative is asserting a steady state while
+    // carrying a backlog the bundle has no field to report.
+    //
+    // Draining here reconciles the two without weakening either. It is outside
+    // the measured interval, so it changes no reported rate; the checkpoints
+    // that establish maintenance kept pace are the periodic ones *inside* it,
+    // counted separately and reported as `checkpointing`.
+    if checkpoints_taken.load(Ordering::Relaxed) > 0 {
+        engine
+            .checkpoint()
+            .map_err(|error| format!("the closing checkpoint failed: {error:?}"))?;
+    }
+
     drop(ack);
     drop(engine);
 
@@ -3847,7 +3959,15 @@ fn run_engine(
     // What the store answers about checkpoints, asked of the store rather than
     // asserted about it. Asked after the reconciliation so a checkpoint the day
     // this stops refusing cannot move what the reconciliation read.
-    let checkpoint = probe_checkpointing(&reopened)?;
+    // `Exercised` comes from the run, never from the probe: the probe can only
+    // establish that a checkpoint is *possible*, and the field is about whether
+    // this measurement contains one. A run that took none falls through to the
+    // probe and reports `enabled_not_reached`, which cannot pass.
+    let checkpoint = if checkpoints_taken.load(Ordering::Relaxed) > 0 {
+        CheckpointProbe::Exercised
+    } else {
+        probe_checkpointing(&reopened)?
+    };
     // Read from the live engine, after the checkpoint probe, so it describes
     // the state the bundle is about — and before the handle is dropped, because
     // the reading only exists while the root is open.
@@ -3883,7 +4003,29 @@ fn run_engine(
     // as index runs rather than counted as directory entries.
     let index_scan = scan_index_runs(root, shard_count);
 
+    // A checkpoint that failed mid-window invalidates the measurement rather
+    // than reducing it: the reported rate would be for a run whose index
+    // maintenance stopped partway, which is not a steady state either.
+    if let Some(error) = checkpoint_failure.into_inner().unwrap_or(None) {
+        return Err(format!(
+            "a checkpoint failed inside the measured interval: {error}. The run is \
+             discarded rather than reported, because its rate would describe a store \
+             that stopped maintaining its index partway through."
+        ));
+    }
+
+    // Whole windows only. The run stops at its deadline, so the last bucket is
+    // almost always a fraction of a minute; keeping it would divide a partial
+    // minute's commits by sixty seconds and report a rate no window achieved.
+    let mut window_commits = window_commits
+        .into_inner()
+        .unwrap_or_else(|p| p.into_inner());
+    let whole_windows = (elapsed.as_secs() / 60) as usize;
+    window_commits.truncate(whole_windows);
+
     Ok(EngineRun {
+        window_commits,
+        checkpoints_taken: checkpoints_taken.load(Ordering::Relaxed),
         facts: RunFacts {
             initialization,
             mutation: MutationPath::StoreEngineSubmit,
@@ -3991,6 +4133,14 @@ fn check_global_uniqueness(records: &[AckRecord]) -> Result<UniquenessCheck, Str
 struct MeasuredRun {
     latencies_micros: Vec<u64>,
     groups: u64,
+    /// Checkpoints completed inside the measured interval. The journal seam has
+    /// no engine and therefore no checkpoint, so it is always zero there --
+    /// which is why the drive path declares `unimplemented` rather than this.
+    checkpoints_taken: u64,
+    /// Commits per whole one-minute window, empty for a run shorter than a
+    /// minute. Empty is what makes the §3 rule unevaluable rather than
+    /// vacuously satisfied.
+    window_commits: Vec<u64>,
     transactions: u64,
     /// Counted from the objects the store actually staged on the submit path,
     /// and derived as `transactions * 3` on the drive path, where there are no
@@ -4028,6 +4178,9 @@ struct MeasuredRun {
 impl From<SkeletonRun> for MeasuredRun {
     fn from(run: SkeletonRun) -> Self {
         Self {
+            // The journal seam has no engine to checkpoint.
+            checkpoints_taken: 0,
+            window_commits: Vec::new(),
             groups: run.groups,
             transactions: run.transactions,
             objects_new: run.transactions * OBJECTS_PER_COMMIT,
@@ -4061,6 +4214,8 @@ impl From<SkeletonRun> for MeasuredRun {
 impl From<EngineRun> for MeasuredRun {
     fn from(run: EngineRun) -> Self {
         Self {
+            checkpoints_taken: run.checkpoints_taken,
+            window_commits: run.window_commits.clone(),
             groups: run.groups,
             transactions: run.transactions,
             objects_new: run.objects_new,
@@ -4338,24 +4493,27 @@ fn dispatch(subcommand: &str, flags: &Flags) -> Result<ExitCode, String> {
             }
         }
     } else if subcommand == "emit-skeleton" {
-        emit_skeleton(&repo_root, &workload, &profile, flags)
+        emit_bundle(&repo_root, &workload, &profile, flags, true)
     } else if subcommand == "run" {
-        Err(
-            "the P2 run goes through StoreEngine::submit, which is B1 NamespaceTxn \
-             (scope 6-B1). Wave A can produce a P1-micro number and a skeleton \
-             bundle; it cannot produce a P2 result."
-                .to_string(),
-        )
+        emit_bundle(&repo_root, &workload, &profile, flags, false)
     } else {
         Err(format!("unknown subcommand {subcommand:?}\n\n{USAGE}"))
     }
 }
 
-fn emit_skeleton(
+/// Emit one bundle, either as a skeleton or as a measured P2 run.
+///
+/// One function for both because the two must not drift: a skeleton whose
+/// measurement block is assembled by different code from the run's would let a
+/// field be checked in rehearsal and unchecked in the campaign. What differs is
+/// stated in `skeleton` and nowhere else -- the window arithmetic below, and
+/// the `skeleton` flag the outcome rule reads.
+fn emit_bundle(
     repo_root: &Path,
     workload: &FrozenWorkload,
     profile: &FrozenProfile,
     flags: &Flags,
+    skeleton: bool,
 ) -> Result<ExitCode, String> {
     if flags.get("allow-unsigned").is_none() {
         return Err(
@@ -4370,8 +4528,24 @@ fn emit_skeleton(
 
     let root = PathBuf::from(flags.required("root")?);
     let out = PathBuf::from(flags.required("out")?);
-    let seconds = flags.number::<u64>("seconds", 2)?;
+    // A skeleton is a rehearsal and defaults to seconds; a measured run defaults
+    // to the frozen `p2_p3_measured_seconds`, so the campaign's length comes
+    // from the workload rather than from whatever the caller typed.
+    let seconds = flags.number::<u64>(
+        "seconds",
+        if skeleton {
+            2
+        } else {
+            workload.measured_seconds
+        },
+    )?;
     let group_len = flags.number::<usize>("group-len", 16)?;
+    // How often the measured window takes a checkpoint. The default is short
+    // enough that even a brief run reaches one, because a run that silently
+    // never checkpointed is exactly the state scope §7 forbids a P2 number from
+    // having been obtained in.
+    let checkpoint_interval =
+        Duration::from_millis(flags.number::<u64>("checkpoint-interval-millis", 1_000)?);
 
     // Precheck 1 runs against the skeleton's own budget, not P2's: the point
     // is to exercise the code path and the arithmetic, and demanding 280 GB
@@ -4402,7 +4576,14 @@ fn emit_skeleton(
         let shards = flags.number::<u16>("shards", 4)?;
         let submitters = flags.number::<usize>("submitters-per-shard", group_len.max(1))?;
         run_engine(
-            &root, &ack_path, ack_fault, group_len, seconds, shards, submitters,
+            &root,
+            &ack_path,
+            ack_fault,
+            group_len,
+            seconds,
+            shards,
+            submitters,
+            checkpoint_interval,
         )?
         .into()
     } else if path == "drive" {
@@ -4466,6 +4647,52 @@ fn emit_skeleton(
         0.0
     };
 
+    // The §3 window rule, computed from whole one-minute windows the run
+    // actually recorded.
+    //
+    // A skeleton has none -- it is shorter than a minute by design -- so it
+    // reports the single whole-run rate and a trivially-satisfied percentage,
+    // and its `skeleton` flag is what stops the outcome rule reading that as a
+    // pass. A measured run with no whole window is refused outright rather than
+    // falling back to the same synthesis: a P2 bundle whose window rule was
+    // evaluated over a synthesized window would state the rule as met without
+    // having tested it.
+    let target_rate = flags.number::<u64>("target-rate", 75_000)? as f64;
+    let (window_rates, windows_meeting_target) = if run.window_commits.is_empty() {
+        if !skeleton {
+            return Err(format!(
+                "refusing to emit a measured bundle: the run recorded no whole one-minute \
+                 window (it ran for {seconds}s). Section 3's rule is about one-minute \
+                 windows, and a run too short to contain one cannot have met it. Pass \
+                 --seconds 60 or more, or emit-skeleton if a rehearsal was intended."
+            ));
+        }
+        (vec![rate], 100.0)
+    } else {
+        let rates: Vec<f64> = run
+            .window_commits
+            .iter()
+            .map(|commits| *commits as f64 / 60.0)
+            .collect();
+        // Both halves of the rule. The percentage is what the schema records;
+        // the floor is checked here because a single window below 90% of target
+        // fails §3 outright however good the percentage is, and nothing
+        // downstream would notice it.
+        let meeting = rates.iter().filter(|r| **r >= target_rate).count();
+        let percent = (meeting as f64 / rates.len() as f64) * 100.0;
+        let floor = target_rate * 0.90;
+        let percent = if rates.iter().any(|r| *r < floor) {
+            // Reported as a failure of the rule rather than as a separate
+            // field, because the schema has one number for it and a bundle that
+            // passed the percentage while dipping below the floor must not read
+            // as having met the rule.
+            0.0
+        } else {
+            percent
+        };
+        (rates, percent)
+    };
+
     let mut histogram_input = String::new();
     for value in &sorted {
         let _ = write!(histogram_input, "{value},");
@@ -4508,14 +4735,8 @@ fn emit_skeleton(
         latency_p99: percentile(&sorted, 0.99),
         latency_max: sorted.last().copied().unwrap_or(0),
         histogram_digest: digest_hex(histogram_input.as_bytes()),
-        // A run shorter than a minute has no one-minute windows. What is
-        // reported is the single whole-run rate, and the percentage is
-        // therefore trivially 100 — which is why the bundle's `outcome` is
-        // `preliminary` and its own gate verdict `not-applicable`. A P2 run
-        // computes real windows; nothing here should be read as having met the
-        // section 3 window rule.
-        one_minute_windows: vec![rate],
-        windows_meeting_target_percent: 100.0,
+        one_minute_windows: window_rates.clone(),
+        windows_meeting_target_percent: windows_meeting_target,
         ack_journal_digest: run.ack_journal_digest.clone(),
         acknowledged_loss: run.acknowledged_loss,
         torn_transactions: run.torn_transactions,
@@ -5431,8 +5652,19 @@ sys.exit(1 if errors else 0)
         let directory = tempfile::tempdir().expect("tempdir");
         let root = directory.path().join("root");
         let ack = directory.path().join("ack-journal");
-        let run = run_engine(&root, &ack, AckJournalFault::None, 4, 1, 2, 1)
-            .expect("an engine-driven run");
+        // A one-second run with a half-second interval, so the measured window
+        // contains a checkpoint rather than depending on the default cadence.
+        let run = run_engine(
+            &root,
+            &ack,
+            AckJournalFault::None,
+            4,
+            1,
+            2,
+            1,
+            Duration::from_millis(500),
+        )
+        .expect("an engine-driven run");
 
         // The exclusion is not vacuous: creating the repositories really did
         // fence and really did sign, so there is something to exclude. Without
@@ -5513,6 +5745,7 @@ sys.exit(1 if errors else 0)
             1,
             2,
             0,
+            Duration::from_secs(3_600),
         )
         .err()
         .expect("a run with no submitter measures nothing");
@@ -5527,6 +5760,7 @@ sys.exit(1 if errors else 0)
             1,
             0,
             1,
+            Duration::from_secs(3_600),
         )
         .err()
         .expect("no shard is no repository and no transaction");

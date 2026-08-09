@@ -1839,6 +1839,46 @@ The integration suite's `cleanup_is_deferred_and_names_its_deliverable` is repla
 deleted — the distinction it stood for, that "nothing to do" and "cannot answer yet" are
 different results, is now asserted the other way round at the public surface.
 
+##### Contract review 2026-08-09-C
+
+`crates/levcs-store/src/index.rs` — `IndexRun::entries`. A frozen Wave A interface, so
+requested rather than emitted. Additive and read-only; no byte of the run format moves.
+
+**Nothing in the store has ever removed an index run.** `seal_index` pushes one per seal and
+the adoption path pushes the runs staging materialized; the successor generation carries the
+predecessor's forward. That was invisible while nothing checkpointed on a cadence. Wiring the
+P2 harness to take checkpoints inside its measured window made it immediate: a 125-second run
+died with `max_open_index_runs (observed: 33, allowed: 32)`.
+
+**The frozen workload is arithmetically unreachable without compaction.** 300 s warmup plus
+900 s measured against a hard ceiling of 32 open runs allows at most one checkpoint per ~37 s,
+and ends at the ceiling with no headroom for a fan-out-triggered seal. The alternatives were
+raising the ceiling — the disclosed-weakening pattern retired the same day by 2026-08-09-B, and
+it would make `index_maintenance = runs_sealed` describe a run whose fan-out grows unbounded —
+or shortening the measured window, which is a Phase 0 contract. Merging runs is the only option
+that does not trade what the number means for the ability to produce one.
+
+**A merge cannot be written against the existing API**, which answers point lookups only:
+`get`, `may_contain`, `entry_count`, `references_segment_generation`,
+`references_only_segment_generation`. `entries` yields `(IndexKey, IndexLocation)` in the order
+already on the device — sections ascending by namespace, entries ascending within a section — so
+a caller that re-encodes what it reads produces the layout it consumed. It returns no `Result`
+per entry: every value is decoded from bytes the run validated at `open`, and a run that could
+not be trusted entry by entry should not have opened.
+`entries_yields_every_entry_and_agrees_with_get` asserts the walk against the run's own `get`
+rather than against the delta it was built from, because the question is whether the decoder
+reads back what the encoder wrote.
+
+**Compaction partitions by generation domain, and that is a rule rather than a preference.** A
+run section is per-namespace with a 16-bit generation span, and adopted-projection generations
+sit in the band at `1 << 63`. Journal-backed runs may merge with each other and staging-owned
+artifact runs with each other; a merge across the two is unencodable. Today's `seal_index` is
+safe only because adopted entries never enter a shard delta, so compaction is the first
+operation that could mix them.
+
+Scope is deliberately narrower than Phase 4's `CompactionBackup`: sealed index runs only, no
+segment compaction, no event-floor retention, no backup interaction.
+
 ##### Contract review 2026-08-09-B
 
 `bench/result-schema.json` — `run_conditions.index_run_ceiling`. Requested after index-delta

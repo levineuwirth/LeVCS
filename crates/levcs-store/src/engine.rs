@@ -262,28 +262,25 @@ impl StoreEngine {
 
         let layout = RootLayout::new(&options.root);
         #[cfg_attr(not(test), allow(unused_variables))]
-        let initialization =
-            match classify_root(&layout)? {
-                // Both reach the same code because they are the same state: a root
-                // that has never finished initializing. The second one only carries
-                // residue this code path wrote, and `initialize_root_state_1`
-                // re-decides which it is under the lock before it writes anything.
-                RootStartupState::AbsentOrEmpty | RootStartupState::InterruptedInitialization => {
-                    Some(initialize_root_state_1(&layout, &options)?)
-                }
-                RootStartupState::Formatted => None,
-                // States 3 and 4 share one refusal because telling them apart is
-                // the legacy recognizer, and returning `UnrecognizedLayout` for a
-                // root that is in fact a legacy instance would tell an operator
-                // holding real data "refusing to modify" instead of the migration
-                // command. Nothing here has written, probed, or inferred.
-                RootStartupState::NonEmptyWithoutFormat => return Err(StoreError::NotImplemented(
-                    "StoreEngine::open startup states 3 and 4 (LegacyLayout carrying the exact \
-                     migrate-store command, UnrecognizedLayout) — B1 NamespaceTxn, scope 6-B1 \
-                     deliverable 1. The root is non-empty and carries no FORMAT; it has not been \
-                     modified",
-                )),
-            };
+        let initialization = match classify_root(&layout)? {
+            // Both reach the same code because they are the same state: a root
+            // that has never finished initializing. The second one only carries
+            // residue this code path wrote, and `initialize_root_state_1`
+            // re-decides which it is under the lock before it writes anything.
+            RootStartupState::AbsentOrEmpty | RootStartupState::InterruptedInitialization => {
+                Some(initialize_root_state_1(&layout, &options)?)
+            }
+            RootStartupState::Formatted => None,
+            // States 3 and 4 share one refusal because telling them apart is
+            // the legacy recognizer, and returning `UnrecognizedLayout` for a
+            // root that is in fact a legacy instance would tell an operator
+            // holding real data "refusing to modify" instead of the migration
+            // command. Nothing here has written, probed, or inferred.
+            RootStartupState::LegacyInstance => return Err(legacy_layout_refusal(&options.root)),
+            RootStartupState::UnrecognizedLayout => {
+                return Err(unrecognized_layout_refusal(&options.root))
+            }
+        };
 
         let session = RecoverySession::open(&options.root)?;
         if session.shard_count() != options.shard_count {
@@ -646,12 +643,6 @@ impl Drop for StoreEngine {
 /// Which of plan §5.2's startup states a root is in, decided by reading and
 /// nothing else.
 ///
-/// States 3 and 4 share a variant because this pass does not implement the
-/// legacy recognizer that separates them. That is a deliberate under-
-/// classification, not a catch-all: the variant is named for exactly the
-/// condition it holds — non-empty, no `FORMAT` — and `open` refuses it by
-/// naming both unbuilt states. Charter item 6 forbids a `_ =>` arm; it does
-/// not require inventing a distinction whose recognizer has not been written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RootStartupState {
     /// §5.2 state 1. The path does not exist, or it is a directory holding
@@ -672,8 +663,104 @@ enum RootStartupState {
     /// code path — and because charter item 6 requires the condition that
     /// authorizes a write to be named rather than folded into a neighbour.
     InterruptedInitialization,
-    /// §5.2 states 3 and 4, undivided this pass.
-    NonEmptyWithoutFormat,
+    /// §5.2 state 3. Non-empty, no `FORMAT`, and carrying the legacy instance
+    /// signature: at least one `<64-hex>/.levcs/` entry.
+    ///
+    /// Recognized rather than inferred. A missing `FORMAT` is not evidence of a
+    /// legacy instance — it is evidence of nothing at all, and most roots that
+    /// lack one are state 4. The signature is what distinguishes an operator
+    /// holding real data that a migration can read from an operator holding a
+    /// directory this store must not touch, and the two get different answers
+    /// because they need different actions.
+    LegacyInstance,
+    /// §5.2 state 4. Non-empty, no `FORMAT`, and no legacy signature.
+    UnrecognizedLayout,
+}
+
+/// §5.2 state 3: a legacy instance, refused with the command that migrates it.
+///
+/// The command is the whole value of distinguishing this state. An operator
+/// holding real data needs the next step, and `UnrecognizedLayout` — which is
+/// the honest answer for a directory this store cannot read — would tell them
+/// "refusing to modify" and leave them to work out that a migration exists.
+///
+/// `--destination` is left as a placeholder because only the operator knows
+/// where the v2 root should go, and inventing one would produce a command that
+/// runs and writes somewhere nobody chose.
+fn legacy_layout_refusal(root: &Path) -> StoreError {
+    StoreError::LegacyLayout {
+        migrate_command: format!(
+            "levcs-instance migrate-store --source {} --destination <dest>",
+            root.display()
+        ),
+    }
+}
+
+/// §5.2 state 4: non-empty, unreadable, and left exactly as found.
+///
+/// The message says what was observed and not what the operator should do,
+/// because this store does not know: the directory might be another
+/// application's, a partially copied backup, or a root whose `FORMAT` was
+/// deleted. Suggesting a migration for any of those would be a guess that
+/// costs data if taken.
+fn unrecognized_layout_refusal(root: &Path) -> StoreError {
+    StoreError::UnrecognizedLayout(format!(
+        "{} is not empty, carries no FORMAT, and does not match the legacy instance layout; \
+         it has not been modified",
+        root.display()
+    ))
+}
+
+/// The legacy instance signature: `<64-hex>/.levcs/`.
+///
+/// Read-only and deliberately shallow. It reads the root's entries and, for
+/// each one whose name is 64 hexadecimal characters, asks whether it holds a
+/// `.levcs` directory. It opens no file, follows no symlink into a decision,
+/// and creates nothing — a probe that wrote so much as a directory would
+/// destroy the byte-identity guarantee state 4 exists to make, and it would
+/// destroy it *before* the refusal that promises it.
+///
+/// One matching entry is enough. The scope says "≥1 entry of the form
+/// `<64-hex>/.levcs/`", and requiring more would refuse a legacy root holding
+/// exactly one repository — which is both a real shape and the one an operator
+/// is most likely to be migrating first.
+fn has_legacy_instance_signature(root: &Path) -> Result<bool, StoreError> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(StoreError::from(error)),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.len() != 64 || !name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        // `file_type` on the entry, not a `metadata` call that follows links:
+        // a symlink named like a repository is not a repository, and resolving
+        // it would let a link outside the root decide what this root is.
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        // `symlink_metadata` and not `is_dir`, for the same reason as the entry
+        // type above and with a sharper consequence. `Path::is_dir` follows
+        // links, so a `.levcs` symlink pointing at any directory anywhere would
+        // satisfy it — and the signature this function reports is a claim about
+        // what is *in this root*, not about what a link in it can reach. A root
+        // that borrowed the shape from somewhere else would be answered with a
+        // migration command for repositories it does not hold.
+        //
+        // A missing `.levcs` is an ordinary answer here, not an error: the
+        // entry simply is not a repository.
+        match std::fs::symlink_metadata(entry.path().join(".levcs")) {
+            Ok(metadata) if metadata.file_type().is_dir() => return Ok(true),
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(StoreError::from(error)),
+        }
+    }
+    Ok(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -988,10 +1075,17 @@ fn classify_root(layout: &RootLayout) -> Result<RootStartupState, StoreError> {
     if has_marker && !has_foreign && initializing_marker_is_ours(layout)? {
         return Ok(RootStartupState::InterruptedInitialization);
     }
-    Ok(if has_content {
-        RootStartupState::NonEmptyWithoutFormat
+    if !has_content {
+        return Ok(RootStartupState::AbsentOrEmpty);
+    }
+    // Last, and only for a root already known to be non-empty and unformatted.
+    // Running the recognizer earlier would read repository-shaped names in a
+    // root that turns out to be state 1 or 2, which is work no state needs and
+    // an answer no state uses.
+    Ok(if has_legacy_instance_signature(&layout.root)? {
+        RootStartupState::LegacyInstance
     } else {
-        RootStartupState::AbsentOrEmpty
+        RootStartupState::UnrecognizedLayout
     })
 }
 
@@ -1068,13 +1162,12 @@ fn initialize_root_state_1(
         // Non-empty with no `FORMAT` and no marker, discovered only under the
         // lock. The refusal is the same one state 3/4 gets, and this path has
         // written nothing but the directories it was told were absent.
-        RootStartupState::NonEmptyWithoutFormat => {
-            return Err(StoreError::NotImplemented(
-                "StoreEngine::open startup states 3 and 4 (LegacyLayout carrying the exact \
-                 migrate-store command, UnrecognizedLayout) — B1 NamespaceTxn, scope 6-B1 \
-                 deliverable 1. The root became non-empty without a FORMAT between \
-                 classification and the root lock; it has not been modified",
-            ))
+        // Discovered only under the lock: the root became non-empty between
+        // classification and here. The answer is the same as the first pass
+        // gives, because the condition is the same one.
+        RootStartupState::LegacyInstance => return Err(legacy_layout_refusal(&layout.root)),
+        RootStartupState::UnrecognizedLayout => {
+            return Err(unrecognized_layout_refusal(&layout.root))
         }
     }
 
@@ -5220,8 +5313,24 @@ mod tests {
     /// that created a directory, truncated a file, or appended a byte, and it
     /// catches all three including the empty-directory case, which a
     /// contents-only digest would miss.
-    fn tree_image(root: &Path) -> Vec<(PathBuf, bool, Vec<u8>)> {
-        fn walk(base: &Path, dir: &Path, out: &mut Vec<(PathBuf, bool, Vec<u8>)>) {
+    /// What one entry of a tree image is.
+    ///
+    /// A symlink is its own kind and carries its target rather than its
+    /// target's contents. An image that resolved links would not be an image of
+    /// *this* root -- it would describe files somewhere else, miss a link whose
+    /// target changed under it, and fail outright on a link to a directory --
+    /// and it would call a symlink replaced by a real directory of the same
+    /// name "unchanged", which is exactly the substitution these refusals
+    /// promise not to make.
+    #[derive(Debug, PartialEq, Eq)]
+    enum ImageNode {
+        Dir,
+        File(Vec<u8>),
+        Symlink(PathBuf),
+    }
+
+    fn tree_image(root: &Path) -> Vec<(PathBuf, ImageNode)> {
+        fn walk(base: &Path, dir: &Path, out: &mut Vec<(PathBuf, ImageNode)>) {
             let mut entries: Vec<_> = std::fs::read_dir(dir)
                 .expect("read a directory of the image")
                 .map(|entry| entry.expect("a directory entry").path())
@@ -5232,16 +5341,31 @@ mod tests {
                     .strip_prefix(base)
                     .expect("every walked path is under the base")
                     .to_path_buf();
-                if path.is_dir() {
-                    out.push((relative, true, Vec::new()));
+                let kind = std::fs::symlink_metadata(&path)
+                    .expect("stat an entry of the image")
+                    .file_type();
+                if kind.is_symlink() {
+                    out.push((
+                        relative,
+                        ImageNode::Symlink(
+                            std::fs::read_link(&path).expect("read a symlink target"),
+                        ),
+                    ));
+                } else if kind.is_dir() {
+                    out.push((relative, ImageNode::Dir));
                     walk(base, &path, out);
                 } else {
-                    out.push((relative, false, std::fs::read(&path).expect("read a file")));
+                    out.push((
+                        relative,
+                        ImageNode::File(std::fs::read(&path).expect("read a file")),
+                    ));
                 }
             }
         }
         let mut image = Vec::new();
-        if root.exists() {
+        // `symlink_metadata`, so a root that is itself a dangling symlink is
+        // an empty image rather than a panic.
+        if std::fs::symlink_metadata(root).is_ok() {
             walk(root, root, &mut image);
         }
         image
@@ -5502,9 +5626,9 @@ mod tests {
         let refuse = |label: &str, root: &Path| {
             let before = tree_image(root);
             match StoreEngine::open(options(&serial, root, 1)) {
-                Err(StoreError::NotImplemented(reason)) => {
+                Err(StoreError::UnrecognizedLayout(reason)) => {
                     assert!(
-                        reason.contains("startup states 3 and 4"),
+                        reason.contains("has not been modified"),
                         "{label}: {reason}"
                     );
                 }
@@ -5589,10 +5713,12 @@ mod tests {
         let refuse = |label: &str, root: &Path| {
             let before = tree_image(root);
             match StoreEngine::open(options(&serial, root, 1)) {
-                Err(StoreError::NotImplemented(reason)) => assert!(
-                    reason.contains("startup states 3 and 4"),
-                    "{label}: {reason}"
-                ),
+                Err(StoreError::UnrecognizedLayout(reason)) => {
+                    assert!(
+                        reason.contains("has not been modified"),
+                        "{label}: {reason}"
+                    )
+                }
                 other => panic!("{label}: expected a refusal, got {other:?}"),
             }
             assert_eq!(
@@ -5657,8 +5783,8 @@ mod tests {
         )
         .expect("mkfifo");
         match StoreEngine::open(options(&serial, fifo.path(), 1)) {
-            Err(StoreError::NotImplemented(reason)) => {
-                assert!(reason.contains("startup states 3 and 4"), "{reason}")
+            Err(StoreError::UnrecognizedLayout(reason)) => {
+                assert!(reason.contains("has not been modified"), "{reason}")
             }
             other => panic!("a fifo at the staging name: expected a refusal, got {other:?}"),
         }
@@ -5699,8 +5825,8 @@ mod tests {
         std::os::unix::fs::symlink(&victim, &link).expect("symlink");
 
         match StoreEngine::open(options(&serial, root.path(), 1)) {
-            Err(StoreError::NotImplemented(reason)) => {
-                assert!(reason.contains("startup states 3 and 4"), "{reason}")
+            Err(StoreError::UnrecognizedLayout(reason)) => {
+                assert!(reason.contains("has not been modified"), "{reason}")
             }
             other => panic!("expected a refusal, got {other:?}"),
         }
@@ -5815,8 +5941,8 @@ mod tests {
         let locked = tempfile::tempdir().expect("tempdir");
         std::os::unix::fs::symlink(&absent, locked.path().join("LOCK")).expect("symlink");
         match StoreEngine::open(options(&serial, locked.path(), 1)) {
-            Err(StoreError::NotImplemented(reason)) => {
-                assert!(reason.contains("startup states 3 and 4"), "{reason}")
+            Err(StoreError::UnrecognizedLayout(reason)) => {
+                assert!(reason.contains("has not been modified"), "{reason}")
             }
             other => panic!("expected a refusal for a symlinked LOCK, got {other:?}"),
         }
@@ -5838,8 +5964,8 @@ mod tests {
         .expect("marker");
         std::os::unix::fs::symlink(&victim, resumable.path().join("FORMAT.tmp")).expect("symlink");
         match StoreEngine::open(options(&serial, resumable.path(), 1)) {
-            Err(StoreError::NotImplemented(reason)) => {
-                assert!(reason.contains("startup states 3 and 4"), "{reason}")
+            Err(StoreError::UnrecognizedLayout(reason)) => {
+                assert!(reason.contains("has not been modified"), "{reason}")
             }
             other => panic!("expected a refusal for a symlinked FORMAT.tmp, got {other:?}"),
         }
@@ -5952,21 +6078,110 @@ mod tests {
         std::fs::create_dir_all(unrecognized.path().join("empty")).expect("stray directory");
         std::fs::write(unrecognized.path().join("empty-file"), b"").expect("stray empty file");
 
-        for root in [legacy.path(), unrecognized.path()] {
-            let before = tree_image(root);
-            match StoreEngine::open(options(&serial, root, 1)) {
-                Err(StoreError::NotImplemented(reason)) => {
-                    assert!(reason.contains("startup states 3 and 4"), "{reason}");
-                    assert!(reason.contains("LegacyLayout"), "{reason}");
-                    assert!(reason.contains("UnrecognizedLayout"), "{reason}");
-                    assert!(reason.contains("has not been modified"), "{reason}");
-                }
-                other => panic!("expected an explicit refusal for {root:?}, got {other:?}"),
+        // The two are asserted separately and not through one shared shape,
+        // because the whole point of the recognizer is that they get different
+        // answers. A test that accepted either error for either root would
+        // pass with the recognizer deleted.
+        let before = tree_image(legacy.path());
+        match StoreEngine::open(options(&serial, legacy.path(), 1)) {
+            Err(StoreError::LegacyLayout { migrate_command }) => {
+                assert_eq!(
+                    migrate_command,
+                    format!(
+                        "levcs-instance migrate-store --source {} --destination <dest>",
+                        legacy.path().display()
+                    ),
+                    "state 3 must carry the exact migrate-store command, source included: an \
+                     operator holding real data needs the next step and not a diagnosis"
+                );
+            }
+            other => panic!("expected a legacy-layout refusal, got {other:?}"),
+        }
+        assert_eq!(
+            tree_image(legacy.path()),
+            before,
+            "a refused legacy layout must be byte-identical afterwards"
+        );
+
+        let before = tree_image(unrecognized.path());
+        match StoreEngine::open(options(&serial, unrecognized.path(), 1)) {
+            Err(StoreError::UnrecognizedLayout(reason)) => {
+                assert!(reason.contains("carries no FORMAT"), "{reason}");
+                assert!(reason.contains("has not been modified"), "{reason}");
+                assert!(
+                    !reason.contains("migrate-store"),
+                    "state 4 must not suggest a migration: this store does not know what the \
+                     directory is, and a migration command taken on faith costs data: {reason}"
+                );
+            }
+            other => panic!("expected an unrecognized-layout refusal, got {other:?}"),
+        }
+        assert_eq!(
+            tree_image(unrecognized.path()),
+            before,
+            "a refused unrecognized layout must be byte-identical afterwards"
+        );
+    }
+
+    /// The signature is a *shape*, not a name that looks repository-ish.
+    ///
+    /// Each root here is one edit away from state 3 and must be state 4: the
+    /// hazard is a recognizer loose enough to call an operator's ordinary
+    /// directory a legacy instance, which answers them with a migration command
+    /// for data that is not there.
+    #[test]
+    fn near_misses_of_the_legacy_signature_are_unrecognized_rather_than_legacy() {
+        let serial = writer_serial();
+        let cases: [(&str, &dyn Fn(&Path)); 6] = [
+            ("63 hex characters", &|root: &Path| {
+                std::fs::create_dir_all(root.join("a".repeat(63)).join(".levcs")).expect("tree");
+            }),
+            ("64 characters that are not all hex", &|root: &Path| {
+                std::fs::create_dir_all(root.join(format!("{}z", "a".repeat(63))).join(".levcs"))
+                    .expect("tree");
+            }),
+            ("a repository name with no .levcs", &|root: &Path| {
+                std::fs::create_dir_all(root.join("a".repeat(64)).join("objects")).expect("tree");
+            }),
+            ("a .levcs that is a file", &|root: &Path| {
+                let repo = root.join("a".repeat(64));
+                std::fs::create_dir_all(&repo).expect("tree");
+                std::fs::write(repo.join(".levcs"), b"not a directory").expect("file");
+            }),
+            // The signature is about what this root holds, not what it can
+            // reach. A `.levcs` link to a directory elsewhere satisfies any
+            // check that follows links, and answering it as state 3 hands an
+            // operator a migration command for repositories that are not here.
+            (
+                "a .levcs symlinked to an external directory",
+                &|root: &Path| {
+                    let external = root.join("elsewhere");
+                    std::fs::create_dir_all(external.join("objects")).expect("external tree");
+                    let repo = root.join("a".repeat(64));
+                    std::fs::create_dir_all(&repo).expect("tree");
+                    std::os::unix::fs::symlink(&external, repo.join(".levcs")).expect("symlink");
+                },
+            ),
+            // And the repository directory itself, for the same reason.
+            ("a repository entry that is a symlink", &|root: &Path| {
+                let external = root.join("elsewhere");
+                std::fs::create_dir_all(external.join(".levcs")).expect("external tree");
+                std::os::unix::fs::symlink(&external, root.join("a".repeat(64))).expect("symlink");
+            }),
+        ];
+
+        for (what, build) in cases {
+            let root = tempfile::tempdir().expect("tempdir");
+            build(root.path());
+            let before = tree_image(root.path());
+            match StoreEngine::open(options(&serial, root.path(), 1)) {
+                Err(StoreError::UnrecognizedLayout(_)) => {}
+                other => panic!("{what} must be state 4, got {other:?}"),
             }
             assert_eq!(
-                tree_image(root),
+                tree_image(root.path()),
                 before,
-                "a refused non-empty layout must be byte-identical afterwards: {root:?}"
+                "{what}: a refused root must be byte-identical afterwards"
             );
         }
     }

@@ -1543,6 +1543,7 @@ fn spawn_shard_writer(
         repositories,
         tail_generation: tail.logical_generation,
         rotation_wanted: false,
+        durable_answer: None,
         run_entry_baseline,
         checkpoint_namespaces,
         journal,
@@ -1624,6 +1625,10 @@ struct ShardWriter {
     /// Logical index generation of the active journal, so an index location
     /// built here resolves to the same pinned file after a reopen.
     tail_generation: u64,
+    /// Set by `prepare` when the operation already committed and the caller is
+    /// retrying. Carries the durable receipt out to `accept`, which completes
+    /// the waiter with it -- a retry is answered, not refused.
+    durable_answer: Option<CommitReceipt>,
     /// Set by `sequence_into_frame` when the forming group no longer fits the
     /// active journal, and consumed by `accept`. A flag rather than an error
     /// variant because the condition is not a refusal — nothing is wrong with
@@ -1871,6 +1876,19 @@ impl ShardWriter {
         let (mut prepared, frame) = match self.prepare_caught(&transaction) {
             Ok(pair) => pair,
             Err(error) => {
+                // A retry of an operation that already committed. The receipt
+                // is the durable one, so nothing is sequenced and no frame is
+                // appended for it.
+                if let Some(receipt) = self.durable_answer.take() {
+                    drop(adoption);
+                    if let Some(waiter) = self.waiters.pop() {
+                        if let Some(key) = waiter.reservation {
+                            self.release_reservation(&key);
+                        }
+                        waiter.completion.complete(Ok(receipt));
+                    }
+                    return;
+                }
                 if !std::mem::take(&mut self.rotation_wanted) {
                     refuse!(error);
                 }
@@ -2127,13 +2145,59 @@ impl ShardWriter {
 
         // Decision 9.8 ordering, first rule: a committed or expired operation
         // is answered from the committed root and never touches the status
-        // root. The answer itself — returning the durable receipt to a
-        // retrying caller — is deliverable 7.
-        if self.shared.committed.load().terminal_status(&key).is_some() {
-            return Err(StoreError::NotImplemented(
-                "submit idempotency against an already committed operation — B1 NamespaceTxn, \
-                 scope 6-B1 deliverable 7",
-            ));
+        // root.
+        //
+        // The rule is `oracle::coalescing_decision`'s durable branch —
+        // `ReturnDurable` on a matching digest, `OperationIdMismatch`
+        // otherwise — applied to a terminal entry rather than restated. What
+        // makes the digest load-bearing is that an operation ID alone cannot
+        // distinguish a retry from a different request reusing an identity, and
+        // answering the second with the first's receipt would tell a caller its
+        // transaction committed when another one did.
+        if let Some(entry) = self.shared.committed.load().terminal_status(&key) {
+            if entry.operation_digest() != transaction.operation_digest {
+                return Err(StoreError::Conflict(format!(
+                    "operation {} already resolved under a different stable digest; one \
+                     operation ID names one request",
+                    key.operation_id.to_hex()
+                )));
+            }
+            return match entry.transaction_status() {
+                // Not an error, so it travels as a flag rather than through the
+                // error channel: `accept` completes this waiter with the
+                // receipt instead of failing it. Smuggling a success through
+                // `StoreError` would make every caller of `prepare` responsible
+                // for noticing that one variant means "it worked".
+                TransactionStatus::Committed(receipt) => {
+                    self.durable_answer = Some(receipt);
+                    Err(StoreError::Overloaded {
+                        limit: "durable_answer",
+                        retry_after_micros: 0,
+                    })
+                }
+                // The receipt aged out and only the tombstone remains, which is
+                // what stops the ID being reused — but it is no longer an
+                // answer about *this* submit's outcome, so it cannot be
+                // returned as one.
+                TransactionStatus::Expired {
+                    tombstone_until_micros,
+                    ..
+                } => Err(StoreError::Conflict(format!(
+                    "operation {} committed and its receipt is no longer retained; the ID stays \
+                     bound until {tombstone_until_micros}",
+                    key.operation_id.to_hex()
+                ))),
+                // A terminal entry is `Committed` or `Expired` by construction.
+                // Naming the rest is the no-catch-all rule: a third terminal
+                // shape must fail this compile rather than fall through to a
+                // default answer about a durable operation.
+                status @ (TransactionStatus::Pending { .. }
+                | TransactionStatus::Resolving { .. }
+                | TransactionStatus::Unknown) => Err(self.poison_error(format!(
+                    "operation {} has a terminal entry reporting {status:?}",
+                    key.operation_id.to_hex()
+                ))),
+            };
         }
 
         // Plan §5.3: at a hard ceiling the shard seals synchronously **before

@@ -53,6 +53,7 @@ use crate::failpoints::{self, Failpoint, FailpointAction};
 use crate::format::{
     frame_total_len, object_type_code, Frame, FrameHeader, FrameObjectV1, FrameObjectsV1,
     FrameReceiptFieldsV1, Manifest, RepositoryCreateV1, TailRange, TransactionFramePayloadV1,
+    JOURNAL_HEADER_LEN,
 };
 use crate::index::{
     delta_pressure, DeltaPressure, IndexDelta, IndexKey, IndexLocation, IndexRun, IndexRunBuilder,
@@ -1541,6 +1542,7 @@ fn spawn_shard_writer(
         in_flight_reservation: None,
         repositories,
         tail_generation: tail.logical_generation,
+        rotation_wanted: false,
         run_entry_baseline,
         checkpoint_namespaces,
         journal,
@@ -1622,6 +1624,11 @@ struct ShardWriter {
     /// Logical index generation of the active journal, so an index location
     /// built here resolves to the same pinned file after a reopen.
     tail_generation: u64,
+    /// Set by `sequence_into_frame` when the forming group no longer fits the
+    /// active journal, and consumed by `accept`. A flag rather than an error
+    /// variant because the condition is not a refusal — nothing is wrong with
+    /// the transaction, and the answer is to seal and continue.
+    rotation_wanted: bool,
     /// Sealed-run entries that some other term of the replay ceiling already
     /// accounts for — a **duplicate-representation baseline**, not a horizon.
     ///
@@ -1863,7 +1870,29 @@ impl ShardWriter {
 
         let (mut prepared, frame) = match self.prepare_caught(&transaction) {
             Ok(pair) => pair,
-            Err(error) => refuse!(error),
+            Err(error) => {
+                if !std::mem::take(&mut self.rotation_wanted) {
+                    refuse!(error);
+                }
+                // `prepare` reserved before sequencing and the fit was tested
+                // after, so the reservation is held and the speculative state
+                // is not yet advanced -- that insertion happens past the test.
+                // Releasing the reservation is therefore the whole rollback.
+                if let Some(key) = self.in_flight_reservation.take() {
+                    self.release_reservation(&key);
+                }
+                self.publish_open_group();
+                if let Some(poison) = self.poison.clone() {
+                    refuse!(poison);
+                }
+                if let Err(error) = self.rotate_journal() {
+                    refuse!(error);
+                }
+                match self.prepare_caught(&transaction) {
+                    Ok(pair) => pair,
+                    Err(error) => refuse!(error),
+                }
+            }
         };
 
         if let Err(frame) = self.builder.push(frame) {
@@ -2158,19 +2187,51 @@ impl ShardWriter {
         let payload_len = payload.len() as u64;
         let total_len = frame_total_len(payload_len);
 
-        // Rotation and sealing are not in this slice. Refusing a group that no
-        // longer fits the preallocated journal here — with the exact length in
-        // hand, before anything is marked `Resolving` — keeps the missing
-        // deliverable a clean pre-append refusal rather than a `LimitExceeded`
-        // discovered between the `Resolving` mark and the fence.
-        if !self
+        // Two independent rotation triggers, and the second is not implied by
+        // the first. A group that no longer fits the preallocated file must
+        // rotate or be refused; a cursor that has reached `segment_max_bytes`
+        // must rotate so segments stay near their configured size, and with
+        // `segment_max_bytes < journal_preallocate_bytes` that boundary arrives
+        // first and every time. Checking only the fit let a shard run to the
+        // end of its preallocation whatever the segment ceiling said.
+        //
+        // The exact frame length is known here and nowhere earlier, so this is
+        // where both are discovered — before anything is marked `Resolving`,
+        // which keeps it a clean pre-append condition.
+        let group_end = self.builder.bytes().saturating_add(total_len);
+        let over_segment_ceiling = self
             .journal
-            .fits(self.builder.bytes().saturating_add(total_len))
-        {
-            return Err(StoreError::NotImplemented(
-                "active journal rotation and sealing — B1 NamespaceTxn, scope 6-B1 \
-                 deliverable 1 and scope 3.4",
-            ));
+            .should_rotate(self.shared.options.segment_max_bytes);
+        if !self.journal.fits(group_end) || over_segment_ceiling {
+            // A frame no *empty* journal could hold is a ceiling and not a
+            // rotation: sealing would produce a fresh journal that refuses it
+            // again, so the shard would seal once per submit forever and still
+            // never accept it.
+            //
+            // Measured against the space a fresh journal actually offers, which
+            // is the preallocation less its header — a new journal's cursor
+            // starts past that header, so comparing the frame with the whole
+            // preallocation calls a frame rotatable when no rotation can ever
+            // seat it.
+            let preallocated = self.shared.options.journal_preallocate_bytes;
+            let usable = preallocated.saturating_sub(JOURNAL_HEADER_LEN as u64);
+            if total_len > usable {
+                return Err(StoreError::LimitExceeded {
+                    limit: "journal_preallocate_bytes",
+                    observed: total_len,
+                    allowed: usable,
+                });
+            }
+            // Rotation cannot happen from in here. The open group's frames are
+            // built but not appended, and each carries `journal_id` in its
+            // header; sealing now would leave them naming a journal that no
+            // longer takes writes. `accept` publishes the open group first and
+            // then rotates, which is the same shape the group-full path uses.
+            self.rotation_wanted = true;
+            return Err(StoreError::Overloaded {
+                limit: "active_journal",
+                retry_after_micros: 0,
+            });
         }
 
         let frame = Frame {
@@ -3698,6 +3759,219 @@ impl ShardWriter {
     }
 
     /// Derived shard state through `committed`, read from the published root.
+    /// Seal the active journal into a segment and continue in a fresh one.
+    ///
+    /// Scope 3.4, driven by the journal filling rather than by a checkpoint.
+    /// The two share a sealing sequence and differ in what they *additionally*
+    /// claim: a checkpoint installs a checkpoint row and moves the replay
+    /// horizon, while this installs only the segment. Both advance
+    /// `committed_shard_sequence`, because both make a prefix durable under a
+    /// manifest-referenced name — and `validate_manifest_sequence_coverage`
+    /// requires the final retained tail range to end exactly there. The
+    /// checkpoint list is carried forward untouched; the horizon is the
+    /// checkpoint's sequence and the active journal's position, not this field.
+    ///
+    /// Called from `accept` with the open group already published, so the
+    /// builder is empty. It cannot be called with one forming: those frames
+    /// carry `journal_id` in their headers and would name a journal that no
+    /// longer accepts writes.
+    ///
+    /// Every failure past the seal poisons. The segment is linked into
+    /// `segments/` before the manifest names it and the active name is unlinked
+    /// only after — §3.4's ordering, which leaves every crash point with either
+    /// a scannable journal or a manifest that references the segment, and never
+    /// neither. A failure in the middle is not something this process can
+    /// resolve by retrying.
+    fn rotate_journal(&mut self) -> Result<(), StoreError> {
+        // Nothing appended means nothing to seal. A1 refuses to seal an empty
+        // journal, and a shard that reached here with one is asking for a
+        // rotation that would produce a segment naming no frames.
+        let Some(last) = self.journal.last_appended_shard_sequence() else {
+            return Ok(());
+        };
+
+        let root = self.shared.committed.load_full();
+        let paths = RootLayout::new(&self.shared.options.root).shard(self.shard_index);
+        let root_uuid = self.shared.root_uuid;
+        let counters = Arc::clone(self.journal.counters_handle());
+        let current_generation = self.current_manifest_generation(&root)?;
+        let manifest = read_manifest_or_empty(&paths, current_generation, &root_uuid)?;
+        let next_generation = current_generation + 1;
+
+        // The segment inherits the tail's logical generation, so every
+        // `IndexLocation` already written against it keeps naming the same
+        // bytes (contract review 2026-07-30-A).
+        let sealed_generation = self.tail_generation;
+        let first = self.journal.header().first_shard_sequence;
+        let active_path = self.journal.path().to_path_buf();
+        let segment_path =
+            match segment::seal_journal(&mut self.journal, &paths, sealed_generation, &counters) {
+                Ok(path) => path,
+                Err(error) => {
+                    return Err(self.poison_now(format!("sealing a full journal: {error}")))
+                }
+            };
+        let filename = match segment_path.file_name().and_then(|name| name.to_str()) {
+            Some(name) => name.to_string(),
+            None => return Err(self.poison_now("sealed segment name is not UTF-8".into())),
+        };
+
+        let mut retained_tail_ranges = manifest.retained_tail_ranges.clone();
+        retained_tail_ranges.push(TailRange {
+            generation: sealed_generation,
+            first_shard_sequence: first,
+            last_shard_sequence: last,
+            filename,
+        });
+        let published = Manifest {
+            root_uuid,
+            generation: next_generation,
+            base_generation: manifest.base_generation,
+            retained_tail_ranges,
+            index_runs: manifest.index_runs.clone(),
+            checkpoints: manifest.checkpoints.clone(),
+            // Advanced to the sealed segment's last sequence, and this is the
+            // one field where rotation differs from installing an index run.
+            //
+            // `install_index_run` carries this forward untouched because a run
+            // makes no journal frame more durable than it already was — the
+            // frames it indexes are still only in `active/`, and advancing
+            // would tell recovery to stop replaying them. Sealing does the
+            // opposite: this prefix is now durable under a second name that the
+            // manifest references, which is exactly what the field records.
+            //
+            // `validate_manifest_sequence_coverage` requires the final retained
+            // tail range to end precisely here, so leaving it behind produced a
+            // manifest whose coverage stopped short of its own last range and a
+            // reopen that refused. Advancing skips nothing: with no checkpoint
+            // installed, recovery replays every manifest-referenced retained
+            // tail range, and the replay horizon is the checkpoint's sequence
+            // and the active journal's position rather than this field alone.
+            committed_shard_sequence: last,
+        };
+        if let Err(error) = segment::install_manifest(
+            &paths,
+            &published,
+            self.shared.options.manifest_retain,
+            &counters,
+        ) {
+            return Err(self.poison_now(format!("publishing a rotation manifest: {error}")));
+        }
+
+        if let Err(error) = segment::unlink_sealed_journal(&active_path, &paths, &counters) {
+            return Err(self.poison_now(format!("unlinking the sealed journal: {error}")));
+        }
+        let journal = match Journal::create(
+            &paths.active(),
+            fresh_checkpoint_journal_id(root_uuid, self.shard_index, last),
+            last.saturating_add(1),
+            self.shard_index,
+            root_uuid,
+            self.shared.options.journal_preallocate_bytes,
+            now_micros(),
+            Arc::clone(&counters),
+        ) {
+            Ok(journal) => journal,
+            Err(error) => {
+                return Err(self.poison_now(format!("opening the post-rotation journal: {error}")))
+            }
+        };
+        self.journal = journal;
+        self.tail_generation = sealed_generation + 1;
+
+        let successor = match self.retain_rotated_generation(
+            &root,
+            current_generation,
+            next_generation,
+            sealed_generation,
+            first,
+            last,
+            &segment_path,
+        ) {
+            Ok(successor) => successor,
+            Err(error) => return Err(self.poison_now(format!("pinning a rotation: {error}"))),
+        };
+
+        let mut generations = GenerationMap::new();
+        generations.insert(successor.id, successor);
+        let mut subtree = ShardSubtree::new(
+            self.shard_index,
+            // Unchanged: no frame was appended by this publication.
+            root.shard_committed_sequence(self.shard_index)
+                .unwrap_or(last),
+            Arc::new(IndexDelta::from_options(&self.shared.options)),
+            // `None`, though a segment was installed. Sealing the *journal* is
+            // not sealing the *index*: naming a sealed-through sequence here
+            // would discard delta layers whose entries no run contains.
+            None,
+            Vector::new(),
+            RepoMap::new(),
+            TerminalStatusMap::new(),
+            generations,
+        );
+        subtree
+            .retained_generation_removals
+            .push_back(GenerationId::new(self.shard_index, current_generation));
+        if let Err(error) = self.publish_subtree(&subtree) {
+            return Err(self.poison_now(format!("publishing a rotation: {error}")));
+        }
+        Ok(())
+    }
+
+    /// The successor generation pinning the newly sealed segment and the fresh
+    /// journal, plus everything the predecessor pinned.
+    ///
+    /// The predecessor's active tail is deliberately **not** carried forward:
+    /// that file is now the segment, reachable at its new name, and retaining
+    /// the old pin as a tail would leave one logical generation naming two
+    /// sources -- exactly the collision `object_source` refuses.
+    #[allow(clippy::too_many_arguments)]
+    fn retain_rotated_generation(
+        &self,
+        root: &CommittedRoot,
+        current_generation: u64,
+        next_generation: u64,
+        sealed_generation: u64,
+        first: u64,
+        last: u64,
+        segment_path: &Path,
+    ) -> Result<Arc<RetainedGeneration>, StoreError> {
+        let previous = root
+            .retained_generations()
+            .get(&GenerationId::new(self.shard_index, current_generation))
+            .map(Arc::clone)
+            .ok_or_else(|| {
+                StoreError::Corruption(format!(
+                    "generation {current_generation} vanished from the root while rotating"
+                ))
+            })?;
+
+        let mut segments = previous.segments.to_vec();
+        segments.push(RootRetainedSegment::new(
+            sealed_generation,
+            self.journal_id_of_sealed_prefix(segment_path)?,
+            first,
+            last,
+            PinnedFile::open(segment_path)?,
+        ));
+        let active_tails = vec![RetainedTail::new(
+            self.tail_generation,
+            PinnedFile::from_shared(
+                self.journal.path().to_path_buf(),
+                Arc::new(self.journal.file().try_clone()?),
+            ),
+        )];
+
+        Ok(Arc::new(RetainedGeneration::new(
+            GenerationId::new(self.shard_index, next_generation),
+            segments.into(),
+            Arc::clone(&previous.index_runs),
+            Arc::clone(&previous.checkpoints),
+            active_tails.into(),
+            Arc::clone(&previous.projection_artifacts),
+        )))
+    }
+
     fn checkpoint_body(
         &self,
         root: &CommittedRoot,

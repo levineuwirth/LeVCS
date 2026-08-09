@@ -281,6 +281,163 @@ pub fn push_transaction(namespace: NamespaceId, operation: u8, blob: u8) -> Vali
         .expect("a complete push transaction")
 }
 
+/// Stage and finalize a two-chunk projection through the engine's own staging.
+///
+/// Two chunks rather than one for the same reason the B1 acceptance test uses
+/// two: it is the smallest projection where per-chunk ownership is load-bearing,
+/// and a crash row that only ever adopted one chunk would not exercise the
+/// partitioned run set at all.
+pub fn stage_projection_for(
+    engine: &StoreEngine,
+    namespace: NamespaceId,
+    seed: u8,
+) -> levcs_store::staging::StagedProjectionAdoption {
+    let (binding, chunks) = projection_binding(namespace, seed);
+    let session = engine
+        .staging()
+        .begin(binding, now_micros())
+        .expect("staging admits the row's session");
+    for chunk in &chunks {
+        session
+            .put_chunk(chunk, now_micros())
+            .expect("the row's chunk lands");
+    }
+    session.seal(now_micros()).expect("the row's session seals");
+    session
+        .finalize(now_micros())
+        .expect("the row's sealed session yields an adoption pin")
+}
+
+/// The victim transaction when the row is driving the staged-projection axis.
+pub fn adopting_transaction(
+    namespace: NamespaceId,
+    operation: u8,
+    adoption: levcs_store::staging::StagedProjectionAdoption,
+) -> ValidatedTransaction {
+    let authority = genesis_id(&namespace);
+    ValidatedTransaction::builder(privileged())
+        .namespace(namespace)
+        .operation(
+            OperationId([operation; 16]),
+            ObjectId([operation; 32]),
+            deadline(),
+        )
+        // Empty: a frame carries inline objects or an install descriptor, never
+        // both, so the projection is this transaction's whole payload.
+        .objects(Vec::new())
+        .refs(Vec::new())
+        .authority(Some(authority), Some(authority))
+        .evidence(evidence())
+        .adopt_projection(adoption)
+        .expect("one adoption is admitted")
+        .build()
+        .expect("a complete adopting transaction")
+}
+
+fn projection_binding(
+    namespace: NamespaceId,
+    seed: u8,
+) -> (
+    levcs_store::staging::ProjectionStageBinding,
+    Vec<levcs_protocol::v2::ProjectionStageChunkV1>,
+) {
+    use levcs_core::{blake3_hash, ObjectHeader, FORMAT_VERSION};
+    use levcs_protocol::v2::{
+        ProjectionMode, ProjectionStageChunkV1, ProjectionStageManifestV1,
+        ProjectionStageSessionV1, StageSourceKindV1, StagedChunkObjectV1, StagedObjectV1,
+    };
+
+    const CHUNKS: u32 = 2;
+    const PER_CHUNK: usize = 1;
+    let session_id = [seed; 16];
+
+    let staged = |index: usize| -> StagedChunkObjectV1 {
+        let body = format!("row-staged-{seed:02x}-{index}");
+        let mut raw = ObjectHeader {
+            object_type: ObjectType::Blob,
+            format_version: FORMAT_VERSION,
+            body_len: body.len() as u64,
+        }
+        .encode()
+        .to_vec();
+        raw.extend_from_slice(body.as_bytes());
+        let id = blake3_hash(&raw);
+        StagedChunkObjectV1 {
+            descriptor: StagedObjectV1 {
+                object_id: id,
+                object_type: ObjectType::Blob as u8,
+                raw_len: raw.len() as u64,
+                raw_digest: id,
+            },
+            raw_bytes: raw,
+        }
+    };
+
+    let mut objects: Vec<StagedChunkObjectV1> =
+        (0..CHUNKS as usize * PER_CHUNK).map(staged).collect();
+    // The manifest is the ordered concatenation of the chunks and must be
+    // strictly sorted, so the sort happens before the split.
+    objects.sort_by(|left, right| left.descriptor.cmp(&right.descriptor));
+
+    let total_object_bytes = objects
+        .iter()
+        .map(|object| object.descriptor.raw_len)
+        .sum::<u64>();
+    let descriptors: Vec<StagedObjectV1> = objects
+        .iter()
+        .map(|object| object.descriptor.clone())
+        .collect();
+    let chunks: Vec<ProjectionStageChunkV1> = (0..CHUNKS)
+        .map(|ordinal| ProjectionStageChunkV1 {
+            session_id,
+            ordinal,
+            chunk_count: CHUNKS,
+            objects: objects[ordinal as usize * PER_CHUNK..][..PER_CHUNK].to_vec(),
+        })
+        .collect();
+    let chunk_digests: Vec<ObjectId> = chunks
+        .iter()
+        .map(|chunk| chunk.chunk_digest().expect("chunk digest"))
+        .collect();
+
+    let membership_root = blake3_hash(&session_id[..]);
+    let manifest = ProjectionStageManifestV1 {
+        session_id,
+        chunk_digests,
+        objects: descriptors,
+        membership_root,
+    };
+    let manifest_digest = manifest.manifest_digest().expect("manifest digest");
+    let authority = genesis_id(&namespace);
+
+    (
+        levcs_store::staging::ProjectionStageBinding {
+            session: ProjectionStageSessionV1 {
+                session_id,
+                destination_repo: ObjectId(*namespace.as_bytes()),
+                destination_genesis: authority,
+                expected_authority: authority,
+                projection: ProjectionMode::Full,
+                source_kind: StageSourceKindV1::Mirror,
+                actor: [0x21; 32],
+                actor_key_epoch: 3,
+                source_generation_digest: ObjectId([12; 32]),
+                fork_proof: None,
+                final_operation_id: [13; 16],
+                final_operation_digest: ObjectId([14; 32]),
+                final_evidence_digest: ObjectId([15; 32]),
+                total_object_count: objects.len() as u64,
+                total_object_bytes,
+                chunk_count: CHUNKS,
+                manifest_digest,
+                expires_at_micros: now_micros() + 3_600_000_000,
+            },
+            membership_root,
+        },
+        chunks,
+    )
+}
+
 fn privileged() -> levcs_store::types::PrivilegedConstruction {
     levcs_store::types::PrivilegedConstruction::assert_validated()
 }
@@ -588,6 +745,56 @@ pub struct RowObservation {
     /// against a comment about where the fence sits.
     pub fences_before: u64,
     pub fences_after: u64,
+    /// Staging's four adoption-pin terminal counters, read on the live engine
+    /// **before** it is dropped. A pin settled by an unwind or by a slot's
+    /// `Drop` is recorded here and nowhere else: the counters live in the
+    /// engine-owned staging and go with it, and reopening builds fresh ones.
+    ///
+    /// `None` for an inline row, which takes no pin. That is a different fact
+    /// from "took a pin and settled it zero times", and collapsing the two
+    /// would let a row that silently stopped adopting keep passing.
+    pub adoption: Option<AdoptionCounters>,
+}
+
+/// The four ways an admitted pin can end, as staging counts them.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct AdoptionCounters {
+    pub adopted: u64,
+    pub released: u64,
+    pub transferred: u64,
+    pub dropped: u64,
+}
+
+impl AdoptionCounters {
+    /// Which terminal outcome this row's pin actually reached.
+    ///
+    /// `None` when no pin settled at all, and an error when more than one did:
+    /// a single adoption has exactly one outcome, and two counters moving means
+    /// the pin was settled twice or two pins were admitted where one was
+    /// expected.
+    pub fn sole_outcome(&self) -> Result<Option<&'static str>, String> {
+        let mut seen: Vec<&'static str> = Vec::new();
+        for (count, name) in [
+            (self.adopted, "Adopted"),
+            (self.released, "DefinitivePreAppendFailure"),
+            (self.transferred, "TransferredToRecovery"),
+            (self.dropped, "DroppedWithoutOutcome"),
+        ] {
+            if count > 1 {
+                return Err(format!(
+                    "{name} was recorded {count} times for one adoption"
+                ));
+            }
+            if count == 1 {
+                seen.push(name);
+            }
+        }
+        match seen.as_slice() {
+            [] => Ok(None),
+            [one] => Ok(Some(one)),
+            many => Err(format!("one adoption reached {many:?}")),
+        }
+    }
 }
 
 impl RowObservation {
@@ -625,8 +832,18 @@ pub fn drive_submit_row(
     serial: &Serial,
     point: Failpoint,
     action: FailpointAction,
+    adopts: bool,
 ) -> RowObservation {
-    let row = format!("{} [{}]", point.name(), action_name(action));
+    let row = format!(
+        "{} [{}] [{}]",
+        point.name(),
+        action_name(action),
+        if adopts {
+            "staged_projection"
+        } else {
+            "inline"
+        }
+    );
     let directory = tempfile::tempdir().expect("tempdir");
     let root = directory.path().join("root");
 
@@ -649,8 +866,16 @@ pub fn drive_submit_row(
         .expect("shard 0 has a writer")
         .fdatasync;
 
+    // Staged *before* the failpoint is armed. Staging writes chunks through
+    // maintenance workers, and arming first would let the row's fault fire on
+    // staging's own I/O rather than on the submit under test.
+    let staged = adopts.then(|| stage_projection_for(&engine, namespace, 0x22));
+
     arm(serial, point, action);
-    let victim = submit(&engine, push_transaction(namespace, 0x22, 0xb2));
+    let victim = match staged {
+        Some(adoption) => submit(&engine, adopting_transaction(namespace, 0x22, adoption)),
+        None => submit(&engine, push_transaction(namespace, 0x22, 0xb2)),
+    };
     let fences_after = engine
         .durability_counters(0)
         .expect("shard 0 has a writer")
@@ -658,6 +883,19 @@ pub fn drive_submit_row(
     let immediate = engine
         .transaction_status(namespace, victim_operation)
         .expect("transaction_status is a read and never fails on an open engine");
+
+    // Read while the engine is alive: staging's counters are engine-owned and a
+    // reopen builds fresh ones, so a pin settled by an unwind is only visible
+    // here.
+    let adoption = adopts.then(|| {
+        let counters = engine.staging().counters().snapshot();
+        AdoptionCounters {
+            adopted: counters.sessions_adopted,
+            released: counters.adoption_pins_released,
+            transferred: counters.adoption_pins_transferred,
+            dropped: counters.adoption_pins_dropped,
+        }
+    });
 
     let probe = submit(&engine, push_transaction(namespace, 0x33, 0xb3));
     // Whatever happened, nothing may stay armed for the next row: the registry
@@ -685,6 +923,7 @@ pub fn drive_submit_row(
         prior_recovered,
         fences_before,
         fences_after,
+        adoption,
     }
 }
 
@@ -946,6 +1185,10 @@ pub fn drive_root_cas_retry_row(
             prior_recovered,
             fences_before,
             fences_after,
+            // The contention driver races shards against each other for the
+            // root CAS and never adopts; the payload axis is driven by
+            // `drive_submit_row`.
+            adoption: None,
         }),
     }
 }

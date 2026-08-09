@@ -1839,6 +1839,73 @@ The integration suite's `cleanup_is_deferred_and_names_its_deliverable` is repla
 deleted — the distinction it stood for, that "nothing to do" and "cannot answer yet" are
 different results, is now asserted the other way round at the public surface.
 
+##### Contract review 2026-08-09-A
+
+B1 deliverable 3 — `adopt_projection` through submit. Requested by B1 on starting the wiring,
+because the public entry point the deliverable is named after could not be called. Three
+visibility changes, two accessors, one lifetime correction, and one signature amendment —
+`adopt_projection` takes the adoption as a single value, for the reason recorded below. No wire
+format moves.
+
+**`ValidatedTransactionBuilder::adopt_projection` was a public function no external caller
+could invoke.** It takes a `ProjectionAdoption`, whose only issuer is
+`ProjectionStageSession::finalize`, which was `pub(crate)` and returned the `pub(crate)`
+`StagedProjectionAdoption`. The pin has no other constructor by design — that unforgeability is
+the point — so the two together made the signature readable and uncallable. **`finalize` and
+`StagedProjectionAdoption` become `pub`.** `StagedProjectionAdoption` sits in D0-B's frozen
+adoption seam; this changes who may name it and nothing about what it is.
+
+**`adopt_projection` now takes the whole `StagedProjectionAdoption`, and its fields stay
+private.** Review found that publishing the two fields and keeping the two-argument signature
+admits a pairing that is *wrong* rather than merely incomplete: finalize session A, take the
+descriptor from session B, submit `(descriptor_B, handle_A)`. Every field of `descriptor_B` is
+internally valid, so nothing looks damaged — the frame would simply name B's artifacts while
+A's are the ones held against deletion. The frozen two-argument form existed so neither half
+could be *forgotten* independently; taking one value keeps that and additionally makes the
+mismatch unrepresentable. A pre-append revalidation against the pin's canonical resolution
+still runs, because staging's state can change between `finalize` and submit — but it is now a
+recheck of a pairing the type guarantees rather than the only thing standing between a caller
+and a mispaired frame. `descriptor()` is added for inspection; it borrows, because taking the
+descriptor out is what the type exists to prevent.
+
+**`StoreEngine::staging()` is added**, returning `&Arc<ProjectionStaging>`. Since the P1-4 fix
+moved staging inside the locked engine lifetime, no caller can construct one beside a
+`StoreEngine` — holding two root locks is what that fix made unrepresentable — so without an
+accessor there is no reachable way to stage the projection an adoption adopts. This closes the
+interface request recorded in the ignored test at `tests/staging_sessions.rs`.
+
+**`ProjectionStaging` now retains the `RecoverySession` lease, and the first version of this
+accessor was unsound without it.** Its justification claimed that returning a reference kept
+staging from outliving the lock. It does not: `Arc::clone` escapes the borrow, and so do a
+`ProjectionStageSession` and an adoption pin, each of which owns an `Arc<ProjectionStaging>`.
+With `LOCK` released when the engine dropped, any of those could still write into a root
+another process had since opened — a second accountant for one root, which is the exact
+condition staging's construction rules exist to prevent. **`ProjectionStaging::open` therefore
+takes `Arc<RecoverySession>` and keeps it**, so the lock is released when the last holder is
+dropped rather than when the engine is. `EngineShared` shares the same lease.
+`a_retained_staging_holds_the_root_lock_past_the_engine` asserts it by taking the lock
+directly, not by attempting a second engine open — staging's in-process root registry would
+refuse that whether or not the lock were held, so only the direct form fails when the lease is
+not retained. Verified by mutation: replacing the retained `Arc` with a `Weak` makes the test
+fail with a second session holding the root.
+
+**`RepoSnapshot` gains `object_source()` and carries its shard index.** `locate` answers *which
+generation*, which stopped being sufficient the moment adoption existed: a logical generation
+is a segment, an active tail, or a projection artifact, and an adopted object's bytes are not in
+the frame that installed it. Before adoption every location a reader could hold was a frame in
+this shard's journal, so the distinction was invisible; now a reader that cannot ask "what
+kind" cannot act on the answer at all. The shard index is passed to `capture` rather than
+derived because deriving it needs the shard count, which lives in `StoreOptions` and not in the
+root. `RetainedObjectSource` is already re-exported, so `lib.rs` does not move.
+
+**One finding recorded and not acted on.** `checkpoint.rs` has no notion of projection
+artifacts: a retained generation's `projection_artifacts` are in-memory pins, and their
+durability comes from the journal frame plus staging's adoption marker, with recovery
+rebuilding them by replaying the frame through `resolve_committed`. The successor-generation
+paths clone them forward correctly within a process. Whether a manifest that outlives the
+frames it was derived from needs to record them is a B3/checkpoint question, not a B1 one, and
+is raised here rather than answered.
+
 ##### Contract review 2026-08-07-A
 
 B1 deliverable 8 — `RepoSnapshot` and `StoreEngine::snapshot`. Requested by B1 before any body

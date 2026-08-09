@@ -44,7 +44,7 @@ use levcs_core::{ObjectId, ObjectType};
 use levcs_protocol::oracle::{self, AppendDeadlinePhase, DeadlineDecision};
 use levcs_protocol::v2::{
     self as protocol, AppliedRefV1, CommittedTransactionV1, DurabilityResultV1, RefMutation,
-    RefStateV1, SignedCommittedTransactionV1,
+    RefStateV1, SignedCommittedTransactionV1, StagedProjectionInstallV1,
 };
 
 use crate::checkpoint::{ReceiptRecord, RefRecord};
@@ -72,8 +72,11 @@ use crate::roots::{
 };
 use crate::segment::{self, RootLayout, SegmentReader};
 use crate::snapshot::RepoSnapshot;
-use crate::staging::ProjectionStaging;
-use crate::transaction::ValidatedTransaction;
+use crate::staging::{
+    ProjectionAdoptionOutcome, ProjectionRecoveryResolver, ProjectionStaging,
+    RecoveredProjectionArtifacts,
+};
+use crate::transaction::{AdoptionSlot, ValidatedTransaction};
 use crate::types::{
     CommitEvidenceSigner, CommitReceipt, DurabilityCounterSnapshot, DurabilityCounters,
     NamespaceId, OperationId, PendingPhase, StoreError, TransactionStatus,
@@ -140,8 +143,10 @@ struct EngineShared {
     /// — two handles, or two processes, each admitting up to the full global
     /// limit. Ownership here is what makes "root-global" true rather than
     /// asserted.
-    _staging: Arc<ProjectionStaging>,
-    _session: RecoverySession,
+    staging: Arc<ProjectionStaging>,
+    /// Shared with [`EngineShared::staging`], which retains its own clone.
+    /// Whichever is dropped last releases `LOCK`.
+    _session: Arc<RecoverySession>,
     /// What startup state 1 actually cost, or `None` when this open did not
     /// initialize.
     ///
@@ -299,9 +304,19 @@ impl StoreEngine {
         // without it, and a resolver constructed after recovery would be a
         // resolver recovery never had. It then lives in `EngineShared` for
         // exactly as long as the session does.
+        //
+        // The session is wrapped first because staging *keeps* the lease
+        // rather than being shown it: a caller may hold staging, a stage
+        // session, or an adoption pin after this engine is gone, and each can
+        // still write under the root. Sharing the lease is what makes the lock
+        // outlive every writer rather than every *shard* writer.
+        let session = Arc::new(session);
         let staging_durability = Arc::new(DurabilityCounters::default());
-        let staging =
-            ProjectionStaging::open(&session, options.clone(), Arc::clone(&staging_durability))?;
+        let staging = ProjectionStaging::open(
+            Arc::clone(&session),
+            options.clone(),
+            Arc::clone(&staging_durability),
+        )?;
 
         let config = RecoveryConfig::from_store_options(&options)
             .with_projection_recovery_resolver(staging.as_ref());
@@ -331,7 +346,7 @@ impl StoreEngine {
             ))),
             status_metrics: OperationStatusMetrics::default(),
             options,
-            _staging: staging,
+            staging,
             _session: session,
             #[cfg(test)]
             initialization,
@@ -349,6 +364,32 @@ impl StoreEngine {
         Ok(Self { shared, shards })
     }
 
+    /// The one [`ProjectionStaging`] for this root.
+    ///
+    /// Staging is reached *through* the engine rather than constructed beside
+    /// it because its ceilings are root-global and its constructor demands
+    /// proof of the root lock, which this engine holds. A caller that opened
+    /// its own would be a second accountant for one root — see the note on
+    /// [`EngineShared::staging`].
+    ///
+    /// **Borrowing here guarantees nothing about lifetimes**, and an earlier
+    /// version of this comment claimed it did. The returned reference cannot
+    /// escape, but an `Arc::clone` of it can, and so can a
+    /// `ProjectionStageSession` or an adoption pin — both of which own a clone.
+    /// Any of them can still write under the root after this engine is gone.
+    /// What actually holds is ownership: [`ProjectionStaging`] retains a clone
+    /// of the `RecoverySession` lease, so `LOCK` is released when the last of
+    /// them is dropped rather than when the engine is.
+    ///
+    /// This is the production path, not a test hook. Staging a projection and
+    /// adopting it are two halves of one flow — `begin`/`put_chunk`/`seal`
+    /// here, then [`ValidatedTransactionBuilder::adopt_projection`] and
+    /// [`Self::submit`] — and the descriptor and pin that join them are only
+    /// issued by this object.
+    pub fn staging(&self) -> &Arc<ProjectionStaging> {
+        &self.shared.staging
+    }
+
     /// Acquire exactly one committed root and derive a repository view from
     /// it. Readers never observe an index entry newer than their captured
     /// root (plan §5.3).
@@ -361,7 +402,11 @@ impl StoreEngine {
         // One load, so the snapshot is a single point in the publication
         // order. Resolving the repository from a second load could pair one
         // generation's `RepoState` with another's index.
-        RepoSnapshot::capture(self.shared.committed.load_full(), repo)
+        RepoSnapshot::capture(
+            self.shared.committed.load_full(),
+            repo,
+            StoreOptions::shard_of(&repo, self.shared.shard_count),
+        )
     }
 
     /// Submit a validated transaction for sequencing, group append, fence, and
@@ -1657,6 +1702,14 @@ struct Prepared {
     repo_state: Arc<RepoState>,
     objects: Vec<(ObjectId, u8)>,
     receipt: CommitReceipt,
+    /// This member's adoption pin, if it adopts a projection.
+    ///
+    /// Beside the `Arc` and not inside it: see [`AdoptionSlot`]. It is attached
+    /// to whichever `Prepared` actually joins `pending` — the group-full path
+    /// prepares twice, and a pin attached to the discarded first attempt would
+    /// settle when that attempt dropped, while the transaction it belongs to
+    /// went on to append.
+    adoption: Option<AdoptionSlot>,
     /// Retained so the whole group can be re-sequenced, re-chained, and
     /// re-signed when the pre-mark deadline recheck drops a member.
     ///
@@ -1764,7 +1817,7 @@ fn pre_append_panic_error() -> StoreError {
 impl ShardWriter {
     fn accept(&mut self, submission: Submission) {
         let Submission {
-            transaction,
+            mut transaction,
             completion,
         } = submission;
         // Registered before anything that can fail or panic. Until this
@@ -1772,18 +1825,45 @@ impl ShardWriter {
         // `fail_newest_waiter` is what resolves it.
         self.waiters.push(Waiter::new(completion));
 
-        if let Some(poison) = self.poison.clone() {
-            self.fail_newest_waiter(poison);
-            return;
-        }
+        // Out **before** the `Arc`, which is the only moment it can leave: an
+        // `Arc` has no move-out, and this pin has to be settled by hand. From
+        // here it is a local, and every failure below settles it explicitly.
+        let adoption = transaction.take_adoption();
         let transaction = Arc::new(transaction);
 
-        let (prepared, frame) = match self.prepare_caught(&transaction) {
-            Ok(pair) => pair,
-            Err(error) => {
-                self.fail_newest_waiter(error);
+        // Every pre-append refusal in this function settles the pin *before*
+        // resolving the waiter. Letting the local drop at the end of scope
+        // would settle it too, but only after the caller already had its
+        // answer — so a submit could return while staging still believed the
+        // pin was live, and a caller that immediately asked staging would get
+        // the pre-submit answer. Settling first makes the order a statement
+        // rather than a consequence of where `adoption` happens to be declared.
+        macro_rules! refuse {
+            ($error:expr) => {{
+                drop(adoption);
+                self.fail_newest_waiter($error);
                 return;
+            }};
+        }
+
+        if let Some(poison) = self.poison.clone() {
+            refuse!(poison);
+        }
+
+        // Pre-append revalidation, and the *only* validation that may use the
+        // pin's read-only view. `resolve_committed` is the post-fence
+        // counterpart and its contract requires the frame to already be
+        // durable, so calling it here would be wrong in the dangerous
+        // direction — it would treat an unwritten frame as authority.
+        if let Some(slot) = adoption.as_ref() {
+            if let Err(error) = self.revalidate_adoption(&transaction, slot) {
+                refuse!(error);
             }
+        }
+
+        let (mut prepared, frame) = match self.prepare_caught(&transaction) {
+            Ok(pair) => pair,
+            Err(error) => refuse!(error),
         };
 
         if let Err(frame) = self.builder.push(frame) {
@@ -1801,29 +1881,98 @@ impl ShardWriter {
             self.roll_back_prepared(&prepared);
             self.publish_open_group();
             if let Some(poison) = self.poison.clone() {
-                self.fail_newest_waiter(poison);
-                return;
+                refuse!(poison);
             }
-            let (reprepared, frame) = match self.prepare_caught(&transaction) {
+            let (mut reprepared, frame) = match self.prepare_caught(&transaction) {
                 Ok(pair) => pair,
-                Err(error) => {
-                    self.fail_newest_waiter(error);
-                    return;
-                }
+                Err(error) => refuse!(error),
             };
             self.builder
                 .push(frame)
                 .expect("an empty group admits any frame");
             self.attach_newest_reservation(reprepared.key);
+            // Onto the second preparation, because the first was rolled back
+            // and dropped. `publish_open_group` above appended the *previous*
+            // group, never this transaction, so the pin is still `BeforeAppend`
+            // and this attachment is not late.
+            reprepared.adoption = adoption;
             self.pending.push(reprepared);
         } else {
             self.attach_newest_reservation(prepared.key);
+            prepared.adoption = adoption;
             self.pending.push(prepared);
         }
 
         if self.builder.is_closed() {
             self.publish_open_group();
         }
+    }
+
+    /// Prove the pin still protects the projection this frame is about to name.
+    ///
+    /// The pairing itself is guaranteed by [`StagedProjectionAdoption`], which
+    /// cannot be assembled from mismatched halves. What that cannot guarantee
+    /// is *time*: the descriptor was derived when the session finalized, and a
+    /// submit happens later. This recomputes it from the pin's current
+    /// read-only resolution and requires the two to be identical.
+    ///
+    /// Rebuilt through staging's own [`install_from_resolution`] rather than
+    /// compared field by field. A second derivation of a canonical value is a
+    /// second opinion about it, and the fields it forgot to compare would be
+    /// exactly the ones that drifted.
+    fn revalidate_adoption(
+        &self,
+        transaction: &ValidatedTransaction,
+        slot: &AdoptionSlot,
+    ) -> Result<(), StoreError> {
+        let Some(descriptor) = transaction.projection() else {
+            return Err(self.pre_append_conflict(
+                "a transaction carries an adoption pin but no install descriptor".into(),
+            ));
+        };
+        let Some(resolution) = slot.resolution() else {
+            return Err(self.pre_append_conflict(
+                "a transaction's adoption pin was already settled before it was sequenced".into(),
+            ));
+        };
+        let resolution = resolution?;
+
+        // The projection is bound to one repository at `begin`, and adopting it
+        // into another would install objects under a namespace that never
+        // agreed to them — the membership boundary §4 makes structural
+        // everywhere else.
+        let bound = NamespaceId::from(resolution.session.destination_repo);
+        if bound != transaction.namespace {
+            return Err(self.pre_append_conflict(format!(
+                "staged projection session {} is bound to repository {} and cannot be adopted \
+                 into {}",
+                hex::encode(resolution.session.session_id),
+                bound.to_hex(),
+                transaction.namespace.to_hex()
+            )));
+        }
+
+        self.adoption_fits_run_ceilings(&resolution)?;
+
+        let current = crate::staging::install_from_resolution(&resolution)?;
+        if current != *descriptor {
+            return Err(self.pre_append_conflict(format!(
+                "the install descriptor for staged projection session {} no longer matches what \
+                 its pin resolves to; the session changed between finalize and submit",
+                hex::encode(descriptor.session_id)
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// A refusal that happens before anything is sequenced.
+    ///
+    /// `Conflict` is the taxonomy's definitive-rejection variant, which is what
+    /// every pre-append refusal in this file returns: nothing was appended and
+    /// nothing can be, so the caller may retry.
+    fn pre_append_conflict(&self, message: String) -> StoreError {
+        StoreError::Conflict(message)
     }
 
     /// Scope 6.3 steps 1-3 with their own unwind boundary.
@@ -2070,6 +2219,9 @@ impl ShardWriter {
                 repo_state: sequenced.repo_state,
                 objects: sequenced.objects,
                 receipt: sequenced.receipt,
+                // Attached by `accept`, which owns the pin until it knows which
+                // preparation is the one that lands.
+                adoption: None,
                 transaction: Arc::clone(transaction),
             },
             frame,
@@ -2334,17 +2486,24 @@ impl ShardWriter {
             receipt,
             payload: TransactionFramePayloadV1 {
                 repository_create: repository_create(transaction)?,
-                objects: FrameObjectsV1::Inline(
-                    transaction
-                        .objects
-                        .iter()
-                        .map(|object| FrameObjectV1 {
-                            object_type: object.object_type,
-                            object_id: object.id,
-                            raw: object.raw.clone(),
-                        })
-                        .collect(),
-                ),
+                // One payload or the other, which the builder already refused
+                // to let a caller ask for both of. An adopting transaction's
+                // objects are in staging's artifacts; the frame carries only
+                // the descriptor that names them.
+                objects: match transaction.projection() {
+                    Some(install) => FrameObjectsV1::StagedProjectionInstall(install.clone()),
+                    None => FrameObjectsV1::Inline(
+                        transaction
+                            .objects
+                            .iter()
+                            .map(|object| FrameObjectV1 {
+                                object_type: object.object_type,
+                                object_id: object.id,
+                                raw: object.raw.clone(),
+                            })
+                            .collect(),
+                    ),
+                },
                 ref_cas: transaction.refs.clone(),
                 expected_authority,
                 new_authority,
@@ -2378,7 +2537,7 @@ impl ShardWriter {
         // sequencing time. Between the two sit the signer handoff and the whole
         // idle delay that closes an unfull group, either of which can be longer
         // than what remains of a caller's signed deadline.
-        let (frames, pending) = self.close_group();
+        let (frames, mut pending) = self.close_group();
         if frames.is_empty() {
             debug_assert!(pending.is_empty());
             return;
@@ -2397,7 +2556,7 @@ impl ShardWriter {
         }
 
         let keys: Vec<OperationKey> = pending.iter().map(|prepared| prepared.key).collect();
-        let outcome = self.publish_window(&frames, &pending, &keys);
+        let outcome = self.publish_window(&frames, &mut pending, &keys);
         match outcome {
             Ok(()) => {
                 // Step 8 removed the status entries, so the reservations are no
@@ -2410,6 +2569,19 @@ impl ShardWriter {
                 self.wake_committed_group(pending.len());
             }
             Err(error) => {
+                // Settle every surviving pin *before* any waiter is told.
+                //
+                // Dropping `pending` at the end of this function would settle
+                // them too — that is what the slot's `Drop` is for — but it
+                // would happen after the caller already had its answer, so a
+                // submit could return while staging still believed the pin was
+                // live. Taking them here makes the order a statement: the
+                // outcome is recorded, from the append phase each slot reached,
+                // and only then does anyone learn the transaction failed.
+                for prepared in pending.iter_mut() {
+                    drop(prepared.adoption.take());
+                }
+
                 // Scope 3.7: steps 4 to 8 are the poison window. The shard is
                 // read-only from here, the group's status entries stay
                 // `Resolving` because step 8 never ran, and nothing is
@@ -2514,15 +2686,23 @@ impl ShardWriter {
         // stay aligned with `new_pending`.
         let mut cursor = 0usize;
 
-        for prepared in pending {
+        for mut prepared in pending {
             let key = prepared.key;
             let transaction = Arc::clone(&prepared.transaction);
+            // Moved out before `prepared` is dropped by this iteration.
+            // `sequence_into_frame` builds a fresh `Prepared` from the retained
+            // `Arc`, which cannot carry the pin — an `Arc` has no move-out —
+            // so a survivor's pin would otherwise settle here as a definitive
+            // pre-append failure while its transaction went on to append. This
+            // is the re-sequencing route the slot exists for.
+            let adoption = prepared.adoption.take();
             let next_sequence = base_sequence + new_pending.len() as u64;
             let outcome = deadline_permits_append(now, prepared.retry_until_micros)
                 .map_err(|reason| reason.into_error(key.operation_id))
                 .and_then(|()| self.sequence_into_frame(&transaction, next_sequence, now));
             match outcome {
-                Ok((reprepared, frame)) => {
+                Ok((mut reprepared, frame)) => {
+                    reprepared.adoption = adoption;
                     new_frames.push(frame);
                     new_pending.push(reprepared);
                     cursor += 1;
@@ -2549,7 +2729,7 @@ impl ShardWriter {
     fn publish_window(
         &mut self,
         frames: &[Frame],
-        pending: &[Prepared],
+        pending: &mut [Prepared],
         keys: &[OperationKey],
     ) -> Result<(), StoreError> {
         // The journal's sequence counter advances here and nowhere else.
@@ -2574,6 +2754,20 @@ impl ShardWriter {
         fire_in_poison_window(self.shard_index, Failpoint::AfterMarkedResolving)?;
 
         // --- step 5: exact reserved frames, one fence ----------------------
+        //
+        // The phase advances here, before the call and not after the fence
+        // inside it. From this line on, no failure may claim that nothing was
+        // written: `append_group_and_fence` can fail with a torn frame or with
+        // whole frames that were never fenced, and both are states only
+        // recovery can read the device to resolve. Advancing after the fence
+        // would leave exactly those two outcomes settling as
+        // `DefinitivePreAppendFailure` — staging releasing artifacts a durable
+        // frame may already name.
+        for prepared in pending.iter_mut() {
+            if let Some(slot) = prepared.adoption.as_mut() {
+                slot.entered_append();
+            }
+        }
         let sequences = self.journal.append_group_and_fence(frames)?;
         if sequences.len() != pending.len() {
             return Err(self.poison_error(format!(
@@ -2609,6 +2803,37 @@ impl ShardWriter {
         // of the crate that implements them.
         fence(Ordering::Release);
         self.remove_status_entries(keys);
+
+        // --- step 9: settle every adoption pin ----------------------------
+        //
+        // Strictly after publication, because `Adopted` is a claim that a
+        // committed root references these artifacts and it carries the sequence
+        // that makes the claim checkable. Staging answers "does any root still
+        // point into this directory?" against a root a caller supplies, and a
+        // root captured before this publication references none of them for the
+        // trivial reason that it predates them — so recording the position is
+        // what stops absence-measured-too-early from reading as absence.
+        //
+        // A settlement that fails poisons: the frame is durable and the root is
+        // published, so staging believing otherwise is a disagreement about
+        // committed state, not a lost update. Anything left unsettled by an
+        // early return above is still correct — the slots are `Appended` by
+        // now, so dropping them transfers to recovery.
+        for prepared in pending.iter_mut() {
+            let Some(slot) = prepared.adoption.take() else {
+                continue;
+            };
+            slot.finish(ProjectionAdoptionOutcome::Adopted {
+                committed_shard_sequence: prepared.shard_sequence,
+            })
+            .map_err(|error| {
+                self.poison_error(format!(
+                    "recording the adoption of the projection committed at shard sequence {}: \
+                     {error}",
+                    prepared.shard_sequence
+                ))
+            })?;
+        }
         Ok(())
     }
 
@@ -2651,6 +2876,64 @@ impl ShardWriter {
         }
     }
 
+    /// Bind a committed adoption descriptor to the artifacts on disk.
+    ///
+    /// The post-fence counterpart of [`Self::revalidate_adoption`], and a
+    /// different question asked of a different authority. That one asked
+    /// staging's live session state whether the pin still matched, and could
+    /// refuse. This asks staging to resolve a descriptor whose frame is
+    /// **already durable**, which is what `resolve_committed` requires and why
+    /// it cannot be called before the fence. There is no refusing here: the
+    /// frame naming these artifacts is committed, so a failure is corruption
+    /// and poisons the shard — every caller of this is inside the poison
+    /// window.
+    ///
+    /// The shard sequence is the adoption's identity and is passed rather than
+    /// looked up: it is what every artifact's logical generation derives from,
+    /// and staging cannot supply it because a finalizing session has no durable
+    /// position of its own. Same reason recovery passes it at `recovery.rs`.
+    fn resolve_adoption(
+        &self,
+        prepared: &Prepared,
+        install: &StagedProjectionInstallV1,
+        shard_sequence: u64,
+    ) -> Result<RecoveredProjectionArtifacts, StoreError> {
+        // Materialize before resolving, because resolution only opens what this
+        // creates. Both take the same sequence, and this is the first moment it
+        // is real: the frame is fenced, so it can no longer be re-sequenced.
+        self.shared
+            .staging
+            .materialize_committed_index_runs(prepared.key.namespace, install, shard_sequence)
+            .map_err(|error| {
+                self.poison_error(format!(
+                    "materializing index runs for committed staged projection session {}: {error}",
+                    hex::encode(install.session_id)
+                ))
+            })?;
+
+        let artifacts = self
+            .shared
+            .staging
+            .resolve_committed(prepared.key.namespace, install, shard_sequence)
+            .map_err(|error| {
+                self.poison_error(format!(
+                    "resolving committed staged projection session {}: {error}",
+                    hex::encode(install.session_id)
+                ))
+            })?;
+        // The same recheck recovery makes for the same reason: resolution is
+        // the one step where a descriptor is handed to another package and a
+        // different one could come back, and every artifact below is trusted on
+        // the strength of this descriptor.
+        if artifacts.descriptor() != install {
+            return Err(self.poison_error(format!(
+                "staging resolved committed session {} to a different descriptor",
+                hex::encode(install.session_id)
+            )));
+        }
+        Ok(artifacts)
+    }
+
     fn build_subtree(&self, pending: &[Prepared]) -> Result<ShardSubtree, StoreError> {
         let mut delta = IndexDelta::from_options(&self.shared.options);
         // The device offsets the fence just made durable, read back from the
@@ -2658,6 +2941,10 @@ impl ShardWriter {
         // name bytes that are actually there.
         let index = self.journal.frame_index();
         let appended = &index[index.len() - pending.len()..];
+        // `(adoption frame's shard sequence, what staging resolved it to)`.
+        // Empty for every group that adopts nothing, which is almost all of
+        // them.
+        let mut adopted: Vec<(u64, RecoveredProjectionArtifacts)> = Vec::new();
         for (prepared, (sequence, offset, len)) in pending.iter().zip(appended) {
             if *sequence != prepared.shard_sequence {
                 return Err(self.poison_error(format!(
@@ -2681,6 +2968,18 @@ impl ShardWriter {
                         shard_sequence: *sequence,
                     },
                 )?;
+            }
+
+            // An adopted projection's objects are **not** indexed at the loop
+            // above's frame location. That location names the bytes of the
+            // frame, and an adopting frame's bytes are a descriptor; the
+            // objects live in staging's artifacts, at one logical generation
+            // per chunk. `prepared.objects` is empty for these — the builder
+            // refuses to pair inline objects with an adoption — so nothing here
+            // overwrites anything the loop above wrote.
+            if let Some(install) = prepared.transaction.projection() {
+                let resolved = self.resolve_adoption(prepared, install, *sequence)?;
+                adopted.push((*sequence, resolved));
             }
         }
 
@@ -2716,18 +3015,147 @@ impl ShardWriter {
             .map(|prepared| prepared.shard_sequence)
             .ok_or_else(|| self.poison_error("published an empty group".into()))?;
 
+        // A group that adopted nothing publishes no generation: the active
+        // journal these frames landed in is already pinned by the generation
+        // recovery installed.
+        let mut generations = GenerationMap::new();
+        let mut adopted_runs = Vector::new();
+        if !adopted.is_empty() {
+            // A resolved projection's membership arrives as a delta, as sealed
+            // index runs, or as both — B3 decides which by size, and the
+            // recovery-direction merge handles both for the same reason.
+            //
+            // The delta is merged into this group's own rather than layered
+            // beside it, because a `ShardSubtree` carries exactly one. The keys
+            // cannot collide: an adopting transaction has no inline objects, so
+            // the frame loop above wrote nothing for it, and two committed
+            // frames cannot name one session — staging refuses a second
+            // finalize.
+            for (_, artifacts) in &adopted {
+                for (key, location) in artifacts.index_delta().iter() {
+                    delta.insert(key, location)?;
+                }
+                // Into the *root's* run stack, and not only into the generation
+                // below. Pinning a run keeps its file alive; it is this that
+                // makes its entries findable, and an adoption whose membership
+                // came back as a run resolves to nothing without it.
+                for run in artifacts.index_runs_newest_first() {
+                    adopted_runs.push_back(Arc::clone(run));
+                }
+            }
+            let generation = self.generation_with_adoptions(&adopted)?;
+            generations.insert(generation.id, generation);
+        }
+
         Ok(ShardSubtree::new(
             self.shard_index,
             last,
             Arc::new(delta),
+            // `None`, though runs are installed: these cover the adopted
+            // projections' own objects, not this shard's delta backlog. Naming
+            // a sealed-through sequence would discard delta layers whose
+            // entries no adopted run contains.
             None,
-            Vector::new(),
+            adopted_runs,
             repositories,
             terminal_statuses,
-            // No new generation: the active journal these frames landed in is
-            // already pinned by the generation recovery installed.
-            GenerationMap::new(),
+            generations,
         ))
+    }
+
+    /// Count an adoption's index runs against the ceilings recovery enforces,
+    /// **before** anything is appended.
+    ///
+    /// An adoption installs staging-owned index runs, and a run count this
+    /// store can publish but not reopen is a root that opens once. `seal_index`
+    /// makes the same check against the same numbers for its own run.
+    ///
+    /// Pre-append and not post-fence, though the runs only materialize after
+    /// the fence: the count is a function of the descriptor's chunk count and
+    /// the encoder's fixed partition rule, so it is knowable now, and knowing
+    /// it now is the difference between a clean refusal the caller can act on
+    /// and a poisoned shard holding a frame it already committed.
+    fn adoption_fits_run_ceilings(
+        &self,
+        resolution: &crate::staging::ProjectionAdoptionResolution,
+    ) -> Result<(), StoreError> {
+        let planned = crate::staging::planned_index_run_count(resolution.session.chunk_count);
+        let root = self.shared.committed.load();
+        let owned: u64 = root
+            .retained_generations()
+            .values()
+            .filter(|generation| generation.id.shard_index == self.shard_index)
+            .map(|generation| generation.index_runs.len() as u64)
+            .sum();
+        let projected = owned.saturating_add(planned);
+        for (limit, allowed) in [
+            ("max_index_runs", self.shared.options.max_index_runs),
+            (
+                "max_open_index_runs",
+                self.shared.options.max_open_index_runs,
+            ),
+        ] {
+            if projected > u64::from(allowed) {
+                return Err(StoreError::LimitExceeded {
+                    limit,
+                    observed: projected,
+                    allowed: u64::from(allowed),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// The current generation, republished with this group's adopted artifacts
+    /// added to its pin set.
+    ///
+    /// Under the **same** `GenerationId`, not a successor. A new manifest
+    /// generation is a durable artifact — `checkpoint` writes one — and this is
+    /// inside the poison window after the fence, where a write that failed
+    /// would poison a shard whose frames are already committed. It does not
+    /// need to be durable: `checkpoint.rs` has no projection-artifact section
+    /// at all, and an adoption's durability comes from the committed frame plus
+    /// staging's marker, with recovery rebuilding these exact pins by replaying
+    /// the frame through `resolve_committed`. What has to survive here is the
+    /// in-memory pin, so that compaction cannot delete an artifact a live root
+    /// resolves through.
+    ///
+    /// Re-publishing the same id is what `CommittedRoot::merge` already does
+    /// for repositories and statuses, and `object_source`'s rule is satisfied
+    /// because the pins carried forward are the identical values — same paths,
+    /// same source kinds — plus new ones for generations no predecessor named.
+    fn generation_with_adoptions(
+        &self,
+        adopted: &[(u64, RecoveredProjectionArtifacts)],
+    ) -> Result<Arc<RetainedGeneration>, StoreError> {
+        let root = self.shared.committed.load();
+        // The *manifest* generation, which is not `tail_generation`: that one
+        // numbers journal segments and is what an index location names, while
+        // retention is keyed by the manifest the checkpointer publishes. The
+        // two are independent counters and only coincide by accident.
+        let id = GenerationId::new(self.shard_index, self.current_manifest_generation(&root)?);
+        let previous = root.retained_generations().get(&id).ok_or_else(|| {
+            self.poison_error(format!(
+                "manifest generation {} vanished from the root while adopting",
+                id.manifest_generation
+            ))
+        })?;
+
+        let mut index_runs = previous.index_runs.to_vec();
+        let mut artifacts = previous.projection_artifacts.to_vec();
+        for (_, resolved) in adopted {
+            index_runs.extend_from_slice(resolved.retained_index_runs());
+            artifacts.extend_from_slice(resolved.retained_artifacts());
+        }
+
+        Ok(Arc::new(RetainedGeneration::new(
+            id,
+            Arc::clone(&previous.segments),
+            index_runs.into(),
+            Arc::clone(&previous.checkpoints),
+            Arc::clone(&previous.active_tails),
+            artifacts.into(),
+        )))
     }
 
     /// This shard's unsealed index backlog, as one captured root reports it.

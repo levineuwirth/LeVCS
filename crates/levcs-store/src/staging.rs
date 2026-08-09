@@ -12,7 +12,7 @@ use levcs_protocol::v2::{
     ProjectionStageManifestV1, ProjectionStageSessionV1, StagedProjectionInstallV1,
 };
 
-use crate::index::{IndexDelta, IndexKey, IndexLocation, IndexRun};
+use crate::index::{IndexDelta, IndexKey, IndexLocation, IndexRun, IndexRunBuilder};
 use crate::roots::{CommittedRoot, PinnedFile, RetainedIndexRun, RetainedProjectionArtifact};
 use crate::types::{NamespaceId, StoreError};
 
@@ -217,12 +217,274 @@ pub(crate) trait ProjectionRecoveryResolver: Send + Sync {
         adoption_shard_sequence: u64,
     ) -> Result<RecoveredProjectionArtifacts, StoreError>;
 
+    /// Create the staging-owned index runs for one committed adoption.
+    ///
+    /// **Post-fence only**, and the one operation in this trait that writes.
+    /// The runs' `IndexLocation`s name `adoption_shard_sequence` in both the
+    /// generation and the shard-sequence field, so they cannot be built earlier:
+    /// before the fence that sequence is a prediction the pre-mark deadline
+    /// recheck may change, and putting a predicted value in a field named
+    /// `shard_sequence` would make the index disagree with the journal.
+    ///
+    /// **Deterministic and idempotent.** The run set, its names, and its bytes
+    /// are a pure function of the descriptor, the verified chunks, and the
+    /// sequence, so a second call recomputes them and compares. That is what
+    /// makes a crash between the fence and this call recoverable rather than
+    /// ambiguous: recovery replays the same authoritative frame, calls this with
+    /// the same sequence, and either finds the identical bytes or writes the
+    /// ones that are missing.
+    ///
+    /// Separate from [`Self::resolve_committed`] so that resolution stays
+    /// read-only. A resolver that wrote on demand could not be called from a
+    /// read path, and the two have different failure meanings — this one is a
+    /// durable write inside the caller's poison window.
+    fn materialize_committed_index_runs(
+        &self,
+        namespace: NamespaceId,
+        descriptor: &StagedProjectionInstallV1,
+        adoption_shard_sequence: u64,
+    ) -> Result<(), StoreError>;
+
     /// Finish one transferred session after the physical-state proof is
     /// complete. This transition must be idempotent: recovery remains unready
     /// if a later notification fails and repeats every notification on the
     /// next attempt.
     fn notify_recovered(&self, resolution: RecoveredProjectionResolution)
         -> Result<(), StoreError>;
+}
+
+/// One staged index run: which ordinals it covers and what it is called.
+struct IndexRunPartition {
+    filename: String,
+    first_ordinal: u32,
+    last_ordinal: u32,
+    first_generation: u64,
+}
+
+impl IndexRunPartition {
+    fn covers(&self, ordinal: u32) -> bool {
+        ordinal >= self.first_ordinal && ordinal <= self.last_ordinal
+    }
+}
+
+/// The exact set of runs a committed descriptor implies at a given sequence.
+///
+/// A pure function of `(chunk_count, adoption_shard_sequence)`, which is what
+/// lets materialization and resolution agree without either recording a list:
+/// both derive the same names from the same committed values, and recovery
+/// derives them again after a restart. The names carry the sequence because a
+/// session adopted at a different sequence is a different set of generations
+/// entirely.
+fn index_run_partitions(
+    session_id: [u8; 16],
+    chunk_count: u32,
+    adoption_shard_sequence: u64,
+) -> Result<Vec<IndexRunPartition>, StoreError> {
+    if chunk_count == 0 {
+        return Err(StoreError::Corruption(format!(
+            "committed staged projection session {} declares no chunks",
+            hex::encode(session_id)
+        )));
+    }
+    let per_run = u32::try_from(PROJECTION_ORDINALS_PER_RUN)
+        .expect("the ordinals-per-run bound is 1 << 16 and fits u32");
+
+    let mut partitions = Vec::new();
+    let mut first_ordinal = 0u32;
+    while first_ordinal < chunk_count {
+        // `- 1` because the range is inclusive: a partition holding ordinals
+        // 0..=65535 spans exactly the 16 bits the encoder allows, and computing
+        // an exclusive end here would place two generations `1 << 16` apart in
+        // one section, which is the one value too far.
+        let last_ordinal = first_ordinal
+            .saturating_add(per_run - 1)
+            .min(chunk_count - 1);
+        partitions.push(IndexRunPartition {
+            filename: format!("index-{adoption_shard_sequence:016x}-{first_ordinal:08x}.run"),
+            first_ordinal,
+            last_ordinal,
+            first_generation: projection_generation(
+                adoption_shard_sequence,
+                first_ordinal,
+                session_id,
+            )?,
+        });
+        first_ordinal = last_ordinal + 1;
+    }
+    Ok(partitions)
+}
+
+impl ProjectionStaging {
+    /// Prove a committed descriptor against the artifacts on this device, and
+    /// hand back the decoded chunks with their pins.
+    ///
+    /// Shared by materialization and resolution because both need exactly this
+    /// and neither may trust the other to have done it. Materialization builds
+    /// index runs from these chunks; resolution pins them. A resolution that
+    /// skipped the proof on the grounds that materialization already ran would
+    /// be trusting a file's name, and a materialization that skipped it would
+    /// encode whatever bytes it found.
+    ///
+    /// Read-only throughout: it may inspect, hash, open and pin, and it repairs
+    /// nothing.
+    #[allow(clippy::type_complexity)]
+    fn verified_chunks(
+        &self,
+        descriptor: &StagedProjectionInstallV1,
+    ) -> Result<
+        (
+            Arc<ProjectionAdoptionResolution>,
+            Vec<(u32, ProjectionStageChunkV1, u64, PinnedFile)>,
+        ),
+        StoreError,
+    > {
+        let session_id = descriptor.session_id;
+        let resolution = {
+            let registry = self.lock();
+            let record = registry.sessions.get(&session_id).ok_or_else(|| {
+                StoreError::Corruption(format!(
+                    "committed staged projection names session {}, which this root does not \
+                     hold; its artifacts cannot be resolved and the objects it published \
+                     would be unreadable",
+                    hex::encode(session_id)
+                ))
+            })?;
+            record.resolution.clone().ok_or_else(|| {
+                StoreError::Corruption(format!(
+                    "committed staged projection session {} has no sealed manifest to \
+                     resolve",
+                    hex::encode(session_id)
+                ))
+            })?
+        };
+
+        // The descriptor a frame carries must be the one this session would
+        // install. Anything else means the frame and the artifacts on this device
+        // describe different projections, and adopting either would publish
+        // membership the other does not support.
+        let expected = install_from_resolution(&resolution)?;
+        if &expected != descriptor {
+            return Err(StoreError::Corruption(format!(
+                "committed staged projection session {} does not reconstruct the descriptor \
+                 its frame carries",
+                hex::encode(session_id)
+            )));
+        }
+
+        let artifacts = Arc::clone(&resolution.artifacts);
+        let session = resolution.session.clone();
+        let sealed_digests = resolution.manifest.chunk_digests.clone();
+        let expected_set = descriptor.artifact_set_digest;
+        let read = self.run_maintenance(move || {
+            let mut chunks = Vec::with_capacity(artifacts.len());
+            let mut observed_set: Vec<ProjectionArtifact> = Vec::with_capacity(artifacts.len());
+            for (ordinal, artifact) in artifacts.iter().enumerate() {
+                let ordinal = u32::try_from(ordinal).map_err(|_| {
+                    StoreError::Corruption("staged chunk ordinal does not fit u32".into())
+                })?;
+                let bytes =
+                    read_staging_artifact(&artifact.path, StagingArtifactKind::Chunk, session_id)?;
+                let chunk = ProjectionStageChunkV1::decode_canonical(&bytes).map_err(|e| {
+                    StoreError::Corruption(format!(
+                        "committed staged chunk {} no longer decodes: {e}",
+                        artifact.path.display()
+                    ))
+                })?;
+                if chunk.ordinal != ordinal
+                    || chunk.session_id != session_id
+                    || chunk.chunk_count != session.chunk_count
+                {
+                    return Err(StoreError::Corruption(format!(
+                        "committed staged chunk {} no longer matches the ordinal, session, or \
+                         chunk count its manifest binds",
+                        artifact.path.display()
+                    )));
+                }
+                // Bind on the bytes just read, not on the sealed record beside
+                // them. Everything above is shape — session, ordinal, count —
+                // and a *different* valid chunk of the same shape satisfies all
+                // of it while carrying entirely different objects. What makes
+                // this artifact the one the descriptor commits to is its digest.
+                let observed = chunk.chunk_digest().map_err(|e| {
+                    StoreError::Corruption(format!(
+                        "committed staged chunk {} digest: {e}",
+                        artifact.path.display()
+                    ))
+                })?;
+                if observed != artifact.digest {
+                    return Err(StoreError::Corruption(format!(
+                        "committed staged chunk {} hashes to {} but its sealed manifest \
+                         records {}; the artifact on disk is not the one this projection \
+                         committed",
+                        artifact.path.display(),
+                        hex::encode(observed.0),
+                        hex::encode(artifact.digest.0)
+                    )));
+                }
+                // And against the manifest's own ordered list, so a resolution
+                // cannot be satisfied by a set of chunks that individually match
+                // records which were themselves swapped.
+                let sealed = sealed_digests.get(ordinal as usize).ok_or_else(|| {
+                    StoreError::Corruption(format!(
+                        "committed staged chunk {} has ordinal {ordinal}, beyond the \
+                         manifest's chunk list",
+                        artifact.path.display()
+                    ))
+                })?;
+                if &observed != sealed {
+                    return Err(StoreError::Corruption(format!(
+                        "committed staged chunk {} does not match the digest its manifest \
+                         binds at ordinal {ordinal}",
+                        artifact.path.display()
+                    )));
+                }
+                let file_bytes = std::fs::metadata(&artifact.path)?.len();
+                if file_bytes != artifact.bytes {
+                    return Err(StoreError::Corruption(format!(
+                        "committed staged chunk {} is {file_bytes} bytes but its sealed \
+                         manifest records {}; a location naming the whole record would name \
+                         a different span than the one that was certified",
+                        artifact.path.display(),
+                        artifact.bytes
+                    )));
+                }
+                let pinned = PinnedFile::open(artifact.path.clone())?;
+                observed_set.push(ProjectionArtifact {
+                    path: artifact.path.clone(),
+                    digest: observed,
+                    bytes: file_bytes,
+                });
+                chunks.push((ordinal, chunk, file_bytes, pinned));
+            }
+            // The descriptor's own binding over the whole set, recomputed from
+            // what is on disk. The per-chunk checks above prove each artifact
+            // against the sealed record; this proves the *set* against the frame,
+            // which is the only value the committed transaction actually signed.
+            let observed_digest = artifact_set_digest(&observed_set);
+            if observed_digest != expected_set {
+                return Err(StoreError::Corruption(format!(
+                    "committed staged projection session {} resolves to artifact set {} but \
+                     its frame commits to {}",
+                    hex::encode(session_id),
+                    hex::encode(observed_digest.0),
+                    hex::encode(expected_set.0)
+                )));
+            }
+            Ok(chunks)
+        })?;
+
+        if u32::try_from(read.len()).unwrap_or(u32::MAX) != session.chunk_count {
+            return Err(StoreError::Corruption(format!(
+                "committed staged projection session {} resolved {} of {} chunks; a partial \
+                 chunk set is never exposed",
+                hex::encode(session_id),
+                read.len(),
+                session.chunk_count
+            )));
+        }
+
+        Ok((resolution, read))
+    }
 }
 
 /// B3's implementation behind the opaque handle.
@@ -288,9 +550,52 @@ impl Drop for ProjectionAdoption {
 }
 
 /// D0-B's exact B1/B3 handoff payload.
-pub(crate) struct StagedProjectionAdoption {
+///
+/// Public because it is the sole issue point for a [`ProjectionAdoption`] and
+/// the pin has no other constructor a caller can reach. While this type was
+/// crate-private, [`crate::ValidatedTransactionBuilder::adopt_projection`] was
+/// a public function naming a type no external caller could obtain — a
+/// signature that could be read but never called. Contract review 2026-08-09-A.
+///
+/// # Opaque, and why the two halves are not separable
+///
+/// The fields are deliberately not public and `adopt_projection` takes this
+/// whole value rather than a descriptor and a handle. Passing them
+/// independently admits a pairing that is wrong rather than merely incomplete:
+/// finalize session A, take the descriptor from session B, and submit
+/// `(descriptor_B, handle_A)`. Every field of `descriptor_B` is internally
+/// valid, so nothing about it looks damaged; it simply describes a different
+/// projection than the pin protects. The frame would name B's artifacts while
+/// A's are the ones held against deletion.
+///
+/// A revalidation before append can catch that, and one still runs — but it is
+/// a check that has to be remembered, against a value that only this type's
+/// construction can guarantee. Keeping the halves together makes the
+/// mispairing unrepresentable instead, which is the difference between an
+/// invariant and a rule.
+pub struct StagedProjectionAdoption {
     pub(crate) descriptor: StagedProjectionInstallV1,
     pub(crate) handle: ProjectionAdoption,
+}
+
+impl StagedProjectionAdoption {
+    /// The canonical descriptor this adoption installs, for inspection.
+    ///
+    /// A borrow and not a move: reading what an adoption names is an ordinary
+    /// thing for a caller to want, and taking the descriptor out is exactly
+    /// what this type exists to prevent.
+    pub fn descriptor(&self) -> &StagedProjectionInstallV1 {
+        &self.descriptor
+    }
+}
+
+impl fmt::Debug for StagedProjectionAdoption {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StagedProjectionAdoption")
+            .field("session_id", &hex::encode(self.descriptor.session_id))
+            .finish_non_exhaustive()
+    }
 }
 
 // ===========================================================================
@@ -902,6 +1207,16 @@ struct Registry {
 /// **Exactly one of these exists per root, for the life of the root lock.**
 /// See [`ProjectionStaging::open`].
 pub struct ProjectionStaging {
+    /// The root lock's lease, **retained** and not merely checked at `open`.
+    ///
+    /// A borrow would prove only that the lock was held at construction. This
+    /// object outlives the engine that built it whenever a caller keeps a
+    /// clone, a `ProjectionStageSession`, or an adoption pin — each of which
+    /// owns an `Arc<ProjectionStaging>` — and every one of them can still write
+    /// under the root. Holding the lease here makes "staging cannot act after
+    /// the lock is released" true by ownership: the lock is released when the
+    /// last of them is dropped, not when the engine is.
+    _lock: Arc<RecoverySession>,
     options: StoreOptions,
     staging_root: PathBuf,
     /// Canonical root path, held so `Drop` releases exactly the entry `open`
@@ -960,8 +1275,12 @@ impl ProjectionStaging {
     /// that both actually exist. A check against a path that is about to be
     /// created would compare the device of whatever `metadata` happened to
     /// resolve, which is how a same-device assertion becomes decorative.
+    /// `lock` is taken by `Arc` and kept, not borrowed. See the field note on
+    /// [`ProjectionStaging::_lock`]: staging and everything it issues outlive
+    /// the engine whenever a caller retains one, so proof-at-construction is
+    /// not enough — the lease has to travel with the thing that can still act.
     pub fn open(
-        lock: &RecoverySession,
+        lock: Arc<RecoverySession>,
         options: StoreOptions,
         durability: Arc<DurabilityCounters>,
     ) -> Result<Arc<Self>, StoreError> {
@@ -969,7 +1288,7 @@ impl ProjectionStaging {
     }
 
     fn open_with_device_probe(
-        lock: &RecoverySession,
+        lock: Arc<RecoverySession>,
         options: StoreOptions,
         durability: Arc<DurabilityCounters>,
         device: Box<dyn DeviceProbe>,
@@ -1005,6 +1324,7 @@ impl ProjectionStaging {
         }
         let maintenance = MaintenancePool::new(&options.root);
         let staging = Arc::new(Self {
+            _lock: lock,
             options,
             staging_root,
             canonical_root,
@@ -2823,8 +3143,10 @@ impl ProjectionStageSession {
     /// a plain sealed session while a committed frame may already reference its
     /// artifacts. That is precisely the security property this package exists to
     /// hold.
-    #[allow(dead_code)] // B1's `adopt_projection` is the only legitimate caller.
-    pub(crate) fn finalize(&self, now_micros: i64) -> Result<StagedProjectionAdoption, StoreError> {
+    /// Public for the reason given on [`StagedProjectionAdoption`]: this is the
+    /// only issue point for an adoption pin, so a crate-private `finalize` made
+    /// the public `adopt_projection` uncallable. Contract review 2026-08-09-A.
+    pub fn finalize(&self, now_micros: i64) -> Result<StagedProjectionAdoption, StoreError> {
         let staging = &self.staging;
 
         // Phase 1, under the registry: admit exactly one finalizer, and do it
@@ -3137,181 +3459,40 @@ impl ProjectionRecoveryResolver for ProjectionStaging {
         descriptor: &StagedProjectionInstallV1,
         adoption_shard_sequence: u64,
     ) -> Result<RecoveredProjectionArtifacts, StoreError> {
+        let (resolution, chunks) = self.verified_chunks(descriptor)?;
         let session_id = descriptor.session_id;
-        let resolution = {
-            let registry = self.lock();
-            let record = registry.sessions.get(&session_id).ok_or_else(|| {
-                StoreError::Corruption(format!(
-                    "committed staged projection names session {}, which this root does not \
-                     hold; its artifacts cannot be resolved and the objects it published \
-                     would be unreadable",
-                    hex::encode(session_id)
-                ))
-            })?;
-            record.resolution.clone().ok_or_else(|| {
-                StoreError::Corruption(format!(
-                    "committed staged projection session {} has no sealed manifest to \
-                     resolve",
-                    hex::encode(session_id)
-                ))
-            })?
-        };
 
-        // The descriptor a frame carries must be the one this session would
-        // install. Anything else means the frame and the artifacts on this device
-        // describe different projections, and adopting either would publish
-        // membership the other does not support.
-        let expected = install_from_resolution(&resolution)?;
-        if &expected != descriptor {
-            return Err(StoreError::Corruption(format!(
-                "committed staged projection session {} does not reconstruct the descriptor \
-                 its frame carries",
-                hex::encode(session_id)
-            )));
-        }
-
-        let artifacts = Arc::clone(&resolution.artifacts);
-        let session = resolution.session.clone();
-        let sealed_digests = resolution.manifest.chunk_digests.clone();
-        let expected_set = descriptor.artifact_set_digest;
-        let read = self.run_maintenance(move || {
-            let mut chunks = Vec::with_capacity(artifacts.len());
-            let mut observed_set: Vec<ProjectionArtifact> = Vec::with_capacity(artifacts.len());
-            for (ordinal, artifact) in artifacts.iter().enumerate() {
-                let ordinal = u32::try_from(ordinal).map_err(|_| {
-                    StoreError::Corruption("staged chunk ordinal does not fit u32".into())
-                })?;
-                let bytes =
-                    read_staging_artifact(&artifact.path, StagingArtifactKind::Chunk, session_id)?;
-                let chunk = ProjectionStageChunkV1::decode_canonical(&bytes).map_err(|e| {
-                    StoreError::Corruption(format!(
-                        "committed staged chunk {} no longer decodes: {e}",
-                        artifact.path.display()
-                    ))
-                })?;
-                if chunk.ordinal != ordinal
-                    || chunk.session_id != session_id
-                    || chunk.chunk_count != session.chunk_count
-                {
-                    return Err(StoreError::Corruption(format!(
-                        "committed staged chunk {} no longer matches the ordinal, session, or \
-                         chunk count its manifest binds",
-                        artifact.path.display()
-                    )));
-                }
-                // Bind on the bytes just read, not on the sealed record beside
-                // them. Everything above is shape — session, ordinal, count —
-                // and a *different* valid chunk of the same shape satisfies all
-                // of it while carrying entirely different objects. What makes
-                // this artifact the one the descriptor commits to is its digest.
-                let observed = chunk.chunk_digest().map_err(|e| {
-                    StoreError::Corruption(format!(
-                        "committed staged chunk {} digest: {e}",
-                        artifact.path.display()
-                    ))
-                })?;
-                if observed != artifact.digest {
-                    return Err(StoreError::Corruption(format!(
-                        "committed staged chunk {} hashes to {} but its sealed manifest \
-                         records {}; the artifact on disk is not the one this projection \
-                         committed",
-                        artifact.path.display(),
-                        hex::encode(observed.0),
-                        hex::encode(artifact.digest.0)
-                    )));
-                }
-                // And against the manifest's own ordered list, so a resolution
-                // cannot be satisfied by a set of chunks that individually match
-                // records which were themselves swapped.
-                let sealed = sealed_digests.get(ordinal as usize).ok_or_else(|| {
-                    StoreError::Corruption(format!(
-                        "committed staged chunk {} has ordinal {ordinal}, beyond the \
-                         manifest's chunk list",
-                        artifact.path.display()
-                    ))
-                })?;
-                if &observed != sealed {
-                    return Err(StoreError::Corruption(format!(
-                        "committed staged chunk {} does not match the digest its manifest \
-                         binds at ordinal {ordinal}",
-                        artifact.path.display()
-                    )));
-                }
-                let file_bytes = std::fs::metadata(&artifact.path)?.len();
-                if file_bytes != artifact.bytes {
-                    return Err(StoreError::Corruption(format!(
-                        "committed staged chunk {} is {file_bytes} bytes but its sealed \
-                         manifest records {}; a location naming the whole record would name \
-                         a different span than the one that was certified",
-                        artifact.path.display(),
-                        artifact.bytes
-                    )));
-                }
-                let pinned = PinnedFile::open(artifact.path.clone())?;
-                observed_set.push(ProjectionArtifact {
-                    path: artifact.path.clone(),
-                    digest: observed,
-                    bytes: file_bytes,
-                });
-                chunks.push((ordinal, chunk, file_bytes, pinned));
-            }
-            // The descriptor's own binding over the whole set, recomputed from
-            // what is on disk. The per-chunk checks above prove each artifact
-            // against the sealed record; this proves the *set* against the frame,
-            // which is the only value the committed transaction actually signed.
-            let observed_digest = artifact_set_digest(&observed_set);
-            if observed_digest != expected_set {
-                return Err(StoreError::Corruption(format!(
-                    "committed staged projection session {} resolves to artifact set {} but \
-                     its frame commits to {}",
+        // Every run this descriptor and sequence imply, opened rather than
+        // built. `materialize_committed_index_runs` ran before this — in the
+        // live path from the writer's poison window, in recovery before each
+        // authoritative adoption frame — so a missing file here is not a run to
+        // create, it is a run that should exist and does not.
+        let directory = self.session_directory(
+            StoreOptions::shard_of(&namespace, self.options.shard_count),
+            &session_id,
+        );
+        let root_uuid = self._lock.root_uuid();
+        let mut runs = Vec::new();
+        for partition in index_run_partitions(
+            session_id,
+            resolution.session.chunk_count,
+            adoption_shard_sequence,
+        )? {
+            let path = directory.join(&partition.filename);
+            let run = IndexRun::open(&path, &root_uuid).map_err(|error| {
+                StoreError::Corruption(format!(
+                    "committed staged projection session {} has no readable index run at {}: \
+                     {error}; materialization must run before resolution",
                     hex::encode(session_id),
-                    hex::encode(observed_digest.0),
-                    hex::encode(expected_set.0)
-                )));
-            }
-            Ok(chunks)
-        })?;
-
-        if u32::try_from(read.len()).unwrap_or(u32::MAX) != session.chunk_count {
-            return Err(StoreError::Corruption(format!(
-                "committed staged projection session {} resolved {} of {} chunks; a partial \
-                 chunk set is never exposed",
-                hex::encode(session_id),
-                read.len(),
-                session.chunk_count
-            )));
-        }
-
-        // The configured active-index bounds, the same ones ordinary recovery
-        // rebuilds under. Sizing this from `max_projection_objects` and a
-        // synthetic byte limit would have let a resolution admit a projection
-        // the recovered root cannot hold: nothing requires the active-index
-        // limits to admit a maximal projection, so the two are independent
-        // configurations and only one of them governs what a reopen may rebuild.
-        let mut delta = IndexDelta::from_options(&self.options);
-        let mut retained = Vec::with_capacity(read.len());
-        for (ordinal, chunk, file_bytes, pinned) in read {
-            let generation = projection_generation(adoption_shard_sequence, ordinal, session_id)?;
-            let frame_len = u32::try_from(file_bytes).map_err(|_| {
-                StoreError::Corruption(format!(
-                    "committed staged chunk ordinal {ordinal} of session {} is {file_bytes} \
-                     bytes, beyond what a location can name",
-                    hex::encode(session_id)
+                    path.display()
                 ))
             })?;
-            for object in &chunk.objects {
-                delta.insert(
-                    IndexKey::new(namespace, object.descriptor.object_id),
-                    IndexLocation {
-                        segment_generation: generation,
-                        // The whole artifact is the certified record.
-                        frame_offset: 0,
-                        frame_len,
-                        object_type: object.descriptor.object_type,
-                        shard_sequence: adoption_shard_sequence,
-                    },
-                )?;
-            }
+            runs.push(RetainedIndexRun::new(path, Arc::new(run)));
+        }
+
+        let mut retained = Vec::with_capacity(chunks.len());
+        for (ordinal, _, _, pinned) in chunks {
+            let generation = projection_generation(adoption_shard_sequence, ordinal, session_id)?;
             retained.push(RetainedProjectionArtifact::new(
                 generation,
                 crate::roots::ProjectionArtifactFormat::CanonicalStageChunkV1,
@@ -3330,12 +3511,117 @@ impl ProjectionRecoveryResolver for ProjectionStaging {
             }
         }
 
+        // An **empty** delta, deliberately. Membership lives entirely in the
+        // runs above, whose generations are in the projection band `1 << 63`
+        // away from this shard's journal generations. A delta would be merged
+        // into a shard delta layer and sealed alongside journal entries into one
+        // run section, and a section packs `segment_generation` as a 16-bit
+        // delta from its base — so the two domains cannot share one. Keeping
+        // membership in staging-owned runs is what keeps them apart.
         RecoveredProjectionArtifacts::new(
             descriptor.clone(),
-            Arc::new(delta),
-            Arc::from([]),
+            Arc::new(IndexDelta::from_options(&self.options)),
+            runs.into(),
             retained.into(),
         )
+    }
+
+    fn materialize_committed_index_runs(
+        &self,
+        namespace: NamespaceId,
+        descriptor: &StagedProjectionInstallV1,
+        adoption_shard_sequence: u64,
+    ) -> Result<(), StoreError> {
+        let (resolution, chunks) = self.verified_chunks(descriptor)?;
+        let session_id = descriptor.session_id;
+        let partitions = index_run_partitions(
+            session_id,
+            resolution.session.chunk_count,
+            adoption_shard_sequence,
+        )?;
+        let root_uuid = self._lock.root_uuid();
+
+        // Encoded before any I/O, so the bytes are a pure function of the
+        // verified chunks, the descriptor, and the sequence. That is what makes
+        // this idempotent: a second call recomputes the identical bytes and
+        // compares rather than trusting a name.
+        let mut planned: Vec<(String, Vec<u8>)> = Vec::with_capacity(partitions.len());
+        for partition in &partitions {
+            let mut delta = IndexDelta::from_options(&self.options);
+            for (ordinal, chunk, file_bytes, _) in &chunks {
+                if !partition.covers(*ordinal) {
+                    continue;
+                }
+                let generation =
+                    projection_generation(adoption_shard_sequence, *ordinal, session_id)?;
+                let frame_len = u32::try_from(*file_bytes).map_err(|_| {
+                    StoreError::Corruption(format!(
+                        "committed staged chunk ordinal {ordinal} of session {} is {file_bytes} \
+                         bytes, beyond what a location can name",
+                        hex::encode(session_id)
+                    ))
+                })?;
+                for object in &chunk.objects {
+                    delta.insert(
+                        IndexKey::new(namespace, object.descriptor.object_id),
+                        IndexLocation {
+                            segment_generation: generation,
+                            // The whole artifact is the certified record.
+                            frame_offset: 0,
+                            frame_len,
+                            object_type: object.descriptor.object_type,
+                            shard_sequence: adoption_shard_sequence,
+                        },
+                    )?;
+                }
+            }
+            // The run's own generation is the first in its partition, which is
+            // also the section base the encoder derives. Naming it anything
+            // else would make the header disagree with the entries.
+            let bytes = IndexRunBuilder::new(
+                root_uuid,
+                partition.first_generation,
+                partition.first_generation,
+            )
+            .build(&delta)?;
+            planned.push((partition.filename.clone(), bytes));
+        }
+
+        let directory = self.session_directory(
+            StoreOptions::shard_of(&namespace, self.options.shard_count),
+            &session_id,
+        );
+        let durability = Arc::clone(&self.durability);
+        let counters = Arc::clone(&self.counters);
+        self.run_maintenance(move || {
+            for (name, bytes) in planned {
+                let path = directory.join(&name);
+                match std::fs::read(&path) {
+                    // Already materialized. Compared byte for byte rather than
+                    // accepted on the strength of its name: a crash between the
+                    // fence and this call can leave any prefix of the run set on
+                    // disk, and the file that decides whether this adoption is
+                    // readable must be the one this descriptor implies, not
+                    // merely a file at the right path.
+                    Ok(existing) => {
+                        if existing != bytes {
+                            return Err(StoreError::Corruption(format!(
+                                "staged index run {} exists with {} bytes that are not the {} \
+                                 this committed descriptor and sequence produce",
+                                path.display(),
+                                existing.len(),
+                                bytes.len()
+                            )));
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        write_artifact(&directory, &name, &bytes, &durability, &counters)?;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Ok(())
+        })
     }
 
     /// Finish one transferred session once recovery has proved its physical
@@ -3459,6 +3745,31 @@ impl ProjectionRecoveryResolver for ProjectionStaging {
 /// so the disjointness is enforced at the one place generations are minted
 /// rather than assumed everywhere they are read.
 const PROJECTION_GENERATION_BAND: u64 = 1 << 63;
+
+/// Chunk ordinals that can share one staged index run.
+///
+/// An index run packs `segment_generation` as a delta from its section's base,
+/// in 16 bits, and a section is per-namespace — so a projection's chunks, which
+/// are all in one namespace, are all in one section. Their generations are
+/// `band | (sequence << PROJECTION_ORDINAL_BITS) | ordinal`, so within a single
+/// adoption the deltas are exactly the ordinals and 65,536 of them fit.
+///
+/// Two *different* adoptions can never share a run: their sequences differ by at
+/// least one, which is `1 << PROJECTION_ORDINAL_BITS` apart — four hundred times
+/// the span. The partition rule is therefore "one run per adoption, split every
+/// `PROJECTION_ORDINALS_PER_RUN` ordinals", and it is a property of the encoder
+/// rather than a tuning choice.
+const PROJECTION_ORDINALS_PER_RUN: u64 = 1 << 16;
+
+/// How many staged index runs a projection of `chunk_count` chunks will need.
+///
+/// Read-only and derived from the fixed partition rule, so B1 can count an
+/// adoption against the index-run ceilings *before* anything is appended. A
+/// count discovered after the fence is a poisoned shard where a refusal would
+/// have done.
+pub(crate) fn planned_index_run_count(chunk_count: u32) -> u64 {
+    u64::from(chunk_count).div_ceil(PROJECTION_ORDINALS_PER_RUN)
+}
 
 /// Bits reserved for the chunk ordinal within a band entry.
 ///
@@ -3784,7 +4095,7 @@ fn remove_adoption_marker(
 /// session cannot produce a descriptor that differs from the one its seal
 /// returned. Two constructions of the same value is how a restart starts
 /// disagreeing with the session it restarted.
-fn install_from_resolution(
+pub(crate) fn install_from_resolution(
     resolution: &ProjectionAdoptionResolution,
 ) -> Result<StagedProjectionInstallV1, StoreError> {
     let manifest_digest = resolution
@@ -4321,6 +4632,18 @@ mod tests {
             Ok(Arc::clone(&self.transferred))
         }
 
+        /// The double's runs are whatever its fixture already holds, so
+        /// materialization has nothing to create. Recording that it *ran* is
+        /// what the callers under test care about; producing bytes is not.
+        fn materialize_committed_index_runs(
+            &self,
+            _namespace: NamespaceId,
+            _descriptor: &StagedProjectionInstallV1,
+            _adoption_shard_sequence: u64,
+        ) -> Result<(), StoreError> {
+            Ok(())
+        }
+
         fn resolve_committed(
             &self,
             _namespace: NamespaceId,
@@ -4490,7 +4813,7 @@ mod b3_tests {
     /// The lock is returned, not dropped: it is the ownership proof, and a
     /// fixture that let it die would be testing a constructor production can
     /// never reach.
-    fn layout(directory: &TempDir) -> (StoreOptions, RecoverySession) {
+    fn layout(directory: &TempDir) -> (StoreOptions, Arc<RecoverySession>) {
         let mut options = StoreOptions::new(directory.path());
         options.shard_count = 4;
         crate::segment::initialize_root(
@@ -4501,7 +4824,7 @@ mod b3_tests {
             &DurabilityCounters::default(),
         )
         .expect("root layout");
-        let lock = RecoverySession::open(directory.path()).expect("root lock");
+        let lock = Arc::new(RecoverySession::open(directory.path()).expect("root lock"));
         (options, lock)
     }
 
@@ -4620,7 +4943,7 @@ mod b3_tests {
 
         let reserved = {
             let staging = ProjectionStaging::open(
-                &lock,
+                Arc::clone(&lock),
                 options.clone(),
                 Arc::new(DurabilityCounters::default()),
             )
@@ -4664,9 +4987,12 @@ mod b3_tests {
             reserved
         };
 
-        let staging =
-            ProjectionStaging::open(&lock, options, Arc::new(DurabilityCounters::default()))
-                .expect("staging reopens");
+        let staging = ProjectionStaging::open(
+            Arc::clone(&lock),
+            options,
+            Arc::new(DurabilityCounters::default()),
+        )
+        .expect("staging reopens");
         assert_eq!(
             describe_state(&staging, session_id),
             StagedSessionState::Adopted,
@@ -4710,7 +5036,7 @@ mod b3_tests {
     /// device.
     fn sealed(
         directory: &TempDir,
-        lock: &RecoverySession,
+        lock: &Arc<RecoverySession>,
         options: StoreOptions,
         session_id: [u8; 16],
     ) -> (
@@ -4724,9 +5050,12 @@ mod b3_tests {
             &NamespaceId::from(binding.session.destination_repo),
             options.shard_count,
         );
-        let staging =
-            ProjectionStaging::open(lock, options, Arc::new(DurabilityCounters::default()))
-                .expect("staging opens");
+        let staging = ProjectionStaging::open(
+            Arc::clone(lock),
+            options,
+            Arc::new(DurabilityCounters::default()),
+        )
+        .expect("staging opens");
         let session = staging.begin(binding, 0).expect("begin");
         session.put_chunk(&chunk, 0).expect("put");
         // Returned rather than discarded: `seal` requires `Open`, so it is the
@@ -4942,9 +5271,12 @@ mod b3_tests {
             "a transferred pin leaves its marker behind"
         );
 
-        let staging =
-            ProjectionStaging::open(&lock, options, Arc::new(DurabilityCounters::default()))
-                .expect("staging reopens");
+        let staging = ProjectionStaging::open(
+            Arc::clone(&lock),
+            options,
+            Arc::new(DurabilityCounters::default()),
+        )
+        .expect("staging reopens");
         assert_eq!(
             describe_state(&staging, session_id),
             StagedSessionState::Finalizing,
@@ -5216,6 +5548,9 @@ mod b3_tests {
         let session_directory = marker.parent().expect("session directory").to_path_buf();
         let namespace = NamespaceId::from(ObjectId([7; 32]));
 
+        staging
+            .materialize_committed_index_runs(namespace, &install, 9)
+            .expect("a sealed session materializes its own index runs");
         let resolved = staging
             .resolve_committed(namespace, &install, 9)
             .expect("a sealed session resolves its own descriptor");
@@ -5231,9 +5566,21 @@ mod b3_tests {
             generation,
             "the artifact is pinned at the generation its locations name"
         );
+        // Through the runs, not through a delta. Membership now lives entirely
+        // in staging-owned index runs: their generations are in the projection
+        // band and cannot share a run section with this shard's journal
+        // generations, so `resolve_committed` returns an empty delta by
+        // contract. Asserting on the delta would now pass vacuously at zero.
+        assert!(
+            resolved.index_delta().is_empty(),
+            "resolution contributes no delta; membership is in the runs"
+        );
+        let run_entries: u64 = resolved
+            .index_runs_newest_first()
+            .map(|run| run.entry_count())
+            .sum();
         assert_eq!(
-            resolved.index_delta().len() as u64,
-            install.object_count,
+            run_entries, install.object_count,
             "every object the descriptor declares is located, or the root would publish \
              membership it cannot resolve"
         );
@@ -5253,10 +5600,34 @@ mod b3_tests {
         )
         .expect("metadata")
         .len();
-        for (_, location) in resolved.index_delta().iter() {
+        let run = resolved
+            .index_runs_newest_first()
+            .next()
+            .expect("a single-chunk projection materializes one run");
+        let manifest_objects: Vec<ObjectId> = {
+            let registry = staging.lock();
+            registry.sessions[&[63; 16]]
+                .resolution
+                .as_ref()
+                .expect("a sealed session has a resolution")
+                .manifest
+                .objects
+                .iter()
+                .map(|object| object.object_id)
+                .collect()
+        };
+        for object in &manifest_objects {
+            let location = run
+                .get(&IndexKey::new(namespace, *object))
+                .expect("every manifest object is in the run this projection materialized");
             assert_eq!(location.segment_generation, generation);
             assert_eq!(location.frame_offset, 0);
             assert_eq!(u64::from(location.frame_len), file_bytes);
+            assert_eq!(
+                location.shard_sequence, 9,
+                "the location names the adoption frame, which is why the run cannot be built \
+                 before that frame is fenced"
+            );
         }
 
         // Now take one chunk away. Nothing partial may resolve.
@@ -5315,9 +5686,14 @@ mod b3_tests {
                 "the fixture must exceed a ceiling of one, or this asserts nothing"
             );
 
+            // Asserted against materialization, which is where the delta is
+            // now built. `resolve_committed` returns an empty delta and opens
+            // runs, so the entry ceilings can only be reached by the operation
+            // that encodes entries — checking the other one would assert
+            // against a step that no longer counts anything.
             let refused = staging
-                .resolve_committed(NamespaceId::from(ObjectId([7; 32])), &install, 9)
-                .expect_err("a projection over the active-index ceiling must not resolve");
+                .materialize_committed_index_runs(NamespaceId::from(ObjectId([7; 32])), &install, 9)
+                .expect_err("a projection over the active-index ceiling must not materialize");
             match refused {
                 StoreError::LimitExceeded { limit: named, .. } => assert_eq!(
                     named, limit,
@@ -5448,6 +5824,9 @@ mod b3_tests {
                 .handle
                 .finish(ProjectionAdoptionOutcome::TransferredToRecovery)
                 .expect("transfer");
+            staging
+                .materialize_committed_index_runs(namespace, &install, 11)
+                .expect("materialize");
             staging
                 .resolve_committed(namespace, &install, 11)
                 .expect("resolve");
@@ -5693,7 +6072,7 @@ mod b3_tests {
         let shard_directory = directory.path().join("shards").join(format!("{shard:02}"));
 
         let staging = ProjectionStaging::open_with_device_probe(
-            &lock,
+            Arc::clone(&lock),
             options,
             Arc::new(DurabilityCounters::default()),
             Box::new(FixedDeviceProbe {
@@ -5728,9 +6107,12 @@ mod b3_tests {
     fn same_device_staging_is_admitted_through_the_production_probe() {
         let directory = TempDir::new().unwrap();
         let (options, lock) = layout(&directory);
-        let staging =
-            ProjectionStaging::open(&lock, options, Arc::new(DurabilityCounters::default()))
-                .expect("staging opens");
+        let staging = ProjectionStaging::open(
+            Arc::clone(&lock),
+            options,
+            Arc::new(DurabilityCounters::default()),
+        )
+        .expect("staging opens");
         staging
             .begin(binding([2; 16], HOUR_MICROS), 0)
             .expect("a same-device session is admitted by the real st_dev probe");
@@ -5822,9 +6204,12 @@ mod b3_tests {
     fn an_unsealed_session_cannot_be_finalized() {
         let directory = TempDir::new().unwrap();
         let (options, lock) = layout(&directory);
-        let staging =
-            ProjectionStaging::open(&lock, options, Arc::new(DurabilityCounters::default()))
-                .expect("staging opens");
+        let staging = ProjectionStaging::open(
+            Arc::clone(&lock),
+            options,
+            Arc::new(DurabilityCounters::default()),
+        )
+        .expect("staging opens");
         let session = staging
             .begin(binding([3; 16], HOUR_MICROS), 0)
             .expect("session");
@@ -5843,9 +6228,12 @@ mod b3_tests {
     fn the_recovery_resolver_seam_answers_rather_than_deferring() {
         let directory = TempDir::new().unwrap();
         let (options, lock) = layout(&directory);
-        let staging =
-            ProjectionStaging::open(&lock, options, Arc::new(DurabilityCounters::default()))
-                .expect("staging opens");
+        let staging = ProjectionStaging::open(
+            Arc::clone(&lock),
+            options,
+            Arc::new(DurabilityCounters::default()),
+        )
+        .expect("staging opens");
 
         // `transferred_sessions` *is* answered, and answers emptily here for the
         // reason it always did: a session that has not been finalized has no pin

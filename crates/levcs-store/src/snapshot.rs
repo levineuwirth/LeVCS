@@ -33,7 +33,7 @@ use std::sync::Arc;
 use levcs_core::{ObjectId, ObjectType};
 
 use crate::index::{IndexKey, NamespaceLifecycle, NamespaceStorageMode};
-use crate::roots::{CommittedRoot, RepoState};
+use crate::roots::{CommittedRoot, RepoState, RetainedObjectSource};
 use crate::types::{NamespaceId, StoreError};
 
 /// One repository's committed logical state at one generation.
@@ -43,6 +43,11 @@ pub struct RepoSnapshot {
     /// traversal.
     root: Arc<CommittedRoot>,
     namespace: NamespaceId,
+    /// The shard this namespace routes to, which is the space its logical
+    /// generation numbers are unique within. Carried so
+    /// [`RepoSnapshot::object_source`] can resolve a location without the
+    /// caller re-deriving the routing.
+    shard_index: u16,
     /// Resolved once, at capture. `RepoMap` holds each `RepoState` behind its
     /// own `Arc`, so this shares that allocation rather than copying the refs
     /// map, and it takes the hash lookup off every accessor below.
@@ -94,9 +99,16 @@ impl RepoSnapshot {
     /// here would make a deleted repository indistinguishable from one that
     /// never existed, and the two have different answers to every question
     /// below.
+    ///
+    /// `shard_index` is supplied rather than derived because deriving it needs
+    /// the shard count, which lives in [`crate::StoreOptions`] and not in the
+    /// root. It is well defined for a snapshot: a namespace routes to exactly
+    /// one shard, so every frame and every index entry it owns lives in that
+    /// shard's generations.
     pub(crate) fn capture(
         root: Arc<CommittedRoot>,
         namespace: NamespaceId,
+        shard_index: u16,
     ) -> Result<Self, StoreError> {
         let Some(state) = root.repo(&namespace) else {
             return Err(StoreError::NoSuchRepository { namespace });
@@ -105,6 +117,7 @@ impl RepoSnapshot {
         Ok(Self {
             root,
             namespace,
+            shard_index,
             state,
         })
     }
@@ -187,6 +200,31 @@ impl RepoSnapshot {
             shard_sequence: location.shard_sequence,
         }))
     }
+
+    /// Resolve a location's decoder and live pin.
+    ///
+    /// [`Self::locate`] answers *which generation*, which is not enough to read
+    /// anything: a logical generation is a segment, an active journal tail, or
+    /// an adopted projection artifact, and the three are different files in
+    /// different formats. Before adoption existed every location a reader could
+    /// hold was a frame in this shard's journal, so the distinction was
+    /// invisible and the generation number alone was serviceable. An adopted
+    /// object is indexed at its artifact's generation and its bytes are not in
+    /// the frame that installed it, so answering "where" without answering
+    /// "what kind" is now an answer a reader cannot act on.
+    ///
+    /// `Ok(None)` means no retained generation in this shard claims that
+    /// number. For a location this snapshot just produced that is corruption in
+    /// waiting, not an ordinary absence — but it is reported the same way the
+    /// root reports it, because the root is what decides retention and this is
+    /// a view onto the root, not a second opinion about it.
+    pub fn object_source(
+        &self,
+        location: &ObjectLocation,
+    ) -> Result<Option<RetainedObjectSource<'_>>, StoreError> {
+        self.root
+            .object_source(self.shard_index, location.segment_generation)
+    }
 }
 
 #[cfg(test)]
@@ -203,6 +241,11 @@ mod tests {
         GenerationMap, IndexDeltaLayer, LayeredObjectIndex, RepoMap, ShardSequenceMap,
         TerminalStatusMap, TypedRefMap,
     };
+
+    /// The shard every root below is built in. Nothing here asserts about
+    /// generation resolution, so the value only has to be the one constant
+    /// these hand-built roots agree on.
+    const SHARD: u16 = 0;
 
     // -----------------------------------------------------------------------
     // A thread-local allocation meter
@@ -331,7 +374,7 @@ mod tests {
         let ns = namespace(1);
         let root = root_with(&[(ns, repo_state(42, NamespaceLifecycle::Active))], &[]);
 
-        let snapshot = RepoSnapshot::capture(root, ns).expect("the namespace is bound");
+        let snapshot = RepoSnapshot::capture(root, ns, SHARD).expect("the namespace is bound");
 
         assert_eq!(snapshot.namespace(), ns);
         assert_eq!(snapshot.repo_sequence(), 42);
@@ -347,7 +390,8 @@ mod tests {
         let unbound = namespace(2);
         let root = root_with(&[(bound, repo_state(1, NamespaceLifecycle::Active))], &[]);
 
-        let error = RepoSnapshot::capture(root, unbound).expect_err("nothing is bound for it");
+        let error =
+            RepoSnapshot::capture(root, unbound, SHARD).expect_err("nothing is bound for it");
 
         // Asserted by name and by payload: contract review 2026-08-07-A makes
         // the identity part of the error, so a caller can recover what it
@@ -366,7 +410,8 @@ mod tests {
         let ns = namespace(1);
         let root = root_with(&[(ns, repo_state(9, NamespaceLifecycle::Deleted))], &[]);
 
-        let snapshot = RepoSnapshot::capture(root, ns).expect("a retired repository is bound");
+        let snapshot =
+            RepoSnapshot::capture(root, ns, SHARD).expect("a retired repository is bound");
 
         assert_eq!(snapshot.lifecycle(), NamespaceLifecycle::Deleted);
         assert_eq!(snapshot.repo_sequence(), 9);
@@ -385,7 +430,7 @@ mod tests {
             &[(ns, id, location(ObjectType::Commit as u8))],
         );
 
-        let found = RepoSnapshot::capture(root, ns)
+        let found = RepoSnapshot::capture(root, ns, SHARD)
             .expect("bound")
             .locate(id)
             .expect("a defined type code decodes")
@@ -427,7 +472,7 @@ mod tests {
             ],
         );
 
-        let through_a = RepoSnapshot::capture(Arc::clone(&root), a).expect("bound");
+        let through_a = RepoSnapshot::capture(Arc::clone(&root), a, SHARD).expect("bound");
 
         // The object present in both resolves to A's row, not B's.
         let found = through_a
@@ -454,7 +499,7 @@ mod tests {
         let root = root_with(&[(ns, repo_state(1, NamespaceLifecycle::Active))], &[]);
 
         assert_eq!(
-            RepoSnapshot::capture(root, ns)
+            RepoSnapshot::capture(root, ns, SHARD)
                 .expect("bound")
                 .locate(object(0xff))
                 .expect("an absent object is not a failure"),
@@ -473,7 +518,7 @@ mod tests {
             &[(ns, id, location(6))],
         );
 
-        let error = RepoSnapshot::capture(root, ns)
+        let error = RepoSnapshot::capture(root, ns, SHARD)
             .expect("bound")
             .locate(id)
             .expect_err("an undefined type code must not be reported as absence");
@@ -555,7 +600,7 @@ mod tests {
         drop(copied);
 
         let (snapshot, capture_bytes) =
-            allocated_bytes(|| RepoSnapshot::capture(Arc::clone(&root), ns));
+            allocated_bytes(|| RepoSnapshot::capture(Arc::clone(&root), ns, SHARD));
         let snapshot = snapshot.expect("bound");
 
         assert_eq!(
@@ -590,7 +635,7 @@ mod tests {
         let ns = namespace(1);
         let added_later = object(0xbb);
         let before = root_with(&[(ns, repo_state(1, NamespaceLifecycle::Active))], &[]);
-        let snapshot = RepoSnapshot::capture(before, ns).expect("bound");
+        let snapshot = RepoSnapshot::capture(before, ns, SHARD).expect("bound");
 
         // A newer root binds the same namespace and indexes a new object.
         let _after = root_with(

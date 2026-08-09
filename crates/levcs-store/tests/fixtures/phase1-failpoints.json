@@ -52,7 +52,8 @@
         ],
         "requires_root_cas_contention": false,
         "payload_kinds": [
-          "inline"
+          "inline",
+          "staged_projection"
         ],
         "adoption_outcome": "DefinitivePreAppendFailure"
       },
@@ -95,7 +96,8 @@
         ],
         "requires_root_cas_contention": false,
         "payload_kinds": [
-          "inline"
+          "inline",
+          "staged_projection"
         ],
         "adoption_outcome": "DefinitivePreAppendFailure"
       },
@@ -163,7 +165,8 @@
         ],
         "requires_root_cas_contention": false,
         "payload_kinds": [
-          "inline"
+          "inline",
+          "staged_projection"
         ],
         "adoption_outcome": "TransferredToRecovery"
       },
@@ -182,7 +185,8 @@
         ],
         "requires_root_cas_contention": false,
         "payload_kinds": [
-          "inline"
+          "inline",
+          "staged_projection"
         ],
         "adoption_outcome": "TransferredToRecovery"
       },
@@ -202,7 +206,8 @@
         ],
         "requires_root_cas_contention": false,
         "payload_kinds": [
-          "inline"
+          "inline",
+          "staged_projection"
         ],
         "adoption_outcome": "TransferredToRecovery"
       },
@@ -222,7 +227,8 @@
         ],
         "requires_root_cas_contention": true,
         "payload_kinds": [
-          "inline"
+          "inline",
+          "staged_projection"
         ],
         "adoption_outcome": "TransferredToRecovery"
       },
@@ -265,7 +271,8 @@
         ],
         "requires_root_cas_contention": false,
         "payload_kinds": [
-          "inline"
+          "inline",
+          "staged_projection"
         ],
         "adoption_outcome": "Adopted"
       },
@@ -284,7 +291,8 @@
         ],
         "requires_root_cas_contention": false,
         "payload_kinds": [
-          "inline"
+          "inline",
+          "staged_projection"
         ],
         "adoption_outcome": "Adopted"
       },

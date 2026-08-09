@@ -1550,11 +1550,37 @@ fn wave_b_rows_drive_through_submit_to_their_full_failpoint_expectation() {
             continue;
         }
 
+        let expected_adoption = AdoptionOutcomeExpectation::from_name(&plan.adoption_outcome)
+            .unwrap_or_else(|| {
+                panic!(
+                    "row {}: submit.adoption_outcome {:?} names no AdoptionOutcomeExpectation",
+                    row.failpoint, plan.adoption_outcome
+                )
+            });
+
         for action in &plan.actions {
             let action = engine_matrix::action_from_name(action)
                 .unwrap_or_else(|| panic!("row {}: unknown action {action:?}", row.failpoint));
-            let observation = engine_matrix::drive_submit_row(&serial, resolved.point, action);
-            assert_full_expectation(resolved.point, resolved.class, &observation);
+            // The payload is a matrix axis, so every row runs once per kind it
+            // declares. The staged-projection pass is what makes the adoption
+            // outcome an observation rather than a fixture field: without it the
+            // column would agree with the class table and describe nothing that
+            // ran.
+            for kind in &plan.payload_kinds {
+                let kind = PayloadKind::from_name(kind).unwrap_or_else(|| {
+                    panic!("row {}: unknown payload kind {kind:?}", row.failpoint)
+                });
+                let observation = engine_matrix::drive_submit_row(
+                    &serial,
+                    resolved.point,
+                    action,
+                    kind.carries_adoption(),
+                );
+                assert_full_expectation(resolved.point, resolved.class, &observation);
+                if kind.carries_adoption() {
+                    assert_adoption_outcome(&observation, expected_adoption);
+                }
+            }
         }
         driven.push(row.failpoint.clone());
     }
@@ -1567,6 +1593,44 @@ fn wave_b_rows_drive_through_submit_to_their_full_failpoint_expectation() {
     assert_eq!(
         driven, expected,
         "every Wave B row must actually have been driven, by name"
+    );
+}
+
+/// The pin's terminal outcome, observed rather than derived.
+///
+/// The expectation comes from the fixture, which `the_adoption_expectation_
+/// agrees_with_the_physical_state_class` independently checks against the class
+/// table. This compares that expectation with what staging actually counted, so
+/// the two derivations the charter requires stay two: a rule about physical
+/// state, and a number a run produced.
+///
+/// Every driven row must settle exactly one pin. Settling none is the leak §6.5
+/// declares a bug, and settling two means one adoption reached two terminal
+/// states — both are failures here rather than shrugs.
+fn assert_adoption_outcome(
+    observation: &engine_matrix::RowObservation,
+    expected: AdoptionOutcomeExpectation,
+) {
+    let counters = observation
+        .adoption
+        .expect("a staged-projection row records staging's pin counters");
+    let observed = counters
+        .sole_outcome()
+        .unwrap_or_else(|why| panic!("row {}: {why}", observation.row));
+    let observed = observed.unwrap_or_else(|| {
+        panic!(
+            "row {}: the adoption pin was never settled; a pin dropped without an outcome is \
+             the lifecycle bug the handle exists to expose ({counters:?})",
+            observation.row
+        )
+    });
+    assert_eq!(
+        observed,
+        expected.name(),
+        "row {}: the adoption pin settled {observed}, but this row's physical state class \
+         requires {} ({counters:?})",
+        observation.row,
+        expected.name()
     );
 }
 

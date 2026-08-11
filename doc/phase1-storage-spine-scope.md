@@ -2044,6 +2044,11 @@ and `scripts/verify-store-recovery.sh --cycles 2` reports `bundle=schema-valid` 
    | `build_profile` | from `cfg!(debug_assertions)` | same |
    | `environment_fidelity` | `diagnostic` unless every reference condition holds | same |
 
+   (The table is a snapshot of its writing. The submit path has since earned
+   `index_maintenance = "runs_sealed"` (`fef8520`) and `checkpointing = "exercised"` under the
+   in-window cadence (`b5db293`); §7 records both movements and corrects the planning claim
+   that accompanied them.)
+
    These are **declarations of what the run did**, not configuration. Each must be derived from
    the `MeasuredRun` and the options rather than hardcoded per path where a derivation exists:
    `index_run_ceiling` follows from comparing the configured ceiling to the store default,
@@ -2325,11 +2330,21 @@ rather than from a label.
 `checkpointing` is the one outstanding, and it has moved from `unimplemented` to
 **`enabled_not_reached`** — `StoreEngine::checkpoint` exists and answers (`5462952`, corrected
 by `bff8e8a`), and the short verification runs simply never accumulate enough work to trip it.
-That distinction matters for planning: what remains is a *run long enough to take a
-checkpoint*, not a mechanism to build. It is the last of the four, and it is the one that
-decides whether a P2 figure describes a steady state or a burst — a run with a lookup fan-out
-that grows for its whole duration and no checkpoint ever taken is measuring a system that has
-not yet reached the condition the number is supposed to characterize.
+**The planning claim this paragraph used to make — that what remained was a *run long enough
+to take a checkpoint*, not a mechanism to build — was wrong in both directions, and is
+corrected here rather than erased** (2026-08-11). Building the run was itself work:
+`store-bench run` was a stub, no code path could declare `checkpointing = "exercised"`, and no
+checkpoint happened inside a measured window until the in-window cadence and the closing
+backlog drain landed (`b5db293`). And a long enough run was not merely unattempted but
+arithmetically unreachable: nothing in the store removed an index run, so the frozen 300 s +
+900 s workload against the hard ceiling of 32 open runs refused partway on any hardware — a
+125-second contention run died at `max_open_index_runs (observed: 33, allowed: 32)`. Index-run
+compaction (contract reviews 2026-08-09-C and 2026-08-11-A) is the mechanism that had to exist
+first. What the paragraph wanted to say survives its correction: the checkpoint cadence is
+what decides whether a P2 figure describes a steady state or a burst — a run with a lookup
+fan-out that grows for its whole duration and no checkpoint ever taken is measuring a system
+that has not yet reached the condition the number is supposed to characterize — and that
+cadence now runs inside the window it qualifies.
 
 **A fourth condition is not on the exit list and bore on the same question, and it is now
 closed.** The submit path used to declare `index_run_ceiling =
@@ -2341,9 +2356,13 @@ the real ceiling; the path now declares `store_default`, and `runs_sealed` above
 under the ceiling a deployment would run. The carry-forward under §6.6 item 5 records the
 evidence.
 
-Three of four is the accurate reading of how much of the P2 exit criterion is currently earned,
-and the remainder is the expensive one — the same disclosure the SIGKILL carry-forward above
-makes about the crash-recovery row.
+Three of four was the accurate reading when measured, and it carried an implication — that the
+remainder was only expensive, not unbuilt — which the correction above retires. After
+`b5db293` and the compaction work, the remainder genuinely is the campaign and only the
+campaign: `scripts/close-phase1.sh` runs the gate, the recovery cycles, and the P2 repetitions
+in one invocation, and the single input it cannot supply itself is the frozen hardware profile
+under it — the same disclosure the SIGKILL carry-forward above makes about the crash-recovery
+row.
 
 ## 8. Capacity analysis for P2 on the frozen reference hardware
 

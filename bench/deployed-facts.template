@@ -1,0 +1,94 @@
+# The deployed-node harness's half of the hardware-profile comparison:
+# every fact the frozen profiles pin that store-bench cannot read from
+# inside an unprivileged process. Copy this file, MEASURE each value on the
+# reference host with the command in its comment, and pass the result to
+# scripts/close-phase1.sh --facts.
+#
+# These are facts to compare, never a profile name to accept. store-bench
+# refuses a fact that contradicts what it can read itself, and a fact merely
+# copied from bench/reference-hardware.toml asserts a measurement nobody
+# made — if the host has drifted from the frozen profile, the honest outcome
+# is the mismatch, not the name.
+#
+# Format: one `table.key = value` per line, spelled exactly as
+# bench/reference-hardware.toml spells the value. Quotes are optional and
+# stripped when they enclose the whole value.
+
+# cat /sys/devices/system/cpu/intel_pstate/no_turbo (0 => true), or
+# `boost` under cpufreq; spell as the profile does.
+#cpu.turbo =
+
+# dmidecode -t memory (sum of installed modules), in GiB.
+#memory.installed_gib =
+
+# cat /sys/fs/cgroup/memory.max for the benchmark's cgroup, in GiB.
+#memory.cgroup_limit_gib =
+
+# nvme id-ctrl /dev/nvme0 | grep -E '^mn '  (trim trailing spaces)
+#nvme.model =
+
+# nvme id-ctrl /dev/nvme0 | grep -E '^fr '
+#nvme.firmware =
+
+# nvme list-ns /dev/nvme0 | wc -l
+#nvme.namespace_count =
+
+# cat /sys/block/nvme0n1/queue/scheduler (the bracketed entry)
+#nvme.scheduler =
+
+# nvme get-feature /dev/nvme0 -f 6  (volatile write cache)
+#nvme.write_cache =
+
+# nvme id-ctrl /dev/nvme0 (ONCS/VWC bits); false for a 990 PRO.
+#nvme.power_loss_protection =
+
+# findmnt -no OPTIONS <mount> | tr ',' '\n' | grep discard
+#nvme.discard =
+
+# findmnt -no OPTIONS <mount> — the full list, spelled as the profile's array.
+#filesystem.mount_options =
+
+# btrfs filesystem df <mount> — Data profile.
+#filesystem.data_profile =
+
+# btrfs filesystem df <mount> — Metadata profile.
+#filesystem.metadata_profile =
+
+# Absent nobarrier in the mount options => "enabled".
+#filesystem.barriers =
+
+# The work directory is on the persistent NVMe mount, verified by findmnt.
+#filesystem.data_mount_must_be_persistent =
+
+# lsattr -d on the bench parent directory: C => "nodatacow".
+#filesystem.store_directory_attributes =
+
+# The store layout under test; the frozen spelling is
+# ["shards/*/active", "shards/*/segments"].
+#filesystem.store_directories =
+
+# lspci | grep -i ethernet, or `ip -d link`.
+#network.nic =
+
+# ethtool -i <iface> | grep driver
+#network.driver =
+
+# ethtool <iface> | grep Speed  (Mb/s as an integer)
+#network.link_mbps =
+
+# ip link show <iface> | grep mtu
+#network.mtu =
+
+# The software facts describe the host's INSTALLED stack, which the frozen
+# profile pins — not the topology of the P2 run. The measured path is
+# in-process and the bundle's deployment object records that separately as
+# "none (in-process P2)"; the two answer different questions.
+
+# caddy version (the proxy fronting the deployed gates, installed on the host).
+#software.proxy =
+
+# The TLS the deployed stack terminates with, as the profile spells it.
+#software.tls =
+
+# The host's service manager (systemctl --version | head -1, spelled as pinned).
+#software.service_manager =

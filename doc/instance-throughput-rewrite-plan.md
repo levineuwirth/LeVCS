@@ -1839,6 +1839,51 @@ The integration suite's `cleanup_is_deferred_and_names_its_deliverable` is repla
 deleted — the distinction it stood for, that "nothing to do" and "cannot answer yet" are
 different results, is now asserted the other way round at the public surface.
 
+##### Contract review 2026-08-11-B
+
+`bench/result-schema.json` — `hardware.temperature_celsius`. Requested during the closure-path
+review, because the emitter fabricated the reading: every bundle carried `0.0`, a number no
+sensor produced, and the placeholder scan could not see it because the field is numeric and
+every marker is a string. §10 requires the bundle to record the NVMe temperature, and a
+fabricated constant is the one value that satisfies a validator while recording nothing.
+
+**One value form is added, none is removed.** The field now admits a number **or** exactly the
+string `"recorded by the deployed-node harness"` — the existing hardware placeholder marker, so
+the derivation's placeholder refusal covers it with no new rule: a bundle carrying the marker
+cannot name a frozen profile and cannot pass. Archived numeric bundles still validate.
+
+**The emitter measures during the run, or refuses — and the number claims exactly what it
+is.** A sampler thread in `run_engine` polls the host's nvme hwmon class on a five-second
+cadence for as long as **any producer thread lives** — submitters and the checkpointer carry
+`ProducerTicket`s that decrement on every exit path, and the count is loaded before anything
+spawns. Draining on producers rather than on gate idleness is what closes the late-enrollment
+window: a worker that had passed its deadline check but not yet enrolled was invisible to the
+gate's in-flight count, and a momentarily idle gate could release the sampler while that
+worker's device load was still coming; a producer count of zero means no thread exists that
+could enroll at all. **Coverage is the contract, and it fails closed**: one failed scheduled
+reading invalidates the whole measurement, so a stale pre-load sample cannot stand in for a
+window nobody measured. The recorded value is a **sampled maximum, not a continuous peak** — a
+sub-cadence transient is invisible, and the field's contract says so rather than claiming
+otherwise. A post-run snapshot was the first cut and was wrong the way it sounds: a drive
+could throttle mid-window and cool before assembly. The reader parses the hwmon ABI as the
+**integer millidegrees** it defines — an `f64` parse admitted `nan`, which the JSON writer
+would emit as a fabricated `0` — and **fails closed across the whole scan**: an unreadable
+directory entry, an unreadable sensor name, or an unreadable NVMe input each make the host
+unmeasured, because an unprivileged scan cannot tell which drive backs the store and an
+unrelated drive must not supply the pass-enabling number for one it could not see. The reader
+takes an explicit hwmon root and is unit-tested per rule; the sampler's producer-drain and
+coverage rules are pinned at the seam with observed-state waits rather than timing. A
+sensor-less host emits the marker and stays diagnostic. Deliberately **not** a deployed fact:
+a fact file asserts identity the harness compares, and a temperature asserted by a file at
+some other instant is not a reading from this run.
+
+**The schema is its own line of defense.** The `reference_profile` rule additionally pins
+`hardware.temperature_celsius` to a number, so a bundle carrying the placeholder cannot claim
+the reference environment even if an emitter ever regressed into permitting it. The
+end-to-end pass test pins all three directions — the passing bundle carries the measured
+number, the same inputs with the measurement withheld refuse naming the field, and the same
+passing bundle with the number swapped for the placeholder fails validation outright.
+
 ##### Contract review 2026-08-11-A
 
 `crates/levcs-store/src/roots.rs` — `ShardSubtree::sealed_run_retirements`, applied by

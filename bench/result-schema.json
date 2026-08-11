@@ -430,7 +430,15 @@
           "minLength": 1
         },
         "temperature_celsius": {
-          "type": "number"
+          "oneOf": [
+            {
+              "type": "number"
+            },
+            {
+              "const": "recorded by the deployed-node harness"
+            }
+          ],
+          "description": "The NVMe composite temperature read for this run, or the deployed-node placeholder when the host exposed no sensor. The placeholder is a hardware-field marker, so a bundle carrying it cannot name a frozen profile and cannot pass; a number here is a measurement, never a default."
         },
         "nic": {
           "type": "string",
@@ -1652,6 +1660,9 @@
                   "minimum-30k",
                   "release-60k"
                 ]
+              },
+              "temperature_celsius": {
+                "type": "number"
               }
             }
           }

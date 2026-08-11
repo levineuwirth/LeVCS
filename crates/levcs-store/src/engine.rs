@@ -171,6 +171,15 @@ struct EngineShared {
     /// seam — `DriveRecovery` retains its report precisely so the two can be
     /// compared, and the engine side had no counterpart. `#[cfg(test)]` for
     /// the same reason as [`EngineShared::initialization`].
+    /// Names of index runs this session's recovery reclaimed, per shard.
+    ///
+    /// The `.idx` a reclamation leaves on the device is forensic evidence the
+    /// recovery report points at (contract review 2026-07-30-G), and
+    /// compaction's sweep spares these names for the lifetime of the session
+    /// that reported them. Kept as names rather than the whole reports — the
+    /// engine consumes reports and keeps only their effects, and this is the
+    /// one effect production needs.
+    reclaimed_run_names: Vec<(u16, String)>,
     #[cfg(test)]
     recovery_reports: Vec<crate::recovery::ShardRecoveryReport>,
     /// Observed committed-root CAS contention.
@@ -346,6 +355,21 @@ impl StoreEngine {
             options,
             staging,
             _session: session,
+            reclaimed_run_names: recovered
+                .iter()
+                .flat_map(|shard| {
+                    let shard_index = shard.report.shard_index;
+                    shard
+                        .report
+                        .reclaimed_index_runs
+                        .iter()
+                        .filter_map(move |path| {
+                            path.file_name()
+                                .and_then(|name| name.to_str())
+                                .map(|name| (shard_index, name.to_string()))
+                        })
+                })
+                .collect(),
             #[cfg(test)]
             initialization,
             #[cfg(test)]
@@ -598,6 +622,191 @@ impl StoreEngine {
 pub struct IndexMaintenanceSnapshot {
     pub sealed_runs: u64,
     pub unsealed_delta_layers: u64,
+}
+
+// ===========================================================================
+// Index-run compaction: merge sealed runs so the open-run count stays under
+// the ceilings recovery enforces
+// ===========================================================================
+
+/// How many merged runs one compaction pass may install.
+///
+/// Between installing a merged run and installing the manifest that retires
+/// its sources, the durable manifest names both — and a crash there reopens
+/// through recovery's own `max_open_index_runs` check. The trigger in
+/// `seal_index` fires while at least this many rows of headroom remain, and
+/// the per-pass budget never exceeds the headroom actually left, so no
+/// intermediate manifest this pass writes can exceed what recovery accepts.
+const COMPACTION_INSTALL_RESERVE: u64 = 2;
+
+/// One manifest row a compaction pass may retire: the row as the retirement
+/// manifest must name it, and the pinned run the root answers from.
+struct CompactionSource {
+    row_generation: u64,
+    filename: String,
+    run: Arc<IndexRun>,
+}
+
+/// A set of adjacent sources whose merge the encoder accepted.
+struct CandidateGroup {
+    /// Newest-first, the order `sealed_runs_newest_first` answers in.
+    sources: Vec<CompactionSource>,
+    merged: IndexDelta,
+}
+
+/// What one compaction pass will do, fully decided before anything durable.
+struct PlannedCompaction {
+    /// Oldest-first with ascending generations, the order they install in —
+    /// which makes manifest order agree with precedence order.
+    installs: Vec<PlannedRunInstall>,
+    /// Every source row the retirement manifest drops.
+    retired: Vec<CompactionSource>,
+    /// The generation of the manifest that retires the sources.
+    retire_generation: u64,
+}
+
+struct PlannedRunInstall {
+    generation: u64,
+    bytes: Vec<u8>,
+}
+
+/// Merge sealed runs, newest first, into one delta that answers exactly what
+/// the source stack answered.
+///
+/// First-hit-wins mirrors `LayeredObjectIndex::lookup`: for a key several
+/// sources carry, the newest source's location survives, which is the answer
+/// the stack gave. The delta's ceilings are relaxed for the reason
+/// `seal_index` gives — every entry here was admitted against the configured
+/// ceilings when its run was.
+///
+/// A merge that crosses the projection generation band is refused, not
+/// resolved. Journal runs are manifest rows this writer owns; band runs are
+/// staging-owned artifacts recovery re-derives from committed adoption
+/// frames, so a run answering for both would put staging's entries under a
+/// manifest row whose lifecycle cannot retire them. The check is per entry
+/// rather than per run so a run that somehow mixes domains is refused too.
+fn merge_index_runs_newest_wins(sources: &[Arc<IndexRun>]) -> Result<IndexDelta, StoreError> {
+    let mut merged = IndexDelta::new(u64::MAX, u64::MAX);
+    let mut in_band: Option<bool> = None;
+    for run in sources {
+        for (key, location) in run.entries() {
+            let band =
+                location.segment_generation & crate::staging::PROJECTION_GENERATION_BAND != 0;
+            if *in_band.get_or_insert(band) != band {
+                return Err(StoreError::Corruption(format!(
+                    "merging index run {} would cross the projection generation band; runs \
+                     merge only within their own domain",
+                    run.generation()
+                )));
+            }
+            if merged.get(&key).is_none() {
+                merged.insert(key, location)?;
+            }
+        }
+    }
+    Ok(merged)
+}
+
+/// Split a newest-first candidate list into groups the encoder can seal.
+///
+/// The run format packs each entry's segment generation and shard sequence as
+/// deltas from per-section bases, so a merge spanning too much history fails
+/// `IndexRunBuilder::build` with a span limit. Rather than duplicating those
+/// width rules here, the encoder itself is the authority: each group is the
+/// **largest newest-prefix** a probe encode accepts, then the remainder is
+/// partitioned the same way. Prefixes, not midpoints — splitting an
+/// over-span list down the middle stranded a mergeable newest pair behind an
+/// arbitrary cut. A run left alone is returned as a group of one — it
+/// installs nothing, but the selection needs to see it, because an
+/// unmergeable run standing between groups is a precedence boundary installs
+/// may not cross. The probe generation never reaches a device, so any
+/// in-range value validates the same bytes the install will re-encode.
+fn span_partitioned_groups(
+    root_uuid: [u8; 16],
+    probe_generation: u64,
+    candidates: &[CompactionSource],
+) -> Result<Vec<CandidateGroup>, StoreError> {
+    let merged_prefix = |prefix: &[CompactionSource]| -> Result<IndexDelta, StoreError> {
+        let runs: Vec<Arc<IndexRun>> = prefix
+            .iter()
+            .map(|source| Arc::clone(&source.run))
+            .collect();
+        merge_index_runs_newest_wins(&runs)
+    };
+    let fits = |merged: &IndexDelta| -> Result<bool, StoreError> {
+        if merged.is_empty() {
+            return Ok(true);
+        }
+        match IndexRunBuilder::new(root_uuid, probe_generation, probe_generation).build(merged) {
+            Ok(_) => Ok(true),
+            Err(StoreError::LimitExceeded {
+                limit: "index_run_segment_generation_span" | "index_run_shard_sequence_span",
+                ..
+            }) => Ok(false),
+            Err(error) => Err(error),
+        }
+    };
+
+    let mut groups = Vec::new();
+    let mut rest = candidates;
+    while !rest.is_empty() {
+        // Binary search over the prefix length. Extending a prefix only adds
+        // entries, and added entries only widen a section's spans, so "fits"
+        // is monotone in the length; a prefix of one always fits, because
+        // that run encoded once already.
+        let mut fits_len = 1;
+        let mut too_long = rest.len() + 1;
+        while fits_len + 1 < too_long {
+            let probe = fits_len + (too_long - fits_len) / 2;
+            if fits(&merged_prefix(&rest[..probe])?)? {
+                fits_len = probe;
+            } else {
+                too_long = probe;
+            }
+        }
+        groups.push(CandidateGroup {
+            sources: rest[..fits_len]
+                .iter()
+                .map(|source| CompactionSource {
+                    row_generation: source.row_generation,
+                    filename: source.filename.clone(),
+                    run: Arc::clone(&source.run),
+                })
+                .collect(),
+            merged: merged_prefix(&rest[..fits_len])?,
+        });
+        rest = &rest[fits_len..];
+    }
+    Ok(groups)
+}
+
+/// Choose which groups a pass takes, newest first, never promoting a merge
+/// above rows it did not merge.
+///
+/// A merged run installs at the highest manifest generation, so it answers
+/// above every remaining row. That is sound exactly when everything newer
+/// than its sources merged too — so the first group that stays behind,
+/// whether a lone unmergeable run or a merge past the install budget, closes
+/// installation for everything older this pass. Groups that merge to empty
+/// are exempt on both sides of that line: they install nothing and retire
+/// rows with no entries, which no precedence order can observe.
+fn select_compaction_groups(groups: Vec<CandidateGroup>, budget: u64) -> Vec<CandidateGroup> {
+    let mut installable = budget;
+    let mut blocked = false;
+    let mut selected = Vec::new();
+    for group in groups {
+        if group.merged.is_empty() {
+            selected.push(group);
+            continue;
+        }
+        if group.sources.len() < 2 || blocked || installable == 0 {
+            blocked = true;
+            continue;
+        }
+        installable -= 1;
+        selected.push(group);
+    }
+    selected
 }
 
 /// Plan §5.1's two-root read, written once so both the engine and its test can
@@ -2123,7 +2332,7 @@ impl ShardWriter {
     /// second opinion about it, and the fields it forgot to compare would be
     /// exactly the ones that drifted.
     fn revalidate_adoption(
-        &self,
+        &mut self,
         transaction: &ValidatedTransaction,
         slot: &AdoptionSlot,
     ) -> Result<(), StoreError> {
@@ -3357,18 +3566,25 @@ impl ShardWriter {
     /// it now is the difference between a clean refusal the caller can act on
     /// and a poisoned shard holding a frame it already committed.
     fn adoption_fits_run_ceilings(
-        &self,
+        &mut self,
         resolution: &crate::staging::ProjectionAdoptionResolution,
     ) -> Result<(), StoreError> {
         let planned = crate::staging::planned_index_run_count(resolution.session.chunk_count);
+        // Compact before admitting, under the same trigger the seal uses with
+        // `planned` standing where the seal's one run stands. An adoption is
+        // allowed to land exactly on the ceiling, but landing there while
+        // mergeable manifest rows still hold slots hands every later seal a
+        // zero install budget: the seal's trigger fires, nothing may install,
+        // and every admission that reaches the seal repeats the refusal.
+        // Returning that headroom first is the difference between an adoption
+        // the shard absorbs and one that wedges it.
         let root = self.shared.committed.load();
-        let owned: u64 = root
-            .retained_generations()
-            .values()
-            .filter(|generation| generation.id.shard_index == self.shard_index)
-            .map(|generation| generation.index_runs.len() as u64)
-            .sum();
-        let projected = owned.saturating_add(planned);
+        let root = if self.compact_index_runs_if_crowded(&root, planned)? {
+            self.shared.committed.load()
+        } else {
+            root
+        };
+        let projected = self.owned_run_count(&root).saturating_add(planned);
         for (limit, allowed) in [
             ("max_index_runs", self.shared.options.max_index_runs),
             (
@@ -4470,7 +4686,391 @@ impl ShardWriter {
         Ok(reader.footer().journal_id)
     }
 
+    /// Merge this shard's manifest-named runs when the next seal is close
+    /// enough to the run ceilings that refusing is the alternative.
+    ///
+    /// Nothing else in the store removes a sealed run, so without this the
+    /// ceilings are a countdown, not a bound: every campaign long enough to
+    /// seal `max_open_index_runs` runs ends in a refusal regardless of load.
+    /// Runs merge newest-wins within their generation domain; staging-owned
+    /// (projection band) runs are never candidates, because they are not
+    /// manifest rows — they are re-derived by recovery from committed adoption
+    /// frames, and retiring what a recovery re-creates removes nothing.
+    ///
+    /// Every run this shard's generation pins hold — manifest rows and
+    /// adoption-resolved runs alike, because recovery's post-resolve count
+    /// enforces the open ceiling over exactly this total.
+    fn owned_run_count(&self, root: &CommittedRoot) -> u64 {
+        root.retained_generations()
+            .values()
+            .filter(|generation| generation.id.shard_index == self.shard_index)
+            .map(|generation| generation.index_runs.len() as u64)
+            .sum()
+    }
+
+    /// Returns whether a compaction was published, in which case the caller's
+    /// root is stale and must be reloaded. `incoming_runs` is what the caller
+    /// is about to add — one for a seal, the planned count for an adoption —
+    /// so both admissions share one trigger arithmetic.
+    fn compact_index_runs_if_crowded(
+        &mut self,
+        root: &CommittedRoot,
+        incoming_runs: u64,
+    ) -> Result<bool, StoreError> {
+        let allowed = u64::from(self.shared.options.max_open_index_runs);
+        let owned = self.owned_run_count(root);
+        // `max_open_index_runs <= max_index_runs` is a `StoreOptions` invariant,
+        // so headroom against the open ceiling is headroom against both.
+        if owned.saturating_add(incoming_runs) + COMPACTION_INSTALL_RESERVE <= allowed {
+            return Ok(false);
+        }
+        // A shard with no committed sequence has sealed nothing this writer may
+        // merge, and a maintenance publication would mint sequence 0 — a real
+        // frame — for a shard that has none.
+        let Some(committed_sequence) = root.shard_committed_sequence(self.shard_index) else {
+            return Ok(false);
+        };
+        let current_generation = self.current_manifest_generation(root)?;
+        let paths = RootLayout::new(&self.shared.options.root).shard(self.shard_index);
+        let manifest = read_manifest_or_empty(&paths, current_generation, &self.shared.root_uuid)?;
+        if manifest.index_runs.len() < 2 {
+            return Ok(false);
+        }
+        let pin = root
+            .retained_generations()
+            .get(&GenerationId::new(self.shard_index, current_generation))
+            .ok_or_else(|| {
+                StoreError::Corruption(format!(
+                    "generation {current_generation} vanished from the root while compacting"
+                ))
+            })?;
+        // Newest-first, mirroring both the answer order and the manifest read
+        // back in reverse — the same orientation recovery rebuilds.
+        let mut candidates = Vec::new();
+        for (row_generation, filename) in manifest.index_runs.iter().rev() {
+            let retained = pin
+                .index_runs
+                .iter()
+                .find(|retained| retained.run().generation() == *row_generation)
+                .ok_or_else(|| {
+                    StoreError::Corruption(format!(
+                        "manifest row {row_generation} ({filename}) is not pinned by \
+                         generation {current_generation}"
+                    ))
+                })?;
+            candidates.push(CompactionSource {
+                row_generation: *row_generation,
+                filename: filename.clone(),
+                run: Arc::clone(retained.run()),
+            });
+        }
+        let budget = allowed
+            .saturating_sub(owned)
+            .min(COMPACTION_INSTALL_RESERVE);
+        let Some(plan) = self.plan_index_run_compaction(&candidates, current_generation, budget)?
+        else {
+            return Ok(false);
+        };
+        self.compact_index_runs(root, committed_sequence, current_generation, plan)?;
+        Ok(true)
+    }
+
+    /// Decide a full pass — groups, install generations, encoded bytes and the
+    /// retirement row set — before anything durable, so every planning failure
+    /// is an ordinary error on an unchanged store.
+    fn plan_index_run_compaction(
+        &self,
+        candidates: &[CompactionSource],
+        current_generation: u64,
+        budget: u64,
+    ) -> Result<Option<PlannedCompaction>, StoreError> {
+        let root_uuid = self.shared.root_uuid;
+        let groups = span_partitioned_groups(root_uuid, current_generation + 1, candidates)?;
+        let selected = select_compaction_groups(groups, budget);
+        if selected.is_empty() {
+            return Ok(None);
+        }
+        // Oldest first, so ascending install generations reproduce precedence
+        // order in the manifest. The bytes are encoded again here rather than
+        // kept from the probe because only now is each group's real generation
+        // known; the delta is unchanged, so a span the probe accepted cannot
+        // fail.
+        let mut next_generation = current_generation;
+        let mut installs = Vec::new();
+        for group in selected.iter().rev() {
+            if group.merged.is_empty() {
+                continue;
+            }
+            next_generation += 1;
+            let bytes = IndexRunBuilder::new(root_uuid, next_generation, next_generation)
+                .build(&group.merged)
+                .map_err(|error| {
+                    StoreError::Corruption(format!(
+                        "encoding merged index run {next_generation}: {error}"
+                    ))
+                })?;
+            installs.push(PlannedRunInstall {
+                generation: next_generation,
+                bytes,
+            });
+        }
+        let retired: Vec<CompactionSource> = selected
+            .into_iter()
+            .flat_map(|group| group.sources)
+            .collect();
+        Ok(Some(PlannedCompaction {
+            installs,
+            retired,
+            retire_generation: next_generation + 1,
+        }))
+    }
+
+    /// Execute a planned pass: install every merged run, then one manifest
+    /// generation that stops naming the sources, then a single root swap that
+    /// answers from the merge.
+    ///
+    /// The durable order is what makes a crash anywhere here recoverable: each
+    /// intermediate manifest names a superset of the index (sources and merge
+    /// both), never less, and the trigger's headroom keeps every superset
+    /// within the row count recovery accepts. The poison boundary is the same
+    /// as `seal_index`'s — everything before the first install is pre-durable
+    /// and fails ordinary; from it onward, failure poisons.
+    fn compact_index_runs(
+        &mut self,
+        root: &CommittedRoot,
+        committed_sequence: u64,
+        current_generation: u64,
+        plan: PlannedCompaction,
+    ) -> Result<(), StoreError> {
+        let paths = RootLayout::new(&self.shared.options.root).shard(self.shard_index);
+        let root_uuid = self.shared.root_uuid;
+        let manifest_retain = self.shared.options.manifest_retain;
+        let counters = Arc::clone(self.journal.counters_handle());
+
+        let previous = root
+            .retained_generations()
+            .get(&GenerationId::new(self.shard_index, current_generation))
+            .map(Arc::clone)
+            .ok_or_else(|| {
+                StoreError::Corruption(format!(
+                    "generation {current_generation} vanished from the root while compacting"
+                ))
+            })?;
+        let mut index_runs: Vec<RetainedIndexRun> = previous
+            .index_runs
+            .iter()
+            .filter(|retained| {
+                !plan
+                    .retired
+                    .iter()
+                    .any(|source| Arc::ptr_eq(&source.run, retained.run()))
+            })
+            .cloned()
+            .collect();
+
+        // --- durable from here: every failure below poisons ----------------
+        let mut previous_generation = current_generation;
+        let mut installed: Vec<Arc<IndexRun>> = Vec::new();
+        for install in &plan.installs {
+            let sealed = match segment::install_index_run(
+                &paths,
+                &root_uuid,
+                previous_generation,
+                install.generation,
+                &install.bytes,
+                manifest_retain,
+                &counters,
+            ) {
+                Ok(sealed) => sealed,
+                Err(error) => {
+                    return Err(self.poison_now(format!("installing a merged index run: {error}")))
+                }
+            };
+            // Reopened from the device for the reason `seal_index` gives: a
+            // merged run that cannot be reopened is found while the shard can
+            // still poison, not at the next open.
+            let run = match IndexRun::open(&sealed.path, &root_uuid) {
+                Ok(run) => Arc::new(run),
+                Err(error) => {
+                    return Err(self.poison_now(format!("reopening a merged run: {error}")))
+                }
+            };
+            index_runs.push(RetainedIndexRun::new(sealed.path.clone(), Arc::clone(&run)));
+            installed.push(run);
+            previous_generation = install.generation;
+        }
+
+        // The retirement manifest: everything carried forward untouched except
+        // the run rows this pass replaced. When nothing was installed — a pass
+        // retiring only empty coverage stamps — the read is still pre-durable
+        // and fails ordinary.
+        let manifest = if plan.installs.is_empty() {
+            segment::read_manifest(&paths, previous_generation, &root_uuid)?
+        } else {
+            match segment::read_manifest(&paths, previous_generation, &root_uuid) {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    return Err(self.poison_now(format!(
+                        "rereading the manifest after a merged-run install: {error}"
+                    )))
+                }
+            }
+        };
+        let mut manifest = manifest;
+        manifest.generation = plan.retire_generation;
+        manifest.index_runs.retain(|(generation, filename)| {
+            !plan
+                .retired
+                .iter()
+                .any(|source| source.row_generation == *generation && &source.filename == filename)
+        });
+        if let Err(error) = segment::install_manifest(&paths, &manifest, manifest_retain, &counters)
+        {
+            return Err(self.poison_now(format!("installing the retirement manifest: {error}")));
+        }
+
+        // Reclaim every run file no manifest still on the device names.
+        // Sources survive exactly as long as a fallback could select them:
+        // `install_manifest` just trimmed the manifest set to
+        // `manifest_retain`, so the union of rows across the manifests that
+        // remain is the complete set of names any recovery can reach. What is
+        // left over is an orphan recovery ignores — but not one it skips:
+        // the generation-artifact scan inspects and budgets every `.idx`, so
+        // a store that compacted forever and unlinked nothing would stop
+        // reopening while its current manifest stayed small, and repeated
+        // full merges would hold roughly quadratic bytes. A retained manifest
+        // that no longer decodes contributes no names on purpose — it can
+        // never be selected, so files only it named are already unreachable.
+        // Open pins are unaffected: an unlinked inode lives for as long as
+        // any root or reader still maps it.
+        let sweep = || -> Result<(), StoreError> {
+            let mut named: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            for generation in segment::list_manifest_generations(&paths)? {
+                let Ok(kept) = segment::read_manifest(&paths, generation, &root_uuid) else {
+                    continue;
+                };
+                named.extend(kept.index_runs.into_iter().map(|(_, filename)| filename));
+            }
+            // Runs this session's recovery reported as reclaimed are forensic
+            // evidence, not residue (contract review 2026-07-30-G): the
+            // reclamation is invisible in the opened store, so the report and
+            // the `.idx` it points at are the only pair that explains it. The
+            // sweep spares them for as long as the report exists — this
+            // session — and a later session, whose recovery reported nothing
+            // about them, may reclaim their bytes like any other unmanifested
+            // run (2026-08-11-A, amendment 2).
+            named.extend(
+                self.shared
+                    .reclaimed_run_names
+                    .iter()
+                    .filter(|(shard, _)| *shard == self.shard_index)
+                    .map(|(_, name)| name.clone()),
+            );
+            let entries = match std::fs::read_dir(paths.indexes()) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(error.into()),
+            };
+            let mut removed = false;
+            for entry in entries {
+                let path = entry?.path();
+                if path.extension().and_then(|value| value.to_str()) != Some("idx") {
+                    continue;
+                }
+                let orphaned = path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|name| !named.contains(name));
+                if orphaned {
+                    crate::sys::unlink(&path)?;
+                    removed = true;
+                }
+            }
+            if removed {
+                crate::sys::fsync_dir(&paths.indexes(), &counters)?;
+            }
+            Ok(())
+        };
+        if let Err(error) = sweep() {
+            return Err(self.poison_now(format!("reclaiming retired index runs: {error}")));
+        }
+
+        // One root swap: merged runs in, sources out, the successor generation
+        // pinning exactly what the retirement manifest names plus what it
+        // carried forward. Retired run files stay on the device — older
+        // manifest generations recovery may fall back to still name them.
+        let successor = Arc::new(RetainedGeneration::new(
+            GenerationId::new(self.shard_index, plan.retire_generation),
+            Arc::clone(&previous.segments),
+            index_runs.into(),
+            Arc::clone(&previous.checkpoints),
+            Arc::clone(&previous.active_tails),
+            Arc::clone(&previous.projection_artifacts),
+        ));
+        let mut generations = GenerationMap::new();
+        generations.insert(successor.id, successor);
+        let mut sealed_runs = Vector::new();
+        for run in installed.iter().rev() {
+            sealed_runs.push_back(Arc::clone(run));
+        }
+        let mut subtree = ShardSubtree::new(
+            self.shard_index,
+            committed_sequence,
+            Arc::new(IndexDelta::from_options(&self.shared.options)),
+            None,
+            sealed_runs,
+            RepoMap::new(),
+            TerminalStatusMap::new(),
+            generations,
+        );
+        for source in &plan.retired {
+            subtree
+                .sealed_run_retirements
+                .push_back(Arc::clone(&source.run));
+        }
+        subtree
+            .retained_generation_removals
+            .push_back(GenerationId::new(self.shard_index, current_generation));
+        if let Err(error) = self.publish_subtree(&subtree) {
+            return Err(self.poison_now(format!("publishing an index compaction: {error}")));
+        }
+
+        // `replayable_index` estimates what a reopen must rebuild as
+        // `sealed_total - run_entry_baseline` plus the unsealed terms, and the
+        // newest-wins merge just shrank `sealed_total` by every duplicate it
+        // dropped — while what a reopen replays did not move at all. Left
+        // alone, that difference under-counts: a baseline-covered entry
+        // rewritten above the horizon loses its old copy here, admission
+        // stops counting the rewrite, and enough of them admit a store whose
+        // reopen exceeds `max_active_index_entries`. Shrinking the baseline by
+        // the same amount preserves the difference; `saturating_sub` can only
+        // leave the estimate higher than exact, which is the refuse-early
+        // direction every term of that estimator already leans.
+        let retired_entries: u64 = plan
+            .retired
+            .iter()
+            .map(|source| source.run.entry_count())
+            .sum();
+        let installed_entries: u64 = installed.iter().map(|run| run.entry_count()).sum();
+        self.run_entry_baseline = self
+            .run_entry_baseline
+            .saturating_sub(retired_entries.saturating_sub(installed_entries));
+        Ok(())
+    }
+
     fn seal_index(&mut self, root: &CommittedRoot, covered_through: u64) -> Result<(), StoreError> {
+        // A seal is the only place this shard's manifest run count grows, so
+        // approaching the ceilings is relieved here, before this seal's own
+        // admission below. When a pass ran, the caller's root is one
+        // publication behind and everything below must build on the compacted
+        // one.
+        let compacted;
+        let root: &CommittedRoot = if self.compact_index_runs_if_crowded(root, 1)? {
+            compacted = self.shared.committed.load();
+            &compacted
+        } else {
+            root
+        };
         // Both ceilings, before anything is durable, and against the *same*
         // numbers recovery enforces when it reopens the manifest (scope 3.8). A
         // seal that passed here can always be reopened; one that bypassed them
@@ -4479,13 +5079,7 @@ impl ShardWriter {
         // against one shard's manifest, so counting every shard here refused a
         // shard its first run because another shard already had one — a refusal
         // recovery would never have made.
-        let owned_runs: u64 = root
-            .retained_generations()
-            .values()
-            .filter(|generation| generation.id.shard_index == self.shard_index)
-            .map(|generation| generation.index_runs.len() as u64)
-            .sum();
-        let projected = owned_runs + 1;
+        let projected = self.owned_run_count(root) + 1;
         for (limit, allowed) in [
             ("max_index_runs", self.shared.options.max_index_runs),
             (
@@ -8240,6 +8834,586 @@ mod index_maintenance_tests {
                     .get(&IndexKey::new(namespace, *object))
                     .is_some(),
                 "{} did not survive the reopen",
+                object.to_hex()
+            );
+        }
+    }
+
+    /// Nothing in the store removes a sealed run except compaction, so a
+    /// workload that seals more runs than `max_open_index_runs` is only
+    /// admissible if approaching the ceiling merges sealed runs instead of
+    /// refusing. Every bound asserted here is the recovery-enforced one — a
+    /// final manifest with more rows than the ceiling is a store that opens
+    /// once — which is why the reopen at the end is part of the assertion.
+    #[test]
+    fn crossing_the_open_run_ceiling_compacts_instead_of_refusing() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let namespace = NamespaceId([0x51; 32]);
+        let configure = || {
+            let mut options = sealing_options(&serial, temporary.path(), 4_000_000);
+            options.max_index_runs = 3;
+            options.max_open_index_runs = 3;
+            options
+        };
+        let mut covered = vec![genesis_object().id];
+        {
+            let engine = StoreEngine::open(configure()).expect("open a fresh root");
+            block_on(engine.submit(create_transaction(namespace, 2))).expect("create");
+            // Every third push crosses the fan-out ceiling and seals one more
+            // run. Fifteen pushes are five seals' worth against a ceiling of
+            // three: without compaction the fourth seal refuses with
+            // `max_open_index_runs` and the push that triggered it fails.
+            for round in 0u8..5 {
+                covered.extend(push_groups(&engine, namespace, 0x60 + round * 3, 3));
+            }
+
+            // Manifest generations advance once per installed run and once per
+            // retirement and never regress, so the pointer is the count the
+            // reclamation sweep cannot erase: five fan-out seals alone reach
+            // five, and anything past seven proves compaction both installed
+            // and retired. Counting files stopped being vitality the moment
+            // retired files began to be reclaimed.
+            let pointer = read_current(
+                &shard_paths(temporary.path(), 0),
+                &root_uuid_of(temporary.path()),
+            )
+            .expect("read CURRENT")
+            .expect("a sealed store has a CURRENT");
+            assert!(
+                pointer.generation >= 7,
+                "manifest generation {} says the ceiling was never approached and this \
+                 test asserts nothing",
+                pointer.generation
+            );
+            assert!(
+                engine.index_maintenance().sealed_runs <= 3,
+                "compaction must keep the open-run count within the ceiling, found {}",
+                engine.index_maintenance().sealed_runs
+            );
+            let rows = manifest_runs(temporary.path(), 0, root_uuid_of(temporary.path()));
+            assert!(
+                rows.len() <= 3,
+                "the manifest names {} rows, more than recovery would accept",
+                rows.len()
+            );
+            // Advance the replay horizon past every frame above, so the reopen
+            // below cannot answer from replayed delta layers and the merged
+            // run is the only index most of these objects have.
+            drop(engine.checkpoint().expect("checkpoint"));
+        }
+
+        let engine = StoreEngine::open(configure()).expect("reopen through production recovery");
+        let root = engine.committed_root();
+        for object in &covered {
+            let key = IndexKey::new(namespace, *object);
+            assert!(
+                root.index()
+                    .delta_layers()
+                    .iter()
+                    .all(|layer| layer.delta.get(&key).is_none()),
+                "{} is answered by a replayed delta layer, so this asserts nothing about \
+                 the merged run",
+                object.to_hex()
+            );
+            let location = root
+                .index()
+                .get(&key)
+                .unwrap_or_else(|| panic!("{} is not answered by any sealed run", object.to_hex()));
+            assert!(
+                root.object_source(0, location.segment_generation)
+                    .expect("resolve")
+                    .is_some(),
+                "{} must resolve to a file the recovered root still pins",
+                object.to_hex()
+            );
+        }
+    }
+
+    /// One sealed run built in memory, for merge tests that need exact
+    /// locations rather than whatever a live engine assigned.
+    fn run_of(
+        uuid: [u8; 16],
+        generation: u64,
+        entries: &[(NamespaceId, ObjectId, IndexLocation)],
+    ) -> Arc<IndexRun> {
+        let mut delta = IndexDelta::new(u64::MAX, u64::MAX);
+        for (namespace, object, location) in entries {
+            delta
+                .insert(IndexKey::new(*namespace, *object), *location)
+                .expect("insert");
+        }
+        Arc::new(
+            IndexRun::from_vec(
+                IndexRunBuilder::new(uuid, generation, generation)
+                    .build(&delta)
+                    .expect("encode"),
+                &uuid,
+            )
+            .expect("reopen from bytes"),
+        )
+    }
+
+    fn location_at(generation: u64, offset: u64, sequence: u64) -> IndexLocation {
+        IndexLocation {
+            segment_generation: generation,
+            frame_offset: offset,
+            frame_len: 8,
+            object_type: ObjectType::Blob as u8,
+            shard_sequence: sequence,
+        }
+    }
+
+    /// The merge is only correct if it answers exactly what the source stack
+    /// answered: every key present, and a key several sources carry answered
+    /// by the newest — `LayeredObjectIndex::lookup`'s first-hit-wins rule.
+    #[test]
+    fn merging_sealed_runs_preserves_entries_and_newest_wins() {
+        let uuid = [0x21; 16];
+        let namespace = NamespaceId([0x52; 32]);
+        let rewritten = ObjectId([0xA0; 32]);
+        let only_new = ObjectId([0xA1; 32]);
+        let only_old = ObjectId([0xA2; 32]);
+        let newest_location = location_at(2, 4096, 9);
+        let stale_location = location_at(1, 512, 3);
+        let newer = run_of(
+            uuid,
+            2,
+            &[
+                (namespace, rewritten, newest_location),
+                (namespace, only_new, location_at(2, 8192, 8)),
+            ],
+        );
+        let older = run_of(
+            uuid,
+            1,
+            &[
+                (namespace, rewritten, stale_location),
+                (namespace, only_old, location_at(1, 1024, 2)),
+            ],
+        );
+
+        let merged = merge_index_runs_newest_wins(&[newer, older]).expect("merge");
+        assert_eq!(merged.len(), 3, "every distinct key must survive the merge");
+        assert_eq!(
+            merged.get(&IndexKey::new(namespace, rewritten)),
+            Some(newest_location),
+            "a rewritten object must answer from the newest source, as the stack did"
+        );
+        assert_eq!(
+            merged.get(&IndexKey::new(namespace, only_new)),
+            Some(location_at(2, 8192, 8))
+        );
+        assert_eq!(
+            merged.get(&IndexKey::new(namespace, only_old)),
+            Some(location_at(1, 1024, 2))
+        );
+    }
+
+    /// Journal runs are manifest rows this writer owns; band runs are
+    /// staging-owned artifacts recovery re-derives. A merge across that line
+    /// must refuse, never resolve.
+    #[test]
+    fn a_merge_crossing_the_projection_band_is_refused() {
+        let uuid = [0x22; 16];
+        let namespace = NamespaceId([0x53; 32]);
+        let journal = run_of(
+            uuid,
+            1,
+            &[(namespace, ObjectId([0xB0; 32]), location_at(1, 512, 1))],
+        );
+        let band = run_of(
+            uuid,
+            2,
+            &[(
+                namespace,
+                ObjectId([0xB1; 32]),
+                location_at(crate::staging::PROJECTION_GENERATION_BAND | (7 << 24), 0, 2),
+            )],
+        );
+
+        let error = merge_index_runs_newest_wins(&[band, journal])
+            .expect_err("a cross-domain merge must be refused");
+        let StoreError::Corruption(message) = error else {
+            panic!("expected a Corruption refusal, got {error:?}")
+        };
+        assert!(
+            message.contains("projection generation band"),
+            "the refusal must name the band it would have crossed: {message}"
+        );
+    }
+
+    /// One candidate row as the planner would build it, from an in-memory run.
+    fn candidate_of(
+        uuid: [u8; 16],
+        namespace: NamespaceId,
+        generation: u64,
+        location: IndexLocation,
+    ) -> CompactionSource {
+        CompactionSource {
+            row_generation: generation,
+            filename: index_run_filename(generation),
+            run: run_of(
+                uuid,
+                generation,
+                &[(namespace, ObjectId([generation as u8; 32]), location)],
+            ),
+        }
+    }
+
+    /// Two groups the encoder cannot bridge and one install of budget: the
+    /// newest pair must be the one taken. A merged run answers above every
+    /// remaining row, so promoting the older pair would put its stale answers
+    /// above rows it never merged.
+    #[test]
+    fn selection_prefers_the_newest_group_under_budget() {
+        let uuid = [0x23; 16];
+        let namespace = NamespaceId([0x55; 32]);
+        // A segment-generation gap the 16-bit section span cannot bridge sits
+        // between the two pairs, so partitioning must split there.
+        let far = 70_000;
+        let candidates = [
+            candidate_of(uuid, namespace, 4, location_at(far + 1, 512, 8)),
+            candidate_of(uuid, namespace, 3, location_at(far, 512, 7)),
+            candidate_of(uuid, namespace, 2, location_at(2, 512, 2)),
+            candidate_of(uuid, namespace, 1, location_at(1, 512, 1)),
+        ];
+
+        let groups = span_partitioned_groups(uuid, 5, &candidates).expect("partition");
+        assert_eq!(groups.len(), 2, "the span gap must split the candidates");
+        let selected = select_compaction_groups(groups, 1);
+        assert_eq!(selected.len(), 1, "one install of budget takes one group");
+        assert_eq!(
+            selected[0]
+                .sources
+                .iter()
+                .map(|source| source.row_generation)
+                .collect::<Vec<_>>(),
+            vec![4, 3],
+            "the newest pair merges; promoting the older pair above it would invert precedence"
+        );
+    }
+
+    /// The partition takes the largest newest-prefix the encoder accepts. A
+    /// midpoint split of this list produced three singletons and no install at
+    /// all — even though the newest pair fits — and at the run ceiling that
+    /// meant the next seal refused.
+    #[test]
+    fn a_mergeable_newest_prefix_is_not_stranded_by_an_over_span_tail() {
+        let uuid = [0x25; 16];
+        let namespace = NamespaceId([0x57; 32]);
+        let candidates = [
+            candidate_of(uuid, namespace, 3, location_at(70_000, 512, 5)),
+            candidate_of(uuid, namespace, 2, location_at(69_999, 512, 4)),
+            candidate_of(uuid, namespace, 1, location_at(1, 512, 1)),
+        ];
+
+        let groups = span_partitioned_groups(uuid, 4, &candidates).expect("partition");
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| group.sources.len())
+                .collect::<Vec<_>>(),
+            vec![2, 1],
+            "the newest pair fits and must form a group; only the far tail stays alone"
+        );
+        let selected = select_compaction_groups(groups, 1);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(
+            selected[0]
+                .sources
+                .iter()
+                .map(|source| source.row_generation)
+                .collect::<Vec<_>>(),
+            vec![3, 2],
+            "the newest pair installs; the lone old run stays behind it"
+        );
+    }
+
+    /// A lone run the encoder cannot merge with anything newer is a boundary:
+    /// installing an older merge above it would let stale locations answer
+    /// ahead of rows the pass never touched, so the pass installs nothing.
+    #[test]
+    fn an_unmergeable_newest_run_blocks_installs_behind_it() {
+        let uuid = [0x24; 16];
+        let namespace = NamespaceId([0x56; 32]);
+        let candidates = [
+            candidate_of(uuid, namespace, 3, location_at(70_000, 512, 5)),
+            candidate_of(uuid, namespace, 2, location_at(2, 512, 2)),
+            candidate_of(uuid, namespace, 1, location_at(1, 512, 1)),
+        ];
+
+        let groups = span_partitioned_groups(uuid, 4, &candidates).expect("partition");
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| group.sources.len())
+                .collect::<Vec<_>>(),
+            vec![1, 2],
+            "the unmergeable newest run must survive as a visible singleton"
+        );
+        assert!(
+            select_compaction_groups(groups, 2).is_empty(),
+            "no install may answer above the unmerged newest run"
+        );
+    }
+
+    /// Retired run files are orphans recovery ignores — but not ones it
+    /// skips: the generation-artifact scan inspects and budgets every `.idx`
+    /// on the device. A store that compacts forever and reclaims nothing
+    /// stops reopening while its current manifest stays small, so the sweep
+    /// is load-bearing for reopen, not tidiness.
+    #[test]
+    fn retired_run_files_are_reclaimed_before_the_artifact_scan_budget() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let namespace = NamespaceId([0x59; 32]);
+        let configure = || {
+            let mut options = sealing_options(&serial, temporary.path(), 4_000_000);
+            options.max_index_runs = 3;
+            options.max_open_index_runs = 3;
+            // The artifact budget is max_manifest_candidates (equal to
+            // manifest_retain) times (max_index_runs + checkpoint_retain + 16),
+            // floored at 64. These minimums land exactly on the floor, so the
+            // rounds below install more runs than a reopen may inspect.
+            options.manifest_retain = 2;
+            options
+        };
+        {
+            let engine = StoreEngine::open(configure()).expect("open a fresh root");
+            block_on(engine.submit(create_transaction(namespace, 2))).expect("create");
+            // Forty-eight fan-out seals plus the compaction passes between
+            // them install over seventy runs against a budget of sixty-four
+            // inspected artifacts.
+            for round in 0u8..48 {
+                push_groups(&engine, namespace, 0x10 + round * 3, 3);
+            }
+            let files = std::fs::read_dir(shard_paths(temporary.path(), 0).indexes())
+                .expect("list run files")
+                .filter_map(|entry| entry.expect("dir entry").file_name().into_string().ok())
+                .filter(|name| name.ends_with(".idx"))
+                .count();
+            assert!(
+                files <= 8,
+                "the sweep left {files} run files behind; unreclaimed sources cross the \
+                 reopen budget long before the manifest does"
+            );
+        }
+        StoreEngine::open(configure())
+            .expect("a long-compacting store must stay inside the artifact-scan budget");
+    }
+
+    /// Compaction may not reclaim what a recovery reported. A reclaimed run's
+    /// `.idx` is the only explanation-bearing artifact the report points at
+    /// (contract review 2026-07-30-G), so the sweep excludes every file this
+    /// session's reports name — while still taking retired sources, which is
+    /// what the file-count bound at the end establishes.
+    #[test]
+    fn compaction_leaves_a_reported_reclaimed_run_inspectable() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let namespace = NamespaceId([0x5A; 32]);
+        let configure = || {
+            let mut options = sealing_options(&serial, temporary.path(), 4_000_000);
+            options.max_index_runs = 3;
+            options.max_open_index_runs = 3;
+            options
+        };
+        // The displacement fixture of 2026-07-30-G: a published run whose only
+        // identity an orphan `.seg` occupies, so the reopen reclaims it and
+        // reports the file it left behind.
+        {
+            let engine = StoreEngine::open(configure()).expect("open a fresh root");
+            block_on(engine.submit(create_transaction(namespace, 2))).expect("create");
+            push_groups(&engine, namespace, 0x60, 2);
+            block_on(engine.submit(push_transaction(namespace, 0x68, 0x68, None)))
+                .expect("the group after the seal commits");
+            assert_eq!(engine.index_maintenance().sealed_runs, 1, "the seal ran");
+            orphan_segment_at(temporary.path(), 0, 1);
+        }
+
+        let engine = StoreEngine::open(configure()).expect("the reopen reclaims the run");
+        let reported = engine.shared.recovery_reports[0]
+            .reclaimed_index_runs
+            .clone();
+        assert_eq!(
+            reported.len(),
+            1,
+            "the fixture must produce exactly one reclaimed run"
+        );
+        assert!(
+            reported[0].exists(),
+            "the reported file precedes compaction"
+        );
+
+        // Enough sealing to cross the trigger repeatedly, so the sweep runs.
+        for round in 0u8..4 {
+            push_groups(&engine, namespace, 0x70 + round * 3, 3);
+        }
+
+        assert!(
+            reported[0].exists(),
+            "the reclaimed run this session reported must stay inspectable through \
+             compaction; the sweep takes retired sources, never forensic evidence"
+        );
+        // And the sweep genuinely ran: a dozen installs happened above, and
+        // only the retained window plus the forensic file may remain.
+        let files = std::fs::read_dir(shard_paths(temporary.path(), 0).indexes())
+            .expect("list run files")
+            .filter_map(|entry| entry.expect("dir entry").file_name().into_string().ok())
+            .filter(|name| name.ends_with(".idx"))
+            .count();
+        assert!(
+            files <= 6,
+            "{files} run files remain, so the sweep never ran and the forensic assertion \
+             above is vacuous"
+        );
+    }
+
+    /// Compaction's newest-wins merge drops duplicate entries, which shrinks
+    /// the `sealed - baseline` difference `replayable_index` admits against —
+    /// while what a reopen actually replays does not shrink at all. The
+    /// baseline must move with the merge, or enough rewrites let admission
+    /// outrun recovery's own ceiling and the store commits work it cannot
+    /// reopen. The property asserted at the end is the whole point: every
+    /// store the writer admits must be a store that opens.
+    #[test]
+    fn compaction_keeps_admission_honest_about_replayable_entries() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let namespace = NamespaceId([0x58; 32]);
+        let configure = || {
+            let mut options = sealing_options(&serial, temporary.path(), 12);
+            options.max_index_runs = 3;
+            options.max_open_index_runs = 3;
+            options
+        };
+        {
+            let engine = StoreEngine::open(configure()).expect("open a fresh root");
+            block_on(engine.submit(create_transaction(namespace, 2))).expect("create");
+            // Four keys below the horizon, then a checkpoint that sets the
+            // baseline over the runs holding them.
+            push_groups(&engine, namespace, 0x30, 4);
+            drop(engine.checkpoint().expect("checkpoint"));
+            // The same four objects rewritten above the horizon: fresh
+            // operations, identical object ids. Their old locations sit in
+            // baseline-covered runs, so compaction drops exactly these
+            // duplicates — the case that used to shrink the estimate while
+            // the replayed frames stayed.
+            for step in 0u8..4 {
+                block_on(engine.submit(push_transaction(
+                    namespace,
+                    0x40 + step,
+                    0x30 + step,
+                    None,
+                )))
+                .unwrap_or_else(|error| panic!("rewrite {step} commits: {error:?}"));
+            }
+            // New keys until the replay guard refuses. The bound is vitality:
+            // a guard that never refuses would otherwise let this loop admit
+            // arbitrarily far past what a reopen can rebuild.
+            let mut refused = None;
+            for step in 0u8..20 {
+                match block_on(engine.submit(push_transaction(
+                    namespace,
+                    0x50 + step,
+                    0x70 + step,
+                    None,
+                ))) {
+                    Ok(_) => {}
+                    Err(error) => {
+                        refused = Some(error);
+                        break;
+                    }
+                }
+            }
+            let refused = refused.expect("the replay guard must refuse within twenty pushes");
+            assert!(
+                matches!(
+                    &refused,
+                    StoreError::LimitExceeded {
+                        limit: "max_active_index_entries",
+                        ..
+                    }
+                ),
+                "the refusal must be the replay guard, got {refused:?}"
+            );
+        }
+
+        StoreEngine::open(configure())
+            .expect("every admitted transaction must leave a store that reopens");
+    }
+
+    /// The one durable window compaction introduces: merged run installed and
+    /// named, sources not yet retired. The manifest names a superset of the
+    /// index, so a crash there must reopen and answer — never refuse, never
+    /// lose a key.
+    #[test]
+    fn an_interrupted_compaction_leaves_a_superset_the_store_reopens() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let namespace = NamespaceId([0x54; 32]);
+        let configure = || {
+            let mut options = sealing_options(&serial, temporary.path(), 4_000_000);
+            options.max_index_runs = 3;
+            options.max_open_index_runs = 3;
+            options
+        };
+        let mut covered = vec![genesis_object().id];
+        {
+            let engine = StoreEngine::open(configure()).expect("open a fresh root");
+            block_on(engine.submit(create_transaction(namespace, 2))).expect("create");
+            // Two seals' worth: every third push crosses the fan-out ceiling.
+            covered.extend(push_groups(&engine, namespace, 0x70, 6));
+        }
+
+        // Exactly the crash window, constructed with the same installer the
+        // pass uses: the merged run is manifest-named, and so are its sources.
+        let uuid = root_uuid_of(temporary.path());
+        let paths = shard_paths(temporary.path(), 0);
+        let pointer = read_current(&paths, &uuid)
+            .expect("read CURRENT")
+            .expect("a sealed store has a CURRENT");
+        let rows = read_manifest(&paths, pointer.generation, &uuid)
+            .expect("read the current manifest")
+            .index_runs;
+        assert_eq!(rows.len(), 2, "two sealed runs precede the interruption");
+        let sources: Vec<Arc<IndexRun>> = rows
+            .iter()
+            .rev()
+            .map(|(_, filename)| {
+                Arc::new(IndexRun::open(&paths.indexes().join(filename), &uuid).expect("open"))
+            })
+            .collect();
+        let merged = merge_index_runs_newest_wins(&sources).expect("merge");
+        let next = pointer.generation + 1;
+        let bytes = IndexRunBuilder::new(uuid, next, next)
+            .build(&merged)
+            .expect("encode");
+        crate::segment::install_index_run(
+            &paths,
+            &uuid,
+            pointer.generation,
+            next,
+            &bytes,
+            configure().manifest_retain,
+            &DurabilityCounters::default(),
+        )
+        .expect("install the merged run without retiring its sources");
+
+        let engine = StoreEngine::open(configure()).expect("a superset manifest must reopen");
+        assert_eq!(
+            engine.index_maintenance().sealed_runs,
+            3,
+            "recovery answers from sources and merge alike"
+        );
+        let root = engine.committed_root();
+        for object in &covered {
+            assert!(
+                root.index()
+                    .get(&IndexKey::new(namespace, *object))
+                    .is_some(),
+                "{} must survive the interrupted compaction",
                 object.to_hex()
             );
         }

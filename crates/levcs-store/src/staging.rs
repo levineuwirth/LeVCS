@@ -3743,8 +3743,10 @@ impl ProjectionRecoveryResolver for ProjectionStaging {
 ///
 /// `projection_generation` refuses anything that would land outside the band,
 /// so the disjointness is enforced at the one place generations are minted
-/// rather than assumed everywhere they are read.
-const PROJECTION_GENERATION_BAND: u64 = 1 << 63;
+/// rather than assumed everywhere they are read. Crate-visible because index
+/// compaction partitions sealed runs by this band and must refuse a merge that
+/// crosses it; the band's *meaning* stays defined here.
+pub(crate) const PROJECTION_GENERATION_BAND: u64 = 1 << 63;
 
 /// Chunk ordinals that can share one staged index run.
 ///

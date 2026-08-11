@@ -52,7 +52,7 @@ mod engine_matrix;
 
 use engine_matrix::{
     create_transaction, deadline, evidence, genesis_id, namespace_on_shard, now_micros,
-    open_absent_root, submit, DEFAULT_MAX_INDEX_RUNS,
+    open_absent_root, push_transaction, submit, DEFAULT_MAX_INDEX_RUNS,
 };
 
 const SHARD_COUNT: u16 = 2;
@@ -286,6 +286,91 @@ fn an_adopted_projection_is_owned_by_its_artifacts_and_survives_a_checkpoint() {
         "an adopted object's generation must not move when a successor generation is published; \
          the artifacts are the same files either side of the checkpoint"
     );
+}
+
+/// An adoption is admitted against the same run ceilings a seal enforces, and
+/// it may land exactly on them. Landing there while mergeable manifest rows
+/// still held slots used to hand every later seal a zero install budget: the
+/// compaction trigger fired, nothing could install, and every admission that
+/// reached the seal repeated the refusal. Admission now compacts first, so
+/// the rows return their headroom before the adoption claims it.
+#[test]
+fn an_adoption_near_the_run_ceiling_compacts_rather_than_wedging_the_seal() {
+    let directory = tempfile::TempDir::new().expect("a temporary root");
+    // Ceiling three: two sealed rows plus this adoption's one staged run land
+    // exactly on it.
+    let engine = open_absent_root(directory.path(), 1, 3);
+    let namespace = namespace_on_shard(0, 1, 1);
+    submit(&engine, create_transaction(namespace, 1))
+        .receipt()
+        .expect("the repository is created");
+
+    // Two sealed manifest rows: each push is its own group and layer, and the
+    // fan-out ceiling seals on the admission that finds three layers.
+    for step in 0u8..6 {
+        let pushed = submit(
+            &engine,
+            push_transaction(namespace, 0x30 + step, 0x30 + step),
+        );
+        pushed
+            .receipt()
+            .unwrap_or_else(|| panic!("push {step} commits: {:?}", pushed.error()));
+    }
+
+    let staged = staged_projection(namespace, [26; 16], [22; 32]);
+    let ids = staged.object_ids();
+    let adoption = stage_and_finalize(&engine, &staged);
+    let committed = submit(&engine, adopting_transaction(namespace, 0x50, adoption));
+    committed.receipt().unwrap_or_else(|| {
+        panic!(
+            "the adoption commits at the ceiling: {:?}",
+            committed.error()
+        )
+    });
+
+    // The admission compacted before claiming the slot: the manifest now names
+    // the merge of the two rows, not the rows beside a resident staged run.
+    let layout = levcs_store::segment::RootLayout::new(directory.path());
+    let uuid = levcs_store::segment::read_format(&layout)
+        .expect("FORMAT")
+        .root_uuid;
+    let paths = layout.shard(0);
+    let pointer = levcs_store::segment::read_current(&paths, &uuid)
+        .expect("read CURRENT")
+        .expect("a sealed store has a CURRENT");
+    let rows = levcs_store::segment::read_manifest(&paths, pointer.generation, &uuid)
+        .expect("read the current manifest")
+        .index_runs;
+    assert_eq!(
+        rows.len(),
+        1,
+        "admission must merge the mergeable rows before the adoption lands, found {rows:?}"
+    );
+
+    // The seal after the adoption is the wedge this test pins: three more
+    // layers and the admission that finds them must seal, not refuse.
+    for step in 0u8..3 {
+        let pushed = submit(
+            &engine,
+            push_transaction(namespace, 0x60 + step, 0x60 + step),
+        );
+        pushed.receipt().unwrap_or_else(|| {
+            panic!(
+                "push {step} after the adoption commits: {:?}",
+                pushed.error()
+            )
+        });
+    }
+
+    // And the adoption's objects still resolve after that seal.
+    let snapshot = engine.snapshot(namespace).expect("snapshot");
+    for id in &ids {
+        assert!(
+            snapshot.locate(*id).expect("locate").is_some(),
+            "adopted object {} must survive the compaction and the seal after it",
+            id.to_hex()
+        );
+    }
 }
 
 /// Staging outlives the engine, so the root lock has to outlive it too.

@@ -537,6 +537,19 @@ impl LayeredObjectIndex {
                     Arc::clone(&subtree.index_delta),
                 ));
         }
+        // Retirements before installations: the two never name the same run,
+        // but applying them in this order means a publication that retires
+        // sources and installs their merge can never drop the merge it is
+        // installing. `retain` keeps a re-merge idempotent — an already-retired
+        // run stays retired.
+        if !subtree.sealed_run_retirements.is_empty() {
+            next.sealed_runs_newest_first.retain(|run| {
+                !subtree
+                    .sealed_run_retirements
+                    .iter()
+                    .any(|retired| Arc::ptr_eq(retired, run))
+            });
+        }
         // `subtree` is already newest-first. Pushing from its back preserves
         // that order at the front of the composed stack.
         for run in subtree.sealed_runs_newest_first.iter().rev() {
@@ -799,6 +812,15 @@ pub struct ShardSubtree {
     pub sealed_through_shard_sequence: Option<u64>,
     /// Any newly installed runs, newest-first. Most groups leave this empty.
     pub sealed_runs_newest_first: Vector<Arc<IndexRun>>,
+    /// Sealed runs this publication retires, identified by the exact `Arc`s
+    /// the publisher read from the root it built against. Pointer identity is
+    /// sound here for the same reason the CAS retry loop is: only one shard
+    /// writer retires its shard's runs, `merge` is pure, and a re-merge against
+    /// a newer root still finds the same `Arc`s because nothing else removes
+    /// them. Retirement composes with installation — compaction publishes the
+    /// merged run in `sealed_runs_newest_first` and its sources here, in one
+    /// root swap, so no root ever answers from neither.
+    pub sealed_run_retirements: Vector<Arc<IndexRun>>,
     pub repositories: RepoMap,
     /// Terminal rows whose tombstone horizon has ended. Removals are applied
     /// before replacements, which keeps retrying the same subtree idempotent.
@@ -828,6 +850,7 @@ impl ShardSubtree {
             index_delta,
             sealed_through_shard_sequence,
             sealed_runs_newest_first,
+            sealed_run_retirements: Vector::new(),
             repositories,
             terminal_status_removals: Vector::new(),
             terminal_statuses,
@@ -847,6 +870,7 @@ impl ShardSubtree {
     pub fn publishes_index_maintenance(&self) -> bool {
         self.sealed_through_shard_sequence.is_some()
             || !self.sealed_runs_newest_first.is_empty()
+            || !self.sealed_run_retirements.is_empty()
             || !self.retained_generations.is_empty()
             || !self.retained_generation_removals.is_empty()
     }

@@ -1839,6 +1839,95 @@ The integration suite's `cleanup_is_deferred_and_names_its_deliverable` is repla
 deleted — the distinction it stood for, that "nothing to do" and "cannot answer yet" are
 different results, is now asserted the other way round at the public surface.
 
+##### Contract review 2026-08-11-A
+
+`crates/levcs-store/src/roots.rs` — `ShardSubtree::sealed_run_retirements`, applied by
+`with_subtree`, recognized by `publishes_index_maintenance`. A lead-owned file, so requested
+rather than emitted; this is the root-side half of the index-run compaction 2026-08-09-C
+established as the only option that keeps the ceilings meaning what they claim. One field, one
+`retain`, one clause; no other merge semantics move.
+
+**A subtree can install a run but could not retire one.** `with_subtree` composes publications
+by pushing new runs at the front and had no removal at all — correct for seals and adoptions,
+where the run count only grows, and exactly the gap 2026-08-09-C names. Retirement is a `Vector`
+of the `Arc`s the publisher read from the root it built against, removed by pointer identity.
+Identity by pointer rather than by generation is deliberate: run header generations are unique
+per shard but the root's run stack is root-wide, and a rule that compared numbers would be a
+rule two shards could trip over. The `Arc`s survive the CAS retry loop for the same reason the
+loop is sound at all — `merge` is pure, one writer owns a shard's retirements, and nothing else
+removes a run, so a re-merge against a newer root finds the same pointers. `retain` keeps a
+re-merge idempotent the way the layer-discard already is: an already-retired run stays retired.
+
+**Retirements apply before installations.** The two never name the same run, but this order
+makes the composition safe by construction: a publication that retires sources and installs
+their merge cannot drop the run it is installing, and no root — not even a hypothetical
+mis-ordered one — ever answers from neither side.
+
+**Precedence is manifest order, because manifest order is what survives.** Recovery rebuilds
+`sealed_runs_newest_first` by reading manifest rows in reverse, so a merged run installed at the
+highest generation answers first after a reopen — and the in-memory publication must agree,
+which the existing front-push already does. The engine side keeps the two orders aligned by
+assigning ascending install generations oldest-group-first and, when its per-pass budget cannot
+take every group, preferring the newest sources: a merge of the newest rows answers above where
+its sources already were, while a merge of older rows promoted over unmerged newer ones would
+invert precedence.
+
+**Evidence.** `crossing_the_open_run_ceiling_compacts_instead_of_refusing` drives five seals'
+worth of load against a ceiling of three and holds the recovery-enforced bounds at every step it
+can observe, then reopens through production recovery with the merged run as the only index most
+objects have. `merging_sealed_runs_preserves_entries_and_newest_wins` pins the merge to the
+answer the source stack gave; `a_merge_crossing_the_projection_band_is_refused` pins the domain
+rule; `an_interrupted_compaction_leaves_a_superset_the_store_reopens` constructs the one durable
+window compaction introduces — merged run named, sources not yet retired — and shows it reopens
+and answers. `selection_prefers_the_newest_group_under_budget` and
+`an_unmergeable_newest_run_blocks_installs_behind_it` pin the precedence rule at its boundary:
+when the encoder's span limits or the install budget leave rows behind, the pass merges the
+newest rows or nothing, never an older merge promoted above rows it did not merge.
+Mutation-checked: dropping the `retain` from `with_subtree` fails the ceiling test on the
+open-run bound, and merging oldest-first fails the newest-wins pin, each and only each.
+
+**Amended the same day, from the lead's review of the first cut — four findings, each fixed
+and separately mutation-checked.** (1) Retired run files are reclaimed once no manifest still
+on the device names them. Recovery's generation-artifact scan budgets every `.idx` it
+inspects, so unreclaimed sources made a long-compacting store stop reopening while its
+current manifest stayed small, and repeated full merges held roughly quadratic bytes.
+`retired_run_files_are_reclaimed_before_the_artifact_scan_budget` drives seventy-odd installs
+against the 64-artifact floor and reopens; skipping the sweep leaves 94 files and fails it.
+(2) The newest-wins merge shrinks the sealed-entry total by every duplicate it drops while
+what a reopen replays does not move, so `run_entry_baseline` now shrinks by the same amount —
+preserving the `sealed − baseline` difference `replayable_index` admits against.
+`compaction_keeps_admission_honest_about_replayable_entries` rewrites baseline-covered keys,
+drives admission to its refusal, and requires the store to reopen; without the adjustment the
+reopen exceeds `max_active_index_entries` instead. (3) Partitioning takes the **largest
+encoder-accepted newest prefix**, not midpoint splits, which could strand a mergeable newest
+pair behind an arbitrary cut and leave the following seal refusing at the ceiling —
+`a_mergeable_newest_prefix_is_not_stranded_by_an_over_span_tail` pins the three-run case.
+(4) Adoption admission compacts under the same trigger the seal uses, with the adoption's
+planned run count standing where the seal's one run stands: an adoption was allowed to land
+exactly on the ceiling, and landing there while mergeable rows still held slots handed every
+later seal a zero install budget and a permanent refusal.
+`an_adoption_near_the_run_ceiling_compacts_rather_than_wedging_the_seal` pins both halves —
+the rows merge before the adoption lands, and the seal after it seals.
+
+**Amendment 2, from the lead's second review — the reclamation sweep exceeded compaction's
+ownership, and the recovery contract of 2026-07-30-G is amended rather than silently
+narrowed.** A run recovery reclaims under 2026-07-30-G stays on the device as the only
+explanation-bearing artifact its report points at, and the first cut's sweep deleted every
+unmanifested `.idx` — forensic evidence included. The sweep now spares every name this
+session's recovery reports reclaimed, carried on the engine as `reclaimed_run_names` because
+the reports themselves are consumed and the engine keeps only their effects. The amended
+contract is: **a reclaimed run remains inspectable for the lifetime of the session that
+reported it.** A later session — whose recovery reported nothing about the file, and after
+which no durable record explains it — may reclaim its bytes along with any other
+unmanifested run, because the report is session-scoped, replay already rebuilt every object
+the run covered, and the generation-artifact budget forces eventual reclamation of
+unmanifested files whatever their origin.
+`compaction_leaves_a_reported_reclaimed_run_inspectable` builds 2026-07-30-G's displacement
+fixture, drives compaction past the trigger repeatedly, and holds the reported file present
+while bounding the surviving file count — the bound is what proves the sweep ran and the
+forensic exemption is not a sweep that never fired. Mutation-checked: dropping the exemption
+fails exactly that test.
+
 ##### Contract review 2026-08-09-C
 
 `crates/levcs-store/src/index.rs` — `IndexRun::entries`. A frozen Wave A interface, so

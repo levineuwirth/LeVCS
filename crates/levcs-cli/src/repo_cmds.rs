@@ -325,6 +325,52 @@ pub fn root() -> Result<()> {
 // commit
 // ---------------------------------------------------------------------------
 
+/// Normalize path arguments to repository-relative strings.
+///
+/// A relative path resolves against the repository root rather than the
+/// current directory — the convention `track`, `forget`, `diff` and
+/// `construct` already use, and worth matching rather than improving on in
+/// one command.
+fn normalize_paths(repo: &Repository, paths: &[PathBuf]) -> Result<Vec<String>> {
+    paths
+        .iter()
+        .map(|p| -> Result<String> {
+            let abs = if p.is_absolute() {
+                p.clone()
+            } else {
+                repo.workdir.join(p)
+            };
+            let rel = abs
+                .strip_prefix(&repo.workdir)
+                .map_err(|_| anyhow!("path {:?} is outside the repository", p))?;
+            Ok(rel
+                .to_string_lossy()
+                .replace('\\', "/")
+                .trim_end_matches('/')
+                .to_string())
+        })
+        .collect()
+}
+
+/// Whether a repository-relative path falls under a path restriction.
+///
+/// An empty restriction means everything, so the unrestricted case needs no
+/// separate branch at any call site. A restriction naming a directory takes
+/// everything beneath it.
+///
+/// `commit` and `diff` share this and `normalize_paths` deliberately: a scope
+/// is only useful if `levcs diff <paths>` is an exact preview of
+/// `levcs commit <paths>`, and two copies of a prefix rule would not stay
+/// exact for long.
+fn path_under(restrict: &[String], p: &str) -> bool {
+    if restrict.is_empty() {
+        return true;
+    }
+    restrict
+        .iter()
+        .any(|r| r.is_empty() || r == "." || p == r || p.starts_with(&format!("{r}/")))
+}
+
 pub fn commit(args: CommitArgs) -> Result<()> {
     let repo = open_repo()?;
     let (label, sk) = load_secret(args.key.as_deref())?;
@@ -364,12 +410,42 @@ pub fn commit(args: CommitArgs) -> Result<()> {
         None
     };
 
-    // Update index from working tree (for tracked files only). With --all,
-    // also include any modified-but-tracked-via-prior-commit files (we
-    // approximate: if the file is on disk and previously in index, refresh).
+    // Update index from working tree, for tracked files only.
     let mut idx = repo.read_index()?;
+
+    // A commit may be scoped to paths. Entries outside the scope are carried
+    // through untouched — neither refreshed from the working tree nor dropped
+    // when the file is gone — so the staged tree differs from HEAD in exactly
+    // the named files, and the rest of a dirty working tree stays dirty.
+    //
+    // This is what makes "commit in coherent units" achievable when a working
+    // tree holds more than one piece of work, which in a repository written by
+    // several hands at once is the ordinary case and not the awkward one.
+    // Attribution is the entire point of signing a commit, and a commit that
+    // had to sweep up someone else's unfinished edits in order to exist
+    // attributes their work to you.
+    let restrict = normalize_paths(&repo, &args.paths)?;
+    for r in &restrict {
+        // A path matching nothing tracked is an error rather than an empty
+        // scope. A mistyped path that quietly commits nothing is the same
+        // class of failure as a repository that reports clean while holding
+        // uncommitted work.
+        if !idx
+            .entries
+            .iter()
+            .any(|e| path_under(std::slice::from_ref(r), &e.path))
+        {
+            bail!("nothing tracked at '{r}'; `levcs track` it first");
+        }
+    }
+    let _ = args.all; // the explicit spelling of the default; clap bars it with paths
+
     let mut new_entries = Vec::new();
     for e in &idx.entries {
+        if !path_under(&restrict, &e.path) {
+            new_entries.push(e.clone());
+            continue;
+        }
         let abs = repo.workdir.join(&e.path);
         if abs.is_file() {
             let bytes = fs::read(&abs)?;
@@ -395,8 +471,7 @@ pub fn commit(args: CommitArgs) -> Result<()> {
                 size: meta.len(),
             });
         }
-        // (deleted from disk → drop entry)
-        let _ = args.all; // already implicit
+        // (deleted from disk, and in scope → drop entry)
     }
     idx.entries = new_entries;
     repo.write_index(&idx)?;
@@ -440,7 +515,13 @@ pub fn commit(args: CommitArgs) -> Result<()> {
             let p_signed = repo.read_signed(p)?;
             let p_commit = Commit::from_signed(&p_signed)?;
             if p_commit.tree == staged_tree {
-                bail!("nothing to commit, working tree matches HEAD");
+                // Say which thing matched HEAD. Under a scope the working
+                // tree very often does not, and claiming it did would send
+                // someone looking for a bug that is not there.
+                if restrict.is_empty() {
+                    bail!("nothing to commit, working tree matches HEAD");
+                }
+                bail!("nothing to commit in the named paths; they match HEAD");
             }
         }
     }
@@ -478,6 +559,12 @@ pub fn commit(args: CommitArgs) -> Result<()> {
         let _ = fs::remove_file(repo.levcs_dir.join("merge-record"));
     }
     println!("[{}] {}", id, summarize_message(&signed));
+    if !restrict.is_empty() {
+        // A partial commit that does not announce itself is a footgun: the
+        // next `status` will still be dirty, and the reason should already
+        // have been said.
+        println!("scoped to {}", restrict.join(", "));
+    }
     Ok(())
 }
 
@@ -651,29 +738,10 @@ pub fn diff(args: DiffArgs) -> Result<()> {
         ZERO_ID
     };
 
-    // Normalize path restrictions to repository-relative strings.
-    let restrict: Vec<String> = paths
-        .iter()
-        .map(|p| -> Result<String> {
-            let abs = if p.is_absolute() {
-                p.clone()
-            } else {
-                repo.workdir.join(p)
-            };
-            let rel = abs
-                .strip_prefix(&repo.workdir)
-                .map_err(|_| anyhow!("path {:?} is outside the repository", p))?;
-            Ok(rel.to_string_lossy().replace('\\', "/"))
-        })
-        .collect::<Result<_>>()?;
-    let path_matches = |p: &str| -> bool {
-        if restrict.is_empty() {
-            return true;
-        }
-        restrict
-            .iter()
-            .any(|r| p == r || p.starts_with(&format!("{r}/")))
-    };
+    // The same normalization and the same prefix rule `commit` uses, so that
+    // `levcs diff <paths>` is an exact preview of `levcs commit <paths>`.
+    let restrict = normalize_paths(&repo, &paths)?;
+    let path_matches = |p: &str| -> bool { path_under(&restrict, p) };
 
     let baseline = collect_tree_files(&repo, baseline_tree, "")?;
     let work: HashMap<String, Vec<u8>> = repo

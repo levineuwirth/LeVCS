@@ -98,8 +98,13 @@ pub struct CommitArgs {
     pub message: Option<String>,
     #[arg(long)]
     pub key: Option<String>,
-    #[arg(long)]
+    /// Commit every tracked file. This is the default; the flag is the
+    /// explicit spelling of it, and cannot be combined with paths.
+    #[arg(long, conflicts_with = "paths")]
     pub all: bool,
+    /// Restrict the commit to these files or directories. Everything else
+    /// keeps the content it has in HEAD and stays uncommitted.
+    pub paths: Vec<PathBuf>,
 }
 
 #[derive(Args, Debug)]

@@ -77,9 +77,30 @@ levcs commit -m "first commit"
 levcs log
 ```
 
-That's a fully working LeVCS repo. Branch and merge — note that creating a
-branch and switching to it are separate operations, so a commit cannot land
-on a branch you only meant to make:
+That's a fully working LeVCS repo.
+
+A commit can be scoped to paths, which is how you commit one piece of work out
+of a tree that holds several:
+
+```sh
+levcs commit -m "just the notes" notes/ README.md
+```
+
+Everything outside the named paths keeps the content it has in HEAD and stays
+uncommitted — including deletions, which are not read as "drop it from the
+tree" when the commit was never about that file. A path naming a directory
+takes everything tracked beneath it; a path matching nothing tracked is
+refused rather than silently committing nothing. `levcs diff <paths>` uses the
+same rule, so it is an exact preview of what `levcs commit <paths>` will take.
+
+This matters more than convenience when a repository is written by more than
+one hand. Attribution is the entire point of signing a commit, and a commit
+that had to sweep up someone else's unfinished edits in order to exist
+attributes their work to whoever signed it.
+
+Branch and merge — note that creating a branch and switching to it are
+separate operations, so a commit cannot land on a branch you only meant to
+make:
 
 ```sh
 levcs branch --create feature/x

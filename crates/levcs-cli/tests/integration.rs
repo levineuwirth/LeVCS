@@ -177,3 +177,63 @@ fn gc_grace_period_keeps_young_objects_and_deletes_old_ones() {
 
     let _ = std::fs::remove_dir_all(&work);
 }
+
+#[test]
+fn a_refused_commit_leaves_the_repository_reporting_dirty() {
+    // Regression: the authority check ran *after* the staged index was
+    // written, so a commit refused for authorship still persisted the index.
+    // `status` then compared the working tree against that index and reported
+    // "working tree clean" while `diff` still showed the change against HEAD.
+    // A repository that reports clean while holding uncommitted work is worse
+    // than one that refuses loudly.
+    let work = tempdir("levcs-refused");
+    let xdg = work.join("cfg");
+    std::fs::create_dir_all(&xdg).unwrap();
+
+    let repo = work.join("r");
+    std::fs::create_dir_all(&repo).unwrap();
+
+    for label in ["owner", "outsider"] {
+        let (c, _, e) = run(&["key", "generate", label], &work, &xdg);
+        assert_eq!(c, 0, "key generate {label}: {e}");
+    }
+
+    std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+    assert_eq!(run(&["init", "--key", "owner"], &repo, &xdg).0, 0);
+    assert_eq!(run(&["track", "--all"], &repo, &xdg).0, 0);
+    assert_eq!(
+        run(&["commit", "-m", "base", "--key", "owner"], &repo, &xdg).0,
+        0
+    );
+
+    // Change the tree, then have the commit refused.
+    std::fs::write(repo.join("a.txt"), "one\ntwo\n").unwrap();
+    let (code, _, err) = run(&["commit", "-m", "no", "--key", "outsider"], &repo, &xdg);
+    assert_ne!(code, 0, "a commit by a non-member must fail");
+    assert!(
+        err.contains("not in the current authority"),
+        "unexpected refusal: {err}"
+    );
+
+    // The two views must agree that work is outstanding.
+    let (_, status, _) = run(&["status"], &repo, &xdg);
+    assert!(
+        !status.contains("working tree clean"),
+        "status reported clean after a refused commit:\n{status}"
+    );
+    assert!(
+        status.contains("a.txt"),
+        "status did not name the file:\n{status}"
+    );
+
+    let (_, diff, _) = run(&["diff"], &repo, &xdg);
+    assert!(diff.contains("two"), "diff lost the change:\n{diff}");
+
+    // And the legitimate commit still lands.
+    assert_eq!(
+        run(&["commit", "-m", "yes", "--key", "owner"], &repo, &xdg).0,
+        0
+    );
+    let (_, status, _) = run(&["status"], &repo, &xdg);
+    assert!(status.contains("working tree clean"), "{status}");
+}

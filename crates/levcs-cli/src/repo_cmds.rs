@@ -331,6 +331,29 @@ pub fn commit(args: CommitArgs) -> Result<()> {
     let pk = sk.public();
     let _ = label;
 
+    // Authority is checked BEFORE the index is written. It used to be checked
+    // after, which meant a rejected commit still persisted the staged index:
+    // `status` then compared the working tree against that index and reported
+    // "working tree clean" while `diff` still showed the change against HEAD.
+    // A repository that reports clean while holding uncommitted work is worse
+    // than one that refuses loudly, so nothing is written until the author is
+    // known to be allowed to write it.
+    let authority = repo
+        .current_authority()?
+        .ok_or_else(|| anyhow!("repository has no current authority"))?;
+    // Verify the author is in the authority and has at least contributor.
+    let auth_signed = repo.read_signed(authority)?;
+    let auth_body = AuthorityBody::parse(&auth_signed.body)?;
+    let member = auth_body
+        .find_member(&pk)
+        .ok_or_else(|| anyhow!("your key is not in the current authority"))?;
+    if member.role < Role::Contributor {
+        bail!(
+            "your key has role '{}', need at least contributor",
+            member.role.name()
+        );
+    }
+
     // Detect a merge in progress so we can attach the second parent and bake
     // the merge-record into the resulting tree.
     let merge_head_path = repo.levcs_dir.join("MERGE_HEAD");
@@ -420,22 +443,6 @@ pub fn commit(args: CommitArgs) -> Result<()> {
                 bail!("nothing to commit, working tree matches HEAD");
             }
         }
-    }
-
-    let authority = repo
-        .current_authority()?
-        .ok_or_else(|| anyhow!("repository has no current authority"))?;
-    // Verify the author is in the authority and has at least contributor.
-    let auth_signed = repo.read_signed(authority)?;
-    let auth_body = AuthorityBody::parse(&auth_signed.body)?;
-    let member = auth_body
-        .find_member(&pk)
-        .ok_or_else(|| anyhow!("your key is not in the current authority"))?;
-    if member.role < Role::Contributor {
-        bail!(
-            "your key has role '{}', need at least contributor",
-            member.role.name()
-        );
     }
 
     let default_message = match merge_head_id {

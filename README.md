@@ -64,7 +64,8 @@ sudo install -m 0755 \
 
 ```sh
 # Generate an identity key (stored in $XDG_CONFIG_HOME/levcs/keys.toml).
-levcs key generate --label me
+# Pass --encrypt if the key should not sit in plaintext.
+levcs key generate me
 
 # Create a repository wherever you have files to track.
 mkdir /tmp/demo && cd /tmp/demo
@@ -76,26 +77,45 @@ levcs commit -m "first commit"
 levcs log
 ```
 
-That's a fully working LeVCS repo. Branch and merge:
+That's a fully working LeVCS repo. Branch and merge — note that creating a
+branch and switching to it are separate operations, so a commit cannot land
+on a branch you only meant to make:
 
 ```sh
-levcs branch feature/x
+levcs branch --create feature/x
+levcs branch --switch feature/x
 echo "more" >> a.txt
 levcs commit -m "wip"
-levcs branch main
+
+levcs branch --switch main
 levcs merge feature/x
 ```
 
-If a merge produces conflicts, drop into the resolution TUI:
+`merge` reports each file and the handler that resolved it:
+
+```
+AUTO     note.md  (markdown)
+
+merge summary:
+  auto-resolved: 1
+  conflicts:     0
+```
+
+To step through a merge rather than take it wholesale, and to abandon one
+that went badly:
 
 ```sh
-levcs merge --resolve
+levcs merge feature/x --review
+levcs merge --abort
 ```
+
+`--explain` prints why each file went to the handler it did, and
+`--format json` emits one structured object per §6.7 for scripting.
 
 Cut a release:
 
 ```sh
-levcs release v0.1.0 --notes "first release"
+levcs release v0.1.0 -m "first release"
 ```
 
 ---

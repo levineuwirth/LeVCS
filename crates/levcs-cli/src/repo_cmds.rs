@@ -116,23 +116,40 @@ pub fn init(args: InitArgs) -> Result<()> {
 
 pub fn track(args: TrackArgs) -> Result<()> {
     let repo = open_repo()?;
+    let root = repo_root(&repo);
     let mut idx = repo.read_index()?;
+    let restrict = normalize_paths(&repo, &args.paths)?;
+
+    // The repository's own walk is the only place `.levcsignore` is applied,
+    // so a directory argument is filtered out of it rather than walked
+    // separately. `track sub/`, `track .` from inside `sub/`, and
+    // `track --all` then cannot disagree about what is ignored — they did,
+    // because each rolled its own descent.
+    let walked = repo.walk_workdir()?;
     let mut targets: Vec<PathBuf> = Vec::new();
-    if args.all || args.paths.iter().any(|p| p.as_os_str() == ".") {
-        targets.extend(repo.walk_workdir()?);
+
+    // An empty restriction is the repository root: `track .` at the top.
+    if args.all || restrict.iter().any(|r| r.is_empty()) {
+        targets.extend(walked);
     } else {
-        for p in args.paths {
-            let abs = if p.is_absolute() {
-                p
-            } else {
-                repo.workdir.join(p)
-            };
+        for r in &restrict {
+            let abs = root.join(r);
             if abs.is_dir() {
-                walk_dir(&abs, &repo.workdir, &mut targets)?;
+                let before = targets.len();
+                for p in &walked {
+                    if path_under(std::slice::from_ref(r), &rel_of(&root, p)) {
+                        targets.push(p.clone());
+                    }
+                }
+                if targets.len() == before {
+                    bail!("nothing to track under '{r}'; everything there is ignored");
+                }
             } else if abs.is_file() {
+                // An explicitly named file is tracked even where
+                // `.levcsignore` would skip it. Naming it is the override.
                 targets.push(abs);
             } else {
-                bail!("path not found: {:?}", abs);
+                bail!("path not found: {r}");
             }
         }
     }
@@ -161,25 +178,76 @@ pub fn track(args: TrackArgs) -> Result<()> {
     Ok(())
 }
 
+/// Stop tracking files.
+///
+/// `forget` means stop remembering, and that is now all it does by default;
+/// `--delete` opts into removing the file as well. It used to be the other
+/// way round, and the flag was not the real defect. The verb was unbounded:
+/// it acted on the filesystem rather than on the repository, so
+/// `levcs forget notes.txt` on a file the repository had never tracked
+/// deleted it — exit 0, no output, and nothing in the object store to
+/// restore from. A tool whose claim is that history is a verifiable record
+/// of what happened must not be able to destroy something it never recorded,
+/// because the hole that leaves is one history cannot describe.
+///
+/// So the verb is bounded to the index. Only tracked paths can be named, a
+/// directory expands to the tracked files beneath it, and a path matching
+/// nothing tracked is refused. `--delete` is therefore safe by construction
+/// rather than by analysis: everything it can reach has a blob in the store,
+/// and the alternative — deleting by default and refusing when the content
+/// is not already in a commit — would require the tool to answer "is this
+/// recoverable?" correctly on every call, with deletion as the price of
+/// being wrong.
 pub fn forget(args: ForgetArgs) -> Result<()> {
     let repo = open_repo()?;
+    let root = repo_root(&repo);
     let mut idx = repo.read_index()?;
-    for p in args.paths {
-        let abs = if p.is_absolute() {
-            p
-        } else {
-            repo.workdir.join(&p)
-        };
-        let rel = abs
-            .strip_prefix(&repo.workdir)?
-            .to_string_lossy()
-            .replace('\\', "/");
-        idx.remove(&rel);
-        if !args.keep_file {
-            let _ = fs::remove_file(&abs);
+    let restrict = normalize_paths(&repo, &args.paths)?;
+    if restrict.is_empty() {
+        bail!("name at least one tracked path to forget");
+    }
+
+    let mut targets: Vec<String> = Vec::new();
+    for r in &restrict {
+        let matched: Vec<String> = idx
+            .entries
+            .iter()
+            .filter(|e| path_under(std::slice::from_ref(r), &e.path))
+            .map(|e| e.path.clone())
+            .collect();
+        if matched.is_empty() {
+            bail!("nothing tracked at '{r}'; forget acts only on tracked files");
         }
+        targets.extend(matched);
+    }
+    targets.sort();
+    targets.dedup();
+
+    // Untrack first and persist that, so the reported state is the state on
+    // disk even if a delete then fails. The index write is the part that must
+    // not be left inconsistent.
+    for path in &targets {
+        idx.remove(path);
     }
     repo.write_index(&idx)?;
+
+    let mut failed: Vec<String> = Vec::new();
+    for path in &targets {
+        if args.delete {
+            match fs::remove_file(root.join(path)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    failed.push(format!("{path}: {e}"));
+                    continue;
+                }
+            }
+        }
+        println!("{} {path}", if args.delete { "deleted  " } else { "untracked" });
+    }
+    if !failed.is_empty() {
+        bail!("untracked, but could not delete: {}", failed.join(", "));
+    }
     Ok(())
 }
 
@@ -325,23 +393,83 @@ pub fn root() -> Result<()> {
 // commit
 // ---------------------------------------------------------------------------
 
-/// Normalize path arguments to repository-relative strings.
+/// Resolve `.` and `..` without touching the filesystem.
 ///
-/// A relative path resolves against the repository root rather than the
-/// current directory — the convention `track`, `forget`, `diff` and
-/// `construct` already use, and worth matching rather than improving on in
-/// one command.
+/// Lexical on purpose: a path argument may name something that does not
+/// exist — a file already deleted, or a typo that should be reported as one
+/// — and `canonicalize` cannot normalize a path it cannot open.
+fn lexical_normalize(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// The repository root, with any `.` component removed.
+///
+/// `init` records the workdir as `<path>/.`, which survives into every join
+/// and every `strip_prefix` built from it.
+fn repo_root(repo: &Repository) -> PathBuf {
+    lexical_normalize(&repo.workdir)
+}
+
+fn rel_of(root: &Path, p: &Path) -> String {
+    p.strip_prefix(root)
+        .map(|r| r.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default()
+}
+
+/// Resolve path arguments to repository-relative strings.
+///
+/// **A relative path resolves against the current directory**, which is what
+/// every other version control tool does and what a shell's tab-completion
+/// produces. It used to resolve against the repository root, and the reason
+/// that mattered is not ergonomics: from a subdirectory, `commit README.md`
+/// selected the *root* `README.md`, committed it, printed success, and left
+/// the file actually named still modified. A signature over a file the
+/// signer did not name is the failure this whole system exists to preclude.
+///
+/// The two resolutions fail differently, and that asymmetry is the argument.
+/// Resolved against the current directory, a name can only ever miss — and a
+/// miss is caught, because every command that takes paths now refuses one
+/// that matches nothing. Resolved against the root, a name that exists at
+/// both levels silently selects the wrong file.
+///
+/// Output stays repository-relative. You type `c.txt` in `sub/` and `status`,
+/// `diff` and `commit`'s `scoped to` line all say `sub/c.txt`, which is both
+/// the canonical form for a record and a free confirmation of what your
+/// argument resolved to.
 fn normalize_paths(repo: &Repository, paths: &[PathBuf]) -> Result<Vec<String>> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let root = repo_root(repo);
+    // Compare in the same world the current directory is expressed in: a
+    // repository reached through a symlink would otherwise strip_prefix
+    // against a path that never matches.
+    let root_real = root.canonicalize().unwrap_or_else(|_| root.clone());
+    let cwd = std::env::current_dir()?;
+    let cwd_real = cwd.canonicalize().unwrap_or(cwd);
+
     paths
         .iter()
         .map(|p| -> Result<String> {
             let abs = if p.is_absolute() {
                 p.clone()
             } else {
-                repo.workdir.join(p)
+                cwd_real.join(p)
             };
+            let abs = lexical_normalize(&abs);
             let rel = abs
-                .strip_prefix(&repo.workdir)
+                .strip_prefix(&root_real)
+                .or_else(|_| abs.strip_prefix(&root))
                 .map_err(|_| anyhow!("path {:?} is outside the repository", p))?;
             Ok(rel
                 .to_string_lossy()
@@ -658,16 +786,9 @@ pub fn construct(args: ConstructArgs) -> Result<()> {
     }
 
     // Path-restricted reconstruction.
-    for p in paths {
-        let abs = if p.is_absolute() {
-            p.clone()
-        } else {
-            repo.workdir.join(&p)
-        };
-        let rel = abs
-            .strip_prefix(&repo.workdir)
-            .map_err(|_| anyhow!("path {:?} is outside the repository", p))?;
-        let rel_str = rel.to_string_lossy().replace('\\', "/");
+    let root = repo_root(&repo);
+    for rel_str in normalize_paths(&repo, &paths)? {
+        let abs = root.join(&rel_str);
         let entry = repo
             .lookup_path(tree_id, &rel_str)?
             .ok_or_else(|| anyhow!("path not in tree: {rel_str}"))?;
@@ -756,6 +877,20 @@ pub fn diff(args: DiffArgs) -> Result<()> {
             Ok((rel, bytes))
         })
         .collect::<Result<_>>()?;
+    // A restriction that matches nothing at all is a mistake, not an empty
+    // diff. Printing nothing and exiting 0 says "no changes" about a path the
+    // repository has never heard of, which is the same silent-success shape
+    // as a commit that reports clean while holding work.
+    for r in &restrict {
+        if !baseline
+            .keys()
+            .chain(work.keys())
+            .any(|k| path_under(std::slice::from_ref(r), k))
+        {
+            bail!("nothing at '{r}' in the working tree or the baseline");
+        }
+    }
+
     use similar::{ChangeTag, TextDiff};
     let mut keys: Vec<&String> = baseline.keys().chain(work.keys()).collect();
     keys.sort();
@@ -2058,24 +2193,6 @@ pub fn gc(args: GcArgs) -> Result<()> {
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
-
-fn walk_dir(dir: &Path, base: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    for ent in fs::read_dir(dir)? {
-        let ent = ent?;
-        let path = ent.path();
-        let rel = path.strip_prefix(base)?;
-        if levcs_core::ignore::always_ignored(rel) {
-            continue;
-        }
-        let ft = ent.file_type()?;
-        if ft.is_dir() {
-            walk_dir(&path, base, out)?;
-        } else {
-            out.push(path);
-        }
-    }
-    Ok(())
-}
 
 fn file_mtime_micros(meta: &fs::Metadata) -> i64 {
     meta.modified()

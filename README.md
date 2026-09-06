@@ -93,10 +93,32 @@ takes everything tracked beneath it; a path matching nothing tracked is
 refused rather than silently committing nothing. `levcs diff <paths>` uses the
 same rule, so it is an exact preview of what `levcs commit <paths>` will take.
 
+Path arguments are relative to **the current directory**, and every command
+that takes them refuses one that matches nothing. Those two go together: a
+name can then only ever miss, and a miss is reported. Output stays
+repository-relative, so `commit`'s `scoped to` line doubles as confirmation of
+what your argument resolved to.
+
 This matters more than convenience when a repository is written by more than
 one hand. Attribution is the entire point of signing a commit, and a commit
 that had to sweep up someone else's unfinished edits in order to exist
 attributes their work to whoever signed it.
+
+`forget` stops tracking a file and leaves it on disk:
+
+```sh
+levcs forget build/output.bin          # untrack, keep the file
+levcs forget --delete build/output.bin # untrack and remove it
+```
+
+This is a deliberate divergence from `git rm`. The verb only ever acts on
+paths that are already tracked — an untracked path is refused, and a directory
+expands to the tracked files beneath it — so everything `--delete` can reach
+has a blob in the object store and comes back with `levcs construct`. Bounding
+the verb is what makes deletion safe by construction rather than by analysis;
+the alternative, deleting by default and refusing when the content is not yet
+in a commit, would make the tool answer "is this recoverable?" on every call,
+with deletion as the price of being wrong.
 
 Branch and merge — note that creating a branch and switching to it are
 separate operations, so a commit cannot land on a branch you only meant to

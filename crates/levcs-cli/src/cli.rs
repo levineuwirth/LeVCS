@@ -87,8 +87,11 @@ pub struct TrackArgs {
 
 #[derive(Args, Debug)]
 pub struct ForgetArgs {
-    #[arg(long = "keep-file")]
-    pub keep_file: bool,
+    /// Also delete the file from disk. Off by default: `forget` means stop
+    /// tracking, and only tracked files can be named, so anything deleted
+    /// here is recoverable from history.
+    #[arg(long)]
+    pub delete: bool,
     pub paths: Vec<PathBuf>,
 }
 

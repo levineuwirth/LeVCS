@@ -243,7 +243,14 @@ pub fn forget(args: ForgetArgs) -> Result<()> {
                 }
             }
         }
-        println!("{} {path}", if args.delete { "deleted  " } else { "untracked" });
+        println!(
+            "{} {path}",
+            if args.delete {
+                "deleted  "
+            } else {
+                "untracked"
+            }
+        );
     }
     if !failed.is_empty() {
         bail!("untracked, but could not delete: {}", failed.join(", "));
@@ -734,9 +741,9 @@ pub fn construct(args: ConstructArgs) -> Result<()> {
     // resolve the target from HEAD (or latest release with --release).
     let mut paths = args.paths.clone();
     let parsed_hash: Option<ObjectId> = match args.hash.as_deref() {
-        Some(s) => match ObjectId::from_hex(s) {
-            Ok(id) => Some(id),
-            Err(_) => {
+        Some(s) => match crate::rev::try_resolve_rev(&repo, s)? {
+            Some(id) => Some(id),
+            None => {
                 paths.insert(0, PathBuf::from(s));
                 None
             }
@@ -822,9 +829,9 @@ pub fn diff(args: DiffArgs) -> Result<()> {
     // Fold a non-hex "commit" positional into the path restriction list.
     let mut paths = args.paths.clone();
     let parsed_commit: Option<ObjectId> = match args.commit.as_deref() {
-        Some(s) => match ObjectId::from_hex(s) {
-            Ok(id) => Some(id),
-            Err(_) => {
+        Some(s) => match crate::rev::try_resolve_rev(&repo, s)? {
+            Some(id) => Some(id),
+            None => {
                 paths.insert(0, PathBuf::from(s));
                 None
             }
@@ -971,7 +978,7 @@ pub fn branch(args: BranchArgs) -> Result<()> {
     }
     if let Some(name) = args.create {
         let from = match args.from {
-            Some(s) => ObjectId::from_hex(&s)?,
+            Some(s) => crate::rev::resolve_rev(&repo, &s)?,
             None => repo
                 .refs
                 .resolve_head()?
@@ -1107,7 +1114,7 @@ fn merge_run(args: MergeArgs) -> Result<()> {
         .refs
         .resolve_head()?
         .ok_or_else(|| anyhow!("no HEAD on current branch"))?;
-    let theirs_id = resolve_target(&repo, &branch_name)?;
+    let theirs_id = crate::rev::resolve_rev(&repo, &branch_name)?;
     if head == theirs_id {
         eprintln!("already up to date.");
         return Ok(());
@@ -1428,16 +1435,6 @@ fn load_effective_merge_config(repo: &Repository) -> Result<MergeConfig> {
 fn load_merge_policy_allowed(repo: &Repository) -> Vec<String> {
     let cfg = read_repo_merge_config(repo);
     cfg.policy.map(|p| p.allowed_handlers).unwrap_or_default()
-}
-
-fn resolve_target(repo: &Repository, name: &str) -> Result<ObjectId> {
-    if let Some(id) = repo.refs.read(&format!("refs/branches/{name}"))? {
-        return Ok(id);
-    }
-    if let Ok(id) = ObjectId::from_hex(name) {
-        return Ok(id);
-    }
-    bail!("unknown branch or commit: {name}")
 }
 
 fn emit_outcome(path: &str, result: &MergeResult, json: bool) {

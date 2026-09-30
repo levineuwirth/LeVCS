@@ -129,3 +129,41 @@ fn a_prefix_that_is_also_a_file_is_refused_until_disambiguated() {
     assert_ne!(code, 0);
     assert!(err.contains("both a revision prefix and a path"), "{err}");
 }
+
+#[test]
+fn a_malformed_suffix_is_rejected_and_never_panics() {
+    let (_w, repo, xdg) = three_commits();
+    for bad in ["HEAD~0x0", "HEAD~0é", "HEAD^é"] {
+        let (code, _, err) = run(&["diff", bad], &repo, &xdg);
+        assert!(code != 0 && code != 101, "{bad}: code {code}: {err}");
+        assert!(err.contains("invalid revision"), "{bad}: {err}");
+    }
+    let (code, _, err) = run(&["branch", "--create", "bad", "HEAD~0x0"], &repo, &xdg);
+    assert_ne!(code, 0, "{err}");
+    let (_, list, _) = run(&["branch", "--list"], &repo, &xdg);
+    assert!(!list.contains("bad"), "{list}");
+}
+
+#[test]
+fn explicit_paths_reach_path_handling_not_ref_validation() {
+    let (_w, repo, xdg) = three_commits();
+    std::fs::write(repo.join("notes~"), "n\n").unwrap();
+    for cmd in ["diff", "construct"] {
+        for p in ["./notes~", "../r/notes~"] {
+            let (_, _, err) = run(&[cmd, p], &repo, &xdg);
+            assert!(!err.contains("reserved component"), "{cmd} {p}: {err}");
+        }
+    }
+    let abs = repo.join("notes~");
+    let (_, _, err) = run(&["diff", abs.to_str().unwrap()], &repo, &xdg);
+    assert!(!err.contains("reserved") && !err.contains("empty component"), "{err}");
+}
+
+#[test]
+fn an_overflowing_suffix_on_a_real_base_is_an_error_even_if_a_file_matches() {
+    let (_w, repo, xdg) = three_commits();
+    std::fs::write(repo.join("HEAD~99999999999"), "x\n").unwrap();
+    let (code, _, err) = run(&["diff", "HEAD~99999999999"], &repo, &xdg);
+    assert_ne!(code, 0);
+    assert!(err.contains("too large"), "{err}");
+}

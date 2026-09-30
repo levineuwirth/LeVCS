@@ -8,6 +8,7 @@ use std::path::Path;
 use anyhow::{anyhow, bail, Result};
 
 use levcs_core::object::ObjectType;
+use levcs_core::refs::validate_ref_name;
 use levcs_core::{Commit, ObjectId, Repository};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -18,14 +19,24 @@ enum Step {
     Parent(u32),
 }
 
-/// Split `spec` into its base and suffix steps. The base is everything
-/// before the first `~` or `^`.
-fn split(spec: &str) -> Result<(&str, Vec<Step>)> {
-    let at = spec.find(['~', '^']).unwrap_or(spec.len());
-    let (base, mut rest) = spec.split_at(at);
+/// Split `spec` at its first `~` or `^`: the base, and the suffix text.
+fn split_base(spec: &str) -> (&str, &str) {
+    spec.split_at(spec.find(['~', '^']).unwrap_or(spec.len()))
+}
+
+/// Parse suffix text into steps. Every operator is checked before it is
+/// consumed, so anything that is not `~` or `^` (or a digit run after one) is
+/// an error rather than being read as some other operator.
+fn parse_steps(spec: &str, suffix: &str) -> Result<Vec<Step>> {
+    let mut rest = suffix;
     let mut steps = Vec::new();
     while let Some(c) = rest.chars().next() {
-        rest = &rest[1..];
+        let make: fn(u32) -> Step = match c {
+            '~' => Step::Ancestor,
+            '^' => Step::Parent,
+            _ => bail!("invalid revision `{spec}`: unexpected `{c}` after the base"),
+        };
+        rest = &rest[1..]; // `~` and `^` are one byte
         let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
         let n = if digits == 0 {
             1
@@ -35,13 +46,14 @@ fn split(spec: &str) -> Result<(&str, Vec<Step>)> {
                 .map_err(|_| anyhow!("number too large in revision `{spec}`"))?
         };
         rest = &rest[digits..];
-        steps.push(if c == '~' {
-            Step::Ancestor(n)
-        } else {
-            Step::Parent(n)
-        });
+        steps.push(make(n));
     }
-    Ok((base, steps))
+    Ok(steps)
+}
+
+fn split(spec: &str) -> Result<(&str, Vec<Step>)> {
+    let (base, suffix) = split_base(spec);
+    Ok((base, parse_steps(spec, suffix)?))
 }
 
 fn walk(
@@ -130,8 +142,12 @@ fn resolve_base(repo: &Repository, base: &str) -> Result<Option<ObjectId>> {
             .map(Some)
             .ok_or_else(|| anyhow!("HEAD has no commits"));
     }
-    if !base.is_empty() {
-        if let Some(id) = repo.refs.read(&format!("refs/branches/{base}"))? {
+    // Text that is not a legal ref name (`./notes`, `../x`, `/abs`) is a path
+    // or nothing, never a branch, so it must not reach the ref lookup, which
+    // rejects it with an error instead of a miss.
+    let name = format!("refs/branches/{base}");
+    if validate_ref_name(&name).is_ok() {
+        if let Some(id) = repo.refs.read(&name)? {
             return Ok(Some(id));
         }
     }
@@ -163,10 +179,8 @@ pub fn resolve_rev(repo: &Repository, spec: &str) -> Result<ObjectId> {
 /// so does a suffixed name whose base is not a ref (`notes~`, an editor
 /// backup); once the base resolves, a bad suffix is an error.
 pub fn try_resolve_rev(repo: &Repository, spec: &str) -> Result<Option<ObjectId>> {
-    let Ok((base, steps)) = split(spec) else {
-        return Ok(None);
-    };
-    let bare = steps.is_empty();
+    let (base, suffix) = split_base(spec);
+    let bare = suffix.is_empty();
     let is_head = base == "HEAD";
     let is_hex = ObjectId::from_hex(base).is_ok();
     let is_prefix = is_hex_prefix(base);
@@ -182,7 +196,9 @@ pub fn try_resolve_rev(repo: &Repository, spec: &str) -> Result<Option<ObjectId>
         }
     }
     match resolved {
-        Some(id) => walk_repo(repo, id, &steps).map(Some),
+        // The base is a real revision, so a malformed suffix is the user's
+        // mistake and is reported, not quietly reinterpreted as a path.
+        Some(id) => walk_repo(repo, id, &parse_steps(spec, suffix)?).map(Some),
         None if bare && (is_head || is_hex) => bail!("unknown commit: {spec}"),
         None => Ok(None),
     }
@@ -209,6 +225,13 @@ mod tests {
         );
         assert_eq!(split("x^0").unwrap().1, vec![Step::Parent(0)]);
         assert!(split("HEAD~99999999999").is_err());
+    }
+
+    #[test]
+    fn rejects_malformed_suffixes_without_panicking() {
+        for bad in ["HEAD~0x0", "HEAD~x", "HEAD~0é", "HEAD^é", "HEAD~1 ", "HEAD~~x"] {
+            assert!(split(bad).is_err(), "{bad} should be rejected");
+        }
     }
 
     // 3 -> 2 -> 1, and 3 also has second parent 9.

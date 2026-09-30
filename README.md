@@ -120,6 +120,29 @@ the alternative, deleting by default and refusing when the content is not yet
 in a commit, would make the tool answer "is this recoverable?" on every call,
 with deletion as the price of being wrong.
 
+Commands that take a commit (`diff`, `construct`, `merge`, `branch --create`)
+accept a revision, not just a full hash:
+
+```sh
+levcs diff HEAD~1            # against the previous commit
+levcs construct HEAD~3 a.txt # a.txt as it was three commits ago
+levcs diff 3fa9c1            # a unique hex prefix (4+ characters)
+levcs merge main^2           # the second parent of main's tip
+```
+
+The base is `HEAD`, a branch, a full hash, or a hex prefix of a commit or
+release. `~N` follows the first parent N times (`~` alone is `~1`); `^N` takes
+the Nth parent, counting from 1, which is how you reach the other side of a
+merge (`^0` is the commit itself). Suffixes chain: `HEAD~2^2`. A branch beats
+a prefix of the same spelling, and a prefix matching more than one commit is
+refused with the candidates listed rather than guessed at.
+
+`diff` and `construct` also take paths, so a word that could be either is
+resolved conservatively: a bare branch name or an unmatched hex word is a
+path, and so is a name like `notes~` whose base is not a ref. If a bare prefix
+matches a commit *and* a file in the current directory, the command refuses
+and asks you to write `./name` for the file.
+
 Branch and merge — note that creating a branch and switching to it are
 separate operations, so a commit cannot land on a branch you only meant to
 make:

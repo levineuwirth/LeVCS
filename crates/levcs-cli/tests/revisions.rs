@@ -103,7 +103,10 @@ fn a_hex_prefix_names_a_commit_and_takes_suffixes() {
     let head = head_hex(&repo, &xdg);
     let (code, out, err) = run(&["diff", &head[..8]], &repo, &xdg);
     assert_eq!(code, 0, "{err}");
-    assert!(out.trim().is_empty(), "prefix of HEAD should match the tree: {out}");
+    assert!(
+        out.trim().is_empty(),
+        "prefix of HEAD should match the tree: {out}"
+    );
     let (code, out, err) = run(&["diff", &format!("{}~1", &head[..8])], &repo, &xdg);
     assert_eq!(code, 0, "{err}");
     assert!(out.contains("two"), "{out}");
@@ -115,7 +118,10 @@ fn a_too_short_or_unmatched_hex_word_stays_a_path() {
     // Under four characters is never a prefix; unmatched four is a path miss.
     for word in ["abc", "ffff"] {
         let (_, _, err) = run(&["diff", word], &repo, &xdg);
-        assert!(!err.contains("unknown") && !err.contains("ambiguous"), "{word}: {err}");
+        assert!(
+            !err.contains("unknown") && !err.contains("ambiguous"),
+            "{word}: {err}"
+        );
     }
 }
 
@@ -156,7 +162,10 @@ fn explicit_paths_reach_path_handling_not_ref_validation() {
     }
     let abs = repo.join("notes~");
     let (_, _, err) = run(&["diff", abs.to_str().unwrap()], &repo, &xdg);
-    assert!(!err.contains("reserved") && !err.contains("empty component"), "{err}");
+    assert!(
+        !err.contains("reserved") && !err.contains("empty component"),
+        "{err}"
+    );
 }
 
 #[test]

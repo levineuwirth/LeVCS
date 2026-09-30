@@ -269,16 +269,31 @@ fn a_scoped_commit_takes_the_named_path_and_leaves_the_rest_dirty() {
 
     let (code, out, err) = run(&["commit", "-m", "just a", "a.txt"], &repo, &xdg);
     assert_eq!(code, 0, "scoped commit failed: {err}");
-    assert!(out.contains("scoped to a.txt"), "commit did not say it was partial:\n{out}");
+    assert!(
+        out.contains("scoped to a.txt"),
+        "commit did not say it was partial:\n{out}"
+    );
 
     let (_, status, _) = run(&["status"], &repo, &xdg);
-    assert!(status.contains("b.txt"), "b.txt should still be outstanding:\n{status}");
-    assert!(!status.contains("a.txt"), "a.txt should be committed:\n{status}");
+    assert!(
+        status.contains("b.txt"),
+        "b.txt should still be outstanding:\n{status}"
+    );
+    assert!(
+        !status.contains("a.txt"),
+        "a.txt should be committed:\n{status}"
+    );
 
     // And HEAD must hold b.txt as it was, not as it is on disk.
     let (_, diff, _) = run(&["diff"], &repo, &xdg);
-    assert!(diff.contains("b changed"), "diff lost b.txt's change:\n{diff}");
-    assert!(!diff.contains("a changed"), "a.txt is committed, so it must not appear:\n{diff}");
+    assert!(
+        diff.contains("b changed"),
+        "diff lost b.txt's change:\n{diff}"
+    );
+    assert!(
+        !diff.contains("a changed"),
+        "a.txt is committed, so it must not appear:\n{diff}"
+    );
 
     let _ = std::fs::remove_dir_all(work);
 }
@@ -294,7 +309,10 @@ fn a_scope_naming_a_directory_takes_everything_beneath_it() {
 
     let (_, status, _) = run(&["status"], &repo, &xdg);
     assert!(status.contains("b.txt"), "{status}");
-    assert!(!status.contains("c.txt"), "the directory scope should have taken it:\n{status}");
+    assert!(
+        !status.contains("c.txt"),
+        "the directory scope should have taken it:\n{status}"
+    );
 
     let _ = std::fs::remove_dir_all(work);
 }
@@ -329,10 +347,16 @@ fn a_path_that_matches_nothing_tracked_is_refused() {
     std::fs::write(repo.join("a.txt"), "a changed\n").unwrap();
     let (code, _, err) = run(&["commit", "-m", "typo", "a.tx"], &repo, &xdg);
     assert_ne!(code, 0, "a path matching nothing must fail");
-    assert!(err.contains("nothing tracked at 'a.tx'"), "unexpected error: {err}");
+    assert!(
+        err.contains("nothing tracked at 'a.tx'"),
+        "unexpected error: {err}"
+    );
 
     let (_, status, _) = run(&["status"], &repo, &xdg);
-    assert!(status.contains("a.txt"), "the refusal must leave the work outstanding:\n{status}");
+    assert!(
+        status.contains("a.txt"),
+        "the refusal must leave the work outstanding:\n{status}"
+    );
 
     let _ = std::fs::remove_dir_all(work);
 }
@@ -358,7 +382,10 @@ fn all_and_paths_are_mutually_exclusive() {
 
     std::fs::write(repo.join("a.txt"), "a changed\n").unwrap();
     let (code, _, _) = run(&["commit", "-m", "both", "--all", "a.txt"], &repo, &xdg);
-    assert_ne!(code, 0, "--all with paths is a contradiction and must be refused");
+    assert_ne!(
+        code, 0,
+        "--all with paths is a contradiction and must be refused"
+    );
 
     let _ = std::fs::remove_dir_all(work);
 }

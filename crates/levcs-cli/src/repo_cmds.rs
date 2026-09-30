@@ -638,9 +638,12 @@ pub fn commit(args: CommitArgs) -> Result<()> {
                 }
             }
         }
-        scoped
-            .entries
-            .extend(idx.entries.iter().filter(|e| path_under(&restrict, &e.path)).cloned());
+        scoped.entries.extend(
+            idx.entries
+                .iter()
+                .filter(|e| path_under(&restrict, &e.path))
+                .cloned(),
+        );
         repo.build_tree_from_index(&scoped)?
     };
     if merge_head_id.is_some() {

@@ -229,7 +229,9 @@ mod tests {
 
     #[test]
     fn rejects_malformed_suffixes_without_panicking() {
-        for bad in ["HEAD~0x0", "HEAD~x", "HEAD~0é", "HEAD^é", "HEAD~1 ", "HEAD~~x"] {
+        for bad in [
+            "HEAD~0x0", "HEAD~x", "HEAD~0é", "HEAD^é", "HEAD~1 ", "HEAD~~x",
+        ] {
             assert!(split(bad).is_err(), "{bad} should be rejected");
         }
     }

@@ -113,8 +113,14 @@ fn a_relative_path_diffs_the_file_it_names_from_a_subdirectory() {
 fn a_diff_path_matching_nothing_is_refused_rather_than_empty() {
     let (work, repo, xdg) = nested("levcs-diff-miss");
     let (code, _, err) = run(&["diff", "no-such-file"], &repo, &xdg);
-    assert_ne!(code, 0, "a path matching nothing must not read as 'no changes'");
-    assert!(err.contains("nothing at 'no-such-file'"), "unexpected error: {err}");
+    assert_ne!(
+        code, 0,
+        "a path matching nothing must not read as 'no changes'"
+    );
+    assert!(
+        err.contains("nothing at 'no-such-file'"),
+        "unexpected error: {err}"
+    );
     let _ = std::fs::remove_dir_all(work);
 }
 
@@ -123,7 +129,10 @@ fn a_path_outside_the_repository_is_refused() {
     let (work, repo, xdg) = nested("levcs-outside");
     let (code, _, err) = run(&["commit", "-m", "no", "/etc/hostname"], &repo, &xdg);
     assert_ne!(code, 0);
-    assert!(err.contains("outside the repository"), "unexpected error: {err}");
+    assert!(
+        err.contains("outside the repository"),
+        "unexpected error: {err}"
+    );
     let _ = std::fs::remove_dir_all(work);
 }
 
@@ -165,11 +174,20 @@ fn forget_untracks_and_leaves_the_file_alone() {
     let (work, repo, xdg) = nested("levcs-forget");
     let (code, out, err) = run(&["forget", "sub/c.txt"], &repo, &xdg);
     assert_eq!(code, 0, "forget failed: {err}");
-    assert!(out.contains("untracked sub/c.txt"), "forget said nothing:\n{out}");
-    assert!(repo.join("sub/c.txt").exists(), "forget must not delete by default");
+    assert!(
+        out.contains("untracked sub/c.txt"),
+        "forget said nothing:\n{out}"
+    );
+    assert!(
+        repo.join("sub/c.txt").exists(),
+        "forget must not delete by default"
+    );
 
     let (_, status, _) = run(&["status"], &repo, &xdg);
-    assert!(status.contains("untracked:"), "the file should now be untracked:\n{status}");
+    assert!(
+        status.contains("untracked:"),
+        "the file should now be untracked:\n{status}"
+    );
 
     let _ = std::fs::remove_dir_all(work);
 }
@@ -180,7 +198,10 @@ fn forget_delete_removes_the_file() {
     let (code, out, err) = run(&["forget", "--delete", "sub/c.txt"], &repo, &xdg);
     assert_eq!(code, 0, "forget --delete failed: {err}");
     assert!(out.contains("deleted"), "{out}");
-    assert!(!repo.join("sub/c.txt").exists(), "--delete should remove it");
+    assert!(
+        !repo.join("sub/c.txt").exists(),
+        "--delete should remove it"
+    );
 
     // And it is recoverable, because only tracked paths can be named.
     assert_eq!(run(&["construct", "sub/c.txt"], &repo, &xdg).0, 0);
@@ -203,7 +224,10 @@ fn forget_refuses_a_path_it_never_tracked_and_does_not_delete_it() {
 
     let (code, _, err) = run(&["forget", "never.txt"], &repo, &xdg);
     assert_ne!(code, 0, "forget must refuse an untracked path");
-    assert!(err.contains("nothing tracked at 'never.txt'"), "unexpected error: {err}");
+    assert!(
+        err.contains("nothing tracked at 'never.txt'"),
+        "unexpected error: {err}"
+    );
     assert!(
         repo.join("never.txt").exists(),
         "the file must survive; it was never the repository's to delete"
@@ -220,7 +244,10 @@ fn forget_expands_a_directory_to_the_tracked_files_beneath_it() {
     let (work, repo, xdg) = nested("levcs-forget-dir");
     let (code, out, err) = run(&["forget", "sub"], &repo, &xdg);
     assert_eq!(code, 0, "forget of a directory failed: {err}");
-    assert!(out.contains("sub/c.txt") && out.contains("sub/README.md"), "{out}");
+    assert!(
+        out.contains("sub/c.txt") && out.contains("sub/README.md"),
+        "{out}"
+    );
 
     let (_, status, _) = run(&["status"], &repo, &xdg);
     assert!(
@@ -265,7 +292,10 @@ fn a_scoped_commit_does_not_commit_a_pending_forget() {
     std::fs::remove_file(repo.join("sub/c.txt")).unwrap();
     let (code, _, err) = run(&["construct", "HEAD", "sub/c.txt"], &repo, &xdg);
     assert_eq!(code, 0, "c.txt must still be in HEAD: {err}");
-    assert_eq!(std::fs::read_to_string(repo.join("sub/c.txt")).unwrap(), "c base\n");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("sub/c.txt")).unwrap(),
+        "c base\n"
+    );
 
     let _ = std::fs::remove_dir_all(work);
 }
@@ -290,7 +320,10 @@ fn a_scoped_commit_cannot_finalize_a_merge() {
     let (code, _, err) = run(&["commit", "-m", "readme only", "README.md"], &repo, &xdg);
     assert_ne!(code, 0);
     assert!(err.contains("merge is in progress"), "{err}");
-    assert!(repo.join(".levcs/MERGE_HEAD").exists(), "merge state must survive");
+    assert!(
+        repo.join(".levcs/MERGE_HEAD").exists(),
+        "merge state must survive"
+    );
 
     let _ = std::fs::remove_dir_all(work);
 }

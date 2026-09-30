@@ -230,3 +230,67 @@ fn forget_expands_a_directory_to_the_tracked_files_beneath_it() {
 
     let _ = std::fs::remove_dir_all(work);
 }
+
+// --- scoped commits carry only what was named ---------------------------------
+
+#[test]
+fn a_scoped_commit_leaves_a_newly_tracked_file_staged_not_committed() {
+    // Regression: out-of-scope entries came from the index, so a file tracked
+    // since HEAD was sealed into a commit that never named it.
+    let (work, repo, xdg) = nested("levcs-scope-tracked");
+    std::fs::write(repo.join("extra.txt"), "not this commit's\n").unwrap();
+    assert_eq!(run(&["track", "extra.txt"], &repo, &xdg).0, 0);
+    std::fs::write(repo.join("README.md"), "root CHANGED\n").unwrap();
+    let (code, _, err) = run(&["commit", "-m", "readme only", "README.md"], &repo, &xdg);
+    assert_eq!(code, 0, "{err}");
+
+    std::fs::remove_file(repo.join("extra.txt")).unwrap();
+    let (code, _, _) = run(&["construct", "HEAD", "extra.txt"], &repo, &xdg);
+    assert_ne!(code, 0, "extra.txt must not be in the commit");
+    assert!(!repo.join("extra.txt").exists());
+
+    let _ = std::fs::remove_dir_all(work);
+}
+
+#[test]
+fn a_scoped_commit_does_not_commit_a_pending_forget() {
+    // Regression: a file forgotten since HEAD vanished from the tree of an
+    // unrelated scoped commit.
+    let (work, repo, xdg) = nested("levcs-scope-forgotten");
+    assert_eq!(run(&["forget", "sub/c.txt"], &repo, &xdg).0, 0);
+    std::fs::write(repo.join("README.md"), "root CHANGED\n").unwrap();
+    let (code, _, err) = run(&["commit", "-m", "readme only", "README.md"], &repo, &xdg);
+    assert_eq!(code, 0, "{err}");
+
+    std::fs::remove_file(repo.join("sub/c.txt")).unwrap();
+    let (code, _, err) = run(&["construct", "HEAD", "sub/c.txt"], &repo, &xdg);
+    assert_eq!(code, 0, "c.txt must still be in HEAD: {err}");
+    assert_eq!(std::fs::read_to_string(repo.join("sub/c.txt")).unwrap(), "c base\n");
+
+    let _ = std::fs::remove_dir_all(work);
+}
+
+#[test]
+fn a_scoped_commit_cannot_finalize_a_merge() {
+    // Regression: the conflict in sub/c.txt was outside the scope, so the
+    // per-file marker check never saw it; the merge commit sealed the markers
+    // and cleared MERGE_HEAD.
+    let (work, repo, xdg) = nested("levcs-scope-merge");
+    assert_eq!(run(&["branch", "--create", "feat"], &repo, &xdg).0, 0);
+    std::fs::write(repo.join("sub/c.txt"), "main version\n").unwrap();
+    assert_eq!(run(&["commit", "-m", "main edit"], &repo, &xdg).0, 0);
+    assert_eq!(run(&["branch", "--switch", "feat"], &repo, &xdg).0, 0);
+    std::fs::write(repo.join("sub/c.txt"), "feat version\n").unwrap();
+    assert_eq!(run(&["commit", "-m", "feat edit"], &repo, &xdg).0, 0);
+    assert_eq!(run(&["branch", "--switch", "main"], &repo, &xdg).0, 0);
+    assert_ne!(run(&["merge", "feat"], &repo, &xdg).0, 0);
+    assert!(repo.join(".levcs/MERGE_HEAD").exists());
+
+    std::fs::write(repo.join("README.md"), "root CHANGED\n").unwrap();
+    let (code, _, err) = run(&["commit", "-m", "readme only", "README.md"], &repo, &xdg);
+    assert_ne!(code, 0);
+    assert!(err.contains("merge is in progress"), "{err}");
+    assert!(repo.join(".levcs/MERGE_HEAD").exists(), "merge state must survive");
+
+    let _ = std::fs::remove_dir_all(work);
+}

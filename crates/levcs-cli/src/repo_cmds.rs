@@ -575,6 +575,13 @@ pub fn commit(args: CommitArgs) -> Result<()> {
     }
     let _ = args.all; // the explicit spelling of the default; clap bars it with paths
 
+    // A merge is finalized as a whole. Scoping would carry every conflict
+    // outside the named paths through the per-file marker check below
+    // unexamined, seal it into a merge commit, and clear MERGE_HEAD.
+    if merge_head_id.is_some() && !restrict.is_empty() {
+        bail!("a merge is in progress; resolve it and commit without paths");
+    }
+
     let mut new_entries = Vec::new();
     for e in &idx.entries {
         if !path_under(&restrict, &e.path) {
@@ -613,7 +620,29 @@ pub fn commit(args: CommitArgs) -> Result<()> {
 
     // Build the staged tree. For a merge commit, splice the merge-record
     // blob into `.levcs/merge-record` (§6.5).
-    let mut staged_tree = repo.build_tree_from_index(&idx)?;
+    //
+    // Under a scope the tree is HEAD's plus the named paths, not the index:
+    // the index also holds changes the commit was not asked to take (a file
+    // tracked since, a file forgotten since), and those stay staged for a
+    // later commit instead of being sealed under this one's signature.
+    let parent = repo.refs.resolve_head()?;
+    let mut staged_tree = if restrict.is_empty() {
+        repo.build_tree_from_index(&idx)?
+    } else {
+        let mut scoped = Index::default();
+        if let Some(p) = parent {
+            let head_tree = Commit::from_signed(&repo.read_signed(p)?)?.tree;
+            for e in tree_index_entries(&repo, head_tree, "")? {
+                if !path_under(&restrict, &e.path) {
+                    scoped.entries.push(e);
+                }
+            }
+        }
+        scoped
+            .entries
+            .extend(idx.entries.iter().filter(|e| path_under(&restrict, &e.path)).cloned());
+        repo.build_tree_from_index(&scoped)?
+    };
     if merge_head_id.is_some() {
         let record_path = repo.levcs_dir.join("merge-record");
         if !record_path.exists() {
@@ -641,7 +670,6 @@ pub fn commit(args: CommitArgs) -> Result<()> {
         staged_tree = crate::tree_helpers::put_merge_record_in_tree(&repo, staged_tree, blob_id)?;
     }
 
-    let parent = repo.refs.resolve_head()?;
     if merge_head_id.is_none() {
         // Skip the "nothing to commit" check for merge commits — a successful
         // three-way merge whose tree happens to equal HEAD's still needs a
@@ -701,6 +729,43 @@ pub fn commit(args: CommitArgs) -> Result<()> {
         println!("scoped to {}", restrict.join(", "));
     }
     Ok(())
+}
+
+/// The files of a tree as index entries, for building a tree that mixes
+/// HEAD's content with staged content. `.levcs/` is skipped: an index never
+/// holds it, so an unscoped commit's tree does not either.
+fn tree_index_entries(
+    repo: &Repository,
+    tree_id: ObjectId,
+    prefix: &str,
+) -> Result<Vec<IndexEntry>> {
+    let mut out = Vec::new();
+    if tree_id.is_zero() {
+        return Ok(out);
+    }
+    let raw = repo.objects.read_typed(tree_id, ObjectType::Tree)?;
+    for e in Tree::parse_body(&raw.body)?.entries {
+        let path = if prefix.is_empty() {
+            e.name.clone()
+        } else {
+            format!("{prefix}/{}", e.name)
+        };
+        if path == ".levcs" {
+            continue;
+        }
+        match e.entry_type {
+            levcs_core::EntryType::Blob => out.push(IndexEntry {
+                path,
+                blob_hash: e.hash,
+                mode: if e.mode.is_executable() { 0o111 } else { 0 },
+                flags: IndexEntryFlags::TRACKED,
+                mtime_micros: 0,
+                size: 0,
+            }),
+            levcs_core::EntryType::Tree => out.extend(tree_index_entries(repo, e.hash, &path)?),
+        }
+    }
+    Ok(out)
 }
 
 fn has_conflict_markers(bytes: &[u8]) -> bool {

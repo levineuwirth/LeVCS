@@ -7,6 +7,7 @@ mod ctx;
 mod fed_cmds;
 mod identity_cmds;
 mod repo_cmds;
+mod rev;
 mod tree_helpers;
 
 use clap::Parser;

@@ -77,9 +77,75 @@ levcs commit -m "first commit"
 levcs log
 ```
 
-That's a fully working LeVCS repo. Branch and merge — note that creating a
-branch and switching to it are separate operations, so a commit cannot land
-on a branch you only meant to make:
+That's a fully working LeVCS repo.
+
+A commit can be scoped to paths, which is how you commit one piece of work out
+of a tree that holds several:
+
+```sh
+levcs commit -m "just the notes" notes/ README.md
+```
+
+Everything outside the named paths keeps the content it has in HEAD and stays
+uncommitted — including deletions, which are not read as "drop it from the
+tree" when the commit was never about that file. A path naming a directory
+takes everything tracked beneath it; a path matching nothing tracked is
+refused rather than silently committing nothing. `levcs diff <paths>` uses the
+same rule, so it is an exact preview of what `levcs commit <paths>` will take.
+
+Path arguments are relative to **the current directory**, and every command
+that takes them refuses one that matches nothing. Those two go together: a
+name can then only ever miss, and a miss is reported. Output stays
+repository-relative, so `commit`'s `scoped to` line doubles as confirmation of
+what your argument resolved to.
+
+This matters more than convenience when a repository is written by more than
+one hand. Attribution is the entire point of signing a commit, and a commit
+that had to sweep up someone else's unfinished edits in order to exist
+attributes their work to whoever signed it.
+
+`forget` stops tracking a file and leaves it on disk:
+
+```sh
+levcs forget build/output.bin          # untrack, keep the file
+levcs forget --delete build/output.bin # untrack and remove it
+```
+
+This is a deliberate divergence from `git rm`. The verb only ever acts on
+paths that are already tracked — an untracked path is refused, and a directory
+expands to the tracked files beneath it — so everything `--delete` can reach
+has a blob in the object store and comes back with `levcs construct`. Bounding
+the verb is what makes deletion safe by construction rather than by analysis;
+the alternative, deleting by default and refusing when the content is not yet
+in a commit, would make the tool answer "is this recoverable?" on every call,
+with deletion as the price of being wrong.
+
+Commands that take a commit (`diff`, `construct`, `merge`, `branch --create`)
+accept a revision, not just a full hash:
+
+```sh
+levcs diff HEAD~1            # against the previous commit
+levcs construct HEAD~3 a.txt # a.txt as it was three commits ago
+levcs diff 3fa9c1            # a unique hex prefix (4+ characters)
+levcs merge main^2           # the second parent of main's tip
+```
+
+The base is `HEAD`, a branch, a full hash, or a hex prefix of a commit or
+release. `~N` follows the first parent N times (`~` alone is `~1`); `^N` takes
+the Nth parent, counting from 1, which is how you reach the other side of a
+merge (`^0` is the commit itself). Suffixes chain: `HEAD~2^2`. A branch beats
+a prefix of the same spelling, and a prefix matching more than one commit is
+refused with the candidates listed rather than guessed at.
+
+`diff` and `construct` also take paths, so a word that could be either is
+resolved conservatively: a bare branch name or an unmatched hex word is a
+path, and so is a name like `notes~` whose base is not a ref. If a bare prefix
+matches a commit *and* a file in the current directory, the command refuses
+and asks you to write `./name` for the file.
+
+Branch and merge — note that creating a branch and switching to it are
+separate operations, so a commit cannot land on a branch you only meant to
+make:
 
 ```sh
 levcs branch --create feature/x

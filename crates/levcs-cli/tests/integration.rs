@@ -237,3 +237,155 @@ fn a_refused_commit_leaves_the_repository_reporting_dirty() {
     let (_, status, _) = run(&["status"], &repo, &xdg);
     assert!(status.contains("working tree clean"), "{status}");
 }
+
+/// Set up a repository with `a.txt`, `b.txt` and `sub/c.txt` all committed.
+fn scoped_repo(prefix: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let work = tempdir(prefix);
+    let xdg = work.join("cfg");
+    std::fs::create_dir_all(&xdg).unwrap();
+    let repo = work.join("r");
+    std::fs::create_dir_all(repo.join("sub")).unwrap();
+
+    assert_eq!(run(&["key", "generate", "owner"], &work, &xdg).0, 0);
+    std::fs::write(repo.join("a.txt"), "a base\n").unwrap();
+    std::fs::write(repo.join("b.txt"), "b base\n").unwrap();
+    std::fs::write(repo.join("sub/c.txt"), "c base\n").unwrap();
+    assert_eq!(run(&["init", "--key", "owner"], &repo, &xdg).0, 0);
+    assert_eq!(run(&["track", "--all"], &repo, &xdg).0, 0);
+    assert_eq!(run(&["commit", "-m", "base"], &repo, &xdg).0, 0);
+    (work, repo, xdg)
+}
+
+#[test]
+fn a_scoped_commit_takes_the_named_path_and_leaves_the_rest_dirty() {
+    // The reason this exists: a working tree written by more than one hand
+    // holds more than one piece of work, and a commit that had to sweep up
+    // someone else's unfinished edits in order to exist would attribute their
+    // work to whoever signed it.
+    let (work, repo, xdg) = scoped_repo("levcs-scope");
+
+    std::fs::write(repo.join("a.txt"), "a changed\n").unwrap();
+    std::fs::write(repo.join("b.txt"), "b changed\n").unwrap();
+
+    let (code, out, err) = run(&["commit", "-m", "just a", "a.txt"], &repo, &xdg);
+    assert_eq!(code, 0, "scoped commit failed: {err}");
+    assert!(
+        out.contains("scoped to a.txt"),
+        "commit did not say it was partial:\n{out}"
+    );
+
+    let (_, status, _) = run(&["status"], &repo, &xdg);
+    assert!(
+        status.contains("b.txt"),
+        "b.txt should still be outstanding:\n{status}"
+    );
+    assert!(
+        !status.contains("a.txt"),
+        "a.txt should be committed:\n{status}"
+    );
+
+    // And HEAD must hold b.txt as it was, not as it is on disk.
+    let (_, diff, _) = run(&["diff"], &repo, &xdg);
+    assert!(
+        diff.contains("b changed"),
+        "diff lost b.txt's change:\n{diff}"
+    );
+    assert!(
+        !diff.contains("a changed"),
+        "a.txt is committed, so it must not appear:\n{diff}"
+    );
+
+    let _ = std::fs::remove_dir_all(work);
+}
+
+#[test]
+fn a_scope_naming_a_directory_takes_everything_beneath_it() {
+    let (work, repo, xdg) = scoped_repo("levcs-scope-dir");
+
+    std::fs::write(repo.join("sub/c.txt"), "c changed\n").unwrap();
+    std::fs::write(repo.join("b.txt"), "b changed\n").unwrap();
+
+    assert_eq!(run(&["commit", "-m", "just sub", "sub"], &repo, &xdg).0, 0);
+
+    let (_, status, _) = run(&["status"], &repo, &xdg);
+    assert!(status.contains("b.txt"), "{status}");
+    assert!(
+        !status.contains("c.txt"),
+        "the directory scope should have taken it:\n{status}"
+    );
+
+    let _ = std::fs::remove_dir_all(work);
+}
+
+#[test]
+fn a_deletion_outside_the_scope_is_not_committed() {
+    // The dangerous half of scoping: an out-of-scope entry must be carried
+    // through untouched, and "the file is gone" must not be read as "drop it
+    // from the tree" when the commit was never about that file.
+    let (work, repo, xdg) = scoped_repo("levcs-scope-del");
+
+    std::fs::write(repo.join("a.txt"), "a changed\n").unwrap();
+    std::fs::remove_file(repo.join("b.txt")).unwrap();
+
+    assert_eq!(run(&["commit", "-m", "just a", "a.txt"], &repo, &xdg).0, 0);
+
+    let (_, status, _) = run(&["status"], &repo, &xdg);
+    assert!(
+        status.contains("deleted:") && status.contains("b.txt"),
+        "the deletion must survive the scoped commit as outstanding work:\n{status}"
+    );
+
+    let _ = std::fs::remove_dir_all(work);
+}
+
+#[test]
+fn a_path_that_matches_nothing_tracked_is_refused() {
+    // A mistyped path that quietly commits nothing is the same class of
+    // failure as a repository that reports clean while holding work.
+    let (work, repo, xdg) = scoped_repo("levcs-scope-typo");
+
+    std::fs::write(repo.join("a.txt"), "a changed\n").unwrap();
+    let (code, _, err) = run(&["commit", "-m", "typo", "a.tx"], &repo, &xdg);
+    assert_ne!(code, 0, "a path matching nothing must fail");
+    assert!(
+        err.contains("nothing tracked at 'a.tx'"),
+        "unexpected error: {err}"
+    );
+
+    let (_, status, _) = run(&["status"], &repo, &xdg);
+    assert!(
+        status.contains("a.txt"),
+        "the refusal must leave the work outstanding:\n{status}"
+    );
+
+    let _ = std::fs::remove_dir_all(work);
+}
+
+#[test]
+fn a_scope_that_matches_head_says_so_rather_than_blaming_the_working_tree() {
+    let (work, repo, xdg) = scoped_repo("levcs-scope-noop");
+
+    std::fs::write(repo.join("b.txt"), "b changed\n").unwrap();
+    let (code, _, err) = run(&["commit", "-m", "nothing", "a.txt"], &repo, &xdg);
+    assert_ne!(code, 0);
+    assert!(
+        err.contains("named paths"),
+        "the working tree does not match HEAD here; the message must not say it does: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(work);
+}
+
+#[test]
+fn all_and_paths_are_mutually_exclusive() {
+    let (work, repo, xdg) = scoped_repo("levcs-scope-all");
+
+    std::fs::write(repo.join("a.txt"), "a changed\n").unwrap();
+    let (code, _, _) = run(&["commit", "-m", "both", "--all", "a.txt"], &repo, &xdg);
+    assert_ne!(
+        code, 0,
+        "--all with paths is a contradiction and must be refused"
+    );
+
+    let _ = std::fs::remove_dir_all(work);
+}

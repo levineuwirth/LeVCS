@@ -1,0 +1,178 @@
+//! Revision specs (`HEAD~1`, `main^2`) on the commands that take a commit.
+
+use std::process::Command;
+
+fn run(args: &[&str], cwd: &std::path::Path, xdg: &std::path::Path) -> (i32, String, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_levcs"))
+        .args(args)
+        .current_dir(cwd)
+        .env("XDG_CONFIG_HOME", xdg)
+        .output()
+        .expect("run levcs");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+fn tempdir(prefix: &str) -> std::path::PathBuf {
+    let mut p = std::env::temp_dir();
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    p.push(format!("{prefix}-{n}-{}", std::process::id()));
+    std::fs::create_dir_all(&p).unwrap();
+    p
+}
+
+/// A repository whose `f.txt` reads "one", "two", "three" across three commits.
+fn three_commits() -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let work = tempdir("levcs-rev");
+    let xdg = work.join("cfg");
+    std::fs::create_dir_all(&xdg).unwrap();
+    let repo = work.join("r");
+    std::fs::create_dir_all(&repo).unwrap();
+    assert_eq!(run(&["key", "generate", "owner"], &work, &xdg).0, 0);
+    std::fs::write(repo.join("f.txt"), "one\n").unwrap();
+    assert_eq!(run(&["init", "--key", "owner"], &repo, &xdg).0, 0);
+    assert_eq!(run(&["track", "--all"], &repo, &xdg).0, 0);
+    assert_eq!(run(&["commit", "-m", "one"], &repo, &xdg).0, 0);
+    for (text, msg) in [("two\n", "two"), ("three\n", "three")] {
+        std::fs::write(repo.join("f.txt"), text).unwrap();
+        assert_eq!(run(&["commit", "-m", msg], &repo, &xdg).0, 0);
+    }
+    (work, repo, xdg)
+}
+
+#[test]
+fn diff_head_tilde_compares_against_the_previous_commit() {
+    let (_w, repo, xdg) = three_commits();
+    let (code, out, err) = run(&["diff", "HEAD~1"], &repo, &xdg);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("two") && out.contains("three"), "{out}");
+    let (code, out, _) = run(&["diff", "HEAD~2"], &repo, &xdg);
+    assert_eq!(code, 0);
+    assert!(out.contains("one"), "{out}");
+}
+
+#[test]
+fn construct_head_tilde_restores_the_older_content() {
+    let (_w, repo, xdg) = three_commits();
+    let (code, _, err) = run(&["construct", "HEAD~2", "f.txt"], &repo, &xdg);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("f.txt")).unwrap(),
+        "one\n"
+    );
+}
+
+#[test]
+fn walking_past_the_root_is_an_error_not_a_path() {
+    let (_w, repo, xdg) = three_commits();
+    let (code, _, err) = run(&["diff", "HEAD~3"], &repo, &xdg);
+    assert_ne!(code, 0);
+    assert!(err.contains("has no parent"), "{err}");
+}
+
+#[test]
+fn a_suffixed_name_that_is_not_a_ref_is_still_a_path() {
+    let (_w, repo, xdg) = three_commits();
+    std::fs::write(repo.join("f.txt~"), "backup\n").unwrap();
+    // Not a revision, so it is treated as a path rather than rejected as one.
+    let (_, _, err) = run(&["diff", "f.txt~"], &repo, &xdg);
+    assert!(
+        !err.contains("unknown") && !err.contains("no parent"),
+        "{err}"
+    );
+}
+
+fn head_hex(repo: &std::path::Path, xdg: &std::path::Path) -> String {
+    let (code, out, err) = run(&["log"], repo, xdg);
+    assert_eq!(code, 0, "{err}");
+    out.split_whitespace()
+        .find(|w| w.len() >= 64 && w.bytes().all(|b| b.is_ascii_hexdigit()))
+        .expect("a full id in log output")[..64]
+        .to_string()
+}
+
+#[test]
+fn a_hex_prefix_names_a_commit_and_takes_suffixes() {
+    let (_w, repo, xdg) = three_commits();
+    let head = head_hex(&repo, &xdg);
+    let (code, out, err) = run(&["diff", &head[..8]], &repo, &xdg);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.trim().is_empty(),
+        "prefix of HEAD should match the tree: {out}"
+    );
+    let (code, out, err) = run(&["diff", &format!("{}~1", &head[..8])], &repo, &xdg);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("two"), "{out}");
+}
+
+#[test]
+fn a_too_short_or_unmatched_hex_word_stays_a_path() {
+    let (_w, repo, xdg) = three_commits();
+    // Under four characters is never a prefix; unmatched four is a path miss.
+    for word in ["abc", "ffff"] {
+        let (_, _, err) = run(&["diff", word], &repo, &xdg);
+        assert!(
+            !err.contains("unknown") && !err.contains("ambiguous"),
+            "{word}: {err}"
+        );
+    }
+}
+
+#[test]
+fn a_prefix_that_is_also_a_file_is_refused_until_disambiguated() {
+    let (_w, repo, xdg) = three_commits();
+    let head = head_hex(&repo, &xdg);
+    let name = &head[..6];
+    std::fs::write(repo.join(name), "x\n").unwrap();
+    let (code, _, err) = run(&["diff", name], &repo, &xdg);
+    assert_ne!(code, 0);
+    assert!(err.contains("both a revision prefix and a path"), "{err}");
+}
+
+#[test]
+fn a_malformed_suffix_is_rejected_and_never_panics() {
+    let (_w, repo, xdg) = three_commits();
+    for bad in ["HEAD~0x0", "HEAD~0é", "HEAD^é"] {
+        let (code, _, err) = run(&["diff", bad], &repo, &xdg);
+        assert!(code != 0 && code != 101, "{bad}: code {code}: {err}");
+        assert!(err.contains("invalid revision"), "{bad}: {err}");
+    }
+    let (code, _, err) = run(&["branch", "--create", "bad", "HEAD~0x0"], &repo, &xdg);
+    assert_ne!(code, 0, "{err}");
+    let (_, list, _) = run(&["branch", "--list"], &repo, &xdg);
+    assert!(!list.contains("bad"), "{list}");
+}
+
+#[test]
+fn explicit_paths_reach_path_handling_not_ref_validation() {
+    let (_w, repo, xdg) = three_commits();
+    std::fs::write(repo.join("notes~"), "n\n").unwrap();
+    for cmd in ["diff", "construct"] {
+        for p in ["./notes~", "../r/notes~"] {
+            let (_, _, err) = run(&[cmd, p], &repo, &xdg);
+            assert!(!err.contains("reserved component"), "{cmd} {p}: {err}");
+        }
+    }
+    let abs = repo.join("notes~");
+    let (_, _, err) = run(&["diff", abs.to_str().unwrap()], &repo, &xdg);
+    assert!(
+        !err.contains("reserved") && !err.contains("empty component"),
+        "{err}"
+    );
+}
+
+#[test]
+fn an_overflowing_suffix_on_a_real_base_is_an_error_even_if_a_file_matches() {
+    let (_w, repo, xdg) = three_commits();
+    std::fs::write(repo.join("HEAD~99999999999"), "x\n").unwrap();
+    let (code, _, err) = run(&["diff", "HEAD~99999999999"], &repo, &xdg);
+    assert_ne!(code, 0);
+    assert!(err.contains("too large"), "{err}");
+}

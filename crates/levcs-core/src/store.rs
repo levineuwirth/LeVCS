@@ -113,6 +113,37 @@ impl ObjectStore {
         Ok(obj)
     }
 
+    /// Loose object ids whose hex starts with `prefix` (lowercase hex, at
+    /// least two characters, since the first two name the shard directory).
+    /// Reads one shard rather than the whole store.
+    pub fn ids_with_prefix(&self, prefix: &str) -> Result<Vec<ObjectId>> {
+        let mut out = Vec::new();
+        if prefix.len() < 2 || !prefix.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Ok(out);
+        }
+        let shard = self.root.join(&prefix[0..2]);
+        if !shard.is_dir() {
+            return Ok(out);
+        }
+        for ent in fs::read_dir(&shard).ctx(shard.clone())? {
+            let ent = ent.ctx(shard.clone())?;
+            let Some(name) = ent.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if name.starts_with("tmp.") {
+                continue;
+            }
+            let full = format!("{}{}", &prefix[0..2], name);
+            if full.starts_with(prefix) {
+                if let Ok(id) = ObjectId::from_hex(&full) {
+                    out.push(id);
+                }
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
     /// Iterate all object IDs currently on disk (used by gc/verify). Returns
     /// loose objects only.
     pub fn iter_ids(&self) -> Result<Vec<ObjectId>> {

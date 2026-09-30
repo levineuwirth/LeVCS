@@ -87,3 +87,45 @@ fn a_suffixed_name_that_is_not_a_ref_is_still_a_path() {
         "{err}"
     );
 }
+
+fn head_hex(repo: &std::path::Path, xdg: &std::path::Path) -> String {
+    let (code, out, err) = run(&["log"], repo, xdg);
+    assert_eq!(code, 0, "{err}");
+    out.split_whitespace()
+        .find(|w| w.len() >= 64 && w.bytes().all(|b| b.is_ascii_hexdigit()))
+        .expect("a full id in log output")[..64]
+        .to_string()
+}
+
+#[test]
+fn a_hex_prefix_names_a_commit_and_takes_suffixes() {
+    let (_w, repo, xdg) = three_commits();
+    let head = head_hex(&repo, &xdg);
+    let (code, out, err) = run(&["diff", &head[..8]], &repo, &xdg);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.trim().is_empty(), "prefix of HEAD should match the tree: {out}");
+    let (code, out, err) = run(&["diff", &format!("{}~1", &head[..8])], &repo, &xdg);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("two"), "{out}");
+}
+
+#[test]
+fn a_too_short_or_unmatched_hex_word_stays_a_path() {
+    let (_w, repo, xdg) = three_commits();
+    // Under four characters is never a prefix; unmatched four is a path miss.
+    for word in ["abc", "ffff"] {
+        let (_, _, err) = run(&["diff", word], &repo, &xdg);
+        assert!(!err.contains("unknown") && !err.contains("ambiguous"), "{word}: {err}");
+    }
+}
+
+#[test]
+fn a_prefix_that_is_also_a_file_is_refused_until_disambiguated() {
+    let (_w, repo, xdg) = three_commits();
+    let head = head_hex(&repo, &xdg);
+    let name = &head[..6];
+    std::fs::write(repo.join(name), "x\n").unwrap();
+    let (code, _, err) = run(&["diff", name], &repo, &xdg);
+    assert_ne!(code, 0);
+    assert!(err.contains("both a revision prefix and a path"), "{err}");
+}

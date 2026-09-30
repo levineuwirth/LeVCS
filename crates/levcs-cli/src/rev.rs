@@ -1,9 +1,13 @@
-//! Revision specs: `HEAD`, a branch, a full hex id, each optionally followed
+//! Revision specs: `HEAD`, a branch, a full hex id or a unique hex prefix of a
+//! commit or release, each optionally followed
 //! by `~N` (first parent, N times) and `^N` (the Nth parent, 1-based; `^0`
 //! is the commit itself). Suffixes chain: `HEAD~2^2`.
 
+use std::path::Path;
+
 use anyhow::{anyhow, bail, Result};
 
+use levcs_core::object::ObjectType;
 use levcs_core::{Commit, ObjectId, Repository};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -71,8 +75,53 @@ fn walk(
     Ok(id)
 }
 
-/// Resolve the base of a spec: `HEAD`, a branch, or a full hex id.
-/// `Ok(None)` means the text is not any of those.
+/// Shortest hex prefix accepted. Short enough to type, long enough that a
+/// handful of commits do not collide on it.
+const MIN_PREFIX: usize = 4;
+
+fn is_hex_prefix(s: &str) -> bool {
+    (MIN_PREFIX..64).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Commits and releases whose id starts with `prefix`. Blobs and trees are
+/// not revisions, so a prefix never names one; a full 64-character id still
+/// may (`construct` takes a tree).
+fn revisions_with_prefix(repo: &Repository, prefix: &str) -> Result<Vec<ObjectId>> {
+    let mut found = Vec::new();
+    for id in repo.objects.ids_with_prefix(&prefix.to_ascii_lowercase())? {
+        if matches!(
+            repo.read_raw_object(id)?.object_type,
+            ObjectType::Commit | ObjectType::Release
+        ) {
+            found.push(id);
+        }
+    }
+    Ok(found)
+}
+
+fn resolve_prefix(repo: &Repository, prefix: &str) -> Result<Option<ObjectId>> {
+    let mut found = revisions_with_prefix(repo, prefix)?;
+    match found.len() {
+        0 => Ok(None),
+        1 => Ok(found.pop()),
+        n => {
+            let list: Vec<String> = found
+                .iter()
+                .take(5)
+                .map(|id| id.to_hex()[..12].to_string())
+                .collect();
+            bail!(
+                "ambiguous revision `{prefix}` matches {n} objects ({}{}); use more characters",
+                list.join(", "),
+                if n > 5 { ", ..." } else { "" }
+            )
+        }
+    }
+}
+
+/// Resolve the base of a spec: `HEAD`, a branch, a full hex id, or a hex
+/// prefix. A branch wins over a prefix. `Ok(None)` means the text is none
+/// of those.
 fn resolve_base(repo: &Repository, base: &str) -> Result<Option<ObjectId>> {
     if base == "HEAD" {
         return repo
@@ -86,7 +135,13 @@ fn resolve_base(repo: &Repository, base: &str) -> Result<Option<ObjectId>> {
             return Ok(Some(id));
         }
     }
-    Ok(ObjectId::from_hex(base).ok())
+    if let Ok(id) = ObjectId::from_hex(base) {
+        return Ok(Some(id));
+    }
+    if is_hex_prefix(base) {
+        return resolve_prefix(repo, base);
+    }
+    Ok(None)
 }
 
 fn walk_repo(repo: &Repository, base: ObjectId, steps: &[Step]) -> Result<ObjectId> {
@@ -114,12 +169,21 @@ pub fn try_resolve_rev(repo: &Repository, spec: &str) -> Result<Option<ObjectId>
     let bare = steps.is_empty();
     let is_head = base == "HEAD";
     let is_hex = ObjectId::from_hex(base).is_ok();
-    if bare && !is_head && !is_hex {
+    let is_prefix = is_hex_prefix(base);
+    if bare && !is_head && !is_hex && !is_prefix {
         return Ok(None);
     }
-    match resolve_base(repo, base)? {
+    let resolved = resolve_base(repo, base)?;
+    if bare && is_prefix && !is_hex {
+        // A bare run of hex digits is also a plausible file name. Only the
+        // collision is an error; a miss is simply a path.
+        if resolved.is_some() && Path::new(spec).exists() {
+            bail!("`{spec}` is both a revision prefix and a path; write ./{spec} for the path");
+        }
+    }
+    match resolved {
         Some(id) => walk_repo(repo, id, &steps).map(Some),
-        None if bare => bail!("unknown commit: {spec}"),
+        None if bare && (is_head || is_hex) => bail!("unknown commit: {spec}"),
         None => Ok(None),
     }
 }

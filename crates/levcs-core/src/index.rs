@@ -19,7 +19,7 @@ use std::path::PathBuf;
 
 use byteorder::{ByteOrder, LittleEndian};
 
-use crate::error::{Error, IoExt, Result};
+use crate::error::{Error, Result};
 use crate::hash::ObjectId;
 
 pub const INDEX_MAGIC: [u8; 4] = *b"LVIX";
@@ -193,13 +193,7 @@ impl Index {
     }
 
     pub fn write_to(&self, path: &PathBuf) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).ctx(parent.to_path_buf())?;
-        }
-        let tmp = path.with_extension("tmp");
-        fs::write(&tmp, self.serialize()).ctx(tmp.clone())?;
-        fs::rename(&tmp, path).ctx(path.clone())?;
-        Ok(())
+        crate::fsutil::replace_file(path, &self.serialize())
     }
 }
 

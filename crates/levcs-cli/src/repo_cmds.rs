@@ -4,7 +4,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 use levcs_core::object::{ObjectType, SignedObject};
 use levcs_core::refs::Head;
@@ -24,7 +24,9 @@ use levcs_merge::{
 };
 
 use crate::cli::*;
-use crate::ctx::{load_keychain, load_secret, now_micros, open_repo, save_keychain};
+use crate::ctx::{
+    load_keychain, load_secret, lock_repo, now_micros, open_repo, open_repo_locked, save_keychain,
+};
 
 // ---------------------------------------------------------------------------
 // init
@@ -115,9 +117,9 @@ pub fn init(args: InitArgs) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 pub fn track(args: TrackArgs) -> Result<()> {
-    let repo = open_repo()?;
+    let (repo, _lock) = open_repo_locked()?;
     let root = repo_root(&repo);
-    let mut idx = repo.read_index()?;
+    let mut idx = load_index(&repo)?;
     let restrict = normalize_paths(&repo, &args.paths)?;
 
     // The repository's own walk is the only place `.levcsignore` is applied,
@@ -199,9 +201,9 @@ pub fn track(args: TrackArgs) -> Result<()> {
 /// recoverable?" correctly on every call, with deletion as the price of
 /// being wrong.
 pub fn forget(args: ForgetArgs) -> Result<()> {
-    let repo = open_repo()?;
+    let (repo, _lock) = open_repo_locked()?;
     let root = repo_root(&repo);
-    let mut idx = repo.read_index()?;
+    let mut idx = load_index(&repo)?;
     let restrict = normalize_paths(&repo, &args.paths)?;
     if restrict.is_empty() {
         bail!("name at least one tracked path to forget");
@@ -264,7 +266,7 @@ pub fn forget(args: ForgetArgs) -> Result<()> {
 
 pub fn status() -> Result<()> {
     let repo = open_repo()?;
-    let idx = repo.read_index()?;
+    let idx = load_index(&repo)?;
     let head = repo.refs.resolve_head()?;
     let branch_ref = repo.current_branch()?;
     let branch = branch_ref
@@ -289,7 +291,14 @@ pub fn status() -> Result<()> {
     }
     if repo.levcs_dir.join("MERGE_HEAD").exists() {
         let mh = fs::read_to_string(repo.levcs_dir.join("MERGE_HEAD"))?;
-        println!("Merge      in progress (theirs={})", mh.trim());
+        if stale_merge_head(&repo)?.is_some() {
+            println!(
+                "Merge      already committed in HEAD (theirs={}); the next commit or merge clears its leftover state",
+                mh.trim()
+            );
+        } else {
+            println!("Merge      in progress (theirs={})", mh.trim());
+        }
     }
     let workdir_files = repo.walk_workdir()?;
     let mut tracked = HashMap::<String, &IndexEntry>::new();
@@ -511,6 +520,8 @@ pub fn commit(args: CommitArgs) -> Result<()> {
     let (label, sk) = load_secret(args.key.as_deref())?;
     let pk = sk.public();
     let _ = label;
+    // Everything from here to the ref write reads and writes shared state.
+    let _lock = lock_repo(&repo)?;
 
     // Authority is checked BEFORE the index is written. It used to be checked
     // after, which meant a rejected commit still persisted the staged index:
@@ -535,6 +546,9 @@ pub fn commit(args: CommitArgs) -> Result<()> {
         );
     }
 
+    // A merge commit that was published but not cleaned up leaves MERGE_HEAD
+    // behind; clear it first, or this commit would be a second merge.
+    clear_stale_merge_state(&repo)?;
     // Detect a merge in progress so we can attach the second parent and bake
     // the merge-record into the resulting tree.
     let merge_head_path = repo.levcs_dir.join("MERGE_HEAD");
@@ -545,8 +559,9 @@ pub fn commit(args: CommitArgs) -> Result<()> {
         None
     };
 
-    // Update index from working tree, for tracked files only.
-    let mut idx = repo.read_index()?;
+    // Update index from working tree, for tracked files only. A lost index
+    // is HEAD with nothing staged (see `load_index`), never an empty tree.
+    let mut idx = load_index(&repo)?;
 
     // A commit may be scoped to paths. Entries outside the scope are carried
     // through untouched — neither refreshed from the working tree nor dropped
@@ -616,7 +631,9 @@ pub fn commit(args: CommitArgs) -> Result<()> {
         // (deleted from disk, and in scope → drop entry)
     }
     idx.entries = new_entries;
-    repo.write_index(&idx)?;
+    // The refreshed index is written only after the commit is on its ref.
+    // Written here, a refusal or failure below would leave the index saying
+    // the work was committed, and `status` would report a clean tree.
 
     // Build the staged tree. For a merge commit, splice the merge-record
     // blob into `.levcs/merge-record` (§6.5).
@@ -680,7 +697,10 @@ pub fn commit(args: CommitArgs) -> Result<()> {
         if let Some(p) = parent {
             let p_signed = repo.read_signed(p)?;
             let p_commit = Commit::from_signed(&p_signed)?;
-            if p_commit.tree == staged_tree {
+            // A merge commit's tree carries `.levcs/merge-record`, which no
+            // later commit does; compare without it, or the first commit after
+            // a merge always differs from HEAD, even with nothing changed.
+            if tree_without_levcs(&repo, p_commit.tree)? == staged_tree {
                 // Say which thing matched HEAD. Under a scope the working
                 // tree very often does not, and claiming it did would send
                 // someone looking for a bug that is not there.
@@ -712,24 +732,44 @@ pub fn commit(args: CommitArgs) -> Result<()> {
     };
     let signed = sign_commit(commit_obj, &sk)?;
     let id = repo.write_signed(&signed)?;
-    // Advance HEAD's branch ref.
+    // Advance HEAD's branch ref, but only from the parent this commit was
+    // built on. Under the lock nothing cooperating moves it. The check also
+    // catches most moves by a writer that skips the lock, but not one that
+    // lands between the comparison and the rename (see `compare_and_write`).
     if let Some(branch) = repo.current_branch()? {
-        repo.refs.write(&branch, id)?;
+        repo.refs.compare_and_write(&branch, parent, id)?;
     } else {
+        if repo.refs.resolve_head()? != parent {
+            bail!("HEAD moved while this commit was being built; nothing was committed");
+        }
         repo.refs.write_head(&Head::Detached(id))?;
     }
-    // Tear down merge state on success.
-    if merge_head_id.is_some() {
-        let _ = fs::remove_file(&merge_head_path);
-        let _ = fs::remove_file(repo.levcs_dir.join("MERGE_BASE"));
-        let _ = fs::remove_file(repo.levcs_dir.join("merge-record"));
-    }
+    // The commit is published from here on. Say so first, so that whatever
+    // fails below is reported against a commit that exists.
     println!("[{}] {}", id, summarize_message(&signed));
     if !restrict.is_empty() {
         // A partial commit that does not announce itself is a footgun: the
         // next `status` will still be dirty, and the reason should already
         // have been said.
         println!("scoped to {}", restrict.join(", "));
+    }
+    // Merge state goes before the index: left behind, it would make the next
+    // commit a second merge; a stale index only makes `status` overstate.
+    let mut problems = Vec::new();
+    if merge_head_id.is_some() {
+        for name in MERGE_STATE {
+            match fs::remove_file(repo.levcs_dir.join(name)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => problems.push(format!("removing .levcs/{name}: {e}")),
+            }
+        }
+    }
+    if let Err(e) = repo.write_index(&idx) {
+        problems.push(format!("writing the index: {e}"));
+    }
+    if !problems.is_empty() {
+        return Err(PublishedIncomplete { id, problems }.into());
     }
     Ok(())
 }
@@ -803,7 +843,7 @@ fn summarize_message(signed: &SignedObject) -> String {
 // ---------------------------------------------------------------------------
 
 pub fn construct(args: ConstructArgs) -> Result<()> {
-    let repo = open_repo()?;
+    let (repo, _lock) = open_repo_locked()?;
     // The first positional arg may be either a hash or a path. If it doesn't
     // parse as a 64-char hex blake3 hash, fold it into the path list and
     // resolve the target from HEAD (or latest release with --release).
@@ -1031,7 +1071,7 @@ fn collect_tree_files(
 // ---------------------------------------------------------------------------
 
 pub fn branch(args: BranchArgs) -> Result<()> {
-    let repo = open_repo()?;
+    let (repo, _lock) = open_repo_locked()?;
     if args.list || (args.create.is_none() && args.switch.is_none() && args.delete.is_none()) {
         let cur = repo.current_branch()?.unwrap_or_default();
         for (name, id) in repo.refs.list_branches()? {
@@ -1108,7 +1148,7 @@ pub fn merge(args: MergeArgs) -> Result<()> {
 /// refuse to proceed when the returned list is non-empty so users don't
 /// silently lose uncommitted work.
 fn dirty_tracked_paths(repo: &Repository) -> Result<Vec<String>> {
-    let idx = repo.read_index()?;
+    let idx = load_index(repo)?;
     let mut workdir_set: HashSet<String> = HashSet::new();
     for path in repo.walk_workdir()? {
         let rel = path
@@ -1151,7 +1191,8 @@ fn merge_run(args: MergeArgs) -> Result<()> {
         .branch
         .clone()
         .ok_or_else(|| anyhow!("missing branch to merge"))?;
-    let repo = open_repo()?;
+    let (repo, _lock) = open_repo_locked()?;
+    clear_stale_merge_state(&repo)?;
     if repo.levcs_dir.join("MERGE_HEAD").exists() {
         bail!("a merge is already in progress; run `levcs merge --abort` to cancel");
     }
@@ -1655,6 +1696,113 @@ fn partial_from(status: MergeStatus, fallback: &[u8]) -> Vec<u8> {
     }
 }
 
+/// The outcome of a commit whose branch ref moved but whose later cleanup
+/// failed. The commit is published: it is on its branch and signed. Reporting
+/// it as a failure, with no id, invited a retry, and a retry with merge state
+/// still present made a second merge commit. `main` reports this outcome
+/// with its own exit status (3) so a caller can tell it from a commit that
+/// did not happen.
+#[derive(Debug)]
+pub struct PublishedIncomplete {
+    pub id: ObjectId,
+    pub problems: Vec<String>,
+}
+
+impl std::fmt::Display for PublishedIncomplete {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "commit {} is published, but cleanup after it did not finish: {}",
+            self.id,
+            self.problems.join("; ")
+        )
+    }
+}
+
+impl std::error::Error for PublishedIncomplete {}
+
+const MERGE_STATE: [&str; 3] = ["MERGE_HEAD", "MERGE_BASE", "merge-record"];
+
+/// The commit MERGE_HEAD names, if HEAD already has it as a parent: the merge
+/// was committed, and the files left in `.levcs/` are stale.
+fn stale_merge_head(repo: &Repository) -> Result<Option<ObjectId>> {
+    let Ok(s) = fs::read_to_string(repo.levcs_dir.join("MERGE_HEAD")) else {
+        return Ok(None);
+    };
+    let Ok(theirs) = ObjectId::from_hex(s.trim()) else {
+        return Ok(None);
+    };
+    let Some(head) = repo.refs.resolve_head()? else {
+        return Ok(None);
+    };
+    let c = Commit::from_signed(&repo.read_signed(head)?)?;
+    Ok((c.parents.len() > 1 && c.parents[1..].contains(&theirs)).then_some(theirs))
+}
+
+/// Remove merge state that a published merge commit left behind, so it
+/// cannot turn the next commit into a second merge. Call under the lock.
+fn clear_stale_merge_state(repo: &Repository) -> Result<()> {
+    if let Some(theirs) = stale_merge_head(repo)? {
+        for name in MERGE_STATE {
+            match fs::remove_file(repo.levcs_dir.join(name)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e).with_context(|| format!("removing .levcs/{name}")),
+            }
+        }
+        eprintln!(
+            "levcs: the merge with {theirs} is already committed in HEAD; \
+             cleared the merge state it left behind"
+        );
+    }
+    Ok(())
+}
+
+/// `tree_id` without its top-level `.levcs` entry, as the id that tree
+/// would have. Only merge commits put anything there (the merge record).
+fn tree_without_levcs(repo: &Repository, tree_id: ObjectId) -> Result<ObjectId> {
+    if tree_id.is_zero() {
+        return Ok(tree_id);
+    }
+    let raw = repo.objects.read_typed(tree_id, ObjectType::Tree)?;
+    let mut tree = Tree::parse_body(&raw.body)?;
+    let before = tree.entries.len();
+    tree.entries.retain(|e| e.name != ".levcs");
+    if tree.entries.len() == before {
+        return Ok(tree_id);
+    }
+    Ok(tree.object_id())
+}
+
+/// The index, for any command that reads it. When the file is missing and
+/// HEAD exists, the index is HEAD's files with nothing staged.
+///
+/// A missing index used to read as empty. `track` would then write back an
+/// index holding only the new file, and the next commit deleted every other
+/// file from HEAD. Treating a lost index as "nothing staged" can drop a
+/// staged change, which stays on disk, but it never deletes committed files.
+fn load_index(repo: &Repository) -> Result<Index> {
+    if repo.index_exists() {
+        return repo.read_index().with_context(|| {
+            format!(
+                "reading {}; if it cannot be repaired, delete it and levcs will \
+                 rebuild it from HEAD with nothing staged",
+                repo.index_path().display()
+            )
+        });
+    }
+    let mut idx = Index::new();
+    if let Some(head) = repo.refs.resolve_head()? {
+        let tree = Commit::from_signed(&repo.read_signed(head)?)?.tree;
+        rebuild_index_from_tree(repo, tree, "", &mut idx)?;
+        eprintln!(
+            "levcs: {} is missing; using HEAD's files with nothing staged",
+            repo.index_path().display()
+        );
+    }
+    Ok(idx)
+}
+
 fn rebuild_index_from_tree(
     repo: &Repository,
     tree_id: ObjectId,
@@ -1696,7 +1844,7 @@ fn rebuild_index_from_tree(
 }
 
 fn merge_abort() -> Result<()> {
-    let repo = open_repo()?;
+    let (repo, _lock) = open_repo_locked()?;
     let merge_head_path = repo.levcs_dir.join("MERGE_HEAD");
     if !merge_head_path.exists() {
         bail!("no merge in progress");
@@ -1881,7 +2029,7 @@ fn merge_explain() -> Result<()> {
 }
 
 fn merge_review() -> Result<()> {
-    let repo = open_repo()?;
+    let (repo, _lock) = open_repo_locked()?;
     let merge_record_path = repo.levcs_dir.join("merge-record");
     if !merge_record_path.exists() {
         bail!("no merge in progress");
@@ -2021,6 +2169,8 @@ fn find_common_ancestor(repo: &Repository, a: ObjectId, b: ObjectId) -> Result<O
 pub fn release(args: ReleaseArgs) -> Result<()> {
     let repo = open_repo()?;
     let (_label, sk) = load_secret(args.key.as_deref())?;
+    // Locked after the key, so a passphrase prompt holds no other writer.
+    let _lock = crate::ctx::lock_repo(&repo)?;
     let pk = sk.public();
     let authority = repo
         .current_authority()?
@@ -2074,7 +2224,7 @@ pub fn release(args: ReleaseArgs) -> Result<()> {
 }
 
 pub fn cache(args: CacheArgs) -> Result<()> {
-    let repo = open_repo()?;
+    let (repo, _lock) = open_repo_locked()?;
     let dir = repo.levcs_dir.join("cache").join("workdir");
     fs::create_dir_all(&dir)?;
     if args.list {
@@ -2162,7 +2312,7 @@ pub fn verify() -> Result<()> {
 }
 
 pub fn gc(args: GcArgs) -> Result<()> {
-    let repo = open_repo()?;
+    let (repo, _lock) = open_repo_locked()?;
     let mut reachable: HashSet<ObjectId> = HashSet::new();
     let mut stack: Vec<ObjectId> = Vec::new();
     if let Some(h) = repo.refs.resolve_head()? {

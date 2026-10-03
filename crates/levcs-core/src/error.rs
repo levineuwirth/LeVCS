@@ -46,6 +46,13 @@ pub enum Error {
     #[error("invalid index file: {0}")]
     InvalidIndex(String),
 
+    #[error("ref {name} moved during this operation: expected {expected}, found {actual}")]
+    RefChanged {
+        name: String,
+        expected: String,
+        actual: String,
+    },
+
     #[error("{0}")]
     Other(String),
 }

@@ -56,7 +56,44 @@ impl Refs {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).ctx(parent.to_path_buf())?;
         }
-        atomic_write(&path, format!("{}\n", id.to_hex()).as_bytes())
+        self.atomic_write(&path, format!("{}\n", id.to_hex()).as_bytes())
+    }
+
+    /// Write `name` only if it still holds `expected` (`None`: absent).
+    ///
+    /// The comparison and the replacement are separate steps, so this is a
+    /// defensive check, not an atomic compare-and-swap. Under the repository
+    /// lock nothing cooperating can move the ref between them. A writer that
+    /// does not take the lock (an older binary) can still move it inside
+    /// that window and be overwritten, which is why a rollout must drain old
+    /// writers before relying on the lock.
+    pub fn compare_and_write(
+        &self,
+        name: &str,
+        expected: Option<ObjectId>,
+        new: ObjectId,
+    ) -> Result<()> {
+        let actual = self.read(name)?;
+        if actual != expected {
+            let show =
+                |v: Option<ObjectId>| v.map(|i| i.to_hex()).unwrap_or_else(|| "nothing".into());
+            return Err(Error::RefChanged {
+                name: name.to_string(),
+                expected: show(expected),
+                actual: show(actual),
+            });
+        }
+        self.write(name, new)
+    }
+
+    /// Replace a ref file atomically. The temporary file is staged in
+    /// `.levcs/tmp/`, outside `refs/`, so one left behind by a crash can
+    /// never be read back as a ref.
+    fn atomic_write(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+        if path.parent().is_none() {
+            return Err(Error::Other(format!("ref path has no parent: {path:?}")));
+        }
+        crate::fsutil::replace_file_staged(path, bytes, &self.levcs_dir.join("tmp"))
     }
 
     pub fn delete(&self, name: &str) -> Result<()> {
@@ -91,7 +128,7 @@ impl Refs {
             }
             Head::Detached(id) => format!("{}\n", id.to_hex()),
         };
-        atomic_write(&self.head_path(), s.as_bytes())
+        self.atomic_write(&self.head_path(), s.as_bytes())
     }
 
     /// Resolve HEAD to a commit hash, if any. None if HEAD points to a branch
@@ -214,23 +251,39 @@ fn parse_head(s: &str) -> Result<Head> {
     }
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| Error::Other(format!("ref path has no parent: {path:?}")))?;
-    fs::create_dir_all(parent).ctx(parent.to_path_buf())?;
-    let tmp = parent.join(format!(
-        ".tmp.{}",
-        path.file_name().unwrap().to_string_lossy()
-    ));
-    fs::write(&tmp, bytes).ctx(tmp.clone())?;
-    fs::rename(&tmp, path).ctx(path.to_path_buf())?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compare_and_write_refuses_a_moved_ref_and_leaves_it_alone() {
+        let d = std::env::temp_dir().join(format!(
+            "levcs-refs-cas-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let refs = Refs::new(&d);
+        let (a, b, c) = (ObjectId([1; 32]), ObjectId([2; 32]), ObjectId([3; 32]));
+        let name = "refs/branches/main";
+        refs.compare_and_write(name, None, a).unwrap();
+        assert!(matches!(
+            refs.compare_and_write(name, None, b),
+            Err(Error::RefChanged { .. })
+        ));
+        // Someone else advanced it to b; a writer still expecting a loses.
+        refs.write(name, b).unwrap();
+        assert!(matches!(
+            refs.compare_and_write(name, Some(a), c),
+            Err(Error::RefChanged { .. })
+        ));
+        assert_eq!(refs.read(name).unwrap(), Some(b));
+        refs.compare_and_write(name, Some(b), c).unwrap();
+        assert_eq!(refs.read(name).unwrap(), Some(c));
+        let _ = std::fs::remove_dir_all(d);
+    }
 
     #[test]
     fn invalid_names_rejected() {

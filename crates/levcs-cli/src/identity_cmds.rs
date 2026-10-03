@@ -217,6 +217,9 @@ where
     };
     let (_, sk) = load_secret(label.as_deref())?;
     let pk = sk.public();
+    // Locked after the key is loaded, so a passphrase prompt never holds
+    // the repository; the authority is re-read under the lock below.
+    let _lock = crate::ctx::lock_repo(&repo)?;
     let cur_id = repo
         .current_authority()?
         .ok_or_else(|| anyhow!("no current authority"))?;
@@ -264,7 +267,7 @@ where
     let signed_commit = sign_commit(commit_obj, &sk)?;
     let id = repo.write_signed(&signed_commit)?;
     if let Some(branch) = repo.current_branch()? {
-        repo.refs.write(&branch, id)?;
+        repo.refs.compare_and_write(&branch, head, id)?;
     }
     repo.set_current_authority(new_auth_id)?;
     eprintln!("authority updated to {new_auth_id} (commit {id})");

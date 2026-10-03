@@ -39,7 +39,8 @@ For a deeper comparison and context, see the
 ## Building
 
 LeVCS is a Rust workspace. You'll need a recent stable toolchain
-(workspace MSRV is 1.75) and a C compiler for the tree-sitter grammars.
+(workspace MSRV is 1.89, for `std::fs::File::lock`) and a C compiler for the
+tree-sitter grammars.
 
 ```sh
 cargo build --release
@@ -103,6 +104,21 @@ This matters more than convenience when a repository is written by more than
 one hand. Attribution is the entire point of signing a commit, and a commit
 that had to sweep up someone else's unfinished edits in order to exist
 attributes their work to whoever signed it.
+
+Several processes can work in one repository at once. Every command that
+changes the index, a ref, or the working tree holds an exclusive lock on
+`.levcs/repo.lock` for its whole run, and waits, saying so, if another holds it. A
+commit only moves its branch from the parent it was built on. Before this,
+two commits started together could both print an id while only one landed.
+The lock orders repository changes; it cannot say who wrote which lines of a
+file that several sessions edit at once, so scope each commit to the files its
+author wrote.
+
+A commit is published once its branch moves. If a step after that fails, such
+as rewriting the index or clearing merge state, `commit` still prints the id,
+says what did not finish, and exits with status 3. The commit stands, and
+committing again will not repeat it. A missing `.levcs/index` is read as HEAD
+with nothing staged, never as an empty tree.
 
 `forget` stops tracking a file and leaves it on disk:
 

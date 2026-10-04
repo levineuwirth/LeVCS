@@ -80,6 +80,19 @@ levcs log
 
 That's a fully working LeVCS repo.
 
+With one key in the keychain, commands sign with it, whatever its role, and
+`init` with an empty keychain creates a key called `personal`. With several
+keys, as when an owner and an agent share a machine, levcs never picks one: a
+signing command, `init` included, must name its key with `--key`. A
+membership change (`levcs authority add`, `remove` or `promote`) must name an
+owner's key with `--signing-key` even when only one key exists. A signature
+records whose hand made a change; that record is worthless if a tool can pick
+the hand.
+
+Naming the key prevents accidents, not misuse. A process that can read the
+keychain can still name the owner's key, so keeping an owner's key from agents
+means keeping it where they cannot reach it.
+
 A commit can be scoped to paths, which is how you commit one piece of work out
 of a tree that holds several:
 

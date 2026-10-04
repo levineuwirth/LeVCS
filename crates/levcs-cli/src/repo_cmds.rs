@@ -43,9 +43,28 @@ pub fn init(args: InitArgs) -> Result<()> {
     if path.join(".levcs").exists() {
         bail!("repository already exists at {:?}", path);
     }
-    // Pick or create a key.
-    let label = args.key.as_deref().unwrap_or("personal").to_string();
+    // Pick or create the key that will own the repository. A named label is
+    // used, or generated if new. Unnamed: an empty keychain gets a new
+    // `personal` key, and a keychain with one key uses it. With several,
+    // refuse. This used to default to `personal` whenever it existed, so a
+    // keychain holding the owner's `personal` and an agent's key made the
+    // owner the genesis Owner of a repository an agent created.
     let mut kc = load_keychain()?;
+    let label = match args.key.as_deref() {
+        Some(l) => l.to_string(),
+        None => match kc.keys.len() {
+            0 => "personal".to_string(),
+            1 => kc.keys[0].label.clone(),
+            _ => {
+                let labels: Vec<&str> = kc.keys.iter().map(|k| k.label.as_str()).collect();
+                bail!(
+                    "the keychain holds several keys ({}); name the one that will own \
+                     the new repository with --key <label>",
+                    labels.join(", ")
+                );
+            }
+        },
+    };
     let sk: SecretKey = if let Some(_) = kc.entry(&label) {
         let (_, sk) = load_secret(Some(&label))?;
         sk

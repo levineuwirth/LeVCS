@@ -78,26 +78,35 @@ pub fn read_passphrase(prompt: &str) -> Result<String> {
     Ok(buf)
 }
 
-/// Resolve a key label and load the secret. If `label` is None, default to
-/// `"personal"`, then to the only key in the chain if there is exactly one.
+/// Resolve a key label and load the secret. If `label` is None, use the
+/// keychain's only key; with several keys, refuse.
+///
+/// This used to prefer a key labelled `personal` even when others existed,
+/// and `init` gives that label to the owner key it creates. In a keychain that
+/// also holds a contributor key for agents, a command that forgot `--key`
+/// signed as the owner. A signature is the record of whose hand made a
+/// change, so the hand is never guessed when there is more than one.
 pub fn load_secret(label: Option<&str>) -> Result<(String, SecretKey)> {
     let kc = load_keychain()?;
     let chosen = match label {
         Some(l) => l.to_string(),
-        None => {
-            if kc.entry("personal").is_some() {
-                "personal".into()
-            } else if kc.keys.len() == 1 {
-                kc.keys[0].label.clone()
-            } else if kc.keys.is_empty() {
+        None => match kc.keys.len() {
+            0 => {
                 return Err(anyhow!(
                     "no keys in keychain at {:?}; run `levcs key generate <label>`",
                     keychain_path()
-                ));
-            } else {
-                return Err(anyhow!("multiple keys in keychain; pass --key <label>"));
+                ))
             }
-        }
+            1 => kc.keys[0].label.clone(),
+            _ => {
+                let labels: Vec<&str> = kc.keys.iter().map(|k| k.label.as_str()).collect();
+                return Err(anyhow!(
+                    "the keychain holds several keys ({}); name the one to sign with, \
+                     with --key <label>",
+                    labels.join(", ")
+                ));
+            }
+        },
     };
     let entry = kc
         .entry(&chosen)

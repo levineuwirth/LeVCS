@@ -184,38 +184,18 @@ where
     F: FnMut(&mut AuthorityBody, PublicKey) -> Result<()>,
 {
     let repo = open_repo()?;
-    // If no label supplied, prefer the only owner of the current authority.
-    let label = match signing_key_label {
-        Some(l) => Some(l.to_string()),
-        None => {
-            let auth_id = repo
-                .current_authority()?
-                .ok_or_else(|| anyhow!("no current authority"))?;
-            let signed = repo.read_signed(auth_id)?;
-            let body = AuthorityBody::parse(&signed.body)?;
-            let owners: Vec<&MemberEntry> = body
-                .members
-                .iter()
-                .filter(|m| m.role == Role::Owner)
-                .collect();
-            if owners.len() == 1 {
-                let kc = crate::ctx::load_keychain()?;
-                let owner_key = owners[0].key;
-                kc.keys
-                    .iter()
-                    .find(|e| {
-                        levcs_identity::keys::PublicKey::parse_levcs(&e.public)
-                            .ok()
-                            .map(|p| p == owner_key)
-                            .unwrap_or(false)
-                    })
-                    .map(|e| e.label.clone())
-            } else {
-                None
-            }
-        }
+    // The owner's key is never chosen for the caller. This used to look up
+    // the sole owner and sign with whichever keychain key matched, so any
+    // process able to run `levcs` could change membership as the owner
+    // without naming that key: `authority promote <agent> --role owner`
+    // produced a commit authored by the owner's key with no prompt.
+    let Some(label) = signing_key_label else {
+        bail!(
+            "authority changes are signed with an owner's key; name it with \
+             --signing-key <label>"
+        );
     };
-    let (_, sk) = load_secret(label.as_deref())?;
+    let (_, sk) = load_secret(Some(label))?;
     let pk = sk.public();
     // Locked after the key is loaded, so a passphrase prompt never holds
     // the repository; the authority is re-read under the lock below.

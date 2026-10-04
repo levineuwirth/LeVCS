@@ -163,6 +163,17 @@ pushes (it's populated by mirroring).
 
 ### 3.3 The merge cascade
 
+**Status, 2026-10-04.** The structural handlers described below are now
+opt-in. Without a rule in `.levcs/merge.toml`, every file merges with the
+textual handler. The 2026-10-03 audit found that, under small disjoint
+edits, the format-aware and tree-sitter handlers lost, invented or
+reordered content while reporting AUTO; the textual handler produced the
+expected result in all 3,226 constructed Markdown cases where the Markdown
+handler did in 1,828. Rules can still select them, and
+`merge.local.toml` can only keep the repository's choice or choose textual.
+The defaults described in this section return once a post-merge validator
+can confirm each handler's output.
+
 This is the technical centerpiece.
 
 A traditional three-way merge — git, mercurial, fossil — works at the

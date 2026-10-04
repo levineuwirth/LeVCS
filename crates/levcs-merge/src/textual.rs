@@ -288,6 +288,14 @@ impl<S: Into<String>, B> MapFirst<S, B> for (S, B) {
     }
 }
 
+/// Bytes no built-in handler may merge: not valid UTF-8, or containing NUL.
+/// NUL is valid UTF-8, so the UTF-8 check alone let binary formats through
+/// to a line merge, which inserted conflict markers into them or spliced
+/// their bytes together and reported AUTO.
+pub fn looks_binary(bytes: &[u8]) -> bool {
+    bytes.contains(&0) || std::str::from_utf8(bytes).is_err()
+}
+
 pub struct TextualHandler;
 
 impl MergeHandler for TextualHandler {
@@ -296,11 +304,8 @@ impl MergeHandler for TextualHandler {
     }
 
     fn applicable(&self, _path: &Path, base: &[u8], ours: &[u8], theirs: &[u8]) -> bool {
-        // Only apply to anything that's valid UTF-8 — we refuse to do
-        // line-based merge on binary. Everything else falls through.
-        std::str::from_utf8(base).is_ok()
-            && std::str::from_utf8(ours).is_ok()
-            && std::str::from_utf8(theirs).is_ok()
+        // Text only: a line merge of binary content corrupts it.
+        !looks_binary(base) && !looks_binary(ours) && !looks_binary(theirs)
     }
 
     fn merge(&self, _path: &Path, base: &[u8], ours: &[u8], theirs: &[u8]) -> MergeResult {

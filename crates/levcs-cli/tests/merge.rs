@@ -162,7 +162,16 @@ fn conflicting_merge_writes_state_and_blocks_commit_until_resolved() {
     assert!(s.contains("<<<<<<<"));
     assert!(s.contains(">>>>>>>"));
 
-    // commit must refuse while conflict markers remain.
+    // commit refuses while the file is marked conflicted.
+    let (code, _, e) = run(&["commit", "-m", "premature"], &work, &xdg);
+    assert_ne!(code, 0, "commit should refuse: {e}");
+    assert!(
+        e.contains("unresolved conflicts in: a.txt") && e.contains("levcs track"),
+        "refusal should name the file and the resolution: {e}"
+    );
+
+    // Marking it resolved with the markers still in it is caught too.
+    assert_eq!(run(&["track", "a.txt"], &work, &xdg).0, 0);
     let (code, _, e) = run(&["commit", "-m", "premature"], &work, &xdg);
     assert_ne!(code, 0, "commit should refuse: {e}");
     assert!(
@@ -170,8 +179,9 @@ fn conflicting_merge_writes_state_and_blocks_commit_until_resolved() {
         "marker check should mention markers: {e}"
     );
 
-    // Resolve manually and commit.
+    // Resolve, mark it resolved, and commit.
     std::fs::write(work.join("a.txt"), b"resolved\n").unwrap();
+    assert_eq!(run(&["track", "a.txt"], &work, &xdg).0, 0);
     let (code, _, e) = run(&["commit", "-m", "merge feat"], &work, &xdg);
     assert_eq!(code, 0, "commit after resolution: {e}");
     assert!(!work.join(".levcs/MERGE_HEAD").exists());
@@ -397,7 +407,7 @@ fn merge_local_toml_promotion_is_rejected() {
     assert_eq!(run(&["commit", "-m", "f"], &work, &xdg).0, 0);
     assert_eq!(run(&["branch", "--switch", "main"], &work, &xdg).0, 0);
 
-    // Repo: textual. Local tries to promote to tree-sitter:rust (rank 2).
+    // Repo: textual. Local tries to select tree-sitter:rust instead.
     std::fs::write(
         work.join(".levcs/merge.toml"),
         b"schema_version = 1\n\n[[rule]]\nglob = \"*.txt\"\nhandler = \"textual\"\n",
@@ -414,7 +424,10 @@ fn merge_local_toml_promotion_is_rejected() {
         e.contains("merge.local.toml"),
         "error must name the offending file: {e}"
     );
-    assert!(e.contains("promote"), "error must say 'promote': {e}");
+    assert!(
+        e.contains("only keep the repository's handler or choose textual"),
+        "error must state the rule: {e}"
+    );
 }
 
 /// Regression test for the dirty-tree merge precondition. Before this

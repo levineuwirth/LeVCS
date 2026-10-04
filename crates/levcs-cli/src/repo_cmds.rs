@@ -147,6 +147,10 @@ pub fn track(args: TrackArgs) -> Result<()> {
     // because each rolled its own descent.
     let walked = repo.walk_workdir()?;
     let mut targets: Vec<PathBuf> = Vec::new();
+    // Files named one by one. Only these can mark a conflict resolved:
+    // `track --all` or a directory would otherwise resolve every conflict
+    // under it, including ones with no markers that nobody looked at.
+    let mut named: HashSet<String> = HashSet::new();
 
     // An empty restriction is the repository root: `track .` at the top.
     if args.all || restrict.iter().any(|r| r.is_empty()) {
@@ -167,6 +171,7 @@ pub fn track(args: TrackArgs) -> Result<()> {
             } else if abs.is_file() {
                 // An explicitly named file is tracked even where
                 // `.levcsignore` would skip it. Naming it is the override.
+                named.insert(r.to_string());
                 targets.push(abs);
             } else {
                 bail!("path not found: {r}");
@@ -185,11 +190,24 @@ pub fn track(args: TrackArgs) -> Result<()> {
         let mtime = file_mtime_micros(&meta);
         let size = meta.len();
         let mode = file_mode_bits(&meta);
+        let was_conflicted = idx
+            .entries
+            .iter()
+            .any(|e| e.path == rel && e.flags.is_conflicted());
+        let mut flags = IndexEntryFlags::TRACKED;
+        if was_conflicted {
+            if named.contains(&rel) {
+                println!("resolved   {rel}");
+            } else {
+                flags = flags.with(IndexEntryFlags::CONFLICTED);
+                println!("conflicted {rel}  (still unresolved; name it to mark it resolved)");
+            }
+        }
         idx.upsert(IndexEntry {
             path: rel,
             blob_hash: id,
             mode,
-            flags: IndexEntryFlags::TRACKED,
+            flags,
             mtime_micros: mtime,
             size,
         });
@@ -228,17 +246,28 @@ pub fn forget(args: ForgetArgs) -> Result<()> {
     }
 
     let mut targets: Vec<String> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
     for r in &restrict {
-        let matched: Vec<String> = idx
+        let matched: Vec<&IndexEntry> = idx
             .entries
             .iter()
             .filter(|e| path_under(std::slice::from_ref(r), &e.path))
-            .map(|e| e.path.clone())
             .collect();
         if matched.is_empty() {
             bail!("nothing tracked at '{r}'; forget acts only on tracked files");
         }
-        targets.extend(matched);
+        for e in matched {
+            // Forgetting a conflicted file resolves its conflict by deletion,
+            // so it must be named, not swept up by a directory.
+            if e.flags.is_conflicted() && e.path != *r {
+                skipped.push(e.path.clone());
+            } else {
+                targets.push(e.path.clone());
+            }
+        }
+    }
+    for path in &skipped {
+        println!("conflicted {path}  (not forgotten; name it to resolve it by deletion)");
     }
     targets.sort();
     targets.dedup();
@@ -358,6 +387,21 @@ pub fn status() -> Result<()> {
         .map(|e| e.path.clone())
         .collect();
     deleted.sort();
+    // Conflicts first: some have no markers, and nothing else shows them.
+    let mut conflicted: Vec<&str> = idx
+        .entries
+        .iter()
+        .filter(|e| e.flags.is_conflicted())
+        .map(|e| e.path.as_str())
+        .collect();
+    conflicted.sort();
+    if !conflicted.is_empty() {
+        println!("\nunresolved conflicts (commit refuses until each is resolved):");
+        for c in &conflicted {
+            println!("  {c}");
+        }
+        println!("\n{RESOLVE_HELP}");
+    }
     if !modified.is_empty() {
         println!("\nmodified:");
         for m in &modified {
@@ -376,7 +420,7 @@ pub fn status() -> Result<()> {
             println!("  {u}");
         }
     }
-    if modified.is_empty() && deleted.is_empty() && untracked.is_empty() {
+    if modified.is_empty() && deleted.is_empty() && untracked.is_empty() && conflicted.is_empty() {
         println!("\nworking tree clean.");
     }
     Ok(())
@@ -615,6 +659,26 @@ pub fn commit(args: CommitArgs) -> Result<()> {
         bail!("a merge is in progress; resolve it and commit without paths");
     }
 
+    // Every file a merge left conflicted must be resolved explicitly before
+    // anything is committed: edited and tracked, or forgotten. Checked here,
+    // under the lock and before the refresh below rewrites the entries. The
+    // marker scan further down cannot see conflicts that have no markers: a
+    // binary file, a file deleted on one side, a structural handler's
+    // conflict. A JSON conflict used to be committable for that reason.
+    let conflicted: Vec<&str> = idx
+        .entries
+        .iter()
+        .filter(|e| e.flags.is_conflicted())
+        .map(|e| e.path.as_str())
+        .collect();
+    if !conflicted.is_empty() {
+        bail!(
+            "unresolved conflicts in: {}\n{}",
+            conflicted.join(", "),
+            RESOLVE_HELP
+        );
+    }
+
     let mut new_entries = Vec::new();
     for e in &idx.entries {
         if !path_under(&restrict, &e.path) {
@@ -690,7 +754,7 @@ pub fn commit(args: CommitArgs) -> Result<()> {
         // Defensive re-check: somebody could have hand-edited the record
         // after `levcs merge` produced it. Refuse to seal a record that
         // names a handler not in this repository's policy.
-        let allowed = load_merge_policy_allowed(&repo);
+        let allowed = load_merge_policy_allowed(&repo)?;
         let record_str = std::str::from_utf8(&record_bytes)
             .map_err(|_| anyhow!("merge-record is not valid UTF-8"))?;
         let parsed = MergeRecord::from_toml(record_str)
@@ -1114,6 +1178,21 @@ pub fn branch(args: BranchArgs) -> Result<()> {
         eprintln!("created branch {name} at {from}");
     }
     if let Some(name) = args.switch {
+        // State a published merge left behind (its cleanup failed, exit 3)
+        // is cleared here, under the lock. Carried onto another branch, it
+        // made the next ordinary commit a merge, with the old merge's record
+        // and two identical parents. If it cannot be cleared, refuse.
+        clear_stale_merge_state(&repo)?;
+        // A switch rewrites HEAD, the working tree and the index. During a
+        // merge it would wipe the conflict flags and keep MERGE_HEAD, so the
+        // next commit sealed the conflicts unresolved, even when switching
+        // to the branch already checked out. Refuse before changing anything.
+        if repo.levcs_dir.join("MERGE_HEAD").exists() && stale_merge_head(&repo)?.is_none() {
+            bail!(
+                "a merge is in progress; commit it or run `levcs merge --abort` \
+                 before switching branches"
+            );
+        }
         let target = repo
             .refs
             .read(&format!("refs/branches/{name}"))?
@@ -1278,8 +1357,7 @@ fn merge_run(args: MergeArgs) -> Result<()> {
     // Layered config per §6.6.3 — `.levcs/merge.local.toml` over
     // `.levcs/merge.toml`. Promotions in the local override are
     // rejected before we touch the working tree.
-    let cfg = load_effective_merge_config(&repo)?;
-    let engine = CascadeEngine::new().with_config(cfg);
+    let engine = load_merge_engine(&repo)?;
     let mut record = MergeRecord {
         schema_version: 1,
         base: format!("blake3:{}", base_id),
@@ -1318,13 +1396,21 @@ fn merge_run(args: MergeArgs) -> Result<()> {
     let mut json_files: Vec<(String, JsonReportData)> = Vec::new();
 
     for path in paths {
-        let base = base_files.get(&path).cloned().unwrap_or_default();
-        let ours = ours_files.get(&path).cloned().unwrap_or_default();
-        let theirs = theirs_files.get(&path).cloned().unwrap_or_default();
+        // Each side as present-with-content or absent. Comparing bytes alone
+        // made a deleted file equal to an empty one: deleting an empty file
+        // while the other side edited it, or deleting a file while the other
+        // side truncated it, merged "cleanly" to whichever side the shortcuts
+        // below happened to reach first.
+        let base_side = base_files.get(&path);
+        let ours_side = ours_files.get(&path);
+        let theirs_side = theirs_files.get(&path);
+        let base = base_side.cloned().unwrap_or_default();
+        let ours = ours_side.cloned().unwrap_or_default();
+        let theirs = theirs_side.cloned().unwrap_or_default();
 
         // Both sides agree: take the value (handles deletes-on-both).
-        if ours == theirs {
-            if ours.is_empty() && !ours_files.contains_key(&path) {
+        if ours_side == theirs_side {
+            if ours_side.is_none() {
                 deleted_files.insert(path);
             } else {
                 merged_files.insert(path, ours);
@@ -1332,10 +1418,10 @@ fn merge_run(args: MergeArgs) -> Result<()> {
             continue;
         }
         // One-sided edits.
-        if base == ours {
+        if base_side == ours_side {
             // Only theirs changed.
             if args.no_auto {
-                let result = make_no_auto_conflict(path.clone(), &ours, &theirs);
+                let result = make_no_auto_conflict(path.clone(), &base, &ours, &theirs);
                 conflict_count += 1;
                 emit_outcome(&path, &result, json_mode);
                 if json_mode {
@@ -1367,7 +1453,7 @@ fn merge_run(args: MergeArgs) -> Result<()> {
             auto_resolved += 1;
             continue;
         }
-        if base == theirs {
+        if base_side == theirs_side {
             // Only ours changed.
             if ours_files.contains_key(&path) {
                 merged_files.insert(path.clone(), ours.clone());
@@ -1391,9 +1477,55 @@ fn merge_run(args: MergeArgs) -> Result<()> {
             auto_resolved += 1;
             continue;
         }
-        // Both sides changed: cascade.
+        // Both sides changed, and one of them deleted the file: a conflict,
+        // never a merge. Handing the deleted side to a handler as empty
+        // content produced fragments of the other side, reported as AUTO.
+        // The edited version stays in the working tree, unmarked; the
+        // resolution is `levcs track` to keep it or `levcs forget` to
+        // delete it.
+        let in_ours = ours_files.contains_key(&path);
+        let in_theirs = theirs_files.contains_key(&path);
+        if in_ours != in_theirs {
+            let (kept, who_kept, who_deleted) = if in_ours {
+                (ours.clone(), "ours", "theirs")
+            } else {
+                (theirs.clone(), "theirs", "ours")
+            };
+            conflict_count += 1;
+            let notes = format!("modified by {who_kept}, deleted by {who_deleted}");
+            if json_mode {
+                let result = MergeResult {
+                    handler: "none".into(),
+                    status: MergeStatus::Conflict {
+                        regions: vec![],
+                        partial: kept.clone(),
+                    },
+                };
+                json_files.push((path.clone(), JsonReportData::from(&result)));
+            } else {
+                eprintln!("CONFLICT {path}  ({notes})");
+            }
+            record.files.push(FileRecord {
+                path: path.clone(),
+                handler: "none".into(),
+                handler_hash: String::new(),
+                status: FileStatus::Manual,
+                notes,
+            });
+            merged_files.insert(path, kept);
+            continue;
+        }
+        // Both sides changed: the handler the configuration selects, which
+        // is textual unless `.levcs/merge.toml` opts this path into a
+        // structural one. A local override that would do anything else
+        // stops the merge here, before anything is written.
+        if !args.no_auto {
+            engine
+                .select(Path::new(&path))
+                .map_err(|e| anyhow!("{e}"))?;
+        }
         let result = if args.no_auto {
-            make_no_auto_conflict(path.clone(), &ours, &theirs)
+            make_no_auto_conflict(path.clone(), &base, &ours, &theirs)
         } else {
             engine.merge_file(Path::new(&path), &base, &ours, &theirs)
         };
@@ -1429,7 +1561,7 @@ fn merge_run(args: MergeArgs) -> Result<()> {
     // files clobbered when the policy check then bailed. Validate up
     // front, before any disk write, so a rejected merge leaves the
     // working tree exactly as we found it.
-    let allowed = load_merge_policy_allowed(&repo);
+    let allowed = load_merge_policy_allowed(&repo)?;
     let bad = validate_record_against_policy(&record, &allowed);
     if !bad.is_empty() {
         bail!(
@@ -1514,54 +1646,69 @@ fn merge_run(args: MergeArgs) -> Result<()> {
     println!("  conflicts:     {conflict_count}");
     println!();
     if conflict_count > 0 {
-        println!(
-            "review with `levcs merge --review`, or edit conflicted files and run `levcs commit`."
-        );
+        println!("{}", RESOLVE_HELP);
         std::process::exit(1);
     }
     println!("clean merge. run `levcs commit` to finalize.");
     Ok(())
 }
 
-/// Read `.levcs/merge.toml` into a `MergeConfig`. Missing file or
-/// malformed contents both produce a default config — the spec's
-/// "absence means permissive" semantics.
-fn read_repo_merge_config(repo: &Repository) -> MergeConfig {
-    let path = repo.levcs_dir.join("merge.toml");
+/// How to finish a merge that left conflicts. `commit` refuses while any
+/// file is still marked conflicted, so every conflict needs one of these.
+const RESOLVE_HELP: &str = "\
+to resolve each conflicted file:
+  edit it, then mark it resolved:    levcs track <path>
+  or delete it and mark that:        levcs forget --delete <path>
+then commit the merge:               levcs commit -m <message>
+to step through conflicts:           levcs merge --review
+to give up on the merge:             levcs merge --abort
+a conflict may have no conflict markers (binary files, a file deleted on one
+side), so name each conflicted path; `levcs status` lists them.";
+
+/// Read a merge config from `.levcs/<name>`. An absent file is the default
+/// config. An unreadable or malformed one is an error: it used to be read
+/// as the default, which silently turned off both the repository's rules
+/// and its `allowed_handlers` policy.
+fn read_merge_config_file(repo: &Repository, name: &str) -> Result<Option<MergeConfig>> {
+    let path = repo.levcs_dir.join(name);
     let raw = match fs::read_to_string(&path) {
         Ok(s) => s,
-        Err(_) => return MergeConfig::default(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(anyhow!("cannot read .levcs/{name}: {e}")),
     };
-    toml::from_str(&raw).unwrap_or_default()
+    toml::from_str(&raw)
+        .map(Some)
+        .map_err(|e| anyhow!(".levcs/{name} is malformed: {e}"))
 }
 
-/// Load the effective merge config for this repository, layering
-/// `.levcs/merge.local.toml` (gitignored, never pushed) over
-/// `.levcs/merge.toml` per §6.6.3. The local layer can demote handler
-/// aggressiveness but not promote it; promotions are rejected with a
-/// hard error so the user knows their override is being silently
-/// dropped instead of quietly ignored.
-fn load_effective_merge_config(repo: &Repository) -> Result<MergeConfig> {
-    let base = read_repo_merge_config(repo);
-    let local_path = repo.levcs_dir.join("merge.local.toml");
-    if !local_path.exists() {
-        return Ok(base);
+fn read_repo_merge_config(repo: &Repository) -> Result<MergeConfig> {
+    Ok(read_merge_config_file(repo, "merge.toml")?.unwrap_or_default())
+}
+
+/// The merge engine for this repository. Without rules, every file merges
+/// textually. `.levcs/merge.toml` may opt paths into structural handlers.
+/// `.levcs/merge.local.toml` (per user, never pushed) may only keep those
+/// choices or choose textual (§6.6.3). Every rule must name an available
+/// handler.
+fn load_merge_engine(repo: &Repository) -> Result<CascadeEngine> {
+    let base = read_repo_merge_config(repo)?;
+    let mut engine = CascadeEngine::new().with_config(base.clone());
+    if let Some(local) = read_merge_config_file(repo, "merge.local.toml")? {
+        engine = engine
+            .with_local_overrides(&base, &local)
+            .map_err(|e| anyhow!("{e}"))?;
     }
-    let local_raw =
-        fs::read_to_string(&local_path).map_err(|e| anyhow!("read merge.local.toml: {e}"))?;
-    let local: MergeConfig =
-        toml::from_str(&local_raw).map_err(|e| anyhow!("parse merge.local.toml: {e}"))?;
-    levcs_merge::engine::layer_local_over(&base, &local)
-        .map_err(|e| anyhow!("merge.local.toml: {e}"))
+    engine.validate().map_err(|e| anyhow!("{e}"))?;
+    Ok(engine)
 }
 
-/// Load `.levcs/merge.toml`'s `policy.allowed_handlers`. Returns an empty
-/// vec (permissive) if the file is absent or has no policy block.
-/// `merge.local.toml` does not influence policy — local overrides
+/// Load `.levcs/merge.toml`'s `policy.allowed_handlers`: empty (permissive)
+/// if the file is absent or has no policy block, an error if it is
+/// malformed. `merge.local.toml` does not influence policy; local overrides
 /// can't widen what's permitted.
-fn load_merge_policy_allowed(repo: &Repository) -> Vec<String> {
-    let cfg = read_repo_merge_config(repo);
-    cfg.policy.map(|p| p.allowed_handlers).unwrap_or_default()
+fn load_merge_policy_allowed(repo: &Repository) -> Result<Vec<String>> {
+    let cfg = read_repo_merge_config(repo)?;
+    Ok(cfg.policy.map(|p| p.allowed_handlers).unwrap_or_default())
 }
 
 fn emit_outcome(path: &str, result: &MergeResult, json: bool) {
@@ -1679,7 +1826,23 @@ fn file_record_from(path: &str, result: &MergeResult) -> FileRecord {
     }
 }
 
-fn make_no_auto_conflict(_path: String, ours: &[u8], theirs: &[u8]) -> MergeResult {
+fn make_no_auto_conflict(_path: String, base: &[u8], ours: &[u8], theirs: &[u8]) -> MergeResult {
+    // Binary content gets no markers here either: `--no-auto` used to wrap
+    // it in them, changing the working bytes of NUL-containing and
+    // non-UTF-8 files. Like the engine's binary guard, keep ours unchanged
+    // and leave the resolution to an explicit `track` or `forget`.
+    if [base, ours, theirs]
+        .iter()
+        .any(|b| levcs_merge::textual::looks_binary(b))
+    {
+        return MergeResult {
+            handler: "no-auto".into(),
+            status: MergeStatus::Conflict {
+                regions: vec![],
+                partial: ours.to_vec(),
+            },
+        };
+    }
     let mut partial = Vec::new();
     partial.extend_from_slice(b"<<<<<<< ours\n");
     partial.extend_from_slice(ours);
@@ -1808,6 +1971,17 @@ fn load_index(repo: &Repository) -> Result<Index> {
                 repo.index_path().display()
             )
         });
+    }
+    // During a merge the index holds the merged files and which of them are
+    // still conflicted. Rebuilt from HEAD it would hold neither, and the
+    // next commit would seal unresolved conflicts and drop files the merge
+    // added. Refuse instead; abort and merge again rebuilds both.
+    if repo.levcs_dir.join("MERGE_HEAD").exists() && stale_merge_head(repo)?.is_none() {
+        bail!(
+            "{} is missing while a merge is in progress, and with it the record of \
+             which files are still conflicted; run `levcs merge --abort`, then merge again",
+            repo.index_path().display()
+        );
     }
     let mut idx = Index::new();
     if let Some(head) = repo.refs.resolve_head()? {

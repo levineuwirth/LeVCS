@@ -39,7 +39,8 @@ For a deeper comparison and context, see the
 ## Building
 
 LeVCS is a Rust workspace. You'll need a recent stable toolchain
-(workspace MSRV is 1.75) and a C compiler for the tree-sitter grammars.
+(workspace MSRV is 1.89, for `std::fs::File::lock`) and a C compiler for the
+tree-sitter grammars.
 
 ```sh
 cargo build --release
@@ -79,6 +80,19 @@ levcs log
 
 That's a fully working LeVCS repo.
 
+With one key in the keychain, commands sign with it, whatever its role, and
+`init` with an empty keychain creates a key called `personal`. With several
+keys, as when an owner and an agent share a machine, levcs never picks one: a
+signing command, `init` included, must name its key with `--key`. A
+membership change (`levcs authority add`, `remove` or `promote`) must name an
+owner's key with `--signing-key` even when only one key exists. A signature
+records whose hand made a change; that record is worthless if a tool can pick
+the hand.
+
+Naming the key prevents accidents, not misuse. A process that can read the
+keychain can still name the owner's key, so keeping an owner's key from agents
+means keeping it where they cannot reach it.
+
 A commit can be scoped to paths, which is how you commit one piece of work out
 of a tree that holds several:
 
@@ -103,6 +117,33 @@ This matters more than convenience when a repository is written by more than
 one hand. Attribution is the entire point of signing a commit, and a commit
 that had to sweep up someone else's unfinished edits in order to exist
 attributes their work to whoever signed it.
+
+Several processes can work in one repository at once. Every command that
+changes the index, a ref, or the working tree holds an exclusive lock on
+`.levcs/repo.lock` for its whole run, and waits, saying so, if another holds it. A
+commit only moves its branch from the parent it was built on. Before this,
+two commits started together could both print an id while only one landed.
+The lock orders repository changes; it cannot say who wrote which lines of a
+file that several sessions edit at once, so scope each commit to the files its
+author wrote.
+
+`levcs verify` checks everything the repository keeps, not just HEAD.
+Every object reachable from any ref is hash-checked, and every commit and
+release is checked against the authority rules in
+[`doc/authority-semantics.md`](doc/authority-semantics.md), with the
+repository's genesis pinned. It says what it covered. It exits 1 if
+anything is invalid, and 4 if history is valid but cites an authority
+lineage that conflicts with this repository's, which means two copies
+disagree rather than that something is damaged. `levcs gc` keeps exactly
+what that walk reaches, from the same roots, including a merge in progress.
+It refuses to delete anything while any reachable object or ref is
+damaged: unreadable, malformed, or not the type its link requires.
+
+A commit is published once its branch moves. If a step after that fails, such
+as rewriting the index or clearing merge state, `commit` still prints the id,
+says what did not finish, and exits with status 3. The commit stands, and
+committing again will not repeat it. A missing `.levcs/index` is read as HEAD
+with nothing staged, never as an empty tree.
 
 `forget` stops tracking a file and leaves it on disk:
 

@@ -59,15 +59,35 @@ impl ObjectStore {
             return Ok(id);
         }
         let parent = path.parent().expect("sharded path has parent");
-        fs::create_dir_all(parent).ctx(parent.to_path_buf())?;
-        // Write to a temp file in the same directory, then atomically rename.
-        let tmp = parent.join(format!("tmp.{}", id.to_hex()));
-        {
-            let mut f = fs::File::create(&tmp).ctx(tmp.clone())?;
-            f.write_all(bytes).ctx(tmp.clone())?;
-            f.sync_all().ctx(tmp.clone())?;
+        crate::fsutil::create_dir_all_durable(parent)?;
+        // Write to a temp file unique to this call, then atomically rename.
+        // A shared `tmp.<id>` let two writers of the same object truncate and
+        // rename each other's file, failing one of them with ENOENT.
+        let tmp = crate::fsutil::unique_tmp(parent, &id.to_hex());
+        let written = (|| -> std::io::Result<()> {
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)?;
+            f.write_all(bytes)?;
+            f.sync_all()
+        })();
+        if let Err(e) = written {
+            let _ = fs::remove_file(&tmp);
+            return Err(e).ctx(tmp);
         }
-        fs::rename(&tmp, &path).ctx(path.clone())?;
+        if let Err(e) = fs::rename(&tmp, &path) {
+            let _ = fs::remove_file(&tmp);
+            // Content addressing: if another writer installed the object
+            // first, the bytes are the same and the write has succeeded.
+            if path.is_file() {
+                return Ok(id);
+            }
+            return Err(e).ctx(path.clone());
+        }
+        // The object's directory entry must be durable before any ref that
+        // depends on it is published; the file's own fsync does not cover it.
+        crate::fsutil::fsync_dir(parent)?;
         Ok(id)
     }
 

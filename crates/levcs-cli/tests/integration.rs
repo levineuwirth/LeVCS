@@ -91,6 +91,8 @@ fn authority_chain_round_trip() {
             "contributor",
             "--handle",
             "bob",
+            "--signing-key",
+            "alice",
         ],
         &work,
         &xdg,

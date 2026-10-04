@@ -2,6 +2,7 @@
 
 pub mod authority;
 pub mod error;
+pub mod history;
 pub mod keychain;
 pub mod keys;
 pub mod sign;

@@ -24,6 +24,7 @@ use crate::error::{Error, IoExt, Result};
 use crate::hash::{blake3_hash, ObjectId};
 use crate::ignore::{always_ignored, Ignore};
 use crate::index::{Index, IndexEntry, IndexEntryFlags};
+use crate::lock::RepoLock;
 use crate::object::{ObjectType, RawObject, SignedObject};
 use crate::refs::{Head, Refs};
 use crate::store::ObjectStore;
@@ -113,8 +114,23 @@ impl Repository {
         self.workdir.join(".levcsignore")
     }
 
+    /// Take the repository lock, waiting for any other holder. See
+    /// [`crate::lock`] for what it covers and what it does not.
+    pub fn lock(&self) -> Result<RepoLock> {
+        RepoLock::acquire(&self.levcs_dir)
+    }
+
+    /// Take the repository lock if it is free.
+    pub fn try_lock(&self) -> Result<Option<RepoLock>> {
+        RepoLock::try_acquire(&self.levcs_dir)
+    }
+
     pub fn read_index(&self) -> Result<Index> {
         Index::read_from(&self.index_path())
+    }
+
+    pub fn index_exists(&self) -> bool {
+        self.index_path().is_file()
     }
 
     pub fn write_index(&self, idx: &Index) -> Result<()> {

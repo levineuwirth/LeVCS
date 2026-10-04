@@ -22,7 +22,7 @@ use levcs_identity::sign::{sign_authority, sign_commit};
 use levcs_protocol::{Pack, PushManifest, PushUpdate};
 
 use crate::cli::*;
-use crate::ctx::{load_secret, now_micros, open_repo};
+use crate::ctx::{load_secret, now_micros, open_repo, open_repo_locked};
 
 #[derive(Default, Serialize, Deserialize)]
 struct RepoConfig {
@@ -99,6 +99,7 @@ fn write_user_cfg(cfg: &UserConfig) -> Result<()> {
 pub fn instance(args: InstanceArgs) -> Result<()> {
     if let Some(url) = args.set {
         if let Ok(repo) = open_repo() {
+            let _lock = crate::ctx::lock_repo(&repo)?;
             write_instance_url(&repo, &url)?;
             eprintln!("set repository instance url to {url}");
         } else {
@@ -282,7 +283,7 @@ pub fn push(args: PushArgs) -> Result<()> {
 }
 
 pub fn pull(args: PullArgs) -> Result<()> {
-    let repo = open_repo()?;
+    let (repo, _lock) = open_repo_locked()?;
     let url = active_instance()?;
     let client = levcs_client::Client::new(url);
     let _ = args.key;
@@ -709,6 +710,8 @@ fn build_deploy_archive(
 pub fn migrate(args: MigrateArgs) -> Result<()> {
     let repo = open_repo()?;
     let (_label, sk) = load_secret(args.key.as_deref())?;
+    // Locked after the key, so a passphrase prompt holds no other writer.
+    let _lock = crate::ctx::lock_repo(&repo)?;
     let repo_id = compute_repo_id(&repo)?;
     let client = levcs_client::Client::new(args.to.clone());
 

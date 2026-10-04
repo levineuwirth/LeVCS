@@ -4,9 +4,11 @@
 pub mod blob;
 pub mod commit;
 pub mod error;
+pub mod fsutil;
 pub mod hash;
 pub mod ignore;
 pub mod index;
+pub mod lock;
 pub mod object;
 pub mod refs;
 pub mod release;
@@ -20,6 +22,7 @@ pub use commit::{Commit, CommitFlags};
 pub use error::{Error, Result};
 pub use hash::{blake3_hash, ObjectId, ZERO_ID};
 pub use index::{Index, IndexEntry, IndexEntryFlags};
+pub use lock::RepoLock;
 pub use object::{
     ObjectHeader, ObjectType, RawObject, SignatureEntry, SignedObject, FORMAT_VERSION, HEADER_SIZE,
     MAGIC, SIGNATURE_ENTRY_SIZE,

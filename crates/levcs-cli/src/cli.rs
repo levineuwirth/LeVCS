@@ -39,7 +39,9 @@ pub enum Cmd {
     Log(LogArgs),
     /// Print the absolute path of the repository root.
     Root,
-    /// Verify all reachable objects and signatures.
+    /// Verify every object reachable from any ref, and the authority rules
+    /// over all history. Exits 1 if anything is invalid, and 4 if history is
+    /// valid but on an authority lineage that conflicts with this one.
     Verify,
     /// Garbage-collect unreachable objects.
     Gc(GcArgs),

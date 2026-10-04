@@ -14,6 +14,24 @@ use clap::Parser;
 
 fn main() {
     if let Err(e) = run() {
+        // A published commit whose cleanup failed is not a failed commit:
+        // its id was printed and it is on its branch. Committing again will
+        // not reproduce it, so say so and use a status of its own.
+        if let Some(p) = e.downcast_ref::<repo_cmds::PublishedIncomplete>() {
+            eprintln!("levcs: {p}");
+            eprintln!(
+                "levcs: the commit stands; do not commit again to retry it. \
+                 `levcs status` may overstate what is uncommitted until the \
+                 next successful commit or branch switch rewrites the index."
+            );
+            std::process::exit(3);
+        }
+        // Valid history on an authority lineage that conflicts with this
+        // repository's: a disagreement between replicas, not damage.
+        if let Some(c) = e.downcast_ref::<repo_cmds::ConflictingLineage>() {
+            eprintln!("levcs: {c}");
+            std::process::exit(4);
+        }
         eprintln!("levcs: {e:#}");
         std::process::exit(1);
     }

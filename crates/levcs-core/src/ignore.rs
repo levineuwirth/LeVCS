@@ -93,12 +93,12 @@ impl Ignore {
     }
 }
 
-/// Always-ignored paths regardless of `.levcsignore`.
+/// Always-ignored paths regardless of `.levcsignore`: the repository's own
+/// `.levcs`, and a nested repository's. Only the top level used to be
+/// skipped, so a nested repository's metadata could be tracked and
+/// committed, into a tree that checkout must refuse.
 pub fn always_ignored(rel: &Path) -> bool {
-    rel.components()
-        .next()
-        .map(|c| c.as_os_str() == ".levcs")
-        .unwrap_or(false)
+    rel.components().any(|c| c.as_os_str() == ".levcs")
 }
 
 #[cfg(test)]
@@ -110,7 +110,9 @@ mod tests {
         let ig = Ignore::empty();
         assert!(always_ignored(Path::new(".levcs")));
         assert!(always_ignored(Path::new(".levcs/objects")));
+        assert!(always_ignored(Path::new("sub/.levcs/config")));
         assert!(!always_ignored(Path::new("src/main.rs")));
+        assert!(!always_ignored(Path::new("src/.levcsignore")));
         let _ = ig;
     }
 

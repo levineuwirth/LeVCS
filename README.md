@@ -142,6 +142,19 @@ what that walk reaches, from the same roots, including a merge in progress.
 It refuses to delete anything while any reachable object or ref is
 damaged: unreadable, malformed, or not the type its link requires.
 
+Commands that write the working tree (`branch --switch`, `merge`, `merge
+--abort`, `merge --review`, `construct`, `forget --delete`, `cache --restore`,
+`fork` and `dial`) write only inside it. Each walks a path one directory at a
+time without following symlinks, and replaces a file by renaming a new one
+over it, so neither a symlinked directory nor a symlinked or hard-linked file
+can carry a write outside the repository. A tree is checked whole before
+anything is written: every name, every blob against its hash, and no `.levcs`
+below the top level. A tree's own top-level `.levcs` entry is history and is
+never written over the repository's metadata. A refused switch or
+fast-forward leaves HEAD, the branch and the index where they were. This
+rests on Unix's directory-relative system calls; on other platforms levcs
+refuses to write a working tree at all, rather than write one less safely.
+
 A commit is published once its branch moves. If a step after that fails, such
 as rewriting the index or clearing merge state, `commit` still prints the id,
 says what did not finish, and exits with status 3. The commit stands, and

@@ -16,6 +16,7 @@ pub mod release_cache;
 pub mod repo;
 pub mod store;
 pub mod tree;
+pub mod worktree;
 
 pub use blob::Blob;
 pub use commit::{Commit, CommitFlags};

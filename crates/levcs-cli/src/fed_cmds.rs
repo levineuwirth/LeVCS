@@ -449,13 +449,15 @@ pub fn fork(args: ForkArgs) -> Result<()> {
     let fork_signed = sign_commit(fork_commit, &sk)?;
     let fork_id = repo.write_signed(&fork_signed)?;
 
-    // 10. Wire up refs and HEAD, then materialise the working tree.
+    // 10. Materialise the working tree, then wire up refs and HEAD, so a
+    //     checkout refused part way leaves no ref naming a tree that was
+    //     never written.
+    repo.checkout_tree(source_commit.tree, &dest)?;
     repo.set_genesis_authority(new_auth_id)?;
     repo.set_current_authority(new_auth_id)?;
     let main_ref = "refs/branches/main".to_string();
     repo.refs.write(&main_ref, fork_id)?;
     repo.refs.write_head(&Head::Branch(main_ref.clone()))?;
-    repo.checkout_tree(source_commit.tree, &dest)?;
 
     eprintln!(
         "forked {} into {:?}\n  new repo_id  = blake3:{}\n  fork commit  = {}\n  source tip   = {} ({})\n  source auth  = {}",
@@ -932,6 +934,31 @@ pub fn dial(args: DialArgs) -> Result<()> {
             .map_err(|e| anyhow!("verify release {hex}: {e}"))?;
     }
 
+    // HEAD on main if present, otherwise any branch we got. Releases-only
+    // archives leave HEAD detached at the latest release's predecessor —
+    // there's no branch to point at. The working tree is materialised
+    // first, so a checkout refused part way leaves no ref naming a tree
+    // that was never written.
+    let head = if let Some((name, hex)) = manifest
+        .branches
+        .iter()
+        .find(|(k, _)| k.as_str() == "main")
+        .or_else(|| manifest.branches.iter().next())
+    {
+        let id = ObjectId::from_hex(hex)?;
+        let commit = Commit::from_signed(&repo.read_signed(id)?)?;
+        Some((Head::Branch(format!("refs/branches/{name}")), commit.tree))
+    } else if let Some((_name, hex)) = manifest.releases.iter().next() {
+        let id = ObjectId::from_hex(hex)?;
+        let rel = levcs_core::Release::from_signed(&repo.read_signed(id)?)?;
+        Some((Head::Detached(id), rel.tree))
+    } else {
+        None
+    };
+    if let Some((_, tree)) = &head {
+        repo.checkout_tree(*tree, &dest)?;
+    }
+
     // Now wire up refs. Authority pointers come from the manifest; we
     // already have those objects in the store and verified them through
     // the commit/release walks.
@@ -946,31 +973,8 @@ pub fn dial(args: DialArgs) -> Result<()> {
         let id = ObjectId::from_hex(hex)?;
         repo.refs.write(&format!("refs/releases/{name}"), id)?;
     }
-
-    // HEAD on main if present, otherwise any branch we got. Releases-only
-    // archives leave HEAD detached at the latest release's predecessor —
-    // there's no branch to point at.
-    if let Some((name, _)) = manifest
-        .branches
-        .iter()
-        .find(|(k, _)| k.as_str() == "main")
-        .or_else(|| manifest.branches.iter().next())
-    {
-        let r = format!("refs/branches/{name}");
-        repo.refs.write_head(&Head::Branch(r))?;
-        // Materialize a working tree from the chosen branch tip.
-        if let Some(id) = manifest.branches.get(name) {
-            let id = ObjectId::from_hex(id)?;
-            let commit_signed = repo.read_signed(id)?;
-            let commit = Commit::from_signed(&commit_signed)?;
-            repo.checkout_tree(commit.tree, &dest)?;
-        }
-    } else if let Some((_name, hex)) = manifest.releases.iter().next() {
-        let id = ObjectId::from_hex(hex)?;
-        repo.refs.write_head(&Head::Detached(id))?;
-        let rel_signed = repo.read_signed(id)?;
-        let rel = levcs_core::Release::from_signed(&rel_signed)?;
-        repo.checkout_tree(rel.tree, &dest)?;
+    if let Some((h, _)) = head {
+        repo.refs.write_head(&h)?;
     }
 
     eprintln!(

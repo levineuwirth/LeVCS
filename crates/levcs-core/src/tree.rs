@@ -159,6 +159,27 @@ impl Tree {
             let mut h = [0u8; 32];
             h.copy_from_slice(&body[p..p + 32]);
             p += 32;
+            // Parse what writing forbids: a name that is empty, `.`, `..`,
+            // or contains `/` or NUL, mode bits beyond executable and
+            // symlink, and entries out of order or repeated. Trees were
+            // validated only when written, so a tree from elsewhere could
+            // name `../outside` and have checkout write it there.
+            TreeEntry::validate_name(&name)?;
+            if mode.0 & !(FileMode::EXECUTABLE.0 | FileMode::SYMLINK.0) != 0 {
+                return Err(Error::MalformedObject(format!(
+                    "tree entry {name:?} has unknown mode bits {:#x}",
+                    mode.0
+                )));
+            }
+            if let Some(prev) = entries.last() {
+                let prev: &TreeEntry = prev;
+                if prev.name.as_bytes() >= name.as_bytes() {
+                    return Err(Error::MalformedObject(format!(
+                        "tree entries are not strictly sorted: {:?} then {name:?}",
+                        prev.name
+                    )));
+                }
+            }
             entries.push(TreeEntry {
                 name,
                 entry_type,

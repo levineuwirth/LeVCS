@@ -26,6 +26,12 @@ fn main() {
             );
             std::process::exit(3);
         }
+        // Valid history on an authority lineage that conflicts with this
+        // repository's: a disagreement between replicas, not damage.
+        if let Some(c) = e.downcast_ref::<repo_cmds::ConflictingLineage>() {
+            eprintln!("levcs: {c}");
+            std::process::exit(4);
+        }
         eprintln!("levcs: {e:#}");
         std::process::exit(1);
     }

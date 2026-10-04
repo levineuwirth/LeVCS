@@ -160,10 +160,13 @@ impl Refs {
                 } else {
                     let rel = path.strip_prefix(base.parent().unwrap()).unwrap();
                     let name = rel.to_string_lossy().replace('\\', "/").to_string();
+                    // A ref that cannot be read or parsed is an error, never
+                    // skipped: `verify` and `gc` take their roots from here,
+                    // and a skipped root made `gc` delete the history it held.
                     let txt = fs::read_to_string(&path).ctx(path.clone())?;
-                    if let Ok(id) = parse_ref_value(&txt) {
-                        out.push((name, id));
-                    }
+                    let id = parse_ref_value(&txt)
+                        .map_err(|e| Error::InvalidReference(format!("{}: {e}", path.display())))?;
+                    out.push((name, id));
                 }
             }
             Ok(())

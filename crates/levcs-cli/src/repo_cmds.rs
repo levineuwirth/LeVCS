@@ -17,7 +17,6 @@ use levcs_identity::authority::{
 };
 use levcs_identity::keys::{PublicKey, SecretKey};
 use levcs_identity::sign::{sign_authority, sign_commit, sign_release};
-use levcs_identity::verify::{verify_authority_chain, verify_commit};
 use levcs_merge::engine::validate_record_against_policy;
 use levcs_merge::{
     CascadeEngine, FileRecord, FileStatus, MergeConfig, MergeRecord, MergeResult, MergeStatus,
@@ -2315,16 +2314,92 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
 // verify, gc
 // ---------------------------------------------------------------------------
 
+/// `verify`'s outcome when all history is valid but some commits cite an
+/// authority incomparable with this repository's current one (decision D2 in
+/// `doc/authority-semantics.md`): a detected disagreement between replicas,
+/// not a forgery. `main` gives it exit status 4.
+#[derive(Debug)]
+pub struct ConflictingLineage(pub usize);
+
+impl std::fmt::Display for ConflictingLineage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} commit(s) are valid but cite an authority lineage that conflicts \
+             with this repository's current authority",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for ConflictingLineage {}
+
+/// The roots of everything a repository keeps: every ref, a detached HEAD,
+/// and the commits a merge in progress names.
+fn reachability_roots(repo: &Repository) -> Result<Vec<(String, ObjectId)>> {
+    let mut roots = repo.refs.list_all()?;
+    if let Some(Head::Detached(id)) = repo.refs.read_head()? {
+        roots.push(("HEAD".into(), id));
+    }
+    // A marker that is absent is no root; one that exists but cannot be read
+    // or parsed is an error. Ignoring it would let `gc` delete the commits a
+    // merge in progress holds.
+    for name in ["MERGE_HEAD", "MERGE_BASE"] {
+        let path = repo.levcs_dir.join(name);
+        let s = match fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(anyhow!("cannot read .levcs/{name}: {e}")),
+        };
+        let id =
+            ObjectId::from_hex(s.trim()).map_err(|e| anyhow!(".levcs/{name} is malformed: {e}"))?;
+        roots.push((name.to_string(), id));
+    }
+    Ok(roots)
+}
+
+/// Check everything the repository keeps, not just HEAD: every object
+/// reachable from any ref is hash-checked, and every commit and release is
+/// checked under the authority rules (Rule H) against the pinned genesis.
+/// This used to check HEAD's signature and the current authority chain and
+/// print "verify: ok" with hundreds of corrupt objects behind HEAD.
 pub fn verify() -> Result<()> {
     let repo = open_repo()?;
-    let head = repo.refs.resolve_head()?;
-    if let Some(h) = head {
-        verify_commit(&repo.objects, h, repo.current_branch()?.as_deref())?;
-        eprintln!("HEAD commit {h}: ok");
+    let genesis = repo
+        .genesis_authority()?
+        .ok_or_else(|| anyhow!("no refs/authority/genesis to verify against"))?;
+    let current = repo.current_authority()?;
+    let roots = reachability_roots(&repo)?;
+    let r = levcs_identity::history::verify_history(&repo.objects, genesis, current, &roots);
+    let foreign = if r.foreign_commits > 0 {
+        format!(", {} fork-source commits", r.foreign_commits)
+    } else {
+        String::new()
+    };
+    eprintln!(
+        "checked {} refs: {} commits, {} trees, {} blobs, {} releases, {} authorities{foreign}; \
+         every object hash-checked",
+        r.roots, r.commits, r.trees, r.blobs, r.releases, r.authorities
+    );
+    const SHOW: usize = 50;
+    for p in r.problems.iter().take(SHOW) {
+        let label = if p.integrity { "damaged" } else { "invalid" };
+        eprintln!("{label:<9} {}: {}", p.object, p.what);
     }
-    if let Some(auth) = repo.current_authority()? {
-        verify_authority_chain(&repo.objects, auth)?;
-        eprintln!("authority chain rooted at {auth}: ok");
+    if r.problems.len() > SHOW {
+        eprintln!("          … and {} more", r.problems.len() - SHOW);
+    }
+    for p in r.conflicting.iter().take(SHOW) {
+        eprintln!("conflict  {}: {}", p.object, p.what);
+    }
+    if r.conflicting.len() > SHOW {
+        eprintln!("          … and {} more", r.conflicting.len() - SHOW);
+    }
+    if !r.problems.is_empty() {
+        bail!("verify failed: {} problem(s)", r.problems.len());
+    }
+    if !r.conflicting.is_empty() {
+        return Err(ConflictingLineage(r.conflicting.len()).into());
     }
     eprintln!("verify: ok");
     Ok(())
@@ -2332,61 +2407,28 @@ pub fn verify() -> Result<()> {
 
 pub fn gc(args: GcArgs) -> Result<()> {
     let (repo, _lock) = open_repo_locked()?;
-    let mut reachable: HashSet<ObjectId> = HashSet::new();
-    let mut stack: Vec<ObjectId> = Vec::new();
-    if let Some(h) = repo.refs.resolve_head()? {
-        stack.push(h);
+    // What gc keeps is exactly what `verify`'s typed walk reaches, from the
+    // same roots and through the same links, each checked for its type. Any
+    // damage on the way stops gc before it deletes anything: an unreadable
+    // or mis-typed object hides everything behind it, and gc used to delete
+    // that history as unreachable (on a copy of a vault with 400 corrupt
+    // objects, 1,243 sound ones, with exit 0). Rule violations in intact
+    // history do not stop it; they cannot be repaired by deleting.
+    let genesis = repo
+        .genesis_authority()?
+        .ok_or_else(|| anyhow!("no refs/authority/genesis; refusing to collect"))?;
+    let current = repo.current_authority()?;
+    let roots = reachability_roots(&repo)?;
+    let report = levcs_identity::history::verify_history(&repo.objects, genesis, current, &roots);
+    if let Some(p) = report.problems.iter().find(|p| p.integrity) {
+        bail!(
+            "{} is damaged ({}); refusing to delete anything. Run `levcs verify` \
+             to see what is damaged.",
+            p.object,
+            p.what
+        );
     }
-    if let Some(c) = repo.current_authority()? {
-        stack.push(c);
-    }
-    if let Some(g) = repo.genesis_authority()? {
-        stack.push(g);
-    }
-    for (_, id) in repo.refs.list_all()? {
-        stack.push(id);
-    }
-    while let Some(id) = stack.pop() {
-        if !reachable.insert(id) {
-            continue;
-        }
-        if let Ok(raw) = repo.objects.read_object(id) {
-            match raw.object_type {
-                ObjectType::Tree => {
-                    if let Ok(t) = Tree::parse_body(&raw.body) {
-                        for e in t.entries {
-                            stack.push(e.hash);
-                        }
-                    }
-                }
-                ObjectType::Commit => {
-                    if let Ok(c) = Commit::parse_body(&raw.body) {
-                        stack.push(c.tree);
-                        stack.push(c.authority);
-                        stack.extend(c.parents);
-                    }
-                }
-                ObjectType::Release => {
-                    if let Ok(r) = Release::parse_body(&raw.body) {
-                        stack.push(r.tree);
-                        stack.push(r.predecessor);
-                        stack.push(r.authority);
-                        if !r.parent_release.is_zero() {
-                            stack.push(r.parent_release);
-                        }
-                    }
-                }
-                ObjectType::Authority => {
-                    if let Ok(b) = AuthorityBody::parse(&raw.body) {
-                        if !b.previous_authority.is_zero() {
-                            stack.push(b.previous_authority);
-                        }
-                    }
-                }
-                ObjectType::Blob => {}
-            }
-        }
-    }
+    let reachable = report.reachable;
     // §4.2.2: don't delete an object that's younger than the grace
     // period. An in-progress `commit` or `push` may have written the
     // blob/tree to the object store but not yet linked it into a ref;

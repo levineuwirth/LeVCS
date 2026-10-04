@@ -68,7 +68,7 @@ impl ObjectSource for MemorySource {
     }
 }
 
-fn read_signed<S: ObjectSource>(src: &S, id: ObjectId) -> Verification<SignedObject> {
+pub(crate) fn read_signed<S: ObjectSource>(src: &S, id: ObjectId) -> Verification<SignedObject> {
     let bytes = src.read_raw(id)?;
     Ok(
         SignedObject::parse(&bytes).map_err(|e| VerifyError::Object {
@@ -143,7 +143,7 @@ pub fn verify_genesis(genesis: &SignedObject) -> Verification<AuthorityBody> {
     Ok(body)
 }
 
-fn verify_authority_step(
+pub(crate) fn verify_authority_step(
     new_signed: &SignedObject,
     new_body: &AuthorityBody,
     prev_body: &AuthorityBody,
@@ -599,7 +599,10 @@ fn verify_release_inner<S: ObjectSource>(
     Ok(())
 }
 
-fn locate_new_authority<S: ObjectSource>(src: &S, tree_id: ObjectId) -> Verification<ObjectId> {
+pub(crate) fn locate_new_authority<S: ObjectSource>(
+    src: &S,
+    tree_id: ObjectId,
+) -> Verification<ObjectId> {
     let raw = parse_raw(src, tree_id, ObjectType::Tree)?;
     let tree = Tree::parse_body(&raw.body).map_err(|e| VerifyError::Object {
         hash: tree_id.to_hex(),

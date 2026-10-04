@@ -127,6 +127,18 @@ The lock orders repository changes; it cannot say who wrote which lines of a
 file that several sessions edit at once, so scope each commit to the files its
 author wrote.
 
+`levcs verify` checks everything the repository keeps, not just HEAD.
+Every object reachable from any ref is hash-checked, and every commit and
+release is checked against the authority rules in
+[`doc/authority-semantics.md`](doc/authority-semantics.md), with the
+repository's genesis pinned. It says what it covered. It exits 1 if
+anything is invalid, and 4 if history is valid but cites an authority
+lineage that conflicts with this repository's, which means two copies
+disagree rather than that something is damaged. `levcs gc` keeps exactly
+what that walk reaches, from the same roots, including a merge in progress.
+It refuses to delete anything while any reachable object or ref is
+damaged: unreadable, malformed, or not the type its link requires.
+
 A commit is published once its branch moves. If a step after that fails, such
 as rewriting the index or clearing merge state, `commit` still prints the id,
 says what did not finish, and exits with status 3. The commit stands, and

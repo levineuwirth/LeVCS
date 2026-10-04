@@ -19,7 +19,7 @@
 //! to disk under `workdir`, and returns the count of files that changed.
 //! The terminal driver calls it after the user quits.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use levcs_merge::{ConflictRegion, MergeStatus};
 
@@ -188,29 +188,37 @@ impl ReviewState {
                 skipped: self.files.len(),
             });
         }
-        let mut written = 0usize;
-        let mut skipped = 0usize;
-        for (entry, resolution) in self.files.iter().zip(&self.resolutions) {
-            let target = workdir.join(&entry.path);
-            match resolution {
-                Resolution::KeepCurrent | Resolution::Skip => {
-                    skipped += 1;
-                }
-                Resolution::AcceptOurs => {
-                    write_file(&target, &entry.ours)?;
-                    written += 1;
-                }
-                Resolution::AcceptTheirs => {
-                    write_file(&target, &entry.theirs)?;
-                    written += 1;
-                }
-                Resolution::Edit { bytes } => {
-                    write_file(&target, bytes)?;
-                    written += 1;
-                }
-            }
+        let chosen: Vec<(&str, &[u8])> = self
+            .files
+            .iter()
+            .zip(&self.resolutions)
+            .filter_map(|(entry, resolution)| {
+                let bytes: &[u8] = match resolution {
+                    Resolution::KeepCurrent | Resolution::Skip => return None,
+                    Resolution::AcceptOurs => &entry.ours,
+                    Resolution::AcceptTheirs => &entry.theirs,
+                    Resolution::Edit { bytes } => bytes,
+                };
+                Some((entry.path.as_str(), bytes))
+            })
+            .collect();
+        // Written through the working tree's descriptor, as a checkout is:
+        // every path checked before the first write, no symlink followed,
+        // and each file replaced by a rename (atomic from the working
+        // tree's point of view, so a Ctrl-C part way never leaves a
+        // half-written file). This used to join the merge record's paths
+        // onto `workdir` and write by pathname.
+        let wt = levcs_core::worktree::open(workdir).map_err(std::io::Error::other)?;
+        wt.preflight(chosen.iter().map(|(path, _)| *path))
+            .map_err(std::io::Error::other)?;
+        for (path, bytes) in &chosen {
+            wt.write_file(path, bytes, levcs_core::worktree::Perms::Keep)
+                .map_err(std::io::Error::other)?;
         }
-        Ok(ApplyReport { written, skipped })
+        Ok(ApplyReport {
+            written: chosen.len(),
+            skipped: self.files.len() - chosen.len(),
+        })
     }
 
     /// Return a non-interactive textual summary of the resolutions —
@@ -231,37 +239,11 @@ pub struct ApplyReport {
     pub skipped: usize,
 }
 
-fn write_file(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    // Write to a sibling temp then rename — atomic from the workdir's
-    // point of view, so a Ctrl-C halfway through `apply` never leaves
-    // a half-written file behind.
-    let tmp: PathBuf = match target.file_name() {
-        Some(n) => {
-            let mut t = target.to_path_buf();
-            let mut name = n.to_os_string();
-            name.push(".levcs-review-tmp");
-            t.set_file_name(name);
-            t
-        }
-        None => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "target has no file name",
-            ))
-        }
-    };
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, target)?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::ops::Range;
+    use std::path::PathBuf;
 
     fn entry(path: &str, regions: usize) -> FileEntry {
         let conflict_regions: Vec<ConflictRegion> = (0..regions)
@@ -397,11 +379,11 @@ mod tests {
         // Skipped file untouched.
         assert_eq!(std::fs::read(dir.join("c.txt")).unwrap(), b"original-c");
 
-        // No leftover .levcs-review-tmp files — atomic rename completed.
+        // No leftover temp files — atomic rename completed.
         for ent in std::fs::read_dir(&dir).unwrap() {
             let name = ent.unwrap().file_name().into_string().unwrap();
             assert!(
-                !name.contains(".levcs-review-tmp"),
+                !name.starts_with(".levcs-write"),
                 "atomic temp leaked: {name}"
             );
         }
@@ -483,6 +465,39 @@ mod tests {
         s.quit();
         assert!(s.quitting);
         assert_eq!(s.current_resolution(), Resolution::AcceptOurs);
+    }
+
+    /// Review application wrote the merge record's paths joined onto the
+    /// working tree, through any symlinked directory, and stopped part way
+    /// when one failed. Now every path is checked before the first write.
+    #[cfg(unix)]
+    #[test]
+    fn apply_does_not_follow_symlinks_and_checks_before_writing() {
+        let base = tempdir();
+        let (dir, outside) = (base.join("w"), base.join("outside"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(dir.join("a.txt"), b"original-a").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("nested")).unwrap();
+
+        let mut s = ReviewState::new(vec![entry("a.txt", 1), entry("nested/leaf.txt", 1)]);
+        s.accept_ours();
+        s.move_down();
+        s.accept_ours();
+        assert!(s.apply(&dir).is_err());
+        assert!(
+            !outside.join("leaf.txt").exists(),
+            "written through the symlink"
+        );
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"original-a");
+
+        for bad in ["../escape.txt", ".levcs/config"] {
+            let mut s = ReviewState::new(vec![entry(bad, 1)]);
+            s.accept_ours();
+            assert!(s.apply(&dir).is_err(), "{bad} accepted");
+        }
+        assert!(!base.join("escape.txt").exists());
+        std::fs::remove_dir_all(&base).ok();
     }
 
     fn tempdir() -> PathBuf {

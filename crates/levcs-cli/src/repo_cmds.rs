@@ -183,6 +183,10 @@ pub fn track(args: TrackArgs) -> Result<()> {
             .strip_prefix(&repo.workdir)?
             .to_string_lossy()
             .replace('\\', "/");
+        // What checkout would refuse to write is refused here, so that no
+        // commit holds a tree its own checkout cannot materialise. A named
+        // `.levcs/config` used to be tracked.
+        levcs_core::worktree::components(&rel).map_err(|e| anyhow!("refusing to track: {e}"))?;
         let bytes = fs::read(&path)?;
         let blob = Blob::new(bytes.clone());
         let id = repo.objects.write_raw(&blob.serialize())?;
@@ -238,7 +242,6 @@ pub fn track(args: TrackArgs) -> Result<()> {
 /// being wrong.
 pub fn forget(args: ForgetArgs) -> Result<()> {
     let (repo, _lock) = open_repo_locked()?;
-    let root = repo_root(&repo);
     let mut idx = load_index(&repo)?;
     let restrict = normalize_paths(&repo, &args.paths)?;
     if restrict.is_empty() {
@@ -272,6 +275,7 @@ pub fn forget(args: ForgetArgs) -> Result<()> {
     targets.sort();
     targets.dedup();
 
+    let wt = levcs_core::worktree::open(&repo.workdir)?;
     // Untrack first and persist that, so the reported state is the state on
     // disk even if a delete then fails. The index write is the part that must
     // not be left inconsistent.
@@ -283,13 +287,12 @@ pub fn forget(args: ForgetArgs) -> Result<()> {
     let mut failed: Vec<String> = Vec::new();
     for path in &targets {
         if args.delete {
-            match fs::remove_file(root.join(path)) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    failed.push(format!("{path}: {e}"));
-                    continue;
-                }
+            // Through the working tree's descriptor: a directory on the
+            // way that had become a symlink used to send the delete to a
+            // file outside the repository.
+            if let Err(e) = wt.remove_file(path) {
+                failed.push(format!("{path}: {e}"));
+                continue;
             }
         }
         println!(
@@ -982,33 +985,45 @@ pub fn construct(args: ConstructArgs) -> Result<()> {
         return Ok(());
     }
 
-    // Path-restricted reconstruction.
-    let root = repo_root(&repo);
+    // Path-restricted reconstruction. The whole selection is listed and
+    // checked before anything is written, as a checkout is, and written
+    // through the working tree's own descriptor: a directory on the way that
+    // is a symlink is refused, and a file that is one is replaced, not
+    // written through. Each path used to be checked and written in turn, by
+    // joined pathname, so `construct a.txt dir/b.txt` overwrote `a.txt`
+    // before finding `dir` was a symlink.
+    let mut files: Vec<levcs_core::repo::TreeFile> = Vec::new();
     for rel_str in normalize_paths(&repo, &paths)? {
-        let abs = root.join(&rel_str);
         let entry = repo
-            .lookup_path(tree_id, &rel_str)?
+            .lookup_entry(tree_id, &rel_str)?
             .ok_or_else(|| anyhow!("path not in tree: {rel_str}"))?;
-        match entry.0 {
-            levcs_core::EntryType::Blob => {
-                let blob = repo.objects.read_typed(entry.1, ObjectType::Blob)?;
-                if !args.all && abs.is_file() {
-                    let cur = fs::read(&abs)?;
-                    if cur == blob.body {
-                        continue;
-                    }
-                }
-                if let Some(parent) = abs.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::write(&abs, blob.body)?;
-            }
-            levcs_core::EntryType::Tree => {
-                fs::create_dir_all(&abs)?;
-                repo.checkout_tree(entry.1, &abs)?;
-            }
+        match entry.entry_type {
+            levcs_core::EntryType::Blob => files.push(levcs_core::repo::TreeFile {
+                path: rel_str,
+                blob: entry.hash,
+                executable: entry.mode.is_executable(),
+            }),
+            levcs_core::EntryType::Tree => files.extend(repo.tree_files(entry.hash, &rel_str)?),
         }
     }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    files.dedup_by(|a, b| a.path == b.path);
+    if !args.all {
+        // A file is left alone only if it is a regular file that already
+        // holds the blob, with the mode the tree gives it. Comparing
+        // contents alone left a mode-only change unrestored, reported as
+        // done.
+        let wt = levcs_core::worktree::open(&repo.workdir)?;
+        let mut stale = Vec::with_capacity(files.len());
+        for f in files {
+            let blob = repo.objects.read_typed(f.blob, ObjectType::Blob)?;
+            if !wt.holds(&f.path, &blob.body, f.perms())? {
+                stale.push(f);
+            }
+        }
+        files = stale;
+    }
+    repo.checkout_files(&files, &repo.workdir)?;
     eprintln!("constructed paths from tree {}", tree_id);
     Ok(())
 }
@@ -1197,14 +1212,18 @@ pub fn branch(args: BranchArgs) -> Result<()> {
             .refs
             .read(&format!("refs/branches/{name}"))?
             .ok_or_else(|| anyhow!("no such branch: {name}"))?;
-        repo.refs
-            .write_head(&Head::Branch(format!("refs/branches/{name}")))?;
         let raw = repo.read_raw_object(target)?;
         let tree_id = match raw.object_type {
             ObjectType::Commit => Commit::parse_body(&raw.body)?.tree,
             _ => bail!("branch tip is not a commit"),
         };
+        // Materialize first: checkout validates the whole tree and refuses
+        // before writing anything it cannot write safely. HEAD and the
+        // index move only once the files are in place, so a refused switch
+        // leaves the repository where it was. HEAD used to move first.
         repo.checkout_tree(tree_id, &repo.workdir)?;
+        repo.refs
+            .write_head(&Head::Branch(format!("refs/branches/{name}")))?;
         // Refresh the index from the new tree. Without this the index
         // keeps the previous branch's blob hashes — invisible to most
         // workflows because the next `commit` rebuilds the index from
@@ -1332,12 +1351,16 @@ fn merge_run(args: MergeArgs) -> Result<()> {
     // Fast-forward: HEAD is an ancestor of theirs, no merge commit needed.
     if base_id == head {
         let theirs_commit = Commit::from_signed(&repo.read_signed(theirs_id)?)?;
+        // Files first, then the ref, then the index: a refused checkout
+        // must not leave the branch moved over a working tree it never
+        // reached. The ref used to move first.
+        repo.checkout_tree(theirs_commit.tree, &repo.workdir)?;
         if let Some(branch_ref) = repo.current_branch()? {
-            repo.refs.write(&branch_ref, theirs_id)?;
+            repo.refs
+                .compare_and_write(&branch_ref, Some(head), theirs_id)?;
         } else {
             repo.refs.write_head(&Head::Detached(theirs_id))?;
         }
-        repo.checkout_tree(theirs_commit.tree, &repo.workdir)?;
         // Refresh index from the new tree.
         let mut idx = Index::new();
         rebuild_index_from_tree(&repo, theirs_commit.tree, "", &mut idx)?;
@@ -1570,17 +1593,28 @@ fn merge_run(args: MergeArgs) -> Result<()> {
         );
     }
 
-    // Apply to working tree.
-    for (path, bytes) in &merged_files {
-        let abs = repo.workdir.join(path);
-        if let Some(parent) = abs.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&abs, bytes)?;
+    // Apply to the working tree through its own descriptor: every path is
+    // checked, and every existing directory on the way confirmed real,
+    // before the first write. Writes never follow a symlink, and replace
+    // rather than write through a linked file. These used to be
+    // `fs::write` and `fs::remove_file` on joined paths, so a symlinked
+    // directory in the working tree sent merge output outside it.
+    let mut writes: Vec<(&String, &Vec<u8>)> = merged_files.iter().collect();
+    writes.sort();
+    let mut deletes: Vec<&String> = deleted_files.iter().collect();
+    deletes.sort();
+    let wt = levcs_core::worktree::open(&repo.workdir)?;
+    wt.preflight(
+        writes
+            .iter()
+            .map(|(p, _)| p.as_str())
+            .chain(deletes.iter().map(|p| p.as_str())),
+    )?;
+    for (path, bytes) in writes {
+        wt.write_file(path, bytes, levcs_core::worktree::Perms::Keep)?;
     }
-    for path in &deleted_files {
-        let abs = repo.workdir.join(path);
-        let _ = fs::remove_file(&abs);
+    for path in deletes {
+        wt.remove_file(path)?;
     }
 
     // Refresh the index to reflect post-merge content. Tracked entries are
@@ -2425,6 +2459,13 @@ pub fn cache(args: CacheArgs) -> Result<()> {
         }
         return Ok(());
     }
+    // An id names one entry of the cache directory. `--drop ../..` used to
+    // remove `.levcs` itself.
+    for id in [&args.drop, &args.restore].into_iter().flatten() {
+        if id.is_empty() || id == "." || id == ".." || id.contains(['/', '\\', '\0']) {
+            bail!("no such cache: {id:?}");
+        }
+    }
     if let Some(id) = args.drop {
         let path = dir.join(&id);
         if path.exists() {
@@ -2438,7 +2479,17 @@ pub fn cache(args: CacheArgs) -> Result<()> {
         if !src.is_dir() {
             bail!("no such cache: {id}");
         }
-        copy_dir_recursive(&src, &repo.workdir)?;
+        // Listed and checked in full, then written through the working
+        // tree's descriptor like a checkout. This used to copy by joined
+        // pathname, through any symlinked directory in the working tree,
+        // and copied the cache's own `.message` into it.
+        let mut files = Vec::new();
+        cached_files(&src, "", &mut files)?;
+        let wt = levcs_core::worktree::open(&repo.workdir)?;
+        wt.preflight(files.iter().map(|(rel, _, _)| rel.as_str()))?;
+        for (rel, path, perms) in &files {
+            wt.write_file(rel, &fs::read(path)?, *perms)?;
+        }
         eprintln!("restored {id}");
         return Ok(());
     }
@@ -2465,20 +2516,41 @@ pub fn cache(args: CacheArgs) -> Result<()> {
     Ok(())
 }
 
-fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
-    for ent in fs::read_dir(src)? {
+/// The files of a saved cache, as (working-tree path, cache path, perms).
+/// `save` writes regular files only, so anything else is refused.
+fn cached_files(
+    dir: &Path,
+    prefix: &str,
+    out: &mut Vec<(String, PathBuf, levcs_core::worktree::Perms)>,
+) -> Result<()> {
+    use levcs_core::worktree::Perms;
+    for ent in fs::read_dir(dir)? {
         let ent = ent?;
-        let p = ent.path();
-        let rel = p.strip_prefix(src)?;
-        let t = dest.join(rel);
-        if p.is_dir() {
-            fs::create_dir_all(&t)?;
-            copy_dir_recursive(&p, &t)?;
+        let name = ent.file_name();
+        let name = name
+            .to_str()
+            .ok_or_else(|| anyhow!("cache entry {:?} is not UTF-8", ent.path()))?;
+        if prefix.is_empty() && name == ".message" {
+            continue;
+        }
+        let rel = if prefix.is_empty() {
+            name.to_string()
         } else {
-            if let Some(parent) = t.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::copy(&p, &t)?;
+            format!("{prefix}/{name}")
+        };
+        let meta = fs::symlink_metadata(ent.path())?;
+        if meta.is_dir() {
+            cached_files(&ent.path(), &rel, out)?;
+        } else if meta.is_file() {
+            // The mode `save` copied, so a private file comes back private.
+            // Only the executable bit used to be carried.
+            #[cfg(unix)]
+            let perms = Perms::Exact(std::os::unix::fs::PermissionsExt::mode(&meta.permissions()));
+            #[cfg(not(unix))]
+            let perms = Perms::Regular;
+            out.push((rel, ent.path(), perms));
+        } else {
+            bail!("cache entry {:?} is not a regular file", ent.path());
         }
     }
     Ok(())

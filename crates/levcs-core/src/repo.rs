@@ -29,8 +29,29 @@ use crate::object::{ObjectType, RawObject, SignedObject};
 use crate::refs::{Head, Refs};
 use crate::store::ObjectStore;
 use crate::tree::{EntryType, FileMode, Tree, TreeEntry};
+use crate::worktree::{self, Perms, Worktree};
 
 pub const LEVCS_DIR: &str = ".levcs";
+
+/// A file a tree puts in a working tree: its checked repository-relative
+/// path, its blob, and whether it is executable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TreeFile {
+    pub path: String,
+    pub blob: ObjectId,
+    pub executable: bool,
+}
+
+impl TreeFile {
+    /// The permissions the tree gives this file.
+    pub fn perms(&self) -> Perms {
+        if self.executable {
+            Perms::Executable
+        } else {
+            Perms::Regular
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Repository {
@@ -210,6 +231,10 @@ impl Repository {
             if !e.flags.is_tracked() {
                 continue;
             }
+            // Never commit a tree that checkout would refuse. `track` checks
+            // too; this covers an index written before it did.
+            worktree::components(&e.path)
+                .map_err(|err| Error::Other(format!("cannot commit: {err}")))?;
             node.insert(&e.path, e.blob_hash, mode_from_index(e.mode));
         }
         node.write(self)
@@ -222,6 +247,8 @@ impl Repository {
         for path in self.walk_workdir()? {
             let rel = path.strip_prefix(&self.workdir).unwrap();
             let rel_str = rel.to_string_lossy().replace('\\', "/");
+            worktree::components(&rel_str)
+                .map_err(|err| Error::Other(format!("cannot commit: {err}")))?;
             let bytes = fs::read(&path).ctx(path.clone())?;
             let blob = crate::blob::Blob::new(bytes);
             let id = self.objects.write_raw(&blob.serialize())?;
@@ -230,42 +257,80 @@ impl Repository {
         node.write(self)
     }
 
-    /// Materialize a tree into the working directory at `prefix`. Existing
-    /// files are overwritten. The top-level `.levcs` entry (if any) is
-    /// skipped so authority-modifying commits do not clobber the repository's
-    /// own metadata directory; that entry exists only for verification.
-    pub fn checkout_tree(&self, tree_id: ObjectId, prefix: &Path) -> Result<()> {
-        self.checkout_tree_inner(tree_id, prefix, true)
+    /// Every file `tree_id` would put in a working tree, each path checked
+    /// by [`worktree::components`]. `prefix` is where the tree goes,
+    /// relative to the working tree; "" is its root. At the root, the
+    /// tree's own `.levcs` entry is synthetic history (an authority, a merge
+    /// record) and is skipped, so that it never overwrites the repository's
+    /// metadata. Any other component named `.levcs` refuses the whole tree.
+    pub fn tree_files(&self, tree_id: ObjectId, prefix: &str) -> Result<Vec<TreeFile>> {
+        let mut out = Vec::new();
+        self.tree_files_into(tree_id, prefix, prefix.is_empty(), &mut out)?;
+        Ok(out)
     }
 
-    fn checkout_tree_inner(&self, tree_id: ObjectId, prefix: &Path, top_level: bool) -> Result<()> {
+    fn tree_files_into(
+        &self,
+        tree_id: ObjectId,
+        prefix: &str,
+        at_root: bool,
+        out: &mut Vec<TreeFile>,
+    ) -> Result<()> {
         let raw = self.objects.read_typed(tree_id, ObjectType::Tree)?;
         let tree = Tree::parse_body(&raw.body)?;
         for e in &tree.entries {
-            if top_level && e.name == ".levcs" {
+            if at_root && e.name == ".levcs" {
                 continue;
             }
-            let target = prefix.join(&e.name);
+            let path = if prefix.is_empty() {
+                e.name.clone()
+            } else {
+                format!("{prefix}/{}", e.name)
+            };
+            worktree::components(&path)?;
             match e.entry_type {
-                EntryType::Tree => {
-                    fs::create_dir_all(&target).ctx(target.clone())?;
-                    self.checkout_tree_inner(e.hash, &target, false)?;
-                }
+                EntryType::Tree => self.tree_files_into(e.hash, &path, false, out)?,
                 EntryType::Blob => {
-                    let blob = self.objects.read_typed(e.hash, ObjectType::Blob)?;
-                    if let Some(parent) = target.parent() {
-                        fs::create_dir_all(parent).ctx(parent.to_path_buf())?;
-                    }
-                    fs::write(&target, &blob.body).ctx(target.clone())?;
-                    #[cfg(unix)]
-                    if e.mode.is_executable() {
-                        use std::os::unix::fs::PermissionsExt;
-                        let mut perms = fs::metadata(&target).ctx(target.clone())?.permissions();
-                        perms.set_mode(0o755);
-                        fs::set_permissions(&target, perms).ctx(target.clone())?;
-                    }
+                    out.push(TreeFile {
+                        path,
+                        blob: e.hash,
+                        executable: e.mode.is_executable(),
+                    });
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Write every file of `tree_id` into the working tree at `dest`.
+    ///
+    /// The whole tree is listed and checked before the first write: its
+    /// names, every blob read and checked against its hash, and no
+    /// directory on the way a symlink.
+    /// Each file is then written by [`Worktree`], which never follows a
+    /// symlink and replaces rather than writes through a link. A failure
+    /// therefore leaves nothing written, short of a working tree changed
+    /// while the checkout runs. Callers move HEAD, refs and the index only
+    /// after this returns.
+    pub fn checkout_tree(&self, tree_id: ObjectId, dest: &Path) -> Result<()> {
+        self.checkout_files(&self.tree_files(tree_id, "")?, dest)
+    }
+
+    /// Write `files` into the working tree at `dest`, as
+    /// [`Self::checkout_tree`] does: every path and blob is checked before
+    /// the first write. For a selection from several trees or subtrees (a
+    /// path-restricted `construct`), which must be checked whole too.
+    pub fn checkout_files(&self, files: &[TreeFile], dest: &Path) -> Result<()> {
+        let wt = Worktree::open(dest)?;
+        // Read twice rather than held: a tree can be larger than memory
+        // should hold, and the second read is from the page cache.
+        for f in files {
+            self.objects.read_typed(f.blob, ObjectType::Blob)?;
+        }
+        wt.preflight(files.iter().map(|f| f.path.as_str()))?;
+        for f in files {
+            let blob = self.objects.read_typed(f.blob, ObjectType::Blob)?;
+            wt.write_file(&f.path, &blob.body, f.perms())?;
         }
         Ok(())
     }
@@ -292,6 +357,13 @@ impl Repository {
         tree_id: ObjectId,
         path: &str,
     ) -> Result<Option<(EntryType, ObjectId)>> {
+        Ok(self
+            .lookup_entry(tree_id, path)?
+            .map(|e| (e.entry_type, e.hash)))
+    }
+
+    /// The tree entry at `path` within a tree, found recursively.
+    pub fn lookup_entry(&self, tree_id: ObjectId, path: &str) -> Result<Option<TreeEntry>> {
         let raw = self.objects.read_typed(tree_id, ObjectType::Tree)?;
         let tree = Tree::parse_body(&raw.body)?;
         let mut comps = path.split('/').filter(|c| !c.is_empty());
@@ -305,10 +377,10 @@ impl Repository {
         };
         let rest: Vec<&str> = comps.collect();
         if rest.is_empty() {
-            Ok(Some((entry.entry_type, entry.hash)))
+            Ok(Some(entry.clone()))
         } else {
             match entry.entry_type {
-                EntryType::Tree => self.lookup_path(entry.hash, &rest.join("/")),
+                EntryType::Tree => self.lookup_entry(entry.hash, &rest.join("/")),
                 EntryType::Blob => Ok(None),
             }
         }

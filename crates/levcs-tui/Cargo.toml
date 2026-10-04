@@ -6,6 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+levcs-core = { workspace = true }
 levcs-merge = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }

@@ -1577,6 +1577,7 @@ dependencies = [
  "glob",
  "hex",
  "proptest",
+ "rustix 1.1.4",
  "serde",
  "thiserror 1.0.69",
 ]
@@ -1711,6 +1712,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "crossterm",
+ "levcs-core",
  "levcs-merge",
  "ratatui",
  "thiserror 1.0.69",

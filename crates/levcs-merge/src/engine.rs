@@ -53,85 +53,53 @@ pub struct MergePolicy {
     pub allowed_handlers: Vec<String>,
 }
 
-/// Handler-aggressiveness rank used by §6.6.3 to enforce the
-/// "per-user config can demote, never promote" rule. The four tiers
-/// match the spec's ordering exactly:
+/// Check `merge.local.toml` rules against the repository's (§6.6.3).
 ///
-///   * `0` — textual fallback (least aggressive)
-///   * `1` — format-aware (json, yaml, toml, xml, markdown, prose)
-///   * `2` — tree-sitter:* built-ins
-///   * `3` — anything else (assumed to be a plugin)
-///
-/// Unknown handler names are treated as plugins (rank 3) so an
-/// unknown-named override always counts as a *promotion* attempt and
-/// can never sneak past the demote-only check by being unrecognised.
-pub fn handler_rank(name: &str) -> u8 {
-    if name == "textual" {
-        return 0;
-    }
-    if matches!(
-        name,
-        "json" | "yaml" | "toml" | "xml" | "markdown" | "prose"
-    ) {
-        return 1;
-    }
-    if name.starts_with("tree-sitter:") && BUILTIN_HANDLERS.contains(&name) {
-        return 2;
-    }
-    // Flow-control labels (ours-only / theirs-only / delete / no-auto /
-    // none) never reach the cascade — they're synthesised by the merge
-    // driver itself. Rank them at 0 so they're conservatively accepted
-    // anywhere.
-    if FLOW_HANDLERS.contains(&name) {
-        return 0;
-    }
-    3
-}
-
-/// Layer a per-user override on top of a repository config (§6.6.3).
-/// The override may add new rules and may *demote* a rule's handler
-/// (replace it with a lower-rank one), but MUST NOT *promote* — the
-/// motivating example is "I don't trust the Rust handler today, force
-/// `*.rs` back to textual." Returns the merged config or, on
-/// promotion attempt, the offending glob.
-pub fn layer_local_over(repo: &MergeConfig, local: &MergeConfig) -> Result<MergeConfig, String> {
-    let mut merged = repo.clone();
-    for local_rule in &local.rules {
-        let local_rank = handler_rank(&local_rule.handler);
-        // For each matching glob in the repo config, the override
-        // rank MUST be ≤ the existing rank. If the glob is new,
-        // anything goes — there's no prior rank to compare against,
-        // and the worst case is a path that previously fell to the
-        // built-in default cascade.
-        if let Some(existing) = repo.rules.iter().find(|r| r.glob == local_rule.glob) {
-            let existing_rank = handler_rank(&existing.handler);
-            if local_rank > existing_rank {
+/// A local rule may keep the repository's handler for its pattern or choose
+/// `textual`, and nothing else. The old rule ranked handlers and refused
+/// only a step up in rank, which still let a local rule switch between
+/// unrelated structural handlers, or name any handler at all under a new
+/// pattern. This check is per pattern. `CascadeEngine::select` repeats it
+/// per path, which also catches local patterns that overlap the
+/// repository's differently.
+pub fn check_local_rules(repo: &MergeConfig, local: &MergeConfig) -> Result<(), String> {
+    for rule in &local.rules {
+        if rule.handler == "textual" {
+            continue;
+        }
+        match repo.rules.iter().find(|r| r.glob == rule.glob) {
+            Some(r) if r.handler == rule.handler => {}
+            Some(r) => {
                 return Err(format!(
-                    "merge.local.toml may not promote handler aggressiveness: \
-                     glob {:?} would go from rank {existing_rank} ({}) to \
-                     rank {local_rank} ({})",
-                    local_rule.glob, existing.handler, local_rule.handler
-                ));
+                    "merge.local.toml may only keep the repository's handler or choose \
+                     textual: glob {:?} is {} in the repository, not {}",
+                    rule.glob, r.handler, rule.handler
+                ))
+            }
+            None => {
+                return Err(format!(
+                    "merge.local.toml may only keep the repository's handler or choose \
+                     textual: glob {:?} is not in the repository's merge.toml, so it can \
+                     only be textual, not {}",
+                    rule.glob, rule.handler
+                ))
             }
         }
-        // Replace the matching rule, or append.
-        if let Some(slot) = merged.rules.iter_mut().find(|r| r.glob == local_rule.glob) {
-            slot.handler = local_rule.handler.clone();
-        } else {
-            merged.rules.push(local_rule.clone());
-        }
     }
-    // Per-user config does NOT touch policy.allowed_handlers or
-    // [[plugin]] entries — those live in repo config exclusively.
-    // Local plugin sources would be a separate trust escalation.
-    Ok(merged)
+    if !local.plugins.is_empty() {
+        return Err("merge.local.toml may not declare plugins".into());
+    }
+    Ok(())
 }
 
 pub struct CascadeEngine {
     /// Handlers indexed by name.
     handlers: Vec<Arc<dyn MergeHandler>>,
-    /// User-supplied rules; checked first in order.
+    /// The repository's rules, in order; the first match selects.
     rules: Vec<MergeRule>,
+    /// Per-user rules from `merge.local.toml`, in order. A matching one may
+    /// only keep the repository's choice for the path or choose `textual`.
+    local_rules: Vec<MergeRule>,
     /// Always-applicable last-resort handler (textual).
     fallback: Arc<dyn MergeHandler>,
 }
@@ -154,6 +122,7 @@ impl Default for CascadeEngine {
         Self {
             handlers,
             rules: Vec::new(),
+            local_rules: Vec::new(),
             fallback: textual,
         }
     }
@@ -203,38 +172,98 @@ impl CascadeEngine {
         self.handlers.push(h);
     }
 
-    /// Locate the handler that should run for `path`, considering rules then
-    /// extension defaults.
-    fn pick(&self, path: &Path) -> Option<Arc<dyn MergeHandler>> {
-        let path_str = path.to_string_lossy();
-        for rule in &self.rules {
-            if let Ok(pat) = Pattern::new(&rule.glob) {
-                if pat.matches(&path_str) {
-                    if let Some(h) = self.handlers.iter().find(|h| h.name() == rule.handler) {
-                        return Some(h.clone());
-                    }
-                }
+    /// Add `merge.local.toml` rules over the repository's, after checking
+    /// them with [`check_local_rules`].
+    pub fn with_local_overrides(
+        mut self,
+        repo: &MergeConfig,
+        local: &MergeConfig,
+    ) -> Result<Self, String> {
+        check_local_rules(repo, local)?;
+        self.local_rules = local.rules.clone();
+        Ok(self)
+    }
+
+    /// Every rule must name a registered handler. A rule naming an unknown
+    /// handler used to fall through silently to the extension default, so
+    /// a typo changed how files merged without saying so.
+    pub fn validate(&self) -> Result<(), String> {
+        for rule in self.rules.iter().chain(&self.local_rules) {
+            Pattern::new(&rule.glob)
+                .map_err(|e| format!("merge rule glob {:?} is invalid: {e}", rule.glob))?;
+            if !self.handlers.iter().any(|h| h.name() == rule.handler) {
+                return Err(format!(
+                    "merge rule for {:?} names handler {:?}, which is not available",
+                    rule.glob, rule.handler
+                ));
             }
         }
-        // Default cascade by extension.
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        let pref: String = match ext {
-            "json" => "json".into(),
-            "toml" => "toml".into(),
-            "yaml" | "yml" => "yaml".into(),
-            "xml" | "svg" | "html" => "xml".into(),
-            "md" | "markdown" => "markdown".into(),
-            "txt" => "prose".into(),
-            other => match Lang::from_extension(other) {
-                Some(lang) => lang.handler_name().to_string(),
-                None => "textual".into(),
-            },
-        };
-        self.handlers.iter().find(|h| h.name() == pref).cloned()
+        Ok(())
+    }
+
+    fn first_match<'r>(rules: &'r [MergeRule], path: &str) -> Option<&'r MergeRule> {
+        rules.iter().find(|r| {
+            Pattern::new(&r.glob)
+                .map(|p| p.matches(path))
+                .unwrap_or(false)
+        })
+    }
+
+    /// The handler that merges `path`. Without a matching rule, `textual`.
+    ///
+    /// The structural handlers used to be the default by file extension,
+    /// and they lose, invent and reorder content under disjoint edits while
+    /// reporting a clean merge (audit 2026-10-03, finding C5). They now run
+    /// only where the repository's `merge.toml` selects them. A matching
+    /// local rule may keep that choice or choose `textual`; any other choice
+    /// is an error naming the rule.
+    pub fn select(&self, path: &Path) -> Result<String, String> {
+        let p = path.to_string_lossy();
+        let repo_choice = Self::first_match(&self.rules, &p)
+            .map(|r| r.handler.clone())
+            .unwrap_or_else(|| "textual".to_string());
+        match Self::first_match(&self.local_rules, &p) {
+            None => Ok(repo_choice),
+            Some(l) if l.handler == "textual" => Ok("textual".into()),
+            Some(l) if l.handler == repo_choice => Ok(repo_choice),
+            Some(l) => Err(format!(
+                "merge.local.toml rule {:?} selects {} for {p}, where the repository \
+                 selects {repo_choice}; a local rule may only keep that or choose textual",
+                l.glob, l.handler
+            )),
+        }
+    }
+
+    /// The handler for `path`. Callers check [`Self::select`] first; if a
+    /// local rule is invalid for this path, merge with `textual`.
+    fn pick(&self, path: &Path) -> Option<Arc<dyn MergeHandler>> {
+        let name = self.select(path).unwrap_or_else(|_| "textual".into());
+        self.handlers.iter().find(|h| h.name() == name).cloned()
     }
 
     pub fn merge_file(&self, path: &Path, base: &[u8], ours: &[u8], theirs: &[u8]) -> MergeResult {
-        if let Some(h) = self.pick(path) {
+        // Binary content is never merged by a built-in handler, whichever
+        // one the configuration selects: divergent edits stay a conflict,
+        // and the working file keeps ours, byte for byte. A plugin selected
+        // by rule decides for itself.
+        let binary = crate::textual::looks_binary(base)
+            || crate::textual::looks_binary(ours)
+            || crate::textual::looks_binary(theirs);
+        let selected = self.pick(path);
+        if binary
+            && selected
+                .as_ref()
+                .is_none_or(|h| is_builtin_handler(h.name()))
+        {
+            return MergeResult {
+                handler: "none".into(),
+                status: MergeStatus::Conflict {
+                    regions: vec![],
+                    partial: ours.to_vec(),
+                },
+            };
+        }
+        if let Some(h) = selected {
             if h.applicable(path, base, ours, theirs) {
                 let result = h.merge(path, base, ours, theirs);
                 if !matches!(result.status, MergeStatus::NotApplicable) {
@@ -406,120 +435,165 @@ mod tests {
         assert!(check_handler_allowed("delete", "", &allow));
     }
 
-    #[test]
-    fn handler_rank_matches_spec_tiers() {
-        assert_eq!(handler_rank("textual"), 0);
-        assert_eq!(handler_rank("json"), 1);
-        assert_eq!(handler_rank("toml"), 1);
-        assert_eq!(handler_rank("yaml"), 1);
-        assert_eq!(handler_rank("xml"), 1);
-        assert_eq!(handler_rank("markdown"), 1);
-        assert_eq!(handler_rank("prose"), 1);
-        assert_eq!(handler_rank("tree-sitter:rust"), 2);
-        assert_eq!(handler_rank("tree-sitter:python"), 2);
-        // Unknown / plugin-shaped names always rank as plugins so an
-        // attacker can't sneak a promotion past the check by typoing.
-        assert_eq!(handler_rank("tree-sitter:protobuf"), 3);
-        assert_eq!(handler_rank("custom-plugin"), 3);
+    fn rules(pairs: &[(&str, &str)]) -> MergeConfig {
+        MergeConfig {
+            schema_version: 1,
+            rules: pairs
+                .iter()
+                .map(|(g, h)| MergeRule {
+                    glob: g.to_string(),
+                    handler: h.to_string(),
+                })
+                .collect(),
+            plugins: vec![],
+            policy: None,
+        }
     }
 
     #[test]
-    fn layer_local_demotes_rs_to_textual() {
-        // Spec example verbatim: user pins `*.rs` back to textual when
-        // they don't trust the Rust handler today.
-        let repo = MergeConfig {
-            schema_version: 1,
-            rules: vec![MergeRule {
-                glob: "*.rs".into(),
-                handler: "tree-sitter:rust".into(),
-            }],
-            plugins: vec![],
-            policy: None,
-        };
-        let local = MergeConfig {
-            schema_version: 1,
-            rules: vec![MergeRule {
-                glob: "*.rs".into(),
-                handler: "textual".into(),
-            }],
-            plugins: vec![],
-            policy: None,
-        };
-        let merged = layer_local_over(&repo, &local).expect("demote allowed");
-        assert_eq!(merged.rules.len(), 1);
-        assert_eq!(merged.rules[0].handler, "textual");
+    fn without_a_rule_every_file_merges_textually() {
+        let e = CascadeEngine::default();
+        for p in [
+            "a.json", "b.md", "c.rs", "d.toml", "e.yaml", "f.py", "g.txt", "h",
+        ] {
+            assert_eq!(e.select(Path::new(p)).unwrap(), "textual", "{p}");
+        }
+        let r = e.merge_file(Path::new("x.json"), b"{}\n", b"{\"a\":1}\n", b"{}\n");
+        assert_eq!(r.handler, "textual");
     }
 
     #[test]
-    fn layer_local_rejects_promotion() {
-        // Repo config pins `*.rs` to textual; user tries to promote
-        // it to tree-sitter. Spec says this MUST be rejected.
-        let repo = MergeConfig {
-            schema_version: 1,
-            rules: vec![MergeRule {
-                glob: "*.rs".into(),
-                handler: "textual".into(),
-            }],
-            plugins: vec![],
-            policy: None,
-        };
-        let local = MergeConfig {
-            schema_version: 1,
-            rules: vec![MergeRule {
-                glob: "*.rs".into(),
-                handler: "tree-sitter:rust".into(),
-            }],
-            plugins: vec![],
-            policy: None,
-        };
-        let err = layer_local_over(&repo, &local).expect_err("must reject");
-        assert!(
-            err.contains("promote"),
-            "error must mention promotion: {err}"
+    fn a_repository_rule_opts_a_path_into_a_structural_handler() {
+        let e = CascadeEngine::default().with_config(rules(&[("*.json", "json")]));
+        assert_eq!(e.select(Path::new("a.json")).unwrap(), "json");
+        assert_eq!(e.select(Path::new("a.md")).unwrap(), "textual");
+    }
+
+    #[test]
+    fn a_local_rule_may_keep_the_repository_handler_or_choose_textual() {
+        let repo = rules(&[("*.rs", "tree-sitter:rust")]);
+        let keep = rules(&[("*.rs", "tree-sitter:rust")]);
+        let demote = rules(&[("*.rs", "textual"), ("vendored/**", "textual")]);
+        let e = CascadeEngine::default()
+            .with_config(repo.clone())
+            .with_local_overrides(&repo, &keep)
+            .unwrap();
+        assert_eq!(e.select(Path::new("a.rs")).unwrap(), "tree-sitter:rust");
+        let e = CascadeEngine::default()
+            .with_config(repo.clone())
+            .with_local_overrides(&repo, &demote)
+            .unwrap();
+        assert_eq!(e.select(Path::new("a.rs")).unwrap(), "textual");
+        assert_eq!(e.select(Path::new("vendored/x.c")).unwrap(), "textual");
+    }
+
+    #[test]
+    fn a_local_rule_cannot_switch_structural_handlers_or_add_one() {
+        let repo = rules(&[("*.rs", "tree-sitter:rust"), ("*.md", "textual")]);
+        // Same rank as the repository's handler, but a different handler.
+        let switch = rules(&[("*.rs", "tree-sitter:python")]);
+        assert!(check_local_rules(&repo, &switch).is_err());
+        // A new pattern can only be textual.
+        let new_pattern = rules(&[("*.json", "json")]);
+        assert!(check_local_rules(&repo, &new_pattern).is_err());
+        // A repository textual rule cannot be raised.
+        let raise = rules(&[("*.md", "markdown")]);
+        assert!(check_local_rules(&repo, &raise).is_err());
+    }
+
+    #[test]
+    fn overlapping_local_patterns_are_checked_per_path() {
+        // The repository selects textual for special/*.json and json
+        // elsewhere. A local *.json -> json passes the per-pattern check
+        // (it keeps the repository's *.json choice) but would promote
+        // special/a.json, so selecting that path is an error.
+        let repo = rules(&[("special/*.json", "textual"), ("*.json", "json")]);
+        let local = rules(&[("*.json", "json")]);
+        let e = CascadeEngine::default()
+            .with_config(repo.clone())
+            .with_local_overrides(&repo, &local)
+            .unwrap();
+        assert_eq!(e.select(Path::new("a.json")).unwrap(), "json");
+        let err = e.select(Path::new("special/a.json")).unwrap_err();
+        assert!(err.contains("special/a.json"), "{err}");
+        // pick never promotes, even if a caller skips select.
+        let r = e.merge_file(
+            Path::new("special/a.json"),
+            b"{}\n",
+            b"{}\n",
+            b"{\"x\":1}\n",
         );
+        assert_eq!(r.handler, "textual");
     }
 
     #[test]
-    fn layer_local_appends_new_glob() {
-        // No matching repo rule means the user's override establishes
-        // a new policy. Anything goes — we accept it because there's
-        // nothing to compare against.
-        let repo = MergeConfig::default();
-        let local = MergeConfig {
-            schema_version: 1,
-            rules: vec![MergeRule {
-                glob: "vendored/**".into(),
-                handler: "textual".into(),
-            }],
-            plugins: vec![],
-            policy: None,
-        };
-        let merged = layer_local_over(&repo, &local).unwrap();
-        assert_eq!(merged.rules.len(), 1);
-        assert_eq!(merged.rules[0].glob, "vendored/**");
+    fn duplicate_rules_resolve_to_the_first_match() {
+        // Duplicate repository globs: the first one is the repository's
+        // choice, and a local rule keeping a later duplicate's handler is
+        // not keeping the repository's choice.
+        let repo = rules(&[("*.json", "textual"), ("*.json", "json")]);
+        let e = CascadeEngine::default().with_config(repo.clone());
+        assert_eq!(e.select(Path::new("a.json")).unwrap(), "textual");
+        assert!(check_local_rules(&repo, &rules(&[("*.json", "json")])).is_err());
+        // Duplicate local globs: the first matching local rule applies.
+        let repo = rules(&[("*.json", "json")]);
+        let local = rules(&[("*.json", "textual"), ("*.json", "json")]);
+        let e = CascadeEngine::default()
+            .with_config(repo.clone())
+            .with_local_overrides(&repo, &local)
+            .unwrap();
+        assert_eq!(e.select(Path::new("a.json")).unwrap(), "textual");
     }
 
     #[test]
-    fn layer_local_rejects_promotion_to_plugin() {
-        let repo = MergeConfig {
-            schema_version: 1,
-            rules: vec![MergeRule {
-                glob: "*.proto".into(),
-                handler: "textual".into(),
-            }],
-            plugins: vec![],
-            policy: None,
-        };
-        let local = MergeConfig {
-            schema_version: 1,
-            rules: vec![MergeRule {
-                glob: "*.proto".into(),
-                handler: "tree-sitter:protobuf".into(),
-            }],
-            plugins: vec![],
-            policy: None,
-        };
-        assert!(layer_local_over(&repo, &local).is_err());
+    fn a_rule_naming_an_unavailable_handler_is_an_error() {
+        let e = CascadeEngine::default().with_config(rules(&[("*.proto", "protobuf")]));
+        assert!(e.validate().is_err());
+        let e = CascadeEngine::default().with_config(rules(&[("*.json", "json")]));
+        assert!(e.validate().is_ok());
+    }
+
+    #[test]
+    fn binary_input_reaches_no_builtin_handler_even_by_rule() {
+        // A Markdown handler accepts NUL-containing UTF-8, so the guard is in
+        // the engine, not only in the textual handler's applicability.
+        let e = CascadeEngine::default().with_config(rules(&[("*.md", "markdown")]));
+        for (base, ours, theirs) in [
+            (&b"\0a\n"[..], &b"\0b\n"[..], &b"\0a\n\0c\n"[..]),
+            (&b"a\n"[..], &b"\xffb\n"[..], &b"a\nc\n"[..]),
+        ] {
+            let r = e.merge_file(Path::new("x.md"), base, ours, theirs);
+            assert_eq!(r.handler, "none");
+            match r.status {
+                MergeStatus::Conflict { partial, .. } => assert_eq!(partial, ours),
+                other => panic!("binary input merged: {other:?}"),
+            }
+        }
+        assert!(crate::textual::looks_binary(b"text\0"));
+        assert!(!crate::textual::looks_binary(
+            "plain text, ünïcode".as_bytes()
+        ));
+    }
+
+    #[test]
+    fn the_textual_handler_itself_refuses_binary_input() {
+        // The engine guard covers built-in selections; this covers the
+        // fall-through to textual after a selected plugin declines a file.
+        let t = crate::textual::TextualHandler;
+        assert!(!t.applicable(Path::new("x"), b"\0a\n", b"\0b\n", b"\0c\n"));
+        assert!(!t.applicable(Path::new("x"), b"a\n", b"\xff\n", b"c\n"));
+        assert!(t.applicable(Path::new("x"), b"a\n", b"b\n", b"c\n"));
+    }
+
+    #[test]
+    fn local_config_cannot_declare_plugins() {
+        let mut local = rules(&[]);
+        local.plugins.push(MergePluginEntry {
+            name: "p".into(),
+            source: String::new(),
+            hash: "0".repeat(64),
+        });
+        assert!(check_local_rules(&MergeConfig::default(), &local).is_err());
     }
 
     #[test]

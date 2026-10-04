@@ -22,11 +22,14 @@ BLAKE3, signed with Ed25519, and built to fix what git can't.
 - **Federation is first-class.** Every repo has a global `repo_id`
   (BLAKE3 of its genesis authority); instances mirror each other in
   three storage modes (full / release-only / metadata-only).
-- **Merge is a cascade**, not a line-level diff. Per-file dispatch to
-  a handler ranked by aggressiveness: textual fallback, format-aware
-  (JSON / YAML / TOML / XML / Markdown / prose), tree-sitter for
-  source code (Rust, Python, JS/TS, Go, C/C++, Java, Ruby, Bash), and
-  wasm-sandboxed plugins for the long tail.
+- **Merge is configurable per file.** By default every file merges with a
+  line-level three-way diff. A repository's `.levcs/merge.toml` can opt
+  paths into format-aware handlers (JSON / YAML / TOML / XML / Markdown /
+  prose), tree-sitter handlers for source code (Rust, Python, JS/TS, Go,
+  C/C++, Java, Ruby, Bash), or wasm-sandboxed plugins. The structural
+  handlers are opt-in because they can lose, invent or reorder content
+  while reporting a clean merge; they stay that way until a validator can
+  confirm their output.
 - **BLAKE3, not SHA-1.** Tree-hashed, ~5 GiB/s on a laptop, 32-byte
   IDs everywhere.
 - **Releases are signed objects**, not mutable name pointers.
@@ -201,12 +204,30 @@ levcs merge feature/x
 `merge` reports each file and the handler that resolved it:
 
 ```
-AUTO     note.md  (markdown)
+AUTO     note.md  (textual)
 
 merge summary:
   auto-resolved: 1
   conflicts:     0
 ```
+
+A merge with conflicts cannot be committed until each conflicted file is
+resolved explicitly. Some conflicts have no markers: a binary file keeps
+your version, byte for byte, and a file one side deleted and the other
+edited keeps the edited version. So resolution is a decision you name:
+
+```sh
+levcs status                      # lists the unresolved conflicts
+levcs track path/to/file          # after editing it: mark it resolved
+levcs forget --delete path/to/file  # or resolve it by deleting it
+levcs commit -m "merge feature/x"
+```
+
+`track --all` and a directory argument never resolve a conflict; only
+naming the file does. While a merge is in progress, `branch --switch` is
+refused: finish the merge with `commit`, or abandon it with `merge --abort`.
+Files containing NUL bytes, or that are not UTF-8, are never line-merged:
+divergent edits to them are always a conflict.
 
 To step through a merge rather than take it wholesale, and to abandon one
 that went badly:

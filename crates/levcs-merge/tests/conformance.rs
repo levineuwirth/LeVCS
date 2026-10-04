@@ -24,7 +24,7 @@
 
 use std::path::{Path, PathBuf};
 
-use levcs_merge::engine::CascadeEngine;
+use levcs_merge::engine::{CascadeEngine, MergeConfig, MergeRule};
 use levcs_merge::handler::MergeStatus;
 use serde::Deserialize;
 
@@ -132,7 +132,19 @@ fn run_scenario(dir: &Path) -> Result<(), String> {
     let theirs = std::fs::read(dir.join(format!("theirs.{ext}")))
         .map_err(|e| format!("read theirs.{ext}: {e}"))?;
 
-    let engine = CascadeEngine::default();
+    // The structural handlers run only where the repository's merge.toml
+    // selects them, so each scenario selects the handler it documents for
+    // its own path. `default_engine_merges_every_scenario_textually` covers
+    // what happens without that rule.
+    let engine = CascadeEngine::default().with_config(MergeConfig {
+        schema_version: 1,
+        rules: vec![MergeRule {
+            glob: manifest.path.clone(),
+            handler: manifest.expected.handler.clone(),
+        }],
+        plugins: vec![],
+        policy: None,
+    });
     let result = engine.merge_file(Path::new(&manifest.path), &base, &ours, &theirs);
 
     if result.handler != manifest.expected.handler {
@@ -266,4 +278,38 @@ fn corpus_runs_clean() {
         "conformance failures:{}",
         failures.join("")
     );
+}
+
+/// Without a rule, no scenario reaches a structural handler: every one is
+/// merged by `textual`. The git-false-conflict scenarios then conflict as
+/// git would; that is the cost of not trusting the structural handlers
+/// until a validator can confirm their output.
+#[test]
+fn default_engine_merges_every_scenario_textually() {
+    for dir in collect_scenarios() {
+        let manifest: Manifest =
+            toml::from_str(&std::fs::read_to_string(dir.join("manifest.toml")).unwrap()).unwrap();
+        let ext = manifest
+            .input_ext
+            .clone()
+            .or_else(|| {
+                Path::new(&manifest.path)
+                    .extension()
+                    .and_then(|e| e.to_str().map(String::from))
+            })
+            .unwrap();
+        let read = |side: &str| std::fs::read(dir.join(format!("{side}.{ext}"))).unwrap();
+        let result = CascadeEngine::default().merge_file(
+            Path::new(&manifest.path),
+            &read("base"),
+            &read("ours"),
+            &read("theirs"),
+        );
+        assert!(
+            result.handler == "textual" || result.handler == "none",
+            "{}: default engine used {}",
+            dir.display(),
+            result.handler
+        );
+    }
 }

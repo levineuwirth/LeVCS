@@ -10,6 +10,7 @@ pub mod ignore;
 pub mod index;
 pub mod lock;
 pub mod object;
+pub mod ref_tx;
 pub mod refs;
 pub mod release;
 pub mod release_cache;

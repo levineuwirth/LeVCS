@@ -222,7 +222,11 @@ fn a_published_merge_whose_cleanup_fails_is_reported_and_not_repeated() {
     std::fs::write(work.join("b.md"), b"b\n").unwrap();
     ok(&work, &cfg, &["track", "a.md", "b.md"]);
     ok(&work, &cfg, &["commit", "-m", "base", "--key", "owner"]);
-    ok(&work, &cfg, &["branch", "--create", "topic"]);
+    ok(
+        &work,
+        &cfg,
+        &["branch", "--create", "topic", "--key", "owner"],
+    );
     std::fs::write(work.join("a.md"), b"main changed a\n").unwrap();
     ok(&work, &cfg, &["commit", "-m", "main", "--key", "owner"]);
     ok(&work, &cfg, &["branch", "--switch", "topic"]);

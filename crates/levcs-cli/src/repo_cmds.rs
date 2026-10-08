@@ -580,6 +580,12 @@ fn path_under(restrict: &[String], p: &str) -> bool {
         .any(|r| r.is_empty() || r == "." || p == r || p.starts_with(&format!("{r}/")))
 }
 
+/// Why nothing can be committed in a repository with no current authority.
+pub(crate) const NO_CURRENT: &str = "this repository has no current authority, so nothing \
+    can be committed or published in it. A replica received by `dial` keeps that history \
+    under refs/remote/… until an owner of the received authority accepts the bootstrap, \
+    and that statement has no defined format yet (D6, deferred)";
+
 pub fn commit(args: CommitArgs) -> Result<()> {
     let repo = open_repo()?;
     let (label, sk) = load_secret(args.key.as_deref())?;
@@ -597,7 +603,7 @@ pub fn commit(args: CommitArgs) -> Result<()> {
     // known to be allowed to write it.
     let authority = repo
         .current_authority()?
-        .ok_or_else(|| anyhow!("repository has no current authority"))?;
+        .ok_or_else(|| anyhow!(NO_CURRENT))?;
     // Verify the author is in the authority and has at least contributor.
     let auth_signed = repo.read_signed(authority)?;
     let auth_body = AuthorityBody::parse(&auth_signed.body)?;
@@ -821,8 +827,18 @@ pub fn commit(args: CommitArgs) -> Result<()> {
     // built on. Under the lock nothing cooperating moves it. The check also
     // catches most moves by a writer that skips the lock, but not one that
     // lands between the comparison and the rename (see `compare_and_write`).
+    //
+    // On a branch this publishes the commit, so it passes Rule P first: a
+    // merge's second parent and everything behind it that was never
+    // published are newly exposed, and are checked like the commit itself.
     if let Some(branch) = repo.current_branch()? {
-        repo.refs.compare_and_write(&branch, parent, id)?;
+        crate::publish::prepare(
+            &repo,
+            Some(&pk),
+            vec![crate::publish::update(branch, parent, Some(id))],
+            None,
+        )?
+        .apply(&repo)?;
     } else {
         if repo.refs.resolve_head()? != parent {
             bail!("HEAD moved while this commit was being built; nothing was committed");
@@ -1168,7 +1184,15 @@ fn collect_tree_files(
 // ---------------------------------------------------------------------------
 
 pub fn branch(args: BranchArgs) -> Result<()> {
-    let (repo, _lock) = open_repo_locked()?;
+    let repo = open_repo()?;
+    // Creating or deleting a branch publishes (Rule P), under a key. It is
+    // loaded before the lock, since loading may ask for a passphrase.
+    let signer = if args.create.is_some() || args.delete.is_some() {
+        crate::publish::signer_for(&repo, args.key.as_deref())?
+    } else {
+        None
+    };
+    let _lock = lock_repo(&repo)?;
     if args.list || (args.create.is_none() && args.switch.is_none() && args.delete.is_none()) {
         let cur = repo.current_branch()?.unwrap_or_default();
         for (name, id) in repo.refs.list_branches()? {
@@ -1189,7 +1213,19 @@ pub fn branch(args: BranchArgs) -> Result<()> {
                 .resolve_head()?
                 .ok_or_else(|| anyhow!("no HEAD"))?,
         };
-        repo.refs.write(&format!("refs/branches/{name}"), from)?;
+        // It used to be written over whatever was there, at whatever the
+        // revision named: an existing branch, or history only received.
+        let ref_name = format!("refs/branches/{name}");
+        if repo.refs.read(&ref_name)?.is_some() {
+            bail!("branch {name} already exists");
+        }
+        crate::publish::prepare(
+            &repo,
+            signer.as_ref(),
+            vec![crate::publish::update(ref_name, None, Some(from))],
+            None,
+        )?
+        .apply(&repo)?;
         eprintln!("created branch {name} at {from}");
     }
     if let Some(name) = args.switch {
@@ -1237,14 +1273,31 @@ pub fn branch(args: BranchArgs) -> Result<()> {
         eprintln!("switched to branch {name}");
     }
     if let Some(name) = args.delete {
-        repo.refs.delete(&format!("refs/branches/{name}"))?;
+        // Deleting a branch whose commits no other ref reaches unpublishes
+        // them: a rewrite, which a maintainer may force.
+        let ref_name = format!("refs/branches/{name}");
+        let old = repo
+            .refs
+            .read(&ref_name)?
+            .ok_or_else(|| anyhow!("no such branch: {name}"))?;
+        crate::publish::prepare(
+            &repo,
+            signer.as_ref(),
+            vec![levcs_identity::admission::RefUpdate {
+                force: args.force,
+                ..crate::publish::update(ref_name, Some(old), None)
+            }],
+            None,
+        )?
+        .apply(&repo)?;
         eprintln!("deleted branch {name}");
     }
     Ok(())
 }
 
 pub fn merge(args: MergeArgs) -> Result<()> {
-    let _ = args.key; // resolution is signed at commit-time, not merge-time
+    // A three-way merge signs nothing: its resolution is signed at commit
+    // time. `--key` is the key a fast-forward publishes under.
     if args.abort {
         return merge_abort();
     }
@@ -1351,15 +1404,34 @@ fn merge_run(args: MergeArgs) -> Result<()> {
     // Fast-forward: HEAD is an ancestor of theirs, no merge commit needed.
     if base_id == head {
         let theirs_commit = Commit::from_signed(&repo.read_signed(theirs_id)?)?;
+        // On a branch, a fast-forward publishes theirs and everything behind
+        // it not yet published, so Rule P is checked first, before the
+        // working tree is touched. This was how received history reached a
+        // branch unchecked. Only a fast-forward needs a key, so it is loaded
+        // here, under the lock.
+        let publish = match repo.current_branch()? {
+            Some(branch_ref) => {
+                let signer = crate::publish::signer_for(&repo, args.key.as_deref())?;
+                Some(crate::publish::prepare(
+                    &repo,
+                    signer.as_ref(),
+                    vec![crate::publish::update(
+                        branch_ref,
+                        Some(head),
+                        Some(theirs_id),
+                    )],
+                    None,
+                )?)
+            }
+            None => None,
+        };
         // Files first, then the ref, then the index: a refused checkout
         // must not leave the branch moved over a working tree it never
         // reached. The ref used to move first.
         repo.checkout_tree(theirs_commit.tree, &repo.workdir)?;
-        if let Some(branch_ref) = repo.current_branch()? {
-            repo.refs
-                .compare_and_write(&branch_ref, Some(head), theirs_id)?;
-        } else {
-            repo.refs.write_head(&Head::Detached(theirs_id))?;
+        match publish {
+            Some(p) => p.apply(&repo)?,
+            None => repo.refs.write_head(&Head::Detached(theirs_id))?,
         }
         // Refresh index from the new tree.
         let mut idx = Index::new();
@@ -2400,7 +2472,7 @@ pub fn release(args: ReleaseArgs) -> Result<()> {
     let pk = sk.public();
     let authority = repo
         .current_authority()?
-        .ok_or_else(|| anyhow!("no current authority"))?;
+        .ok_or_else(|| anyhow!(NO_CURRENT))?;
     let auth_signed = repo.read_signed(authority)?;
     let auth_body = AuthorityBody::parse(&auth_signed.body)?;
     let m = auth_body
@@ -2433,8 +2505,21 @@ pub fn release(args: ReleaseArgs) -> Result<()> {
     };
     let signed = sign_release(release, &sk)?;
     let id = repo.write_signed(&signed)?;
-    repo.refs
-        .write(&format!("refs/releases/{}", args.label), id)?;
+    // Publishing the release publishes its predecessor too, if that is not
+    // already published: a release from a detached HEAD on received
+    // history is checked like the history itself.
+    let expected = Some(parent_release).filter(|p| !p.is_zero());
+    crate::publish::prepare(
+        &repo,
+        Some(&pk),
+        vec![crate::publish::update(
+            format!("refs/releases/{}", args.label),
+            expected,
+            Some(id),
+        )],
+        None,
+    )?
+    .apply(&repo)?;
 
     // §4.4: warm the release cache and run LRU eviction so the
     // cache stays under its configured cap. The cap is 1 GiB by
@@ -2611,6 +2696,11 @@ fn reachability_roots(repo: &Repository) -> Result<Vec<(String, ObjectId)>> {
 /// print "verify: ok" with hundreds of corrupt objects behind HEAD.
 pub fn verify() -> Result<()> {
     let repo = open_repo()?;
+    // A publication interrupted part way is rolled back first, under the
+    // lock, so verify never vouches for a half-applied state.
+    if levcs_core::ref_tx::RefStore::pending(&repo.refs)?.is_some() {
+        let _lock = lock_repo(&repo)?;
+    }
     let genesis = repo
         .genesis_authority()?
         .ok_or_else(|| anyhow!("no refs/authority/genesis to verify against"))?;

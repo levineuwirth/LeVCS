@@ -1,5 +1,6 @@
 //! levcs-identity: keychains, authority objects, signing, verification.
 
+pub mod admission;
 pub mod authority;
 pub mod error;
 pub mod history;

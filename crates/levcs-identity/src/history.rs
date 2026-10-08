@@ -157,21 +157,38 @@ impl Expect {
 }
 
 /// A verified authority and its chain, newest first, ending at its genesis.
-struct Auth {
-    body: AuthorityBody,
-    chain: Vec<ObjectId>,
+pub(crate) struct Auth {
+    pub(crate) body: AuthorityBody,
+    pub(crate) chain: Vec<ObjectId>,
 }
 
-struct Walker<'a, S: ObjectSource> {
+/// Rule H, object by object, with the authority chains and effective
+/// authorities it needs memoized. Shared with admission, so that a commit
+/// is held to exactly the same rules when it is published as when the
+/// history holding it is verified.
+pub(crate) struct Walker<'a, S: ObjectSource> {
     src: &'a S,
     auth: HashMap<ObjectId, Result<Auth, String>>,
     effective: HashMap<ObjectId, Result<ObjectId, String>>,
 }
 
 impl<'a, S: ObjectSource> Walker<'a, S> {
+    pub(crate) fn new(src: &'a S) -> Self {
+        Walker {
+            src,
+            auth: HashMap::new(),
+            effective: HashMap::new(),
+        }
+    }
+
+    /// The objects it reads.
+    pub(crate) fn source(&self) -> &'a S {
+        self.src
+    }
+
     /// `id`'s chain back to a genesis, verified and memoized per authority:
     /// every step, every signature on every authority in it.
-    fn authority(&mut self, id: ObjectId) -> Result<&Auth, String> {
+    pub(crate) fn authority(&mut self, id: ObjectId) -> Result<&Auth, String> {
         if !self.auth.contains_key(&id) {
             let r = self.verify_chain(id);
             self.auth.insert(id, r);
@@ -242,7 +259,7 @@ impl<'a, S: ObjectSource> Walker<'a, S> {
         Ok(Auth { body, chain })
     }
 
-    fn genesis_of(&mut self, id: ObjectId) -> Result<ObjectId, String> {
+    pub(crate) fn genesis_of(&mut self, id: ObjectId) -> Result<ObjectId, String> {
         self.authority(id).map(|a| *a.chain.last().unwrap())
     }
 
@@ -274,7 +291,7 @@ impl<'a, S: ObjectSource> Walker<'a, S> {
     /// Rule H for one commit of the history whose genesis is `genesis`.
     /// Returns the authority it cites and, if it changes authority, the one
     /// it installs.
-    fn check_commit(
+    pub(crate) fn check_commit(
         &mut self,
         id: ObjectId,
         genesis: ObjectId,
@@ -420,7 +437,7 @@ impl<'a, S: ObjectSource> Walker<'a, S> {
     }
 
     /// D5 for one release; returns the authority it cites.
-    fn check_release(
+    pub(crate) fn check_release(
         &mut self,
         id: ObjectId,
         genesis: ObjectId,
@@ -485,11 +502,7 @@ pub fn verify_history<S: ObjectSource>(
         roots: roots.len(),
         ..Default::default()
     };
-    let mut w = Walker {
-        src,
-        auth: HashMap::new(),
-        effective: HashMap::new(),
-    };
+    let mut w = Walker::new(src);
     let flag = |report: &mut HistoryReport, object: ObjectId, what: String| {
         report.problems.push(Problem {
             object,

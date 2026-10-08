@@ -34,9 +34,7 @@ use levcs_core::object::ObjectType;
 use levcs_core::{Commit, EntryType, ObjectId, ObjectStore, Tree};
 use levcs_identity::authority::AuthorityBody;
 use levcs_identity::keys::PublicKey;
-use levcs_identity::verify::{
-    verify_authority_chain, verify_genesis, ObjectSource as VerifySource,
-};
+use levcs_identity::verify::{verify_genesis, ObjectSource as VerifySource};
 use levcs_merge::engine::check_handler_allowed;
 use levcs_merge::record::MergeRecord;
 use levcs_protocol::auth::{verify_request, AuthRequest, DEFAULT_CLOCK_SKEW, NONCE_TTL_SECS};
@@ -146,6 +144,14 @@ impl AppState {
 
     pub fn store(&self, repo_id: &str) -> ObjectStore {
         ObjectStore::new(self.repo_dir(repo_id).join(".levcs/objects"))
+    }
+
+    /// The lock every writer of `repo_id`'s refs holds.
+    fn repo_lock(&self, repo_id: &str) -> Arc<Mutex<()>> {
+        let mut map = self.repo_locks.write().unwrap();
+        map.entry(repo_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 }
 
@@ -291,6 +297,7 @@ async fn handle_repo_info(
         return Err(err(StatusCode::NOT_FOUND, "repo not found"));
     }
     let refs = levcs_core::Refs::new(dir.join(".levcs"));
+    refuse_if_interrupted(&refs)?;
     let cur = refs
         .read("refs/authority/current")
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -338,6 +345,7 @@ async fn handle_repo_refs(
         return Err(err(StatusCode::NOT_FOUND, "repo not found"));
     }
     let refs = levcs_core::Refs::new(dir.join(".levcs"));
+    refuse_if_interrupted(&refs)?;
     let mut out = RefList::default();
     for (k, v) in refs
         .list_branches()
@@ -524,12 +532,26 @@ async fn handle_init(
             "URL repo_id does not match authority body",
         ));
     }
-    if body_parsed.find_member(&auth.key).is_none() {
-        return Err(err(
-            StatusCode::FORBIDDEN,
-            "init key is not a member of the authority",
-        ));
+    // Creating a repository publishes its genesis and current authority.
+    // As in the v2 init contract, only an owner of that genesis may; any
+    // member could, a Reader included.
+    match body_parsed.find_member(&auth.key) {
+        Some(m) if m.role == levcs_identity::authority::Role::Owner => {}
+        Some(_) => {
+            return Err(err(
+                StatusCode::FORBIDDEN,
+                "init key is not an owner of the genesis authority",
+            ))
+        }
+        None => {
+            return Err(err(
+                StatusCode::FORBIDDEN,
+                "init key is not a member of the authority",
+            ))
+        }
     }
+    let lock = s.repo_lock(&repo_id);
+    let _guard = lock.lock().unwrap();
     let dir = s.repo_dir(&repo_id);
     if dir.is_dir() {
         return Err(err(StatusCode::CONFLICT, "repo already exists"));
@@ -561,19 +583,18 @@ async fn handle_push(
     if !dir.is_dir() {
         return Err(err(StatusCode::NOT_FOUND, "repo not found"));
     }
-    // §5.6: a mirror is read-only by default. Reject pushes unless the
-    // operator has explicitly opted into writeback. We return 403 with a
-    // body that points clients at the source so they can retry there.
+    // §5.6: a mirror's refs are records of its source's state (Rule R.4).
+    // Publishing over them is not replication, and `writeback`, which was
+    // to forward a push to the source, is not implemented: a push used to
+    // be applied here, over the records. Refuse, and point at the source.
     if let Some(m) = s.config.mirror_for(&repo_id) {
-        if !m.writeback {
-            return Err(err(
-                StatusCode::FORBIDDEN,
-                format!(
-                    "this instance mirrors {repo_id} from {} and does not accept writes; push to the source instead",
-                    m.source
-                ),
-            ));
-        }
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            format!(
+                "this instance mirrors {repo_id} from {} and does not accept writes; push to the source instead",
+                m.source
+            ),
+        ));
     }
     // §4.3 storage-mode enforcement. We need the parsed manifest to
     // gate by ref namespace, so the actual rejection happens after
@@ -634,27 +655,18 @@ async fn handle_push(
     }
     let store = s.store(&repo_id);
 
-    // Acquire per-repo lock for atomic ref updates.
-    let lock = {
-        let mut map = s.repo_locks.write().unwrap();
-        map.entry(repo_id.clone())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
-    };
+    // The per-repo lock, held from reading S0 to the last ref write.
+    let lock = s.repo_lock(&repo_id);
     let _guard = lock.lock().unwrap();
 
-    // Step 1: write all pack objects to the loose store (validated framing).
-    for ent in &pack.entries {
-        store
-            .write_raw(&ent.bytes)
-            .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
-    }
-    // Step 1b: enforce instance merge-policy (§6.6.4). Walk every Commit in
-    // the pack; if its tree carries `.levcs/merge-record`, parse it and
-    // reject the whole push if any handler reference falls outside
-    // `allowed_handlers`. The repository's own policy is the inner
-    // constraint and is verified independently elsewhere; this is the
-    // outer ceiling.
+    // The pushed objects, held apart from the store until the push is
+    // admitted. They used to be written first, so a refused push still
+    // left them stored.
+    let incoming = Overlay::new(&store, &pack)?;
+
+    // Instance merge policy (§6.6.4): the outer ceiling on the merge
+    // handlers a pushed commit may record. The repository's own policy is
+    // the inner constraint and is verified independently.
     if !s.config.allowed_handlers.is_empty() {
         for ent in &pack.entries {
             if ent.object_type != ObjectType::Commit as u8 {
@@ -668,7 +680,7 @@ async fn handle_push(
                 Ok(c) => c,
                 Err(_) => continue,
             };
-            let record_bytes = match find_merge_record(&store, commit.tree) {
+            let record_bytes = match find_merge_record(&incoming, commit.tree) {
                 Ok(Some(b)) => b,
                 _ => continue,
             };
@@ -697,153 +709,243 @@ async fn handle_push(
             }
         }
     }
-    // Step 2: verify authority chain on the manifest's authority_hash.
-    let auth_hash = ObjectId::from_hex(&manifest.authority_hash)
-        .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
-    verify_authority_chain(&store, auth_hash)
-        .map_err(|e| err(StatusCode::BAD_REQUEST, format!("authority chain: {e}")))?;
-    let auth_obj = store
-        .read_raw(auth_hash)
-        .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
-    let auth_signed = levcs_core::object::SignedObject::parse(&auth_obj)
-        .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
-    let auth_body = AuthorityBody::parse(&auth_signed.body)
-        .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
 
-    // Step 3: verify pusher has appropriate role.
-    let member = auth_body
-        .find_member(&auth.key)
-        .ok_or_else(|| err(StatusCode::FORBIDDEN, "pusher not in authority"))?;
-    if member.role < levcs_identity::authority::Role::Contributor {
-        return Err(err(StatusCode::FORBIDDEN, "pusher lacks contributor role"));
-    }
-
-    // Step 4: verify each new commit and compare-and-swap each ref.
+    // Rule P (`doc/authority-semantics.md`), against the state read here,
+    // under the lock: the stored current authority and the history the
+    // instance's refs already reach. The manifest's authority used to
+    // authorize the push (C1), only tips were checked, and `current` was
+    // set to the newest authority any tip cited, without a boundary.
     let refs = levcs_core::Refs::new(dir.join(".levcs"));
+    // A push this instance was killed part way through is rolled back
+    // before anything reads the refs.
+    levcs_core::ref_tx::recover(&refs).map_err(|e| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("an interrupted push could not be rolled back: {e}"),
+        )
+    })?;
+    let s0 = pre_state(&refs, &store, &repo_id)?;
+    let named = ObjectId::from_hex(&manifest.authority_hash)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, format!("authority_hash: {e}")))?;
+    let authority_update = authority_update(&incoming, &s0, named)?;
+    let mut updates = Vec::new();
     for u in &manifest.updates {
-        let new_id = ObjectId::from_hex(&u.new_hash)
-            .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
-        let old_actual = refs
-            .read(&u.r#ref)
-            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        let old_expected = match &u.old_hash {
-            Some(s) if !s.is_empty() => Some(
-                ObjectId::from_hex(s)
+        let new = ObjectId::from_hex(&u.new_hash)
+            .map_err(|e| err(StatusCode::BAD_REQUEST, format!("new_hash: {e}")))?;
+        let expected = match &u.old_hash {
+            Some(h) if !h.is_empty() => Some(
+                ObjectId::from_hex(h)
                     .map_err(|e| err(StatusCode::BAD_REQUEST, format!("bad old_hash: {e}")))?,
             ),
             _ => None,
         };
-        if old_actual != old_expected {
-            return Err(err(
+        updates.push(levcs_identity::admission::RefUpdate {
+            name: u.r#ref.clone(),
+            expected,
+            new: Some(new),
+            force: manifest.force,
+        });
+    }
+    let tx = levcs_identity::admission::Transaction {
+        signer: auth.key,
+        updates,
+        authority_update,
+    };
+    let admitted = levcs_identity::admission::admit(&incoming, &s0, &tx).map_err(|r| {
+        use levcs_identity::admission::Refused;
+        match r.kind {
+            Refused::Stale => err(StatusCode::CONFLICT, r.to_string()),
+            Refused::NotFastForward => err(
                 StatusCode::CONFLICT,
-                format!("ref {} changed concurrently", u.r#ref),
-            ));
+                format!("non-fast-forward update: {r}; pass --force to override"),
+            ),
+            Refused::Unauthorized | Refused::Invalid => err(StatusCode::FORBIDDEN, r.to_string()),
         }
-        // Dispatch verification by the new tip's object type so we can
-        // accept both branch refs (commit-typed) and release refs
-        // (release-typed). Anything else gets rejected up front.
-        let raw = store
-            .read_object(new_id)
-            .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
-        match raw.object_type {
-            ObjectType::Commit => {
-                levcs_identity::verify::verify_commit(&store, new_id, Some(&u.r#ref))
-                    .map_err(|e| err(StatusCode::BAD_REQUEST, format!("commit verify: {e}")))?;
-            }
-            ObjectType::Release => {
-                levcs_identity::verify::verify_release(&store, new_id)
-                    .map_err(|e| err(StatusCode::BAD_REQUEST, format!("release verify: {e}")))?;
-            }
-            other => {
-                return Err(err(
-                    StatusCode::BAD_REQUEST,
-                    format!(
-                        "ref tip is {} object, must be Commit or Release",
-                        other.name()
-                    ),
-                ));
-            }
-        }
-        // §5.4(e): non-fast-forward updates require force-push and a
-        // sufficiently privileged key. Only check when this is an
-        // update of an existing ref (old_actual is Some) — first-write
-        // refs have no ancestry constraint.
-        if let Some(old_id) = old_actual {
-            if !is_ancestor(&store, old_id, new_id) {
-                if !manifest.force {
-                    return Err(err(
-                        StatusCode::CONFLICT,
-                        format!(
-                            "non-fast-forward update for ref {}; pass --force to override",
-                            u.r#ref
-                        ),
-                    ));
-                }
-                if member.role < levcs_identity::authority::Role::Maintainer {
-                    return Err(err(
-                        StatusCode::FORBIDDEN,
-                        format!(
-                            "force-push to {} requires maintainer or owner role",
-                            u.r#ref
-                        ),
-                    ));
-                }
-            }
-        }
-        refs.write(&u.r#ref, new_id)
+    })?;
+
+    // Admitted: store the objects, then move the refs, then current.
+    for ent in &pack.entries {
+        store
+            .write_raw(&ent.bytes)
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     }
-    // Update current authority pointer if any pushed tip modified it.
-    // Walk all updates rather than just the last so the order in `updates`
-    // can be arbitrary; pick the highest-numbered authority by version.
-    let mut best_auth: Option<(ObjectId, u32)> = None;
-    for u in &manifest.updates {
-        let id = match ObjectId::from_hex(&u.new_hash) {
-            Ok(i) => i,
-            Err(_) => continue,
-        };
-        let bytes = match store.read_raw(id) {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
-        let signed = match levcs_core::object::SignedObject::parse(&bytes) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        let auth_id = match signed.object_type {
-            ObjectType::Commit => match levcs_core::Commit::from_signed(&signed) {
-                Ok(c) => c.authority,
-                Err(_) => continue,
-            },
-            ObjectType::Release => match levcs_core::Release::parse_body(&signed.body) {
-                Ok(r) => r.authority,
-                Err(_) => continue,
-            },
-            _ => continue,
-        };
-        let auth_bytes = match store.read_raw(auth_id) {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
-        let auth_signed = match levcs_core::object::SignedObject::parse(&auth_bytes) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        let auth_body = match AuthorityBody::parse(&auth_signed.body) {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
-        match best_auth {
-            None => best_auth = Some((auth_id, auth_body.version)),
-            Some((_, v)) if auth_body.version > v => best_auth = Some((auth_id, auth_body.version)),
-            _ => {}
-        }
+    // One transaction: if any write fails, every ref it reached is read
+    // back and put back, `current` included, since a write can land and
+    // still fail. It used to leave `current` out, and to trust each write's
+    // own report.
+    let mut changes: Vec<levcs_core::ref_tx::RefChange> = tx
+        .updates
+        .iter()
+        .map(|u| levcs_core::ref_tx::RefChange {
+            name: u.name.clone(),
+            expected: u.expected,
+            new: u.new,
+        })
+        .collect();
+    if let Some(a1) = admitted.new_current {
+        changes.push(levcs_core::ref_tx::RefChange {
+            name: "refs/authority/current".into(),
+            expected: s0.current,
+            new: Some(a1),
+        });
     }
-    if let Some((auth_id, _)) = best_auth {
-        refs.write("refs/authority/current", auth_id)
-            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    }
+    levcs_core::ref_tx::apply(&refs, &changes).map_err(|e| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("push not applied: {e}"),
+        )
+    })?;
     Ok(StatusCode::OK)
+}
+
+/// The pushed objects over the store, read by admission before anything is
+/// written. Each pushed object is keyed by the hash of its own bytes, so it
+/// can only ever be found under its true id.
+struct Overlay<'a> {
+    store: &'a ObjectStore,
+    pushed: HashMap<ObjectId, Vec<u8>>,
+}
+
+impl<'a> Overlay<'a> {
+    fn new(store: &'a ObjectStore, pack: &Pack) -> Result<Self, ApiError> {
+        let mut pushed = HashMap::new();
+        for ent in &pack.entries {
+            levcs_core::RawObject::parse(&ent.bytes)
+                .map_err(|e| err(StatusCode::BAD_REQUEST, format!("pack object: {e}")))?;
+            pushed.insert(levcs_core::blake3_hash(&ent.bytes), ent.bytes.clone());
+        }
+        Ok(Overlay { store, pushed })
+    }
+}
+
+impl VerifySource for Overlay<'_> {
+    fn read_raw(&self, id: ObjectId) -> levcs_identity::verify::Verification<Vec<u8>> {
+        match self.pushed.get(&id) {
+            Some(b) => Ok(b.clone()),
+            None => Ok(self.store.read_raw(id)?),
+        }
+    }
+}
+
+/// `S0`: the genesis this repository's id pins, its current authority, and
+/// its branch and release refs.
+fn pre_state(
+    refs: &levcs_core::Refs,
+    store: &ObjectStore,
+    repo_id: &str,
+) -> Result<levcs_identity::admission::PreState, ApiError> {
+    let internal =
+        |e: levcs_core::error::Error| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    let pinned =
+        ObjectId::from_hex(repo_id).map_err(|_| err(StatusCode::NOT_FOUND, "repo not found"))?;
+    let genesis = refs
+        .read("refs/authority/genesis")
+        .map_err(internal)?
+        .ok_or_else(|| {
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "repository has no genesis",
+            )
+        })?;
+    let body = store
+        .read_typed(genesis, ObjectType::Authority)
+        .ok()
+        .and_then(|raw| AuthorityBody::parse(&raw.body).ok());
+    if body.map(|b| b.repo_id) != Some(pinned) {
+        return Err(err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "this repository's genesis does not match its repo_id",
+        ));
+    }
+    let current = refs.read("refs/authority/current").map_err(internal)?;
+    let mut published = std::collections::BTreeMap::new();
+    for (name, id) in refs.list_all().map_err(internal)? {
+        if name.starts_with("refs/branches/") || name.starts_with("refs/releases/") {
+            published.insert(name, id);
+        }
+    }
+    Ok(levcs_identity::admission::PreState {
+        genesis,
+        current,
+        refs: published,
+    })
+}
+
+/// What the v1 manifest's `authority_hash` asks for. It is never used to
+/// authorize anything. It is the authority the client made the push under,
+/// as v2's `expected_authority`: the stored current authority asks for no
+/// change, and a direct successor of it asks `current` to move there with
+/// a boundary commit (`authority_update`). Anything else means the client
+/// worked against a state this instance has left.
+fn authority_update<S: VerifySource>(
+    src: &S,
+    s0: &levcs_identity::admission::PreState,
+    named: ObjectId,
+) -> Result<Option<ObjectId>, ApiError> {
+    if Some(named) == s0.current {
+        return Ok(None);
+    }
+    let previous = src
+        .read_raw(named)
+        .ok()
+        .and_then(|b| levcs_core::object::SignedObject::parse(&b).ok())
+        .filter(|o| o.object_type == ObjectType::Authority)
+        .and_then(|o| AuthorityBody::parse(&o.body).ok())
+        .map(|b| b.previous_authority);
+    match (previous, s0.current) {
+        (Some(p), Some(cur)) if p == cur => Ok(Some(named)),
+        _ => Err(err(
+            StatusCode::CONFLICT,
+            format!(
+                "this push was made under authority {named}, but this repository's \
+                 current authority is {}",
+                s0.current.map_or("unset".to_string(), |c| c.to_hex())
+            ),
+        )),
+    }
+}
+
+/// A push killed part way leaves a record (`levcs_core::ref_tx`) until it
+/// is rolled back. Its refs are not served meanwhile: they may be half of
+/// a transaction.
+fn refuse_if_interrupted(refs: &levcs_core::Refs) -> Result<(), ApiError> {
+    match levcs_core::ref_tx::RefStore::pending(refs) {
+        Ok(None) => Ok(()),
+        Ok(Some(_)) => Err(err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an interrupted push is being rolled back; try again",
+        )),
+        Err(e) => Err(err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
+}
+
+/// Roll back every push this instance was killed part way through, before
+/// it serves anything: a push interrupted by an error is rolled back as it
+/// fails, but one interrupted by the process dying leaves its record for
+/// the next process. Returns one line per repository rolled back or not.
+pub fn recover_interrupted_pushes(root: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return out;
+    };
+    for ent in entries.flatten() {
+        let levcs = ent.path().join(".levcs");
+        if !levcs.is_dir() {
+            continue;
+        }
+        let name = ent.file_name().to_string_lossy().into_owned();
+        match levcs_core::ref_tx::recover(&levcs_core::Refs::new(levcs)) {
+            Ok(None) => {}
+            Ok(Some(refs)) => out.push(format!(
+                "{name}: rolled back an interrupted push ({})",
+                refs.join(", ")
+            )),
+            Err(e) => out.push(format!(
+                "{name}: an interrupted push could not be rolled back: {e}"
+            )),
+        }
+    }
+    out
 }
 
 /// Helper used by tests and the binary's `main` to bind and serve.
@@ -853,82 +955,38 @@ pub async fn serve(state: AppState, addr: std::net::SocketAddr) -> std::io::Resu
     axum::serve(listener, app).await
 }
 
-/// Decide whether `old_id` is an ancestor of `new_id` for fast-forward
-/// detection on push (§5.4(e)). Walks parent chains starting from
-/// `new_id`. Considers Commit parents and Release predecessor +
-/// parent_release; both flavours of ref can be advanced and either
-/// chain might lead back to `old_id`. Returns false on read errors —
-/// safer to require force-push than to silently accept an update we
-/// can't verify.
-fn is_ancestor(store: &ObjectStore, old_id: ObjectId, new_id: ObjectId) -> bool {
-    use levcs_core::Release;
-    if old_id == new_id {
-        return true;
-    }
-    let mut visited: HashSet<ObjectId> = HashSet::new();
-    let mut stack = vec![new_id];
-    while let Some(id) = stack.pop() {
-        if !visited.insert(id) {
-            continue;
-        }
-        if id == old_id {
-            return true;
-        }
-        let raw = match store.read_object(id) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        match raw.object_type {
-            ObjectType::Commit => {
-                if let Ok(c) = Commit::parse_body(&raw.body) {
-                    stack.extend(c.parents);
-                }
-            }
-            ObjectType::Release => {
-                if let Ok(r) = Release::parse_body(&raw.body) {
-                    if !r.predecessor.is_zero() {
-                        stack.push(r.predecessor);
-                    }
-                    if !r.parent_release.is_zero() {
-                        stack.push(r.parent_release);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    false
-}
-
 /// Walk into `tree_id` looking for `.levcs/merge-record` and return the blob
 /// body if found. Returns `Ok(None)` for a tree with no `.levcs` subtree, no
 /// `merge-record` entry, or any non-blob entry at that path.
-fn find_merge_record(
-    store: &ObjectStore,
+fn find_merge_record<S: VerifySource>(
+    src: &S,
     tree_id: ObjectId,
-) -> Result<Option<Vec<u8>>, levcs_core::error::Error> {
+) -> Result<Option<Vec<u8>>, String> {
     if tree_id.is_zero() {
         return Ok(None);
     }
-    let raw = store.read_typed(tree_id, ObjectType::Tree)?;
-    let tree = Tree::parse_body(&raw.body)?;
+    let typed = |id: ObjectId, want: ObjectType| -> Result<levcs_core::RawObject, String> {
+        let bytes = src.read_raw(id).map_err(|e| e.to_string())?;
+        let raw = levcs_core::RawObject::parse(&bytes).map_err(|e| e.to_string())?;
+        if raw.object_type != want {
+            return Err(format!("{id} is not a {}", want.name()));
+        }
+        Ok(raw)
+    };
+    let raw = typed(tree_id, ObjectType::Tree)?;
+    let tree = Tree::parse_body(&raw.body).map_err(|e| e.to_string())?;
     let levcs_entry = match tree.entries.iter().find(|e| e.name == ".levcs") {
         Some(e) if e.entry_type == EntryType::Tree => e,
         _ => return Ok(None),
     };
-    let raw = store.read_typed(levcs_entry.hash, ObjectType::Tree)?;
-    let levcs_tree = Tree::parse_body(&raw.body)?;
+    let raw = typed(levcs_entry.hash, ObjectType::Tree)?;
+    let levcs_tree = Tree::parse_body(&raw.body).map_err(|e| e.to_string())?;
     let mr_entry = match levcs_tree.entries.iter().find(|e| e.name == "merge-record") {
         Some(e) if e.entry_type == EntryType::Blob => e,
         _ => return Ok(None),
     };
-    let blob = store.read_typed(mr_entry.hash, ObjectType::Blob)?;
-    Ok(Some(blob.body))
+    Ok(Some(typed(mr_entry.hash, ObjectType::Blob)?.body))
 }
-
-// Allow `verify_authority_chain` to use ObjectStore directly.
-#[allow(dead_code)]
-fn _vs(_: &dyn VerifySource) {}
 
 #[cfg(test)]
 mod tests {

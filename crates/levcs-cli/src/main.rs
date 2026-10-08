@@ -6,6 +6,7 @@ mod cli;
 mod ctx;
 mod fed_cmds;
 mod identity_cmds;
+mod publish;
 mod repo_cmds;
 mod rev;
 mod tree_helpers;

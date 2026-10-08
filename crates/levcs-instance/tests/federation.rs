@@ -25,12 +25,14 @@ fn tempdir() -> PathBuf {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn instance_info_and_init_roundtrip() {
     let root = tempdir();
+    let sk = SecretKey::generate();
     let config = InstanceConfig {
         root: root.clone(),
         storage_mode: "full".into(),
         federation_peers: Vec::new(),
         allowed_handlers: vec!["builtin".into()],
         mirrors: Vec::new(),
+        creators: vec![sk.public().to_levcs()],
     };
     let state = AppState::new(config);
     // Bind to an ephemeral port.
@@ -57,7 +59,6 @@ async fn instance_info_and_init_roundtrip() {
     assert_eq!(info["software"], "levcs-instance");
 
     // POST /repos/{id}/init
-    let sk = SecretKey::generate();
     let pk = sk.public();
     let now = 1_700_000_000_000_000;
     let mut body = AuthorityBody {

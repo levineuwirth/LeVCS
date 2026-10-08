@@ -34,7 +34,9 @@ use levcs_core::object::ObjectType;
 use levcs_core::{Commit, EntryType, ObjectId, ObjectStore, Tree};
 use levcs_identity::authority::AuthorityBody;
 use levcs_identity::keys::PublicKey;
-use levcs_identity::verify::{verify_genesis, ObjectSource as VerifySource};
+use levcs_identity::verify::{
+    verify_authority_chain, verify_genesis, ObjectSource as VerifySource,
+};
 use levcs_merge::engine::check_handler_allowed;
 use levcs_merge::record::MergeRecord;
 use levcs_protocol::auth::{verify_request, AuthRequest, DEFAULT_CLOCK_SKEW, NONCE_TTL_SECS};
@@ -56,6 +58,36 @@ pub struct InstanceConfig {
     /// fresh by `sync_mirror`.
     #[serde(default)]
     pub mirrors: Vec<MirrorConfig>,
+    /// Keys that may create repositories here, as `levcs key show` prints
+    /// them (`ed25519:<hex>`). None by default: an instance that names no
+    /// creator accepts no new repository. Any owner of a genesis used to be
+    /// able to create one.
+    #[serde(default)]
+    pub creators: Vec<String>,
+}
+
+/// A hosted repository's id: exactly 64 lowercase hex characters. It is the
+/// only thing ever joined onto the instance's root. The id used to be joined
+/// as the request gave it, percent-decoded, so `/repos/%2F<path>/info` read
+/// a repository anywhere on the host (audit C3).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RepoId(String);
+
+impl RepoId {
+    pub fn parse(s: &str) -> Option<Self> {
+        let hex = s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        hex.then(|| RepoId(s.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for RepoId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 /// Per-repository mirror configuration (§5.6).
@@ -89,8 +121,41 @@ fn default_mirror_mode() -> String {
 impl InstanceConfig {
     /// Look up a mirror declaration for `repo_id`. Returns `None` for
     /// repositories the instance is authoritative for.
-    pub fn mirror_for(&self, repo_id: &str) -> Option<&MirrorConfig> {
-        self.mirrors.iter().find(|m| m.repo_id == repo_id)
+    pub fn mirror_for(&self, repo_id: &RepoId) -> Option<&MirrorConfig> {
+        self.mirrors.iter().find(|m| m.repo_id == repo_id.as_str())
+    }
+
+    /// Where `repo` lives.
+    pub fn repo_dir(&self, repo: &RepoId) -> PathBuf {
+        self.root.join(repo.as_str())
+    }
+
+    /// What the configuration names that is not what it should be: a
+    /// creator that is not a key, a mirror whose repository is not named by
+    /// its id. The binary refuses to start over any of it; where these are
+    /// used, an entry that does not parse authorizes and reaches nothing.
+    pub fn validate(&self) -> Result<(), String> {
+        let mut bad = Vec::new();
+        for c in &self.creators {
+            if PublicKey::parse_levcs(c).is_err() {
+                bad.push(format!(
+                    "creators: {c:?} is not a key (expected ed25519:<64 hex digits>)"
+                ));
+            }
+        }
+        for m in &self.mirrors {
+            if RepoId::parse(&m.repo_id).is_none() {
+                bad.push(format!(
+                    "mirrors: repo_id {:?} is not 64 lowercase hex characters",
+                    m.repo_id
+                ));
+            }
+        }
+        if bad.is_empty() {
+            Ok(())
+        } else {
+            Err(bad.join("\n"))
+        }
     }
 
     /// Resolve the storage mode (§4.3). Empty / unset / "full" all
@@ -126,31 +191,45 @@ pub enum StorageMode {
 pub struct AppState {
     pub config: Arc<InstanceConfig>,
     pub nonce_cache: Arc<Mutex<NonceCache>>,
-    pub repo_locks: Arc<RwLock<HashMap<String, Arc<Mutex<()>>>>>,
+    pub repo_locks: Arc<RwLock<HashMap<RepoId, Arc<tokio::sync::RwLock<()>>>>>,
+    /// `config.creators`, parsed. An entry that does not parse is left out,
+    /// and so authorizes no one.
+    creators: Arc<HashSet<PublicKey>>,
 }
 
 impl AppState {
     pub fn new(config: InstanceConfig) -> Self {
+        let creators = config
+            .creators
+            .iter()
+            .filter_map(|c| PublicKey::parse_levcs(c).ok())
+            .collect();
         Self {
             config: Arc::new(config),
             nonce_cache: Arc::new(Mutex::new(NonceCache::default())),
             repo_locks: Arc::new(RwLock::new(HashMap::new())),
+            creators: Arc::new(creators),
         }
     }
 
-    pub fn repo_dir(&self, repo_id: &str) -> PathBuf {
-        self.config.root.join(repo_id)
+    pub fn repo_dir(&self, repo: &RepoId) -> PathBuf {
+        self.config.repo_dir(repo)
     }
 
-    pub fn store(&self, repo_id: &str) -> ObjectStore {
-        ObjectStore::new(self.repo_dir(repo_id).join(".levcs/objects"))
+    pub fn store(&self, repo: &RepoId) -> ObjectStore {
+        ObjectStore::new(self.repo_dir(repo).join(".levcs/objects"))
     }
 
-    /// The lock every writer of `repo_id`'s refs holds.
-    fn repo_lock(&self, repo_id: &str) -> Arc<Mutex<()>> {
+    /// `repo`'s lock. Every writer of its refs holds it exclusively, from
+    /// reading the state it decides against to its last ref write. Every
+    /// read holds it shared, from deciding who may read to its answer, so
+    /// that a read sees a push wholly before or wholly after. Reads used to
+    /// take no lock: one could decide by an authority a push had moved
+    /// `current` to and not yet committed.
+    pub fn repo_lock(&self, repo: &RepoId) -> Arc<tokio::sync::RwLock<()>> {
         let mut map = self.repo_locks.write().unwrap();
-        map.entry(repo_id.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
+        map.entry(repo.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(())))
             .clone()
     }
 }
@@ -291,11 +370,11 @@ async fn handle_instance_peers(State(s): State<AppState>) -> impl IntoResponse {
 async fn handle_repo_info(
     State(s): State<AppState>,
     Path(repo_id): Path<String>,
+    headers: HeaderMap,
 ) -> Result<axum::Json<InfoResponse>, ApiError> {
-    let dir = s.repo_dir(&repo_id);
-    if !dir.is_dir() {
-        return Err(err(StatusCode::NOT_FOUND, "repo not found"));
-    }
+    let repo = RepoId::parse(&repo_id).ok_or_else(not_found)?;
+    let _reading = admit_read(&s, &repo, &headers, &format!("/repos/{repo}/info")).await?;
+    let dir = s.repo_dir(&repo);
     let refs = levcs_core::Refs::new(dir.join(".levcs"));
     refuse_if_interrupted(&refs)?;
     let cur = refs
@@ -307,9 +386,9 @@ async fn handle_repo_info(
     let branches = refs
         .list_branches()
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let mirror = s.config.mirror_for(&repo_id);
+    let mirror = s.config.mirror_for(&repo);
     let mut info = InfoResponse {
-        repo_id,
+        repo_id: repo.to_string(),
         current_authority: cur.map(|c| c.to_hex()).unwrap_or_default(),
         genesis_authority: genesis.map(|c| c.to_hex()).unwrap_or_default(),
         is_mirror: mirror.is_some(),
@@ -339,11 +418,11 @@ async fn handle_repo_info(
 async fn handle_repo_refs(
     State(s): State<AppState>,
     Path(repo_id): Path<String>,
+    headers: HeaderMap,
 ) -> Result<axum::Json<RefList>, ApiError> {
-    let dir = s.repo_dir(&repo_id);
-    if !dir.is_dir() {
-        return Err(err(StatusCode::NOT_FOUND, "repo not found"));
-    }
+    let repo = RepoId::parse(&repo_id).ok_or_else(not_found)?;
+    let _reading = admit_read(&s, &repo, &headers, &format!("/repos/{repo}/refs")).await?;
+    let dir = s.repo_dir(&repo);
     let refs = levcs_core::Refs::new(dir.join(".levcs"));
     refuse_if_interrupted(&refs)?;
     let mut out = RefList::default();
@@ -370,9 +449,12 @@ async fn handle_repo_refs(
 async fn handle_get_object(
     State(s): State<AppState>,
     Path((repo_id, hash)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Result<Vec<u8>, ApiError> {
+    let repo = RepoId::parse(&repo_id).ok_or_else(not_found)?;
     let id = ObjectId::from_hex(&hash).map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
-    let store = s.store(&repo_id);
+    let _reading = admit_read(&s, &repo, &headers, &format!("/repos/{repo}/objects/{id}")).await?;
+    let store = s.store(&repo);
     let bytes = store
         .read_raw(id)
         .map_err(|e| err(StatusCode::NOT_FOUND, e.to_string()))?;
@@ -391,8 +473,14 @@ async fn handle_get_pack(
     State(s): State<AppState>,
     Path(repo_id): Path<String>,
     Query(q): Query<PackQuery>,
+    headers: HeaderMap,
 ) -> Result<Vec<u8>, ApiError> {
-    let store = s.store(&repo_id);
+    let repo = RepoId::parse(&repo_id).ok_or_else(not_found)?;
+    // Signed over the query rebuilt in a fixed order, never as a proxy may
+    // have rewritten it.
+    let path = format!("/repos/{repo}/pack?have={}&want={}", q.have, q.want);
+    let _reading = admit_read(&s, &repo, &headers, &path).await?;
+    let store = s.store(&repo);
     let have: Vec<ObjectId> = q
         .have
         .split(',')
@@ -512,21 +600,158 @@ fn verify_request_against(
     Ok(AuthCheck { key: auth.key })
 }
 
+/// The answer for a repository that does not exist, and for one this
+/// request may not read: the two are not told apart.
+fn not_found() -> ApiError {
+    err(
+        StatusCode::NOT_FOUND,
+        "repo not found, or not readable by this request",
+    )
+}
+
+/// Who may read a repository.
+enum Readers {
+    Anyone,
+    /// The members of its current authority.
+    Members(AuthorityBody),
+}
+
+/// Who may read `repo`: its current authority's `public_read`, with that
+/// authority proved back to the genesis the id pins. Decided under the
+/// repository's lock, where no push is part way. A transaction record found
+/// even so is one a recovery could not roll back, and the authority it would
+/// replace decides: a change to `current` is not in effect until its push
+/// has landed. Fails closed: an authority that is missing, unreadable or
+/// unproved, and a `public_read` that is neither true nor false, let no one
+/// read.
+fn readers(s: &AppState, repo: &RepoId) -> Result<Readers, String> {
+    let refs = levcs_core::Refs::new(s.repo_dir(repo).join(".levcs"));
+    let pending = levcs_core::ref_tx::RefStore::pending(&refs)
+        .map_err(|e| format!("its ref-transaction record is unreadable: {e}"))?;
+    let current = match pending
+        .into_iter()
+        .flatten()
+        .find(|c| c.name == "refs/authority/current")
+    {
+        Some(change) => change.expected,
+        None => refs
+            .read("refs/authority/current")
+            .map_err(|e| format!("refs/authority/current is unreadable: {e}"))?,
+    }
+    .ok_or("it has no current authority")?;
+    let store = s.store(repo);
+    let genesis = verify_authority_chain(&store, current)
+        .map_err(|e| format!("its current authority {current} is not proved: {e}"))?;
+    if genesis.repo_id.to_hex() != repo.as_str() {
+        return Err(format!(
+            "its current authority {current} belongs to another repository"
+        ));
+    }
+    let body = store
+        .read_typed(current, ObjectType::Authority)
+        .map_err(|e| e.to_string())
+        .and_then(|raw| AuthorityBody::parse(&raw.body).map_err(|e| e.to_string()))
+        .map_err(|e| format!("its current authority {current} is unreadable: {e}"))?;
+    match body.policy_value("public_read") {
+        Some([0x01]) => Ok(Readers::Anyone),
+        None | Some([0x00]) => Ok(Readers::Members(body)),
+        Some(v) => Err(format!(
+            "its public_read policy is malformed ({} byte(s), not a boolean)",
+            v.len()
+        )),
+    }
+}
+
+/// Who may read `repo`, if it exists and that can be established; the
+/// answer for a missing repository otherwise. A repository whose read
+/// policy cannot be established is logged for the operator.
+fn read_gate(s: &AppState, repo: &RepoId) -> Result<Readers, ApiError> {
+    if !s.repo_dir(repo).is_dir() {
+        return Err(not_found());
+    }
+    readers(s, repo).map_err(|why| {
+        tracing::error!(repo = %repo, "reads refused: {why}");
+        not_found()
+    })
+}
+
+fn member_or_not_found(
+    repo: &RepoId,
+    body: &AuthorityBody,
+    key: &PublicKey,
+) -> Result<(), ApiError> {
+    if body.find_member(key).is_some() {
+        Ok(())
+    } else {
+        tracing::warn!(repo = %repo, key = %key, "refused: not a member of its current authority");
+        Err(not_found())
+    }
+}
+
+/// `repo`'s lock, if it exists; the answer for a missing repository
+/// otherwise. Only a repository that exists has a lock: an id no one
+/// created, which anyone can name and any key can sign for, takes no entry
+/// in the table of locks.
+fn lock_of_existing(s: &AppState, repo: &RepoId) -> Result<Arc<tokio::sync::RwLock<()>>, ApiError> {
+    if !s.repo_dir(repo).is_dir() {
+        return Err(not_found());
+    }
+    Ok(s.repo_lock(repo))
+}
+
+/// Let a read of `repo` through, or answer as for a repository that does
+/// not exist. A public repository is read by anyone. A private one only by
+/// a member of its current authority, in a request signed over `path`. No
+/// handler used to look at `public_read`, so a private repository was read
+/// by anyone (audit C3).
+///
+/// The guard returned holds the repository's lock shared: the read keeps
+/// it until it has answered, so that what it serves is of the state its
+/// readers were decided by.
+async fn admit_read(
+    s: &AppState,
+    repo: &RepoId,
+    headers: &HeaderMap,
+    path: &str,
+) -> Result<tokio::sync::OwnedRwLockReadGuard<()>, ApiError> {
+    let reading = lock_of_existing(s, repo)?.read_owned().await;
+    match read_gate(s, repo)? {
+        Readers::Anyone => {}
+        Readers::Members(body) => {
+            let auth = verify_request_against(s, headers, "GET", path, b"").map_err(|e| {
+                tracing::warn!(repo = %repo, "read refused: {}", e.1);
+                not_found()
+            })?;
+            member_or_not_found(repo, &body, &auth.key)?;
+        }
+    }
+    Ok(reading)
+}
+
 async fn handle_init(
     State(s): State<AppState>,
     Path(repo_id): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
-    let path = format!("/repos/{repo_id}/init");
+    let repo = RepoId::parse(&repo_id).ok_or_else(not_found)?;
+    let path = format!("/repos/{repo}/init");
     let auth = verify_request_against(&s, &headers, "POST", &path, body.as_ref())?;
+    // Only the keys the operator names create repositories. Before this,
+    // any key that owned the genesis it sent did, on any instance.
+    if !s.creators.contains(&auth.key) {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            format!("{} may not create repositories on this instance", auth.key),
+        ));
+    }
     // Body is the genesis authority object (signed).
     use levcs_core::object::SignedObject;
     let signed =
         SignedObject::parse(&body).map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
     let body_parsed =
         verify_genesis(&signed).map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
-    if hex::encode(body_parsed.repo_id.as_bytes()) != repo_id {
+    if hex::encode(body_parsed.repo_id.as_bytes()) != repo.as_str() {
         return Err(err(
             StatusCode::BAD_REQUEST,
             "URL repo_id does not match authority body",
@@ -550,15 +775,15 @@ async fn handle_init(
             ))
         }
     }
-    let lock = s.repo_lock(&repo_id);
-    let _guard = lock.lock().unwrap();
-    let dir = s.repo_dir(&repo_id);
+    let lock = s.repo_lock(&repo);
+    let _guard = lock.write().await;
+    let dir = s.repo_dir(&repo);
     if dir.is_dir() {
         return Err(err(StatusCode::CONFLICT, "repo already exists"));
     }
     levcs_core::Repository::init_skeleton(&dir)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let store = s.store(&repo_id);
+    let store = s.store(&repo);
     let bytes = signed.serialize();
     let id = store
         .write_raw(&bytes)
@@ -577,21 +802,34 @@ async fn handle_push(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
-    let path = format!("/repos/{repo_id}/push");
+    let repo = RepoId::parse(&repo_id).ok_or_else(not_found)?;
+    let path = format!("/repos/{repo}/push");
     let auth = verify_request_against(&s, &headers, "POST", &path, body.as_ref())?;
-    let dir = s.repo_dir(&repo_id);
-    if !dir.is_dir() {
-        return Err(err(StatusCode::NOT_FOUND, "repo not found"));
+    // A push to a repository its signer may not read is answered as one to
+    // a repository that does not exist. Its refusals would describe what
+    // the repository holds, its current authority among them. Checked here,
+    // under the lock shared as a read holds it, so that a stranger's push is
+    // not even decoded; and again under the exclusive lock, which decides.
+    // Checked here without the lock, it could find the repository opened by
+    // a push not yet landed, and decode a stranger's push to a private one.
+    let lock = lock_of_existing(&s, &repo)?;
+    {
+        let _deciding = lock.read().await;
+        match read_gate(&s, &repo)? {
+            Readers::Anyone => {}
+            Readers::Members(body) => member_or_not_found(&repo, &body, &auth.key)?,
+        }
     }
+    let dir = s.repo_dir(&repo);
     // §5.6: a mirror's refs are records of its source's state (Rule R.4).
     // Publishing over them is not replication, and `writeback`, which was
     // to forward a push to the source, is not implemented: a push used to
     // be applied here, over the records. Refuse, and point at the source.
-    if let Some(m) = s.config.mirror_for(&repo_id) {
+    if let Some(m) = s.config.mirror_for(&repo) {
         return Err(err(
             StatusCode::FORBIDDEN,
             format!(
-                "this instance mirrors {repo_id} from {} and does not accept writes; push to the source instead",
+                "this instance mirrors {repo} from {} and does not accept writes; push to the source instead",
                 m.source
             ),
         ));
@@ -653,11 +891,17 @@ async fn handle_push(
             }
         }
     }
-    let store = s.store(&repo_id);
+    let store = s.store(&repo);
 
     // The per-repo lock, held from reading S0 to the last ref write.
-    let lock = s.repo_lock(&repo_id);
-    let _guard = lock.lock().unwrap();
+    let _guard = lock.write().await;
+    // Again, under the lock and against the state admission decides by:
+    // the repository may have become private since the check above, and
+    // each refusal from here on describes that state.
+    match read_gate(&s, &repo)? {
+        Readers::Anyone => {}
+        Readers::Members(body) => member_or_not_found(&repo, &body, &auth.key)?,
+    }
 
     // The pushed objects, held apart from the store until the push is
     // admitted. They used to be written first, so a refused push still
@@ -724,7 +968,7 @@ async fn handle_push(
             format!("an interrupted push could not be rolled back: {e}"),
         )
     })?;
-    let s0 = pre_state(&refs, &store, &repo_id)?;
+    let s0 = pre_state(&refs, &store, repo.as_str())?;
     let named = ObjectId::from_hex(&manifest.authority_hash)
         .map_err(|e| err(StatusCode::BAD_REQUEST, format!("authority_hash: {e}")))?;
     let authority_update = authority_update(&incoming, &s0, named)?;
@@ -929,11 +1173,11 @@ pub fn recover_interrupted_pushes(root: &std::path::Path) -> Vec<String> {
         return out;
     };
     for ent in entries.flatten() {
+        let name = ent.file_name().to_string_lossy().into_owned();
         let levcs = ent.path().join(".levcs");
-        if !levcs.is_dir() {
+        if RepoId::parse(&name).is_none() || !levcs.is_dir() {
             continue;
         }
-        let name = ent.file_name().to_string_lossy().into_owned();
         match levcs_core::ref_tx::recover(&levcs_core::Refs::new(levcs)) {
             Ok(None) => {}
             Ok(Some(refs)) => out.push(format!(
@@ -991,6 +1235,26 @@ fn find_merge_record<S: VerifySource>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only an id is ever joined onto the root.
+    #[test]
+    fn a_repo_id_is_64_lowercase_hex_characters_and_nothing_else() {
+        let id = "0123456789abcdef".repeat(4);
+        assert_eq!(RepoId::parse(&id).map(|r| r.to_string()), Some(id.clone()));
+        for not in [
+            id.to_uppercase(),
+            id[..63].to_string(),
+            format!("{id}0"),
+            format!("{}g", &id[..63]),
+            format!("../{}", &id[..61]),
+            format!("/{}", &id[..63]),
+            format!("{}%2F", &id[..61]),
+            format!("{}\0", &id[..63]),
+            String::new(),
+        ] {
+            assert!(RepoId::parse(&not).is_none(), "{not:?}");
+        }
+    }
 
     fn micros_from_secs(s: i64) -> i64 {
         s * 1_000_000

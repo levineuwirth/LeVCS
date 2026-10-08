@@ -307,8 +307,14 @@ pub fn push(args: PushArgs) -> Result<()> {
 pub fn pull(args: PullArgs) -> Result<()> {
     let (repo, _lock) = open_repo_locked()?;
     let url = active_instance()?;
-    let client = levcs_client::Client::new(url);
-    let _ = args.key;
+    // A private repository is served only to its members, so its reads are
+    // signed with the key `--key` names. Without one they are anonymous,
+    // which reads a public repository.
+    let client = match args.key.as_deref() {
+        Some(label) => levcs_client::Client::new(url)
+            .with_reader(std::sync::Arc::new(load_secret(Some(label))?.1)),
+        None => levcs_client::Client::new(url),
+    };
     let repo_id = compute_repo_id(&repo)?;
     let remote_refs = client.refs(&repo_id)?;
     let want_refs: Vec<String> = if args.refs.is_empty() {
@@ -353,6 +359,7 @@ pub fn fork(args: ForkArgs) -> Result<()> {
         None => active_instance()?,
     };
     let (label, sk) = load_secret(args.key.as_deref())?;
+    let sk = std::sync::Arc::new(sk);
     let pk = sk.public();
 
     let dest_name = args
@@ -365,7 +372,8 @@ pub fn fork(args: ForkArgs) -> Result<()> {
     }
 
     // 1. Talk to the source instance.
-    let client = levcs_client::Client::new(url.clone());
+    // Signed, so that a member can fork a private repository.
+    let client = levcs_client::Client::new(url.clone()).with_reader(sk.clone());
     let info = client.repo_info(&args.repo_id)?;
     if info.repo_id.is_empty() {
         bail!("source instance returned no repo_id");

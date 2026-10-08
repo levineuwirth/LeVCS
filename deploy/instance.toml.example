@@ -29,6 +29,14 @@ storage_mode = "full"
 # tree-sitter or plugin handler names to admit them.
 allowed_handlers = ["builtin"]
 
+# Keys that may create repositories on this instance, as
+# `levcs key show <label>` prints them. None by default: an instance
+# that names no creator accepts no new repository, and refuses to
+# start if an entry here is not a key. Name your own key to host
+# your repositories.
+creators = []
+# creators = ["ed25519:<64 hex digits>"]
+
 # Other instances this one knows about. Currently informational —
 # advertised on /levcs/v1/instance/peers but not used for cross-instance
 # fetching. Leave empty unless you're publishing a federation directory.

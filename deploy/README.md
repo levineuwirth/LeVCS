@@ -61,6 +61,10 @@ The defaults (full storage, builtin handlers only, no mirrors, listen
 on 127.0.0.1:7117) are correct for a single-VPS install. Change `root`
 only if `/var/lib/levcs` doesn't suit your filesystem layout.
 
+Name the keys that may create repositories in `creators`, as
+`levcs key show <label>` prints them. With none named, the instance
+accepts no new repository.
+
 ### 4. Install the systemd unit
 
 ```sh
@@ -201,12 +205,16 @@ repo not yet on instance; initialising
 pushed 1 ref(s)
 ```
 
-That's it. The repo is now hosted on the VPS, available to anyone over
-HTTPS:
+That's it. The repo is now hosted on the VPS. `levcs init` makes a
+public repository, which anyone who can reach the instance may read:
 
 ```sh
 curl -fsS https://levcs.example.com/levcs/v1/repos/<repo_id>/info | jq
 ```
+
+A private one (`public_read` false) is served only to members of its
+current authority, in signed requests (`levcs pull --key <label>`).
+Anyone else is answered as if it did not exist.
 
 ### 6. (Optional) Verify the server-side state
 

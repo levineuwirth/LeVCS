@@ -36,6 +36,11 @@ fn tempdir(prefix: &str) -> PathBuf {
     p
 }
 
+/// The key every repository here is created by, which the instance names
+/// as a creator; and a second creator, which owns nothing.
+const OWNER: [u8; 32] = [7; 32];
+const CREATOR: [u8; 32] = [8; 32];
+
 async fn start() -> (SocketAddr, tokio::task::JoinHandle<()>, PathBuf) {
     start_with(Vec::new()).await
 }
@@ -50,6 +55,10 @@ async fn start_with(
         federation_peers: Vec::new(),
         allowed_handlers: Vec::new(),
         mirrors,
+        creators: [OWNER, CREATOR]
+            .iter()
+            .map(|s| SecretKey::from_seed(*s).public().to_levcs())
+            .collect(),
     };
     let app = router(AppState::new(cfg));
     let listener = tokio::net::TcpListener::bind::<SocketAddr>("127.0.0.1:0".parse().unwrap())
@@ -74,7 +83,7 @@ type Auth = (ObjectId, AuthorityBody);
 impl World {
     fn new() -> Self {
         World {
-            owner: SecretKey::generate(),
+            owner: SecretKey::from_seed(OWNER),
             objects: HashMap::new(),
             t: 1_700_000_000_000_000,
         }
@@ -211,8 +220,11 @@ struct Repo {
 }
 
 impl Repo {
+    /// Reads as the owner. These repositories are private, since their
+    /// genesis sets no `public_read`, and an instance serves a private
+    /// repository only to its members.
     fn client(&self) -> Client {
-        Client::new(self.base.clone())
+        Client::new(self.base.clone()).with_reader(std::sync::Arc::new(SecretKey::from_seed(OWNER)))
     }
     fn read(&self, name: &str) -> Option<String> {
         std::fs::read_to_string(self.dir.join(".levcs").join(name))
@@ -297,13 +309,19 @@ async fn run(f: impl FnOnce(String, PathBuf) + Send + 'static) {
 
 /// C1: the manifest's authority authorizes nothing. A revoked contributor
 /// naming the authority that still lists them is refused, and `current`
-/// stays where the boundary put it.
+/// stays where the boundary put it. The repository is public, so that the
+/// revoked contributor can still read it and is refused by the authority
+/// check, not as a stranger to a private repository.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_authority_a_push_names_authorizes_nothing() {
     run(|base, root| {
         let mut w = World::new();
         let x = SecretKey::generate();
-        let v1 = w.genesis(&[(&x, Role::Contributor)], vec![]);
+        let public = vec![PolicyEntry {
+            key: "public_read".into(),
+            value: vec![0x01],
+        }];
+        let v1 = w.genesis(&[(&x, Role::Contributor)], public);
         let repo = init(base, &root, &w, &v1);
         let owner = SecretKey::from_seed(*w.owner.seed());
         let c1 = w.commit(v1.0, &[], &owner);
@@ -477,12 +495,13 @@ async fn incomplete_history_is_refused_and_nothing_stored() {
     .await;
 }
 
-/// Creating a repository publishes its genesis: an owner of it only.
+/// Creating a repository publishes its genesis: an owner of it only, even
+/// among the keys the instance lets create repositories.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn init_needs_an_owner_of_the_genesis() {
     run(|base, root| {
         let mut w = World::new();
-        let x = SecretKey::generate();
+        let x = SecretKey::from_seed(CREATOR);
         let v1 = w.genesis(&[(&x, Role::Maintainer)], vec![]);
         let repo_id = v1.1.repo_id.to_hex();
         match Client::new(base).init(&x, &repo_id, &w.objects[&v1.0].1) {

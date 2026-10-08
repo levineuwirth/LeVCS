@@ -13,6 +13,7 @@
 //! storage_mode = "full"          # full | release | metadata
 //! allowed_handlers = ["builtin"]
 //! federation_peers = []
+//! creators = ["ed25519:..."]     # keys that may create repositories; none by default
 //!
 //! [[mirrors]]
 //! repo_id = "..."
@@ -45,6 +46,8 @@ struct FileConfig {
     allowed_handlers: Option<Vec<String>>,
     #[serde(default)]
     mirrors: Option<Vec<MirrorConfig>>,
+    #[serde(default)]
+    creators: Option<Vec<String>>,
 }
 
 const DEFAULT_BIND: &str = "127.0.0.1:7117";
@@ -166,7 +169,14 @@ async fn main() -> std::io::Result<()> {
             .allowed_handlers
             .unwrap_or_else(|| vec!["builtin".into()]),
         mirrors: file.mirrors.unwrap_or_default(),
+        creators: file.creators.unwrap_or_default(),
     };
+    if let Err(problems) = config.validate() {
+        die(format!("invalid configuration:\n{problems}"));
+    }
+    if config.creators.is_empty() {
+        tracing::warn!("no creators are configured; this instance accepts no new repository");
+    }
 
     tracing::info!(
         addr = %bind,

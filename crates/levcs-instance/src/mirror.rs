@@ -20,7 +20,7 @@ use levcs_core::{ObjectId, ObjectStore, Refs, Repository};
 use levcs_identity::verify::ChainVerifier;
 use thiserror::Error;
 
-use crate::{InstanceConfig, MirrorConfig};
+use crate::{InstanceConfig, MirrorConfig, RepoId};
 
 #[derive(Debug, Error)]
 pub enum MirrorError {
@@ -41,6 +41,9 @@ pub enum MirrorError {
 
     #[error("unsupported mode: {0}")]
     Mode(String),
+
+    #[error("mirror repo_id {0:?} is not 64 lowercase hex characters")]
+    RepoId(String),
 }
 
 /// What the most recent sync pass changed locally.
@@ -67,7 +70,11 @@ pub fn sync_mirror(
         return Err(MirrorError::Mode(mirror.mode.clone()));
     }
 
-    let repo_dir: PathBuf = config.root.join(&mirror.repo_id);
+    // Only an id is ever joined onto the root: a mirror's `repo_id` used to
+    // be joined as configured.
+    let repo = RepoId::parse(&mirror.repo_id)
+        .ok_or_else(|| MirrorError::RepoId(mirror.repo_id.clone()))?;
+    let repo_dir: PathBuf = config.repo_dir(&repo);
     if !repo_dir.is_dir() {
         Repository::init_skeleton(&repo_dir)?;
     }

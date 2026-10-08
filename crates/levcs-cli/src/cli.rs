@@ -298,6 +298,8 @@ pub struct PushArgs {
 
 #[derive(Args, Debug)]
 pub struct PullArgs {
+    /// Sign reads with this key: a private repository is served only to its
+    /// members.
     #[arg(long)]
     pub key: Option<String>,
     pub refs: Vec<String>,

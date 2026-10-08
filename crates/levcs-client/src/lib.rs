@@ -2,6 +2,7 @@
 //! request signing per §5.3 and provides typed methods for the §5.2
 //! endpoints.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -30,11 +31,23 @@ pub enum ClientError {
     Decode(String),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Client {
     base: String,
     http: Http,
     user_agent: String,
+    /// Signs every read of a repository, so that a private one can be read
+    /// by its members. Without a key, reads are anonymous.
+    reader: Option<Arc<SecretKey>>,
+}
+
+impl std::fmt::Debug for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Client")
+            .field("base", &self.base)
+            .field("reader", &self.reader.as_ref().map(|k| k.public()))
+            .finish()
+    }
 }
 
 impl Client {
@@ -46,7 +59,40 @@ impl Client {
                 .build()
                 .expect("build reqwest client"),
             user_agent: "levcs-client/0.1.0".into(),
+            reader: None,
         }
+    }
+
+    /// Sign reads of repositories with `sk`. An instance serves a private
+    /// repository only to members of its current authority, and answers
+    /// anyone else as if it did not exist.
+    pub fn with_reader(mut self, sk: Arc<SecretKey>) -> Self {
+        self.reader = Some(sk);
+        self
+    }
+
+    /// GET `path` (`/repos/<id>/...`, the form the instance verifies a
+    /// signature over), signed if this client has a reader key.
+    fn get(&self, path: &str) -> Result<reqwest::blocking::Response, ClientError> {
+        let mut req = self
+            .http
+            .get(format!("{}{path}", self.base))
+            .header("user-agent", &self.user_agent);
+        if let Some(sk) = &self.reader {
+            let signed = AuthRequest {
+                method: "GET",
+                path_with_query: path,
+                body: b"",
+            };
+            let (key, ts, nonce, sig) =
+                sign_request(sk, &signed).map_err(|e| ClientError::Auth(e.to_string()))?;
+            req = req
+                .header("LeVCS-Key", key)
+                .header("LeVCS-Timestamp", ts)
+                .header("LeVCS-Nonce", nonce)
+                .header("LeVCS-Signature", sig);
+        }
+        check(req.send()?)
     }
 
     pub fn instance_info(&self) -> Result<InstanceInfo, ClientError> {
@@ -60,33 +106,19 @@ impl Client {
     }
 
     pub fn repo_info(&self, repo_id: &str) -> Result<InfoResponse, ClientError> {
-        let url = format!("{}/repos/{repo_id}/info", self.base);
-        let res = self
-            .http
-            .get(&url)
-            .header("user-agent", &self.user_agent)
-            .send()?;
-        check(res)?.json::<InfoResponse>().map_err(Into::into)
+        self.get(&format!("/repos/{repo_id}/info"))?
+            .json::<InfoResponse>()
+            .map_err(Into::into)
     }
 
     pub fn refs(&self, repo_id: &str) -> Result<RefList, ClientError> {
-        let url = format!("{}/repos/{repo_id}/refs", self.base);
-        let res = self
-            .http
-            .get(&url)
-            .header("user-agent", &self.user_agent)
-            .send()?;
-        check(res)?.json::<RefList>().map_err(Into::into)
+        self.get(&format!("/repos/{repo_id}/refs"))?
+            .json::<RefList>()
+            .map_err(Into::into)
     }
 
     pub fn get_object(&self, repo_id: &str, id: ObjectId) -> Result<Vec<u8>, ClientError> {
-        let url = format!("{}/repos/{repo_id}/objects/{}", self.base, id.to_hex());
-        let res = self
-            .http
-            .get(&url)
-            .header("user-agent", &self.user_agent)
-            .send()?;
-        let res = check(res)?;
+        let res = self.get(&format!("/repos/{repo_id}/objects/{}", id.to_hex()))?;
         Ok(res.bytes()?.to_vec())
     }
 
@@ -98,18 +130,12 @@ impl Client {
     ) -> Result<Pack, ClientError> {
         let have_q: Vec<String> = have.iter().map(|h| h.to_hex()).collect();
         let want_q: Vec<String> = want.iter().map(|h| h.to_hex()).collect();
-        let url = format!(
-            "{}/repos/{repo_id}/pack?have={}&want={}",
-            self.base,
+        let path = format!(
+            "/repos/{repo_id}/pack?have={}&want={}",
             have_q.join(","),
             want_q.join(",")
         );
-        let res = self
-            .http
-            .get(&url)
-            .header("user-agent", &self.user_agent)
-            .send()?;
-        let bytes = check(res)?.bytes()?;
+        let bytes = self.get(&path)?.bytes()?;
         Pack::decode(&bytes).map_err(|e| ClientError::Decode(e.to_string()))
     }
 

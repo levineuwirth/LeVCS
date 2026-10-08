@@ -32,6 +32,7 @@ fn tempdir(prefix: &str) -> PathBuf {
 
 async fn start(
     allowed_handlers: Vec<String>,
+    creators: Vec<String>,
 ) -> (SocketAddr, tokio::task::JoinHandle<()>, PathBuf) {
     let root = tempdir("levcs-policy");
     let cfg = InstanceConfig {
@@ -40,6 +41,7 @@ async fn start(
         federation_peers: Vec::new(),
         allowed_handlers,
         mirrors: Vec::new(),
+        creators,
     };
     let state = AppState::new(cfg);
     let app = router(state);
@@ -175,9 +177,10 @@ fn build_pack_with_optional_record(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn builtin_only_policy_admits_clean_push() {
-    let (addr, task, root) = start(vec!["builtin".into()]).await;
-    let base = format!("http://{addr}/levcs/v1");
     let setup = build_genesis();
+    let (addr, task, root) =
+        start(vec!["builtin".into()], vec![setup.sk.public().to_levcs()]).await;
+    let base = format!("http://{addr}/levcs/v1");
 
     let result = tokio::task::spawn_blocking({
         let seed = *setup.sk.seed();
@@ -213,9 +216,10 @@ async fn builtin_only_policy_admits_clean_push() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn builtin_only_policy_rejects_disallowed_plugin_handler() {
-    let (addr, task, root) = start(vec!["builtin".into()]).await;
-    let base = format!("http://{addr}/levcs/v1");
     let setup = build_genesis();
+    let (addr, task, root) =
+        start(vec!["builtin".into()], vec![setup.sk.public().to_levcs()]).await;
+    let base = format!("http://{addr}/levcs/v1");
 
     let merge_record_toml = r#"schema_version = 1
 base = "blake3:0000000000000000000000000000000000000000000000000000000000000000"
@@ -280,9 +284,9 @@ status = "auto"
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn empty_policy_admits_anything() {
-    let (addr, task, root) = start(vec![]).await;
-    let base = format!("http://{addr}/levcs/v1");
     let setup = build_genesis();
+    let (addr, task, root) = start(vec![], vec![setup.sk.public().to_levcs()]).await;
+    let base = format!("http://{addr}/levcs/v1");
 
     let merge_record_toml = r#"schema_version = 1
 base = "blake3:0000000000000000000000000000000000000000000000000000000000000000"

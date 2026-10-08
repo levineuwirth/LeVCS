@@ -155,6 +155,26 @@ fast-forward leaves HEAD, the branch and the index where they were. This
 rests on Unix's directory-relative system calls; on other platforms levcs
 refuses to write a working tree at all, rather than write one less safely.
 
+Work that is not committed is never overwritten. A branch switch, a
+fast-forward and a merge plan the whole move before writing anything. Each
+refuses if the move would overwrite or remove:
+- a staged change;
+- an edit to a file the target changes or lacks;
+- an untracked file or a link where the target has a file.
+A switch carries over edits to files both branches have alike, and removes
+the committed files the target lacks. The refusal names each path and why
+it is not committed.
+
+Symlinks are never followed and never recorded. A link committed as its
+target's bytes put another file, possibly from outside the repository, into
+history; Fossil turned its symlink support off by default for the same
+reason.
+- `track` refuses a named link, and a path reached through one.
+- `track` passes over links in a directory or with `--all`, and says so.
+- `commit` refuses a tracked file that has become a link.
+- `status` lists links on their own.
+- `cache --save` skips them.
+
 Publishing follows Rule P of
 [`doc/authority-semantics.md`](doc/authority-semantics.md). Without an
 instance, every command that moves a branch, release or authority ref

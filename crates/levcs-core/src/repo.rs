@@ -17,6 +17,7 @@
 //!   hooks/
 //! ```
 
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -29,7 +30,7 @@ use crate::object::{ObjectType, RawObject, SignedObject};
 use crate::refs::{Head, Refs};
 use crate::store::ObjectStore;
 use crate::tree::{EntryType, FileMode, Tree, TreeEntry};
-use crate::worktree::{self, Perms, Worktree};
+use crate::worktree::{self, Found, Perms, Worktree};
 
 pub const LEVCS_DIR: &str = ".levcs";
 
@@ -49,6 +50,51 @@ impl TreeFile {
             Perms::Executable
         } else {
             Perms::Regular
+        }
+    }
+}
+
+/// What a walk of the working tree found at a path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Walked {
+    File,
+    /// Never followed, never recorded.
+    Symlink,
+}
+
+/// Work that is not committed, at `path`, which a move of the working tree
+/// would destroy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unsaved {
+    pub path: String,
+    pub why: &'static str,
+}
+
+/// A move of the working tree from one tree to another, checked whole by
+/// [`Repository::plan_checkout`] before anything is written.
+#[derive(Clone, Debug, Default)]
+pub struct CheckoutPlan {
+    /// Files to write, in the target's version.
+    pub write: Vec<TreeFile>,
+    /// Files the target does not have, each still as committed.
+    pub remove: Vec<String>,
+    /// Staged changes to paths the move does not touch, carried into the
+    /// index rebuilt from the target: an entry to keep, or `None` for a path
+    /// no longer tracked.
+    pub carry: Vec<(String, Option<IndexEntry>)>,
+}
+
+impl CheckoutPlan {
+    /// Keep, in `index` (rebuilt from the target), the staged changes the
+    /// move carried over.
+    pub fn carry_into(&self, index: &mut Index) {
+        for (path, entry) in &self.carry {
+            match entry {
+                Some(e) => index.upsert(e.clone()),
+                None => {
+                    index.remove(path);
+                }
+            }
         }
     }
 }
@@ -190,15 +236,23 @@ impl Repository {
         self.refs.write("refs/authority/genesis", id)
     }
 
-    /// Iterate over all working-tree files (excluding `.levcs/` and ignored).
-    pub fn walk_workdir(&self) -> Result<Vec<PathBuf>> {
+    /// Every regular file and every symlink in the working tree, by
+    /// repository-relative path, excluding `.levcs/` and ignored paths. A
+    /// link is never followed, into a directory or otherwise. Anything
+    /// else (a fifo, a socket) is passed over.
+    pub fn walk_workdir_entries(&self) -> Result<Vec<(String, Walked)>> {
         let mut out = Vec::new();
         let ignore = self.read_ignore();
         walk(&self.workdir, &self.workdir, &ignore, &mut out)?;
         out.sort();
         return Ok(out);
 
-        fn walk(base: &Path, dir: &Path, ig: &Ignore, out: &mut Vec<PathBuf>) -> Result<()> {
+        fn walk(
+            base: &Path,
+            dir: &Path,
+            ig: &Ignore,
+            out: &mut Vec<(String, Walked)>,
+        ) -> Result<()> {
             for ent in fs::read_dir(dir).ctx(dir.to_path_buf())? {
                 let ent = ent.ctx(dir.to_path_buf())?;
                 let path = ent.path();
@@ -213,12 +267,27 @@ impl Repository {
                 let ft = ent.file_type().ctx(path.clone())?;
                 if ft.is_dir() {
                     walk(base, &path, ig, out)?;
-                } else if ft.is_file() || ft.is_symlink() {
-                    out.push(path);
+                } else if ft.is_symlink() {
+                    out.push((rel_str, Walked::Symlink));
+                } else if ft.is_file() {
+                    out.push((rel_str, Walked::File));
                 }
             }
             Ok(())
         }
+    }
+
+    /// The regular files of [`Self::walk_workdir_entries`], as absolute
+    /// paths. Symlinks are not among them: they used to be, and every
+    /// reader followed them, so a link to a file outside the repository
+    /// put that file's bytes into history.
+    pub fn walk_workdir(&self) -> Result<Vec<PathBuf>> {
+        Ok(self
+            .walk_workdir_entries()?
+            .into_iter()
+            .filter(|(_, k)| *k == Walked::File)
+            .map(|(rel, _)| self.workdir.join(rel))
+            .collect())
     }
 
     /// Build a `Tree` object for a single directory level given a sorted set
@@ -236,23 +305,6 @@ impl Repository {
             worktree::components(&e.path)
                 .map_err(|err| Error::Other(format!("cannot commit: {err}")))?;
             node.insert(&e.path, e.blob_hash, mode_from_index(e.mode));
-        }
-        node.write(self)
-    }
-
-    /// Build a tree from a working directory directly (used when no index is
-    /// available). All files are added as regular blobs.
-    pub fn build_tree_from_workdir(&self) -> Result<ObjectId> {
-        let mut node = TreeBuilder::default();
-        for path in self.walk_workdir()? {
-            let rel = path.strip_prefix(&self.workdir).unwrap();
-            let rel_str = rel.to_string_lossy().replace('\\', "/");
-            worktree::components(&rel_str)
-                .map_err(|err| Error::Other(format!("cannot commit: {err}")))?;
-            let bytes = fs::read(&path).ctx(path.clone())?;
-            let blob = crate::blob::Blob::new(bytes);
-            let id = self.objects.write_raw(&blob.serialize())?;
-            node.insert(&rel_str, id, FileMode::REGULAR);
         }
         node.write(self)
     }
@@ -335,6 +387,144 @@ impl Repository {
         Ok(())
     }
 
+    /// The files of `tree` by path; none for no tree.
+    fn files_by_path(&self, tree: Option<ObjectId>) -> Result<BTreeMap<String, TreeFile>> {
+        Ok(match tree {
+            Some(t) if !t.is_zero() => self
+                .tree_files(t, "")?
+                .into_iter()
+                .map(|f| (f.path.clone(), f))
+                .collect(),
+            _ => BTreeMap::new(),
+        })
+    }
+
+    /// Everything not committed: staged changes, and every path HEAD's tree
+    /// or the index tracks whose working-tree state is not HEAD's. Each
+    /// tracked path is read directly, ignored or not. A merge starts only
+    /// over a clean tree.
+    ///
+    /// This used to compare the working tree with the index, so staged work
+    /// counted as clean, and through the ignore-filtered walk, so a tracked
+    /// file matching an ignore pattern counted as deleted.
+    pub fn uncommitted(&self, head_tree: Option<ObjectId>, index: &Index) -> Result<Vec<Unsaved>> {
+        let wt = Worktree::open(&self.workdir)?;
+        let head = self.files_by_path(head_tree)?;
+        let mut out: Vec<Unsaved> = staged(&head, index).into_iter().map(|(u, _)| u).collect();
+        let mut seen: HashSet<String> = out.iter().map(|u| u.path.clone()).collect();
+        for (path, f) in &head {
+            if seen.contains(path) {
+                continue;
+            }
+            let found = wt.read(path)?;
+            if !holds(&found, f) {
+                out.push(Unsaved {
+                    path: path.clone(),
+                    why: changed(&found),
+                });
+                seen.insert(path.clone());
+            }
+        }
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(out)
+    }
+
+    /// Plan moving the working tree from `from` (HEAD's tree, or none) to
+    /// `to`, refusing anything that would destroy work not committed:
+    /// staged changes, a file changed or deleted since HEAD that the move
+    /// rewrites or removes, an untracked file or a link where the target has
+    /// a file. A file both trees have alike is not touched, so changes to it
+    /// are carried over. Nothing is written here.
+    ///
+    /// A switch and a fast-forward used to write the target over all of it,
+    /// and leave behind the files the target does not have.
+    pub fn plan_checkout(
+        &self,
+        from: Option<ObjectId>,
+        to: ObjectId,
+        index: &Index,
+    ) -> Result<std::result::Result<CheckoutPlan, Vec<Unsaved>>> {
+        let wt = Worktree::open(&self.workdir)?;
+        let head = self.files_by_path(from)?;
+        let target = self.files_by_path(Some(to))?;
+        let mut lost = Vec::new();
+        let mut plan = CheckoutPlan::default();
+        // Staged work the move would overwrite is refused; on a path the
+        // move does not touch it is carried into the rebuilt index.
+        let touched = |p: &String| {
+            head.get(p).map(|f| (f.blob, f.executable))
+                != target.get(p).map(|f| (f.blob, f.executable))
+        };
+        for (unsaved, entry) in staged(&head, index) {
+            if touched(&unsaved.path) {
+                lost.push(unsaved);
+            } else {
+                plan.carry.push((unsaved.path, entry));
+            }
+        }
+        let paths: BTreeSet<&String> = head.keys().chain(target.keys()).collect();
+        for path in paths {
+            let (h, t) = (head.get(path), target.get(path));
+            if h.map(|f| (f.blob, f.executable)) == t.map(|f| (f.blob, f.executable)) {
+                continue;
+            }
+            let found = wt.read(path)?;
+            let clean = match h {
+                Some(h) => holds(&found, h),
+                None => found == Found::Missing,
+            };
+            match t {
+                Some(t) if holds(&found, t) => {}
+                Some(t) if clean => plan.write.push(t.clone()),
+                Some(_) => lost.push(Unsaved {
+                    path: path.clone(),
+                    why: match (&found, h) {
+                        (Found::File { .. }, None) => "untracked, and the target has a file there",
+                        (f, _) => changed(f),
+                    },
+                }),
+                None if found == Found::Missing => {}
+                None if clean => plan.remove.push(path.clone()),
+                None => lost.push(Unsaved {
+                    path: path.clone(),
+                    why: changed(&found),
+                }),
+            }
+        }
+        if !lost.is_empty() {
+            lost.sort_by(|a, b| a.path.cmp(&b.path));
+            lost.dedup_by(|a, b| a.path == b.path);
+            return Ok(Err(lost));
+        }
+        Ok(Ok(plan))
+    }
+
+    /// Make a [`CheckoutPlan`]: every blob it writes read and checked, every
+    /// path checked, then the files written and removed, without following
+    /// links. It reads only the blobs it writes; a caller that rebuilds its
+    /// index from the target builds it first, so that every blob of the
+    /// target is checked before anything changes.
+    pub fn apply_checkout(&self, plan: &CheckoutPlan) -> Result<()> {
+        let wt = Worktree::open(&self.workdir)?;
+        for f in &plan.write {
+            self.objects.read_typed(f.blob, ObjectType::Blob)?;
+        }
+        wt.preflight(
+            plan.write
+                .iter()
+                .map(|f| f.path.as_str())
+                .chain(plan.remove.iter().map(|p| p.as_str())),
+        )?;
+        for f in &plan.write {
+            let blob = self.objects.read_typed(f.blob, ObjectType::Blob)?;
+            wt.write_file(&f.path, &blob.body, f.perms())?;
+        }
+        for p in &plan.remove {
+            wt.remove_file(p)?;
+        }
+        Ok(())
+    }
+
     pub fn read_signed(&self, id: ObjectId) -> Result<SignedObject> {
         let bytes = self.objects.read_raw(id)?;
         SignedObject::parse(&bytes)
@@ -392,6 +582,64 @@ impl Repository {
             _ => Ok(None),
         }
     }
+}
+
+/// Whether what is found is `f`'s file, with its executable bit.
+fn holds(found: &Found, f: &TreeFile) -> bool {
+    match found {
+        Found::File { bytes, executable } => {
+            *executable == f.executable
+                && crate::blob::Blob::new(bytes.clone()).object_id() == f.blob
+        }
+        _ => false,
+    }
+}
+
+/// How a path that is not as committed differs.
+fn changed(found: &Found) -> &'static str {
+    match found {
+        Found::Missing => "deleted and not committed",
+        Found::File { .. } => "changed and not committed",
+        Found::Symlink => "a symlink (levcs neither follows nor records links)",
+        Found::Other => "a directory or special file where a file is tracked",
+    }
+}
+
+/// Changes staged in the index and not committed: tracked entries that are
+/// not HEAD's, and HEAD's files no longer tracked. Each with the entry the
+/// index holds for it, if any.
+fn staged(head: &BTreeMap<String, TreeFile>, index: &Index) -> Vec<(Unsaved, Option<IndexEntry>)> {
+    let mut out = Vec::new();
+    let mut indexed = HashSet::new();
+    for e in index.entries.iter().filter(|e| e.flags.is_tracked()) {
+        indexed.insert(e.path.as_str());
+        // The executable bit too: a staged `chmod +x` is a staged change,
+        // and was discarded as none.
+        let staged_as = (e.blob_hash, e.mode & 0o111 != 0);
+        if head.get(&e.path).map(|f| (f.blob, f.executable)) != Some(staged_as) {
+            let why = "staged and not committed";
+            out.push((
+                Unsaved {
+                    path: e.path.clone(),
+                    why,
+                },
+                Some(e.clone()),
+            ));
+        }
+    }
+    for path in head.keys() {
+        if !indexed.contains(path.as_str()) {
+            let why = "no longer tracked, and not committed";
+            out.push((
+                Unsaved {
+                    path: path.clone(),
+                    why,
+                },
+                None,
+            ));
+        }
+    }
+    out
 }
 
 fn mode_from_index(m: u8) -> FileMode {

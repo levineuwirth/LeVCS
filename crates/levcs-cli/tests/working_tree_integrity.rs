@@ -11,6 +11,10 @@
 //! - **Ignored but tracked.** `status` and `diff` read only the
 //!   ignore-filtered walk, so a tracked file matching an ignore pattern was
 //!   reported deleted, and `diff HEAD` showed it removed whole.
+//! - **Staged work.** `status` compared the working tree with the index
+//!   only, so a change staged with `track`, a newly tracked file and a
+//!   forgotten one showed nowhere, though a switch refused over them (the
+//!   audit's H7).
 
 #![cfg(unix)]
 
@@ -74,6 +78,35 @@ impl Repo {
     fn branch(&self, name: &str) -> Option<String> {
         std::fs::read_to_string(self.work.join(".levcs/refs/branches").join(name)).ok()
     }
+}
+
+/// The paths `status` lists under the heading that begins with `name`.
+fn section(status: &str, name: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut on = false;
+    for line in status.lines() {
+        if let Some(path) = line.strip_prefix("  ") {
+            if on {
+                out.push(path.to_string());
+            }
+        } else if !line.is_empty() {
+            on = line.ends_with(':')
+                && (line == format!("{name}:") || line.starts_with(&format!("{name} (")));
+        }
+    }
+    out
+}
+
+/// The paths a refusal names, from its `  path  (why)` lines.
+fn named(refusal: &str) -> Vec<String> {
+    let mut out: Vec<String> = refusal
+        .lines()
+        .filter_map(|l| l.strip_prefix("  "))
+        .filter_map(|l| l.split("  (").next())
+        .map(str::to_string)
+        .collect();
+    out.sort();
+    out
 }
 
 fn repo(tag: &str) -> Repo {
@@ -179,9 +212,11 @@ fn a_switch_refuses_staged_work_it_would_overwrite_and_carries_the_rest() {
     r.ok(&["track", "notes.md"]);
     r.ok(&["branch", "--switch", "feature"]);
     assert_eq!(r.read("notes.md"), "staged notes\n");
-    // Still staged: the index holds it, so status does not call it modified.
+    // Still staged: the index holds it, so status lists it as staged and
+    // not as modified.
     let status = r.ok(&["status"]);
-    assert!(!status.contains("notes.md"), "{status}");
+    assert_eq!(section(&status, "staged"), ["notes.md"], "{status}");
+    assert!(section(&status, "modified").is_empty(), "{status}");
     // Committing takes it, with nothing further tracked.
     r.ok(&["commit", "-m", "carried", "--", "notes.md"]);
     assert!(r.ok(&["status"]).contains("working tree clean"));
@@ -416,7 +451,12 @@ fn a_staged_executable_bit_is_kept() {
     r.ok(&["track", "script.sh"]);
     r.ok(&["branch", "--switch", "other"]);
     let status = r.ok(&["status"]);
-    assert!(!status.contains("script.sh"), "staged mode lost: {status}");
+    assert_eq!(
+        section(&status, "staged"),
+        ["script.sh"],
+        "staged mode lost: {status}"
+    );
+    assert!(section(&status, "modified").is_empty(), "{status}");
 
     chmod(0o644);
     let e = r.refused(&["merge", "main"]);
@@ -461,4 +501,125 @@ fn a_missing_target_blob_refuses_the_move_before_anything_changes() {
         before,
         "a refused fast-forward changed something"
     );
+}
+
+// Staged work in `status`.
+
+/// The audit's H7. A change staged with `track`, a staged mode, a newly
+/// tracked file and two forgotten ones, one gone from disk and one still
+/// there but ignored: `status` compared the working tree with the index,
+/// found them alike, and said the working tree was clean.
+#[test]
+fn status_lists_what_the_index_holds_that_head_does_not() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = repo("status-staged");
+    r.commit(
+        &[
+            (".levcsignore", "pdf\n"),
+            ("a.txt", "a\n"),
+            ("b.sh", "echo b\n"),
+            ("c.txt", "c\n"),
+            ("pdf/paper.pdf", "%PDF-1.4 not really\n"),
+        ],
+        "base",
+    );
+    r.write("a.txt", "a, staged\n");
+    r.ok(&["track", "a.txt"]);
+    std::fs::set_permissions(r.work.join("b.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    r.ok(&["track", "b.sh"]);
+    r.ok(&["forget", "c.txt"]);
+    std::fs::remove_file(r.work.join("c.txt")).unwrap();
+    r.ok(&["forget", "pdf/paper.pdf"]);
+    r.write("d.txt", "d\n");
+    r.ok(&["track", "d.txt"]);
+
+    let status = r.ok(&["status"]);
+    assert!(!status.contains("working tree clean"), "{status}");
+    assert_eq!(section(&status, "new"), ["d.txt"], "{status}");
+    assert_eq!(section(&status, "staged"), ["a.txt", "b.sh"], "{status}");
+    assert_eq!(
+        section(&status, "no longer tracked"),
+        ["c.txt", "pdf/paper.pdf"],
+        "{status}"
+    );
+    assert!(section(&status, "modified").is_empty(), "{status}");
+
+    // Committing takes all of it, and leaves the ignored file on disk.
+    r.ok(&["commit", "-m", "everything staged"]);
+    let status = r.ok(&["status"]);
+    assert!(status.contains("working tree clean"), "{status}");
+    assert_eq!(r.read("pdf/paper.pdf"), "%PDF-1.4 not really\n");
+}
+
+/// `status` lists every path a refusal names as uncommitted, and nothing
+/// else that is tracked: what a merge refuses over is what `status` shows.
+/// A switch used to refuse over staged work `status` called clean.
+#[test]
+fn status_lists_exactly_what_a_merge_refuses_over() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = repo("status-agrees");
+    r.commit(
+        &[
+            (".levcsignore", "pdf\n"),
+            ("a.txt", "a\n"),
+            ("b.sh", "echo b\n"),
+            ("c.txt", "c\n"),
+            ("e.txt", "e\n"),
+            ("f.txt", "f\n"),
+            ("same.txt", "same\n"),
+            ("pdf/paper.pdf", "%PDF-1.4 not really\n"),
+        ],
+        "base",
+    );
+    r.ok(&["branch", "--create", "other"]);
+    r.ok(&["branch", "--switch", "other"]);
+    r.commit(&[("g.txt", "g\n")], "other");
+    r.ok(&["branch", "--switch", "main"]);
+
+    // Staged, then edited again: staged and modified both.
+    r.write("a.txt", "a, staged\n");
+    r.ok(&["track", "a.txt"]);
+    r.write("a.txt", "a, edited after\n");
+    std::fs::set_permissions(r.work.join("b.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    r.ok(&["track", "b.sh"]);
+    r.ok(&["forget", "c.txt"]);
+    std::fs::remove_file(r.work.join("c.txt")).unwrap();
+    r.ok(&["forget", "pdf/paper.pdf"]);
+    r.write("d.txt", "d\n");
+    r.ok(&["track", "d.txt"]);
+    r.write("e.txt", "e, edited\n");
+    std::fs::remove_file(r.work.join("f.txt")).unwrap();
+    // Staged, then put back on disk: only the index differs.
+    r.write("same.txt", "same, staged\n");
+    r.ok(&["track", "same.txt"]);
+    r.write("same.txt", "same\n");
+
+    let e = r.refused(&["merge", "other"]);
+    assert!(e.contains("levcs track <path>"), "{e}");
+    let status = r.ok(&["status"]);
+    let mut listed: Vec<String> = [
+        "new",
+        "staged",
+        "no longer tracked",
+        "modified",
+        "deleted",
+        "no longer a regular file",
+    ]
+    .iter()
+    .flat_map(|s| section(&status, s))
+    .collect();
+    listed.sort();
+    listed.dedup();
+    let expected = [
+        "a.txt",
+        "b.sh",
+        "c.txt",
+        "d.txt",
+        "e.txt",
+        "f.txt",
+        "pdf/paper.pdf",
+        "same.txt",
+    ];
+    assert_eq!(named(&e), expected, "{e}");
+    assert_eq!(listed, expected, "{status}");
 }

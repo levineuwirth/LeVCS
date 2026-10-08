@@ -30,25 +30,47 @@ struct RepoConfig {
     instance: BTreeMap<String, toml::Value>,
 }
 
-fn read_instance_url(repo: &Repository) -> Result<Option<String>> {
+/// The instance this repository is a workspace of, from its own
+/// `.levcs/config`. A config that cannot be read or parsed is an error,
+/// never read as naming no instance: whether this repository's refs are
+/// its published state turns on it (`publish::mode`). A malformed config
+/// used to read as empty, and so turned a workspace standalone.
+pub(crate) fn read_instance_url(repo: &Repository) -> Result<Option<String>> {
     let path = repo.config_path();
     let s = match fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    let cfg: RepoConfig = toml::from_str(&s).unwrap_or_default();
-    Ok(cfg
-        .instance
-        .get("url")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string()))
+    let cfg: RepoConfig =
+        toml::from_str(&s).map_err(|e| anyhow!("cannot read {}: {e}", path.display()))?;
+    match cfg.instance.get("url") {
+        None => Ok(None),
+        Some(toml::Value::String(u)) => Ok(Some(u.clone())),
+        Some(_) => bail!(
+            "cannot read {}: [instance] url is not a string",
+            path.display()
+        ),
+    }
 }
 
+/// Make this repository a workspace of the instance at `url`. It is marked
+/// so first, durably: see `publish::mode`. A config that cannot be parsed
+/// is refused, not rewritten.
 fn write_instance_url(repo: &Repository, url: &str) -> Result<()> {
     let path = repo.config_path();
-    let s = fs::read_to_string(&path).unwrap_or_default();
-    let mut cfg: RepoConfig = toml::from_str(&s).unwrap_or_default();
+    let s = match fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.into()),
+    };
+    let mut cfg: RepoConfig = toml::from_str(&s).map_err(|e| {
+        anyhow!(
+            "cannot read {}: {e}; not rewriting a config that cannot be read",
+            path.display()
+        )
+    })?;
+    crate::publish::mark_workspace(repo)?;
     cfg.instance
         .insert("url".into(), toml::Value::String(url.to_string()));
     let out = toml::to_string_pretty(&cfg)?;
@@ -449,14 +471,28 @@ pub fn fork(args: ForkArgs) -> Result<()> {
     let fork_signed = sign_commit(fork_commit, &sk)?;
     let fork_id = repo.write_signed(&fork_signed)?;
 
-    // 10. Materialise the working tree, then wire up refs and HEAD, so a
-    //     checkout refused part way leaves no ref naming a tree that was
-    //     never written.
-    repo.checkout_tree(source_commit.tree, &dest)?;
+    // 10. Creating the repository sets its genesis and current authority,
+    //     as `init` does. The fork commit is then its first publication,
+    //     checked under Rule P before anything else is written, with the
+    //     source history behind it checked under Rule H against the
+    //     source's own genesis: it used to be signed over unverified. Then
+    //     the working tree, then the branch and HEAD, so a checkout refused
+    //     part way leaves no ref naming a tree that was never written.
     repo.set_genesis_authority(new_auth_id)?;
     repo.set_current_authority(new_auth_id)?;
     let main_ref = "refs/branches/main".to_string();
-    repo.refs.write(&main_ref, fork_id)?;
+    let publish = crate::publish::prepare(
+        &repo,
+        Some(&pk),
+        vec![crate::publish::update(
+            main_ref.clone(),
+            None,
+            Some(fork_id),
+        )],
+        None,
+    )?;
+    repo.checkout_tree(source_commit.tree, &dest)?;
+    publish.apply(&repo)?;
     repo.refs.write_head(&Head::Branch(main_ref.clone()))?;
 
     eprintln!(
@@ -906,10 +942,13 @@ pub fn dial(args: DialArgs) -> Result<()> {
     }
 
     // Cross-check the manifest's repo_id against the genesis authority we
-    // just received. The recipient never trusts the manifest's word for it.
+    // just received. The recipient never trusts the manifest's word for it,
+    // and the genesis is pinned only once it verifies as one.
     let genesis_id = ObjectId::from_hex(&manifest.genesis_authority)
         .map_err(|_| anyhow!("manifest genesis_authority not a valid hash"))?;
     let genesis_signed = repo.read_signed(genesis_id)?;
+    levcs_identity::verify::verify_genesis(&genesis_signed)
+        .map_err(|e| anyhow!("received genesis authority: {e}"))?;
     let genesis_body = AuthorityBody::parse(&genesis_signed.body)?;
     let derived_repo_id = genesis_body.repo_id.to_hex();
     if derived_repo_id != manifest.repo_id {
@@ -921,7 +960,7 @@ pub fn dial(args: DialArgs) -> Result<()> {
     }
 
     // Verify each tip end-to-end. verify_commit / verify_release walk the
-    // authority chain and the embedded signatures — refuse to advance any
+    // authority chain and the embedded signatures — refuse to record any
     // ref whose tip can't be verified, even if the bytes hash-match.
     for (_name, hex) in &manifest.branches {
         let id = ObjectId::from_hex(hex)?;
@@ -934,51 +973,60 @@ pub fn dial(args: DialArgs) -> Result<()> {
             .map_err(|e| anyhow!("verify release {hex}: {e}"))?;
     }
 
-    // HEAD on main if present, otherwise any branch we got. Releases-only
-    // archives leave HEAD detached at the latest release's predecessor —
-    // there's no branch to point at. The working tree is materialised
-    // first, so a checkout refused part way leaves no ref naming a tree
-    // that was never written.
-    let head = if let Some((name, hex)) = manifest
+    // HEAD on main if present, otherwise any branch we got, otherwise a
+    // release's predecessor: detached, since nothing here is a branch of
+    // this replica's own (below). It used to name the release itself,
+    // which is not a commit. The working tree is materialised first, so a
+    // checkout refused part way leaves no ref naming a tree that was never
+    // written.
+    let tip = if let Some((_, hex)) = manifest
         .branches
         .iter()
         .find(|(k, _)| k.as_str() == "main")
         .or_else(|| manifest.branches.iter().next())
     {
+        Some(ObjectId::from_hex(hex)?)
+    } else if let Some((_, hex)) = manifest.releases.iter().next() {
         let id = ObjectId::from_hex(hex)?;
-        let commit = Commit::from_signed(&repo.read_signed(id)?)?;
-        Some((Head::Branch(format!("refs/branches/{name}")), commit.tree))
-    } else if let Some((_name, hex)) = manifest.releases.iter().next() {
-        let id = ObjectId::from_hex(hex)?;
-        let rel = levcs_core::Release::from_signed(&repo.read_signed(id)?)?;
-        Some((Head::Detached(id), rel.tree))
+        Some(levcs_core::Release::from_signed(&repo.read_signed(id)?)?.predecessor)
     } else {
         None
     };
-    if let Some((_, tree)) = &head {
-        repo.checkout_tree(*tree, &dest)?;
+    if let Some(id) = tip {
+        let commit = Commit::from_signed(&repo.read_signed(id)?)?;
+        repo.checkout_tree(commit.tree, &dest)?;
     }
 
-    // Now wire up refs. Authority pointers come from the manifest; we
-    // already have those objects in the store and verified them through
-    // the commit/release walks.
+    // Record what was received, and publish none of it (Rule R.4, D6).
+    // A v1 transfer carries no evidence that the sender published this
+    // history, only the sender's word. So its refs are kept as records,
+    // under refs/remote/origin/, not as this replica's branches, and the
+    // sender's current authority is not adopted as this replica's: with
+    // none, nothing here can be published. Accepting the history needs an
+    // owner of the received authority to sign a bootstrap statement, and
+    // that statement has no defined format yet (D6, deferred). Dial used to
+    // install the refs as branches and set `current` from the manifest.
     repo.set_genesis_authority(genesis_id)?;
-    let auth_id = ObjectId::from_hex(&manifest.authority_hash)?;
-    repo.set_current_authority(auth_id)?;
     for (name, hex) in &manifest.branches {
         let id = ObjectId::from_hex(hex)?;
-        repo.refs.write(&format!("refs/branches/{name}"), id)?;
+        repo.refs
+            .write(&format!("refs/remote/origin/branches/{name}"), id)?;
     }
     for (name, hex) in &manifest.releases {
         let id = ObjectId::from_hex(hex)?;
-        repo.refs.write(&format!("refs/releases/{name}"), id)?;
+        repo.refs
+            .write(&format!("refs/remote/origin/releases/{name}"), id)?;
     }
-    if let Some((h, _)) = head {
-        repo.refs.write_head(&h)?;
+    if let Some(id) = tip {
+        repo.refs.write_head(&Head::Detached(id))?;
     }
 
     eprintln!(
-        "dial complete: repository at {:?}\n  repo_id    = blake3:{}\n  authority  = {}",
+        "dial complete: repository at {:?}\n  repo_id    = blake3:{}\n  \
+         received   = refs/remote/origin/ (the sender's current authority is {})\n\n\
+         This replica can be read but not published from. Accepting received history \
+         needs an owner's bootstrap statement, which has no defined format yet (D6, \
+         deferred).",
         dest, derived_repo_id, manifest.authority_hash
     );
     Ok(())

@@ -155,6 +155,44 @@ fast-forward leaves HEAD, the branch and the index where they were. This
 rests on Unix's directory-relative system calls; on other platforms levcs
 refuses to write a working tree at all, rather than write one less safely.
 
+Publishing follows Rule P of
+[`doc/authority-semantics.md`](doc/authority-semantics.md). Without an
+instance, every command that moves a branch, release or authority ref
+publishes: `commit` on a branch, `merge`, `branch --create` and `--delete`,
+`release`, `authority add`, `remove` and `promote`, and `fork`. With an
+instance, the instance checks each push.
+- **Against what.** Each publication is checked against the state before
+  it: the current authority, and the history the branches and releases
+  already reach. Being present in the store, or under `refs/remote/`, does
+  not count as published.
+- **Exact authority.** Everything the change would newly publish must cite
+  the current authority exactly and be signed by a member of it.
+- **Authority changes.** An authority change publishes one commit that
+  installs a direct successor, and `current` moves with it. Work under the
+  new authority follows in a later publication.
+- **Roles.** A protected branch needs a Maintainer. So does a rewrite of
+  published history, which must also be forced. Deleting a branch whose
+  commits nothing else reaches counts as one (`branch --delete --force`).
+- **Not yet publishable:**
+  - Work made under an older authority, until adoption (D1) has a defined
+    record format.
+  - A repository received by `dial`, until an owner's bootstrap statement
+    exists (D6). Until then it keeps the received history under
+    `refs/remote/` and has no current authority.
+- **Interrupted publications.** A publication's ref changes land together
+  or not at all. They are recorded in `.levcs/ref-transaction/` before any
+  ref moves. One stopped part way, by an error or by the process being
+  killed, is rolled back before anything else reads the refs to publish,
+  or before `verify` vouches for them.
+- **Keys.** Commands that publish take `--key` when the keychain holds
+  several keys.
+- **Workspaces.** A repository whose own `.levcs/config` names an instance
+  is that instance's workspace. Its refs move freely, and the instance
+  applies the rules when the work is pushed. Becoming a workspace is
+  recorded in `.levcs/workspace`. A workspace's refs moved without
+  admission, so they never become published history: if its config stops
+  naming the instance, or cannot be read, nothing publishes.
+
 A commit is published once its branch moves. If a step after that fails, such
 as rewriting the index or clearing merge state, `commit` still prints the id,
 says what did not finish, and exits with status 3. The commit stands, and

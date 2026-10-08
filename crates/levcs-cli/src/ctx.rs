@@ -38,14 +38,27 @@ pub fn open_repo_locked() -> Result<(Repository, RepoLock)> {
 /// Take the lock on an already-open repository. Commands that may prompt for
 /// a passphrase take it after the prompt, so a person typing does not hold
 /// every other session's commit.
+///
+/// A ref transaction that a killed process left part way (its record in
+/// `.levcs/ref-transaction/`) is rolled back here, before the command reads
+/// anything: no command acts on a half-published state.
 pub fn lock_repo(repo: &Repository) -> Result<RepoLock> {
-    match repo.try_lock()? {
-        Some(lock) => Ok(lock),
+    let lock = match repo.try_lock()? {
+        Some(lock) => lock,
         None => {
             eprintln!("levcs: waiting for another levcs process to release the repository lock");
-            Ok(repo.lock()?)
+            repo.lock()?
         }
+    };
+    match levcs_core::ref_tx::recover(&repo.refs) {
+        Ok(None) => {}
+        Ok(Some(refs)) => eprintln!(
+            "levcs: rolled back a publication that was interrupted part way ({})",
+            refs.join(", ")
+        ),
+        Err(e) => return Err(anyhow!("{e}")),
     }
+    Ok(lock)
 }
 
 pub fn keychain_path() -> PathBuf {

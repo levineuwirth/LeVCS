@@ -202,7 +202,15 @@ where
     let _lock = crate::ctx::lock_repo(&repo)?;
     let cur_id = repo
         .current_authority()?
-        .ok_or_else(|| anyhow!("no current authority"))?;
+        .ok_or_else(|| anyhow!(crate::repo_cmds::NO_CURRENT))?;
+    // The boundary commit is what publishes the new authority (P.3). On a
+    // detached HEAD no ref would carry it, and `current` used to move anyway.
+    let branch = repo.current_branch()?.ok_or_else(|| {
+        anyhow!(
+            "an authority change is made on a branch: its commit is what publishes \
+             the new authority, and on a detached HEAD no ref would carry it"
+        )
+    })?;
     let cur_signed = repo.read_signed(cur_id)?;
     let cur_body = AuthorityBody::parse(&cur_signed.body)?;
     let me = cur_body
@@ -221,6 +229,10 @@ where
     new_body.created_micros = now_micros();
     f(&mut new_body, pk)?;
     new_body.normalize()?;
+    // D4: an authority without an owner could never be changed again.
+    if !new_body.members.iter().any(|m| m.role == Role::Owner) {
+        bail!("the new authority would have no owner, and could never be changed again (D4)");
+    }
     let new_signed = sign_authority(&new_body, &sk)?;
     let new_auth_id = repo.write_signed(&new_signed)?;
 
@@ -246,10 +258,17 @@ where
     };
     let signed_commit = sign_commit(commit_obj, &sk)?;
     let id = repo.write_signed(&signed_commit)?;
-    if let Some(branch) = repo.current_branch()? {
-        repo.refs.compare_and_write(&branch, head, id)?;
-    }
-    repo.set_current_authority(new_auth_id)?;
+    // The branch moves to the boundary commit and `current` moves with it,
+    // each by compare-and-swap, as one publication. `current` used to be
+    // written plainly after the branch, so a failure between them left the
+    // branch on a boundary whose authority was not current.
+    crate::publish::prepare(
+        &repo,
+        Some(&pk),
+        vec![crate::publish::update(branch, head, Some(id))],
+        Some(new_auth_id),
+    )?
+    .apply(&repo)?;
     eprintln!("authority updated to {new_auth_id} (commit {id})");
     Ok(())
 }

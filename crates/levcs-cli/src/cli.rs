@@ -141,6 +141,14 @@ pub struct BranchArgs {
     #[arg(long)]
     pub delete: Option<String>,
     pub from: Option<String>,
+    /// The key that creating or deleting a branch publishes under, in a
+    /// repository with no instance. Needed when the keychain holds several.
+    #[arg(long)]
+    pub key: Option<String>,
+    /// With --delete: delete a branch whose commits no other ref reaches,
+    /// which unpublishes them. Needs a maintainer.
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Args, Debug)]

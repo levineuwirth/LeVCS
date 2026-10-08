@@ -187,21 +187,49 @@ fn deploy_and_dial_round_trip() {
         .to_string();
     assert_eq!(src_repo_id, dst_repo_id, "genesis authority must match");
 
-    // Branch tip must match.
+    // The received branch is recorded, not published: a v1 transfer
+    // carries only the sender's word for what was published, so the
+    // replica keeps it under refs/remote/ and adopts no current authority
+    // (Rule R.4; D6, deferred). Dial used to install it as `main` and set
+    // `current` from the sender's manifest.
     let src_main = std::fs::read_to_string(source.join(".levcs/refs/branches/main"))
         .unwrap()
         .trim()
         .to_string();
-    let dst_main = std::fs::read_to_string(dest.join(".levcs/refs/branches/main"))
+    let dst_main = std::fs::read_to_string(dest.join(".levcs/refs/remote/origin/branches/main"))
         .unwrap()
         .trim()
         .to_string();
     assert_eq!(src_main, dst_main, "branch main tip must match");
+    assert!(!dest.join(".levcs/refs/branches/main").exists());
+    assert!(!dest.join(".levcs/refs/authority/current").exists());
+    let head = std::fs::read_to_string(dest.join(".levcs/HEAD")).unwrap();
+    assert_eq!(
+        head.trim(),
+        src_main,
+        "HEAD is detached at the received tip"
+    );
 
     // verify on the dialed repo passes — every signature and the full
     // authority chain reconstruct correctly from what we received.
     let (code, _, e) = run(&["verify"], &dest, &xdg);
     assert_eq!(code, 0, "verify on dialed repo: {e}");
+
+    // Nothing can be published from it, by anyone, until an owner's
+    // bootstrap statement exists, and that has no format yet: the refusal
+    // says so rather than inventing one. Even the sender's own owner key.
+    std::fs::write(dest.join("README"), "changed\n").unwrap();
+    let (code, _, e) = run(&["commit", "-m", "x", "--key", "alice"], &dest, &xdg);
+    assert_ne!(code, 0, "a commit was published from a v1 replica");
+    assert!(e.contains("D6, deferred"), "{e}");
+    let (code, _, e) = run(
+        &["branch", "--create", "main", "--key", "alice"],
+        &dest,
+        &xdg,
+    );
+    assert_ne!(code, 0, "received history was published as a branch");
+    assert!(e.contains("D6, deferred"), "{e}");
+    assert!(!dest.join(".levcs/refs/branches/main").exists());
 
     // Cleanup.
     let _ = std::fs::remove_dir_all(&source);

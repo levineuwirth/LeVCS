@@ -176,6 +176,9 @@ async fn main() -> std::io::Result<()> {
         "levcs instance starting"
     );
 
+    for line in levcs_instance::recover_interrupted_pushes(&config.root) {
+        tracing::warn!("{line}");
+    }
     let state = AppState::new(config.clone());
 
     // Spawn one background poller per configured mirror. The handles

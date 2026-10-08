@@ -70,6 +70,19 @@ pub struct Unsaved {
     pub why: &'static str,
 }
 
+/// How the index differs from HEAD at a path: a change staged and not
+/// committed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Staged {
+    /// Tracked, and not in HEAD.
+    New,
+    /// Tracked, and not as HEAD has it: other bytes, or another executable
+    /// bit.
+    Changed,
+    /// In HEAD, and no longer tracked.
+    Forgotten,
+}
+
 /// A move of the working tree from one tree to another, checked whole by
 /// [`Repository::plan_checkout`] before anything is written.
 #[derive(Clone, Debug, Default)]
@@ -426,6 +439,30 @@ impl Repository {
             }
         }
         out.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(out)
+    }
+
+    /// The changes staged in `index` against `head_tree` (HEAD's tree, or
+    /// none), by path: the staged work a move refuses to overwrite, as
+    /// `status` reports it.
+    pub fn staged_changes(
+        &self,
+        head_tree: Option<ObjectId>,
+        index: &Index,
+    ) -> Result<Vec<(String, Staged)>> {
+        let head = self.files_by_path(head_tree)?;
+        let mut out: Vec<(String, Staged)> = staged(&head, index)
+            .into_iter()
+            .map(|(u, entry)| {
+                let kind = match entry {
+                    None => Staged::Forgotten,
+                    Some(_) if head.contains_key(&u.path) => Staged::Changed,
+                    Some(_) => Staged::New,
+                };
+                (u.path, kind)
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(out)
     }
 

@@ -157,14 +157,36 @@ fn concurrent_track_keeps_every_entry_and_a_parseable_index() {
         String::from_utf8_lossy(&st.stderr)
     );
     let out = String::from_utf8_lossy(&st.stdout).into_owned();
+    // The paths `status` lists under the heading that begins `heading`.
+    let listed_under = |heading: &str| -> Vec<String> {
+        let mut on = false;
+        out.lines()
+            .filter_map(|l| match l.strip_prefix("  ") {
+                Some(p) => on.then(|| p.to_string()),
+                None => {
+                    if !l.is_empty() {
+                        on = l.starts_with(heading);
+                    }
+                    None
+                }
+            })
+            .collect()
+    };
+    let untracked_now = listed_under("untracked");
     let untracked: Vec<String> = (0..N)
         .map(name)
-        .filter(|n| out.contains(&format!("  {n}")))
+        .filter(|n| untracked_now.contains(n))
         .collect();
     assert!(
         untracked.is_empty(),
         "`track` exited 0 but these are untracked: {untracked:?}"
     );
+    // Each is tracked and not yet committed: new, every one of them.
+    let mut new = listed_under("new");
+    new.sort();
+    let mut all: Vec<String> = (0..N).map(name).collect();
+    all.sort();
+    assert_eq!(new, all, "not every tracked file is listed as new:\n{out}");
 }
 
 /// Which of `names` are in HEAD's tree: delete each from the working tree

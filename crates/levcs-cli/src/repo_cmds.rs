@@ -8,6 +8,7 @@ use anyhow::{anyhow, bail, Context, Result};
 
 use levcs_core::object::{ObjectType, SignedObject};
 use levcs_core::refs::Head;
+use levcs_core::repo::Staged;
 use levcs_core::worktree::Found;
 use levcs_core::{
     Blob, Commit, CommitFlags, Index, IndexEntry, IndexEntryFlags, ObjectId, Refs, Release,
@@ -349,9 +350,11 @@ pub fn status() -> Result<()> {
         .map(|s| s.trim_start_matches("refs/branches/").to_string())
         .unwrap_or_else(|| "(detached)".into());
     println!("On branch {branch}");
+    let mut head_tree = None;
     if let Some(h) = head {
         let signed = repo.read_signed(h)?;
         let commit = Commit::from_signed(&signed)?;
+        head_tree = Some(commit.tree);
         let subject = commit.message.lines().next().unwrap_or("").to_string();
         println!("HEAD       {h}");
         if !subject.is_empty() {
@@ -405,6 +408,18 @@ pub fn status() -> Result<()> {
         }
     }
     deleted.sort();
+    // What the index holds that HEAD does not. Only the working tree was
+    // compared with the index, so a change staged with `track`, a newly
+    // tracked file and a forgotten one showed nowhere, and status could say
+    // clean over work a switch refuses to overwrite (audit H7).
+    let (mut new, mut staged, mut forgotten) = (Vec::new(), Vec::new(), Vec::new());
+    for (path, kind) in repo.staged_changes(head_tree, &idx)? {
+        match kind {
+            Staged::New => new.push(path),
+            Staged::Changed => staged.push(path),
+            Staged::Forgotten => forgotten.push(path),
+        }
+    }
     // Conflicts first: some have no markers, and nothing else shows them.
     let mut conflicted: Vec<&str> = idx
         .entries
@@ -419,6 +434,24 @@ pub fn status() -> Result<()> {
             println!("  {c}");
         }
         println!("\n{RESOLVE_HELP}");
+    }
+    for (heading, paths) in [
+        ("new (tracked since HEAD)", &new),
+        (
+            "staged (the index holds a version that is not HEAD's)",
+            &staged,
+        ),
+        (
+            "no longer tracked (HEAD has them; a commit without paths removes them)",
+            &forgotten,
+        ),
+    ] {
+        if !paths.is_empty() {
+            println!("\n{heading}:");
+            for p in paths {
+                println!("  {p}");
+            }
+        }
     }
     if !modified.is_empty() {
         println!("\nmodified:");
@@ -450,7 +483,10 @@ pub fn status() -> Result<()> {
             println!("  {l}");
         }
     }
-    if modified.is_empty()
+    if new.is_empty()
+        && staged.is_empty()
+        && forgotten.is_empty()
+        && modified.is_empty()
         && deleted.is_empty()
         && replaced.is_empty()
         && untracked.is_empty()
@@ -1417,8 +1453,10 @@ fn refuse_unsaved(action: &str, lost: &[levcs_core::repo::Unsaved]) -> anyhow::E
     };
     anyhow!(
         "{action} would overwrite or remove uncommitted changes:\n{listing}{more}\n\
-         commit it, or put the file back as committed (`levcs construct HEAD <path>`; \
-         `levcs cache --save` keeps a copy first), and try again. Nothing was changed."
+         commit them, or put each back as committed and try again: `levcs construct \
+         HEAD <path>` restores a file, and `levcs track <path>` then stages it as \
+         committed; an untracked file has to be moved aside (`levcs cache --save` \
+         keeps a copy first). Nothing was changed."
     )
 }
 

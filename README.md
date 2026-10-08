@@ -165,6 +165,13 @@ A switch carries over edits to files both branches have alike, and removes
 the committed files the target lacks. The refusal names each path and why
 it is not committed.
 
+`status` lists the same work. First comes what the index holds that HEAD
+does not: new files, staged changes, and files no longer tracked. Then come
+edits and deletions since a file was last tracked or committed. A staged
+path stays refused until it is committed, or put back with
+`levcs construct HEAD <path>` and staged as committed with
+`levcs track <path>`.
+
 Symlinks are never followed and never recorded. A link committed as its
 target's bytes put another file, possibly from outside the repository, into
 history; Fossil turned its symlink support off by default for the same

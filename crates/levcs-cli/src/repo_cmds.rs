@@ -8,6 +8,7 @@ use anyhow::{anyhow, bail, Context, Result};
 
 use levcs_core::object::{ObjectType, SignedObject};
 use levcs_core::refs::Head;
+use levcs_core::worktree::Found;
 use levcs_core::{
     Blob, Commit, CommitFlags, Index, IndexEntry, IndexEntryFlags, ObjectId, Refs, Release,
     Repository, Tree, ZERO_ID,
@@ -145,8 +146,20 @@ pub fn track(args: TrackArgs) -> Result<()> {
     // separately. `track sub/`, `track .` from inside `sub/`, and
     // `track --all` then cannot disagree about what is ignored — they did,
     // because each rolled its own descent.
-    let walked = repo.walk_workdir()?;
-    let mut targets: Vec<PathBuf> = Vec::new();
+    //
+    // Symlinks are never followed and never recorded: one into the store
+    // would put another file's bytes, possibly from outside the repository,
+    // into history. Every symlink was read through. A walk now passes over
+    // them, saying so, and naming one is refused.
+    let (mut walked, mut links): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+    for (rel, kind) in repo.walk_workdir_entries()? {
+        match kind {
+            levcs_core::repo::Walked::File => walked.push(rel),
+            levcs_core::repo::Walked::Symlink => links.push(rel),
+        }
+    }
+    let mut targets: Vec<String> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
     // Files named one by one. Only these can mark a conflict resolved:
     // `track --all` or a directory would otherwise resolve every conflict
     // under it, including ones with no markers that nobody looked at.
@@ -155,45 +168,57 @@ pub fn track(args: TrackArgs) -> Result<()> {
     // An empty restriction is the repository root: `track .` at the top.
     if args.all || restrict.iter().any(|r| r.is_empty()) {
         targets.extend(walked);
+        skipped.extend(links);
     } else {
         for r in &restrict {
-            let abs = root.join(r);
-            if abs.is_dir() {
-                let before = targets.len();
-                for p in &walked {
-                    if path_under(std::slice::from_ref(r), &rel_of(&root, p)) {
-                        targets.push(p.clone());
+            let under = |p: &String| path_under(std::slice::from_ref(r), p);
+            match fs::symlink_metadata(root.join(r)) {
+                Ok(m) if m.file_type().is_symlink() => bail!(
+                    "{r} is a symlink; levcs neither follows nor records links (forget it, \
+                     or add it to .levcsignore)"
+                ),
+                Ok(m) if m.is_dir() => {
+                    let before = targets.len();
+                    targets.extend(walked.iter().filter(|p| under(p)).cloned());
+                    skipped.extend(links.iter().filter(|p| under(p)).cloned());
+                    if targets.len() == before {
+                        bail!("nothing to track under '{r}'; everything there is ignored");
                     }
                 }
-                if targets.len() == before {
-                    bail!("nothing to track under '{r}'; everything there is ignored");
+                Ok(m) if m.is_file() => {
+                    // An explicitly named file is tracked even where
+                    // `.levcsignore` would skip it. Naming it is the override.
+                    named.insert(r.to_string());
+                    targets.push(r.to_string());
                 }
-            } else if abs.is_file() {
-                // An explicitly named file is tracked even where
-                // `.levcsignore` would skip it. Naming it is the override.
-                named.insert(r.to_string());
-                targets.push(abs);
-            } else {
-                bail!("path not found: {r}");
+                _ => bail!("path not found: {r}"),
             }
         }
     }
-    for path in targets {
-        let rel = path
-            .strip_prefix(&repo.workdir)?
-            .to_string_lossy()
-            .replace('\\', "/");
+    for link in &skipped {
+        println!("skipped    {link}  (a symlink; levcs neither follows nor records links)");
+    }
+    let wt = levcs_core::worktree::open(&repo.workdir)?;
+    for rel in targets {
         // What checkout would refuse to write is refused here, so that no
         // commit holds a tree its own checkout cannot materialise. A named
         // `.levcs/config` used to be tracked.
         levcs_core::worktree::components(&rel).map_err(|e| anyhow!("refusing to track: {e}"))?;
-        let bytes = fs::read(&path)?;
-        let blob = Blob::new(bytes.clone());
+        let (bytes, executable) = match wt.read(&rel)? {
+            Found::File { bytes, executable } => (bytes, executable),
+            Found::Symlink => bail!(
+                "{rel} is, or is reached through, a symlink; levcs neither follows nor \
+                 records links"
+            ),
+            Found::Missing => bail!("path not found: {rel}"),
+            Found::Other => bail!("{rel} is not a regular file"),
+        };
+        let blob = Blob::new(bytes);
         let id = repo.objects.write_raw(&blob.serialize())?;
-        let meta = fs::metadata(&path)?;
+        let meta = fs::symlink_metadata(repo.workdir.join(&rel))?;
         let mtime = file_mtime_micros(&meta);
         let size = meta.len();
-        let mode = file_mode_bits(&meta);
+        let mode = if executable { 0o111 } else { 0 };
         let was_conflicted = idx
             .entries
             .iter()
@@ -350,45 +375,35 @@ pub fn status() -> Result<()> {
             println!("Merge      in progress (theirs={})", mh.trim());
         }
     }
-    let workdir_files = repo.walk_workdir()?;
-    let mut tracked = HashMap::<String, &IndexEntry>::new();
+    // Every tracked path is read where it is, ignored or not, and nothing is
+    // read through a link. Only the ignore-filtered walk used to be looked
+    // at, so a tracked file matching an ignore pattern was reported deleted.
+    let wt = levcs_core::worktree::open(&repo.workdir)?;
+    let tracked: HashSet<&str> = idx.entries.iter().map(|e| e.path.as_str()).collect();
+    let (mut modified, mut deleted, mut replaced) = (Vec::new(), Vec::new(), Vec::new());
     for e in &idx.entries {
-        tracked.insert(e.path.clone(), e);
-    }
-    let mut modified = Vec::new();
-    let mut untracked = Vec::new();
-    for path in workdir_files {
-        let rel = path
-            .strip_prefix(&repo.workdir)?
-            .to_string_lossy()
-            .replace('\\', "/");
-        match tracked.get(&rel) {
-            None => untracked.push(rel),
-            Some(entry) => {
-                let bytes = fs::read(&path)?;
-                let blob_id = Blob::new(bytes).object_id();
-                if blob_id != entry.blob_hash {
-                    modified.push(rel);
+        match wt.read(&e.path)? {
+            Found::File { bytes, executable } => {
+                if Blob::new(bytes).object_id() != e.blob_hash
+                    || executable != (e.mode & 0o111 != 0)
+                {
+                    modified.push(e.path.clone());
                 }
             }
+            Found::Missing => deleted.push(e.path.clone()),
+            Found::Symlink | Found::Other => replaced.push(e.path.clone()),
         }
     }
-    let work_set: HashSet<String> = repo
-        .walk_workdir()?
-        .iter()
-        .map(|p| {
-            p.strip_prefix(&repo.workdir)
-                .unwrap()
-                .to_string_lossy()
-                .replace('\\', "/")
-        })
-        .collect();
-    let mut deleted: Vec<String> = idx
-        .entries
-        .iter()
-        .filter(|e| !work_set.contains(&e.path))
-        .map(|e| e.path.clone())
-        .collect();
+    let (mut untracked, mut links) = (Vec::new(), Vec::new());
+    for (rel, kind) in repo.walk_workdir_entries()? {
+        if tracked.contains(rel.as_str()) {
+            continue;
+        }
+        match kind {
+            levcs_core::repo::Walked::File => untracked.push(rel),
+            levcs_core::repo::Walked::Symlink => links.push(rel),
+        }
+    }
     deleted.sort();
     // Conflicts first: some have no markers, and nothing else shows them.
     let mut conflicted: Vec<&str> = idx
@@ -417,13 +432,31 @@ pub fn status() -> Result<()> {
             println!("  {d}");
         }
     }
+    if !replaced.is_empty() {
+        println!("\nno longer a regular file (levcs neither follows nor records links):");
+        for r in &replaced {
+            println!("  {r}");
+        }
+    }
     if !untracked.is_empty() {
         println!("\nuntracked:");
         for u in &untracked {
             println!("  {u}");
         }
     }
-    if modified.is_empty() && deleted.is_empty() && untracked.is_empty() && conflicted.is_empty() {
+    if !links.is_empty() {
+        println!("\nsymlinks (levcs neither follows nor records links):");
+        for l in &links {
+            println!("  {l}");
+        }
+    }
+    if modified.is_empty()
+        && deleted.is_empty()
+        && replaced.is_empty()
+        && untracked.is_empty()
+        && links.is_empty()
+        && conflicted.is_empty()
+    {
         println!("\nworking tree clean.");
     }
     Ok(())
@@ -499,12 +532,6 @@ fn lexical_normalize(p: &Path) -> PathBuf {
 /// and every `strip_prefix` built from it.
 fn repo_root(repo: &Repository) -> PathBuf {
     lexical_normalize(&repo.workdir)
-}
-
-fn rel_of(root: &Path, p: &Path) -> String {
-    p.strip_prefix(root)
-        .map(|r| r.to_string_lossy().replace('\\', "/"))
-        .unwrap_or_default()
 }
 
 /// Resolve path arguments to repository-relative strings.
@@ -689,35 +716,44 @@ pub fn commit(args: CommitArgs) -> Result<()> {
     }
 
     let mut new_entries = Vec::new();
+    let wt = levcs_core::worktree::open(&repo.workdir)?;
     for e in &idx.entries {
         if !path_under(&restrict, &e.path) {
             new_entries.push(e.clone());
             continue;
         }
-        let abs = repo.workdir.join(&e.path);
-        if abs.is_file() {
-            let bytes = fs::read(&abs)?;
-            // Refuse to commit content that still has unresolved conflict
-            // markers — this is the last guard before a half-finished merge
-            // ends up in the object store.
-            if has_conflict_markers(&bytes) {
-                bail!(
-                    "{} still contains conflict markers; resolve before committing",
-                    e.path
-                );
+        // Read without following a link. A tracked path that is now a link
+        // used to be committed as whatever it pointed at.
+        match wt.read(&e.path)? {
+            Found::File { bytes, executable } => {
+                // Refuse to commit content that still has unresolved conflict
+                // markers — this is the last guard before a half-finished
+                // merge ends up in the object store.
+                if has_conflict_markers(&bytes) {
+                    bail!(
+                        "{} still contains conflict markers; resolve before committing",
+                        e.path
+                    );
+                }
+                let size = bytes.len() as u64;
+                let blob_id = repo.objects.write_raw(&Blob::new(bytes).serialize())?;
+                let meta = fs::symlink_metadata(repo.workdir.join(&e.path))?;
+                new_entries.push(IndexEntry {
+                    path: e.path.clone(),
+                    blob_hash: blob_id,
+                    mode: if executable { 0o111 } else { 0 },
+                    flags: IndexEntryFlags::TRACKED,
+                    mtime_micros: file_mtime_micros(&meta),
+                    size,
+                });
             }
-            let blob_id = repo
-                .objects
-                .write_raw(&Blob::new(bytes.clone()).serialize())?;
-            let meta = fs::metadata(&abs)?;
-            new_entries.push(IndexEntry {
-                path: e.path.clone(),
-                blob_hash: blob_id,
-                mode: file_mode_bits(&meta),
-                flags: IndexEntryFlags::TRACKED,
-                mtime_micros: file_mtime_micros(&meta),
-                size: meta.len(),
-            });
+            Found::Missing => {}
+            Found::Symlink => bail!(
+                "{} is now, or is reached through, a symlink; levcs neither follows nor \
+                 records links (forget it, or replace the link with a file)",
+                e.path
+            ),
+            Found::Other => bail!("{} is no longer a regular file", e.path),
         }
         // (deleted from disk, and in scope → drop entry)
     }
@@ -1093,18 +1129,33 @@ pub fn diff(args: DiffArgs) -> Result<()> {
     let path_matches = |p: &str| -> bool { path_under(&restrict, p) };
 
     let baseline = collect_tree_files(&repo, baseline_tree, "")?;
-    let work: HashMap<String, Vec<u8>> = repo
-        .walk_workdir()?
-        .into_iter()
-        .map(|p| -> Result<_> {
-            let rel = p
-                .strip_prefix(&repo.workdir)?
-                .to_string_lossy()
-                .replace('\\', "/");
-            let bytes = fs::read(&p)?;
-            Ok((rel, bytes))
-        })
-        .collect::<Result<_>>()?;
+    // The working tree's side: every path the baseline or the index tracks,
+    // read where it is, ignored or not, and the walk's untracked files.
+    // Nothing is read through a link. Only the ignore-filtered walk used to
+    // be read, so a tracked file matching an ignore pattern diffed as
+    // deleted, whole.
+    let wt = levcs_core::worktree::open(&repo.workdir)?;
+    let mut candidates: BTreeSet<String> = baseline.keys().cloned().collect();
+    if let Ok(idx) = load_index(&repo) {
+        candidates.extend(idx.entries.iter().map(|e| e.path.clone()));
+    }
+    candidates.extend(
+        repo.walk_workdir_entries()?
+            .into_iter()
+            .filter(|(_, k)| *k == levcs_core::repo::Walked::File)
+            .map(|(rel, _)| rel),
+    );
+    let mut work: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut unreadable: Vec<String> = Vec::new();
+    for rel in candidates {
+        match wt.read(&rel)? {
+            Found::File { bytes, .. } => {
+                work.insert(rel, bytes);
+            }
+            Found::Missing => {}
+            Found::Symlink | Found::Other => unreadable.push(rel),
+        }
+    }
     // A restriction that matches nothing at all is a mistake, not an empty
     // diff. Printing nothing and exiting 0 says "no changes" about a path the
     // repository has never heard of, which is the same silent-success shape
@@ -1113,6 +1164,7 @@ pub fn diff(args: DiffArgs) -> Result<()> {
         if !baseline
             .keys()
             .chain(work.keys())
+            .chain(unreadable.iter())
             .any(|k| path_under(std::slice::from_ref(r), k))
         {
             bail!("nothing at '{r}' in the working tree or the baseline");
@@ -1123,8 +1175,16 @@ pub fn diff(args: DiffArgs) -> Result<()> {
     let mut keys: Vec<&String> = baseline.keys().chain(work.keys()).collect();
     keys.sort();
     keys.dedup();
+    for k in &unreadable {
+        if path_matches(k) {
+            println!(
+                "--- a/{k}\n+++ b/{k}\n# not a regular file now; levcs neither follows nor \
+                 records links"
+            );
+        }
+    }
     for k in keys {
-        if !path_matches(k) {
+        if !path_matches(k) || unreadable.contains(k) {
             continue;
         }
         let a = baseline.get(k).cloned().unwrap_or_default();
@@ -1253,11 +1313,31 @@ pub fn branch(args: BranchArgs) -> Result<()> {
             ObjectType::Commit => Commit::parse_body(&raw.body)?.tree,
             _ => bail!("branch tip is not a commit"),
         };
+        // The move is planned whole before anything is written: work that
+        // is not committed (staged changes, edits to a file the target
+        // changes or lacks, an untracked file or a link where the target has
+        // a file) refuses it. A switch used to write the target over all of
+        // that, and leave behind files the target lacks; edits to files
+        // both branches share are carried over.
+        let head_tree = match repo.refs.resolve_head()? {
+            Some(h) => Some(Commit::from_signed(&repo.read_signed(h)?)?.tree),
+            None => None,
+        };
+        let plan = repo
+            .plan_checkout(head_tree, tree_id, &load_index(&repo)?)?
+            .map_err(|lost| refuse_unsaved("switching branches", &lost))?;
+        // The replacement index is built before anything changes: it reads
+        // and checks every blob of the target, including files the switch
+        // does not write. A missing one used to fail only after files were
+        // written and HEAD moved, leaving the old index behind.
+        let mut idx = Index::new();
+        rebuild_index_from_tree(&repo, tree_id, "", &mut idx)?;
+        plan.carry_into(&mut idx);
         // Materialize first: checkout validates the whole tree and refuses
         // before writing anything it cannot write safely. HEAD and the
         // index move only once the files are in place, so a refused switch
         // leaves the repository where it was. HEAD used to move first.
-        repo.checkout_tree(tree_id, &repo.workdir)?;
+        repo.apply_checkout(&plan)?;
         repo.refs
             .write_head(&Head::Branch(format!("refs/branches/{name}")))?;
         // Refresh the index from the new tree. Without this the index
@@ -1267,8 +1347,6 @@ pub fn branch(args: BranchArgs) -> Result<()> {
         // index-vs-workdir (e.g., the merge command's dirty-tree
         // precondition, which would otherwise false-positive on every
         // branch switch).
-        let mut idx = Index::new();
-        rebuild_index_from_tree(&repo, tree_id, "", &mut idx)?;
         repo.write_index(&idx)?;
         eprintln!("switched to branch {name}");
     }
@@ -1310,49 +1388,38 @@ pub fn merge(args: MergeArgs) -> Result<()> {
     merge_run(args)
 }
 
-/// Return the list of tracked paths whose working-tree contents differ from
-/// the index, including paths that are tracked but missing from disk. Used
-/// as a precondition for any operation that overwrites the working tree
-/// (currently: `merge`, both fast-forward and three-way). Callers should
-/// refuse to proceed when the returned list is non-empty so users don't
-/// silently lose uncommitted work.
-fn dirty_tracked_paths(repo: &Repository) -> Result<Vec<String>> {
-    let idx = load_index(repo)?;
-    let mut workdir_set: HashSet<String> = HashSet::new();
-    for path in repo.walk_workdir()? {
-        let rel = path
-            .strip_prefix(&repo.workdir)?
-            .to_string_lossy()
-            .replace('\\', "/");
-        workdir_set.insert(rel);
-    }
-    let mut dirty = Vec::new();
-    for entry in &idx.entries {
-        if !entry.flags.is_tracked() {
-            continue;
-        }
-        let abs = repo.workdir.join(&entry.path);
-        if !workdir_set.contains(&entry.path) {
-            // Tracked file removed from working tree without `levcs commit`
-            // — counts as dirty for merge purposes since the merge would
-            // resurrect it (or compute against stale on-disk state).
-            dirty.push(entry.path.clone());
-            continue;
-        }
-        let bytes = match fs::read(&abs) {
-            Ok(b) => b,
-            Err(_) => {
-                dirty.push(entry.path.clone());
-                continue;
-            }
-        };
-        let id = Blob::new(bytes).object_id();
-        if id != entry.blob_hash {
-            dirty.push(entry.path.clone());
-        }
-    }
-    dirty.sort();
-    Ok(dirty)
+/// A merged file's bytes in the working tree, for review: read without
+/// following a link, and empty if it is not a regular file. It was read
+/// through a link, showing whatever the link pointed at.
+fn current_in_worktree(repo: &Repository, path: &str) -> Vec<u8> {
+    levcs_core::worktree::open(&repo.workdir)
+        .and_then(|wt| wt.read(path))
+        .map(|found| match found {
+            Found::File { bytes, .. } => bytes,
+            _ => Vec::new(),
+        })
+        .unwrap_or_default()
+}
+
+/// A refusal that names the work `action` would destroy and why each is
+/// not committed.
+fn refuse_unsaved(action: &str, lost: &[levcs_core::repo::Unsaved]) -> anyhow::Error {
+    let listing = lost
+        .iter()
+        .take(20)
+        .map(|u| format!("  {}  ({})", u.path, u.why))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let more = if lost.len() > 20 {
+        format!("\n  ... and {} more", lost.len() - 20)
+    } else {
+        String::new()
+    };
+    anyhow!(
+        "{action} would overwrite or remove uncommitted changes:\n{listing}{more}\n\
+         commit it, or put the file back as committed (`levcs construct HEAD <path>`; \
+         `levcs cache --save` keeps a copy first), and try again. Nothing was changed."
+    )
 }
 
 fn merge_run(args: MergeArgs) -> Result<()> {
@@ -1365,33 +1432,20 @@ fn merge_run(args: MergeArgs) -> Result<()> {
     if repo.levcs_dir.join("MERGE_HEAD").exists() {
         bail!("a merge is already in progress; run `levcs merge --abort` to cancel");
     }
-    // Refuse to start a merge when tracked files have uncommitted changes —
-    // both the fast-forward and three-way paths overwrite the working
-    // tree, and silently clobbering local edits is the kind of bug that
-    // costs users hours of work. Mirrors git's `Your local changes to
-    // the following files would be overwritten by merge` precondition.
-    let dirty = dirty_tracked_paths(&repo)?;
-    if !dirty.is_empty() {
-        let listing = dirty
-            .iter()
-            .take(10)
-            .map(|p| format!("  {p}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let more = if dirty.len() > 10 {
-            format!("\n  ... and {} more", dirty.len() - 10)
-        } else {
-            String::new()
-        };
-        bail!(
-            "uncommitted changes to tracked files would be overwritten by merge:\n{listing}{more}\n\
-             commit them (or revert to HEAD) before merging — see `levcs status`."
-        );
-    }
     let head = repo
         .refs
         .resolve_head()?
         .ok_or_else(|| anyhow!("no HEAD on current branch"))?;
+    // A merge starts only over a tree with nothing uncommitted: both kinds
+    // write the working tree. This used to compare with the index, so
+    // staged work counted as clean and was overwritten, and through the
+    // ignore-filtered walk, so a tracked file matching an ignore pattern
+    // counted as deleted and refused every merge.
+    let head_tree = Commit::from_signed(&repo.read_signed(head)?)?.tree;
+    let lost = repo.uncommitted(Some(head_tree), &load_index(&repo)?)?;
+    if !lost.is_empty() {
+        return Err(refuse_unsaved("this merge", &lost));
+    }
     let theirs_id = crate::rev::resolve_rev(&repo, &branch_name)?;
     if head == theirs_id {
         eprintln!("already up to date.");
@@ -1404,6 +1458,16 @@ fn merge_run(args: MergeArgs) -> Result<()> {
     // Fast-forward: HEAD is an ancestor of theirs, no merge commit needed.
     if base_id == head {
         let theirs_commit = Commit::from_signed(&repo.read_signed(theirs_id)?)?;
+        // The working tree's move, planned whole: an untracked file where
+        // theirs has one is refused, not overwritten. It used to be.
+        let plan = repo
+            .plan_checkout(Some(head_tree), theirs_commit.tree, &load_index(&repo)?)?
+            .map_err(|lost| refuse_unsaved("this fast-forward", &lost))?;
+        // Built first, as for a switch: every blob of theirs is read and
+        // checked before anything changes.
+        let mut idx = Index::new();
+        rebuild_index_from_tree(&repo, theirs_commit.tree, "", &mut idx)?;
+        plan.carry_into(&mut idx);
         // On a branch, a fast-forward publishes theirs and everything behind
         // it not yet published, so Rule P is checked first, before the
         // working tree is touched. This was how received history reached a
@@ -1428,14 +1492,12 @@ fn merge_run(args: MergeArgs) -> Result<()> {
         // Files first, then the ref, then the index: a refused checkout
         // must not leave the branch moved over a working tree it never
         // reached. The ref used to move first.
-        repo.checkout_tree(theirs_commit.tree, &repo.workdir)?;
+        repo.apply_checkout(&plan)?;
         match publish {
             Some(p) => p.apply(&repo)?,
             None => repo.refs.write_head(&Head::Detached(theirs_id))?,
         }
         // Refresh index from the new tree.
-        let mut idx = Index::new();
-        rebuild_index_from_tree(&repo, theirs_commit.tree, "", &mut idx)?;
         repo.write_index(&idx)?;
         eprintln!("fast-forward to {theirs_id}");
         return Ok(());
@@ -1676,6 +1738,42 @@ fn merge_run(args: MergeArgs) -> Result<()> {
     let mut deletes: Vec<&String> = deleted_files.iter().collect();
     deletes.sort();
     let wt = levcs_core::worktree::open(&repo.workdir)?;
+    // Every path HEAD tracks is clean (checked before the merge began). A
+    // path it does not track may hold an untracked file, which a merge used
+    // to overwrite: refused unless it already holds what would be written.
+    let head_paths: HashSet<String> = repo
+        .tree_files(head_commit.tree, "")?
+        .into_iter()
+        .map(|f| f.path)
+        .collect();
+    let mut lost = Vec::new();
+    for (path, bytes) in &writes {
+        if head_paths.contains(*path) {
+            continue;
+        }
+        match wt.read(path)? {
+            Found::Missing => {}
+            Found::File { bytes: have, .. } if have == **bytes => {}
+            found => lost.push(levcs_core::repo::Unsaved {
+                path: (*path).clone(),
+                why: match found {
+                    Found::Symlink => "a symlink, where the merge has a file",
+                    Found::Other => "a directory or special file, where the merge has a file",
+                    _ => "untracked, and the merge has a file there",
+                },
+            }),
+        }
+    }
+    if !lost.is_empty() {
+        return Err(refuse_unsaved("this merge", &lost));
+    }
+    // A deletion touches the working tree only where HEAD tracks the path,
+    // and there it is clean. Where HEAD no longer has it, a file there is
+    // untracked and not the merge's to remove: a merge deleted one.
+    let deletes: Vec<&String> = deletes
+        .into_iter()
+        .filter(|p| head_paths.contains(*p))
+        .collect();
     wt.preflight(
         writes
             .iter()
@@ -2259,7 +2357,7 @@ fn merge_explain() -> Result<()> {
             // For an in-progress merge that's the working tree; for a
             // committed merge it's the file at HEAD.
             let current = if in_progress_path.exists() {
-                fs::read(repo.workdir.join(&fr.path)).unwrap_or_default()
+                current_in_worktree(&repo, &fr.path)
             } else {
                 read_path(ours_tree, &fr.path)
             };
@@ -2377,7 +2475,7 @@ fn merge_review() -> Result<()> {
         .files
         .iter()
         .map(|fr| {
-            let current = fs::read(repo.workdir.join(&fr.path)).unwrap_or_default();
+            let current = current_in_worktree(&repo, &fr.path);
             let ours = read_path(ours_tree, &fr.path);
             let theirs = read_path(theirs_tree, &fr.path);
             let base = base_tree
@@ -2583,13 +2681,33 @@ pub fn cache(args: CacheArgs) -> Result<()> {
         let id = format!("c{}", now_micros());
         let dest = dir.join(&id);
         fs::create_dir_all(&dest)?;
-        for path in repo.walk_workdir()? {
-            let rel = path.strip_prefix(&repo.workdir)?;
-            let target = dest.join(rel);
+        // Read without following a link, as everything that reads the
+        // working tree is: `fs::copy` used to follow one. Links are passed
+        // over, saying so. A file's permission bits are kept, so a private
+        // file comes back private.
+        let wt = levcs_core::worktree::open(&repo.workdir)?;
+        for (rel, kind) in repo.walk_workdir_entries()? {
+            if kind == levcs_core::repo::Walked::Symlink {
+                println!("skipped    {rel}  (a symlink; levcs neither follows nor records links)");
+                continue;
+            }
+            let Found::File { bytes, .. } = wt.read(&rel)? else {
+                continue;
+            };
+            let target = dest.join(&rel);
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent)?;
             }
-            fs::copy(&path, &target)?;
+            fs::write(&target, bytes)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = fs::symlink_metadata(repo.workdir.join(&rel))?
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                fs::set_permissions(&target, fs::Permissions::from_mode(mode))?;
+            }
         }
         if let Some(m) = args.message {
             fs::write(dest.join(".message"), m)?;
@@ -2812,22 +2930,6 @@ fn file_mtime_micros(meta: &fs::Metadata) -> i64 {
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_micros() as i64)
         .unwrap_or(0)
-}
-
-#[cfg(unix)]
-fn file_mode_bits(meta: &fs::Metadata) -> u8 {
-    use std::os::unix::fs::PermissionsExt;
-    let m = meta.permissions().mode();
-    if m & 0o111 != 0 {
-        0o111
-    } else {
-        0
-    }
-}
-
-#[cfg(not(unix))]
-fn file_mode_bits(_meta: &fs::Metadata) -> u8 {
-    0
 }
 
 #[allow(dead_code)]

@@ -80,6 +80,22 @@ pub enum Perms {
     Exact(u32),
 }
 
+/// What a working-tree path holds, read without following a link anywhere
+/// on the way: what levcs reads into history, and compares with it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Found {
+    /// Nothing is there.
+    Missing,
+    /// A regular file, and whether any execute bit is set.
+    File { bytes: Vec<u8>, executable: bool },
+    /// A symbolic link at the path, or on the way to it. levcs neither
+    /// follows nor records links: one into the store would put another
+    /// file's bytes, possibly from outside the repository, into history.
+    Symlink,
+    /// A directory or a special file.
+    Other,
+}
+
 #[cfg_attr(not(unix), allow(dead_code))]
 fn refuse(rel: &str, why: &str) -> Error {
     Error::Other(format!("refusing to write {rel:?}: {why}"))
@@ -98,7 +114,7 @@ mod imp {
     };
     use rustix::io::Errno;
 
-    use super::{components, refuse, Perms};
+    use super::{components, refuse, Found, Perms};
     use crate::error::{Error, Result};
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -308,6 +324,68 @@ mod imp {
             Ok(cur == bytes)
         }
 
+        /// What `rel` holds, without following a link at the path or on the
+        /// way to it. Every read of the working tree into history, or
+        /// against it, goes through here: `track`, `commit`, `status`,
+        /// `diff`, merges, and the checks that keep uncommitted work.
+        pub fn read(&self, rel: &str) -> Result<Found> {
+            let comps = components(rel)?;
+            let (name, parents) = comps.split_last().expect("split yields a component");
+            let mut cur = openat(&self.root, ".", dir_flags(), Mode::empty())
+                .map_err(|e| io(&self.root_path, e))?;
+            for c in parents {
+                cur = match openat(&cur, *c, dir_flags(), Mode::empty()) {
+                    Ok(fd) => fd,
+                    Err(Errno::NOENT) => return Ok(Found::Missing),
+                    Err(Errno::LOOP) | Err(Errno::NOTDIR) => {
+                        return match statat(&cur, *c, AtFlags::SYMLINK_NOFOLLOW) {
+                            Ok(st) if FileType::from_raw_mode(st.st_mode) == FileType::Symlink => {
+                                Ok(Found::Symlink)
+                            }
+                            // A file where a directory would be: nothing
+                            // can be at `rel`.
+                            Ok(_) | Err(Errno::NOENT) => Ok(Found::Missing),
+                            Err(e) => Err(io(&self.root_path.join(rel), e)),
+                        };
+                    }
+                    Err(e) => return Err(io(&self.root_path.join(rel), e)),
+                };
+            }
+            match statat(&cur, *name, AtFlags::SYMLINK_NOFOLLOW) {
+                Err(Errno::NOENT) => return Ok(Found::Missing),
+                Err(e) => return Err(io(&self.root_path.join(rel), e)),
+                Ok(st) => match FileType::from_raw_mode(st.st_mode) {
+                    FileType::RegularFile => {}
+                    FileType::Symlink => return Ok(Found::Symlink),
+                    _ => return Ok(Found::Other),
+                },
+            }
+            // Only a regular file is opened, without following, and not
+            // blocking: what is opened is checked again.
+            let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+            let fd = match openat(&cur, *name, flags, Mode::empty()) {
+                Ok(fd) => fd,
+                Err(Errno::NOENT) => return Ok(Found::Missing),
+                Err(Errno::LOOP) => return Ok(Found::Symlink),
+                Err(e) => return Err(io(&self.root_path.join(rel), e)),
+            };
+            let st = fstat(&fd).map_err(|e| io(&self.root_path.join(rel), e))?;
+            if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile {
+                return Ok(Found::Other);
+            }
+            let mut bytes = Vec::new();
+            std::fs::File::from(fd)
+                .read_to_end(&mut bytes)
+                .map_err(|e| Error::Io {
+                    path: Some(self.root_path.join(rel)),
+                    source: e,
+                })?;
+            Ok(Found::File {
+                bytes,
+                executable: st.st_mode & 0o111 != 0,
+            })
+        }
+
         /// Remove the file at `rel`. A symlink there is removed itself, not
         /// its target; a directory there is refused. `false` if nothing was
         /// there.
@@ -367,6 +445,10 @@ mod imp {
         }
 
         pub fn holds(&self, _rel: &str, _bytes: &[u8], _perms: Perms) -> Result<bool> {
+            match self.never {}
+        }
+
+        pub fn read(&self, _rel: &str) -> Result<super::Found> {
             match self.never {}
         }
 

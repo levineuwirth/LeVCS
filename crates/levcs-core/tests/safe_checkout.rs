@@ -525,3 +525,56 @@ fn commit_refuses_paths_checkout_would_refuse() {
         );
     }
 }
+
+/// The reader every working-tree read goes through: a link is reported,
+/// never followed, at the path or on the way to it, and a special file is
+/// never opened in a way that blocks.
+#[cfg(unix)]
+#[test]
+fn the_working_tree_is_read_without_following_links() {
+    use levcs_core::worktree::Found;
+    use std::os::unix::fs::PermissionsExt;
+    let (root, repo) = setup();
+    let w = |p: &str| repo.workdir.join(p);
+    std::fs::write(w("a.txt"), b"a").unwrap();
+    std::fs::write(w("run.sh"), b"#!").unwrap();
+    std::fs::set_permissions(w("run.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::create_dir(w("dir")).unwrap();
+    let outside = root.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("f.txt"), b"secret").unwrap();
+    std::os::unix::fs::symlink(outside.join("f.txt"), w("link.txt")).unwrap();
+    std::os::unix::fs::symlink(&outside, w("linkdir")).unwrap();
+    let fifo = std::ffi::CString::new(w("fifo").to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc_mkfifo(fifo.as_ptr(), 0o644) }, 0);
+
+    let wt = worktree::open(&repo.workdir).unwrap();
+    assert_eq!(
+        wt.read("a.txt").unwrap(),
+        Found::File {
+            bytes: b"a".to_vec(),
+            executable: false
+        }
+    );
+    assert_eq!(
+        wt.read("run.sh").unwrap(),
+        Found::File {
+            bytes: b"#!".to_vec(),
+            executable: true
+        }
+    );
+    assert_eq!(wt.read("absent").unwrap(), Found::Missing);
+    assert_eq!(wt.read("absent/x").unwrap(), Found::Missing);
+    assert_eq!(wt.read("a.txt/x").unwrap(), Found::Missing);
+    assert_eq!(wt.read("link.txt").unwrap(), Found::Symlink);
+    assert_eq!(wt.read("linkdir/f.txt").unwrap(), Found::Symlink);
+    assert_eq!(wt.read("dir").unwrap(), Found::Other);
+    assert_eq!(wt.read("fifo").unwrap(), Found::Other);
+    assert!(wt.read("../outside/f.txt").is_err());
+}
+
+#[cfg(unix)]
+extern "C" {
+    #[link_name = "mkfifo"]
+    fn libc_mkfifo(path: *const std::os::raw::c_char, mode: u32) -> i32;
+}

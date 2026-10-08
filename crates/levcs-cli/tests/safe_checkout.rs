@@ -194,30 +194,38 @@ fn refused_fast_forward_leaves_branch_and_index() {
     assert_eq!(f.read("a.txt"), b"base\n");
 }
 
+/// A tracked file replaced by a symlink is uncommitted work: the switch is
+/// refused before anything is written, and the link's target is never
+/// written through. (It used to be replaced; before that, written through.)
 #[test]
-fn switch_replaces_a_symlinked_file_rather_than_writing_through() {
+fn switch_refuses_a_symlinked_file_and_never_writes_through() {
     let f = diverged("final-link");
     let target = f.outside.join("secret");
     std::fs::write(&target, b"protected").unwrap();
     std::fs::remove_file(f.work.join("a.txt")).unwrap();
     symlink(&target, f.work.join("a.txt")).unwrap();
-    f.ok(&["branch", "--switch", "topic"]);
+    let before = f.state();
+    let e = f.refused(&["branch", "--switch", "topic"]);
+    assert!(e.contains("a.txt") && e.contains("symlink"), "{e}");
     assert_eq!(std::fs::read(&target).unwrap(), b"protected");
     assert!(std::fs::symlink_metadata(f.work.join("a.txt"))
         .unwrap()
-        .is_file());
-    assert_eq!(f.read("a.txt"), b"topic\n");
+        .file_type()
+        .is_symlink());
+    assert_eq!(f.state(), before);
 }
 
+/// A clean file hard-linked to one outside is replaced by the switch, so
+/// the outside file keeps its contents. Writing in place changed both.
 #[test]
 fn switch_replaces_a_hard_linked_file() {
     let f = diverged("hard-link");
     let target = f.outside.join("shared");
-    std::fs::write(&target, b"protected").unwrap();
+    std::fs::write(&target, b"base\n").unwrap();
     std::fs::remove_file(f.work.join("a.txt")).unwrap();
     std::fs::hard_link(&target, f.work.join("a.txt")).unwrap();
     f.ok(&["branch", "--switch", "topic"]);
-    assert_eq!(std::fs::read(&target).unwrap(), b"protected");
+    assert_eq!(std::fs::read(&target).unwrap(), b"base\n");
     assert_eq!(f.read("a.txt"), b"topic\n");
 }
 

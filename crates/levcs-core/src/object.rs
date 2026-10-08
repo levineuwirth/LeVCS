@@ -221,7 +221,10 @@ impl SignedObject {
         let body_end = body_start
             .checked_add(body_len)
             .ok_or_else(|| Error::MalformedObject("body offset overflow".into()))?;
-        if bytes.len() < body_end + 1 {
+        // The body and the count byte after it. Written `body_end + 1`, this
+        // overflowed for a body ending at usize::MAX, and a 16-byte header
+        // panicked the parser: in release builds as well, at the slice.
+        if bytes.len() <= body_end {
             return Err(Error::MalformedObject("body truncated".into()));
         }
         let body = bytes[body_start..body_end].to_vec();
@@ -394,6 +397,46 @@ mod tests {
         assert_eq!(so.object_type, so2.object_type);
         assert_eq!(so.body, so2.body);
         assert_eq!(so.signatures, so2.signatures);
+    }
+
+    /// A header alone, claiming a body that ends at or near the end of the
+    /// address space, is refused, never a panic: the audit's
+    /// `audit_signed_object_rejects_body_end_at_usize_max_without_panicking`.
+    #[test]
+    fn a_body_ending_at_the_end_of_the_address_space_is_refused() {
+        for body_len in [
+            (usize::MAX - HEADER_SIZE) as u64,
+            (usize::MAX - HEADER_SIZE - 1) as u64,
+            u64::MAX,
+        ] {
+            for object_type in [ObjectType::Commit, ObjectType::Blob] {
+                let bytes = ObjectHeader {
+                    object_type,
+                    format_version: FORMAT_VERSION,
+                    body_len,
+                }
+                .encode();
+                let signed = std::panic::catch_unwind(|| SignedObject::parse(&bytes));
+                assert!(matches!(signed, Ok(Err(_))), "{object_type:?} {body_len}");
+                let raw = std::panic::catch_unwind(|| RawObject::parse(&bytes));
+                assert!(matches!(raw, Ok(Err(_))), "{object_type:?} {body_len}");
+            }
+        }
+    }
+
+    /// A signed object cut off right after its body, before the count
+    /// byte, is refused; with the count byte it parses.
+    #[test]
+    fn a_signed_object_without_its_count_byte_is_refused() {
+        let bytes = SignedObject::new(ObjectType::Commit, b"hello".to_vec()).serialize();
+        assert!(SignedObject::parse(&bytes).is_ok());
+        let cut = &bytes[..bytes.len() - 1];
+        assert!(std::panic::catch_unwind(|| SignedObject::parse(cut))
+            .unwrap()
+            .is_err());
+        assert!(std::panic::catch_unwind(|| RawObject::parse(cut))
+            .unwrap()
+            .is_err());
     }
 
     #[test]

@@ -15,7 +15,7 @@ use levcs_identity::keys::SecretKey;
 use levcs_protocol::auth::{sign_request, AuthRequest};
 use levcs_protocol::pack::{DEFAULT_MAX_OBJECT_BYTES, DEFAULT_MAX_TOTAL_BYTES};
 use levcs_protocol::wire::{InfoResponse, InstanceInfo, RefList};
-use levcs_protocol::{Pack, PushManifest};
+use levcs_protocol::{Pack, PushLimits, PushManifest};
 
 #[derive(Debug, Error)]
 pub enum ClientError {
@@ -212,6 +212,65 @@ impl Client {
             .send()?;
         check(res)?;
         Ok(())
+    }
+}
+
+/// What a push would send: its objects, their decoded bytes together and
+/// the largest one, and its request body's length.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PushSize {
+    pub objects: u64,
+    pub decoded: u64,
+    pub largest: u64,
+    pub body: u64,
+    /// Refs it updates.
+    pub updates: u64,
+}
+
+impl PushSize {
+    /// Measure the push of `pack` with `manifest`, as `Client::push` would
+    /// send it.
+    pub fn of(pack: &Pack, manifest: &PushManifest) -> Result<Self, ClientError> {
+        let json = serde_json::to_vec(manifest).map_err(|e| ClientError::Decode(e.to_string()))?;
+        Ok(PushSize {
+            objects: pack.entries.len() as u64,
+            decoded: pack.entries.iter().map(|e| e.bytes.len() as u64).sum(),
+            largest: pack
+                .entries
+                .iter()
+                .map(|e| e.bytes.len() as u64)
+                .max()
+                .unwrap_or(0),
+            body: (pack.encode().len() + 4 + json.len() + 64) as u64,
+            updates: manifest.updates.len() as u64,
+        })
+    }
+
+    /// The first of `limits` this push would pass, said as a refusal.
+    pub fn over(&self, limits: &PushLimits) -> Option<String> {
+        let checks = [
+            ("a request body", self.body, limits.max_push_bytes, "bytes"),
+            ("objects", self.objects, limits.max_pack_objects, "objects"),
+            (
+                "decoded objects",
+                self.decoded,
+                limits.max_pack_bytes,
+                "bytes",
+            ),
+            ("one object", self.largest, limits.max_object_bytes, "bytes"),
+            (
+                "ref updates",
+                self.updates,
+                limits.max_ref_updates.unwrap_or(u64::MAX),
+                "updates",
+            ),
+        ];
+        checks
+            .into_iter()
+            .find(|(_, size, max, _)| size > max)
+            .map(|(what, size, max, unit)| {
+                format!("this push is {size} {unit} of {what}; the instance takes at most {max}")
+            })
     }
 }
 

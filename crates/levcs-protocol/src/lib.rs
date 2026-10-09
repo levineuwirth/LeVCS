@@ -14,4 +14,6 @@ pub use auth::{
 };
 pub use codec::{CanonicalCodec, CodecError, CodecResult};
 pub use pack::{Pack, PackEntry, PackError, PackLimits, PACK_MAGIC, PACK_VERSION};
-pub use wire::{InfoResponse, InstanceInfo, PushManifest, PushUpdate, RefList, RefsResponse};
+pub use wire::{
+    InfoResponse, InstanceInfo, PushLimits, PushManifest, PushUpdate, RefList, RefsResponse,
+};

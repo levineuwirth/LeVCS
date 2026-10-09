@@ -57,6 +57,7 @@ max_pack_objects = 100000       # objects in a pack, pushed or sent
 max_pack_bytes = 268435456      # a pack's objects together, decoded (256 MiB)
 max_object_bytes = 67108864     # one object, decoded (64 MiB)
 max_walk_objects = 1000000      # objects a pack being sent may walk
+max_ref_updates = 1024          # refs one push may update
 body_timeout_secs = 120         # to receive a request body
 max_nonces = 100000             # signed requests remembered against replay
 

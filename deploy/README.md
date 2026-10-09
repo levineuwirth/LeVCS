@@ -192,18 +192,31 @@ pull on this repo.
 
 ### 5. First push (auto-init)
 
+Measure it first. A dry run reports what the push would send, against
+what the instance says it takes, and sends nothing:
+
+```sh
+levcs push --dry-run refs/branches/main
+```
+
+The LeVCS source itself is about 300 objects, under 5 MB decoded and
+under 2 MB as a request: far inside the defaults. Then push:
+
 ```sh
 levcs push refs/branches/main
 ```
 
-Behind the scenes the client tries `/push` first, gets a 404 (the repo
-doesn't exist on the instance yet), then falls back to `/init` with the
-genesis authority object and re-pushes. Output looks like:
+The client asks the instance what it holds first. A repository it does
+not hold yet is created from its genesis authority, which takes a key
+named in `creators`, and then pushed. Output looks like:
 
 ```
 repo not yet on instance; initialising
-pushed 1 ref(s)
+pushed 1 ref(s): 313 object(s)
 ```
+
+Each later push expects what the instance holds for each ref, and sends
+only what the instance's refs do not already reach.
 
 That's it. The repo is now hosted on the VPS. `levcs init` makes a
 public repository, which anyone who can reach the instance may read:
@@ -255,9 +268,12 @@ default, and an unknown key stops the instance from starting.
   `max_concurrent_transfers` wait their turn. `/health` is always
   answered.
 - A push larger than `max_push_bytes`, or whose pack decodes past
-  `max_pack_bytes`, `max_pack_objects` or `max_object_bytes`, is refused
-  (413) before it is decoded further; so is a pack request past those
-  limits or `max_walk_objects`.
+  `max_pack_bytes`, `max_pack_objects` or `max_object_bytes`, or that
+  updates more than `max_ref_updates` refs, is refused (413) before it is
+  decoded further; so is a pack request past those limits or
+  `max_walk_objects`. The instance says these push limits in
+  `/instance/info`, and `levcs push` checks a push against them before it
+  sends anything.
 - A request body not received within `body_timeout_secs` is refused (408).
 - While `max_nonces` signed requests are remembered against replay, the
   next is refused (503) rather than an earlier one forgotten.

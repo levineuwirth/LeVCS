@@ -354,13 +354,21 @@ async fn a_push_is_decoded_only_within_its_budgets() {
     .await;
 }
 
-/// One push names at most 1024 refs.
+/// One push names at most `max_ref_updates` refs, 1024 unless configured,
+/// and the instance says so.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_push_naming_too_many_refs_is_refused() {
-    run(Limits::default(), |base, root, _| {
+    assert_eq!(Limits::default().max_ref_updates, 1024);
+    let limits = Limits {
+        max_ref_updates: 2,
+        ..Limits::default()
+    };
+    run(limits, |base, root, _| {
+        let said = Client::new(api(&base)).instance_info().unwrap().limits;
+        assert_eq!(said.unwrap().max_ref_updates, Some(2));
         let h = host(&base, &root, public(1), 0);
         let c = commit(h.genesis, &[h.commit], &[b"x".to_vec()], 1);
-        let updates = (0..1025)
+        let updates = (0..3)
             .map(|i| (format!("refs/branches/b{i}"), c.0))
             .collect();
         let m = manifest(h.genesis, updates);

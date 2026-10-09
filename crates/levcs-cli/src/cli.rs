@@ -293,6 +293,9 @@ pub struct PushArgs {
     pub key: Option<String>,
     #[arg(long)]
     pub force: bool,
+    /// Measure the push, against the instance's limits, and send nothing.
+    #[arg(long)]
+    pub dry_run: bool,
     pub refs: Vec<String>,
 }
 

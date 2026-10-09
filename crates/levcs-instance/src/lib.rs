@@ -109,6 +109,8 @@ pub struct Limits {
     /// Objects a pack being sent may visit, through what is wanted and
     /// what the client says it has.
     pub max_walk_objects: usize,
+    /// Refs one push may update.
+    pub max_ref_updates: usize,
     /// Seconds to receive a request body.
     pub body_timeout_secs: u64,
     /// Signed requests remembered against replay. When it is full, signed
@@ -127,6 +129,7 @@ impl Default for Limits {
             max_pack_bytes: 256 << 20,
             max_object_bytes: 64 << 20,
             max_walk_objects: 1_000_000,
+            max_ref_updates: 1024,
             body_timeout_secs: 120,
             max_nonces: 100_000,
         }
@@ -134,6 +137,17 @@ impl Default for Limits {
 }
 
 impl Limits {
+    /// What one push may carry, as advertised to clients.
+    pub fn push(&self) -> levcs_protocol::PushLimits {
+        levcs_protocol::PushLimits {
+            max_push_bytes: self.max_push_bytes as u64,
+            max_pack_objects: self.max_pack_objects as u64,
+            max_pack_bytes: self.max_pack_bytes as u64,
+            max_object_bytes: self.max_object_bytes as u64,
+            max_ref_updates: Some(self.max_ref_updates as u64),
+        }
+    }
+
     fn pack(&self) -> PackLimits {
         PackLimits {
             max_entries: self.max_pack_objects,
@@ -230,6 +244,7 @@ impl InstanceConfig {
             ("max_pack_bytes", l.max_pack_bytes),
             ("max_object_bytes", l.max_object_bytes),
             ("max_walk_objects", l.max_walk_objects),
+            ("max_ref_updates", l.max_ref_updates),
             ("body_timeout_secs", l.body_timeout_secs as usize),
             ("max_nonces", l.max_nonces),
         ] {
@@ -612,8 +627,6 @@ const MAX_INIT_BYTES: usize = 64 << 10;
 /// Ids in a pack request's `have` or `want`: a client names its branch
 /// tips, and a query this long is about 17 KB.
 const MAX_IDS: usize = 256;
-/// Ref updates in one push.
-const MAX_UPDATES: usize = 1024;
 
 async fn handle_health() -> impl IntoResponse {
     axum::Json(serde_json::json!({"status": "ok"}))
@@ -655,6 +668,7 @@ async fn handle_instance_info(State(s): State<AppState>) -> impl IntoResponse {
         },
         allowed_handlers: s.config.allowed_handlers.clone(),
         federation_peers: s.config.federation_peers.clone(),
+        limits: Some(s.config.limits.push()),
     };
     axum::Json(info)
 }
@@ -704,16 +718,12 @@ fn repo_info(s: &AppState, repo: &RepoId) -> Result<InfoResponse, ApiError> {
     }
     // Releases also belong in /info — clients without a mirror config look
     // here to discover the latest release for `construct --release` etc.
-    let releases_dir = dir.join(".levcs/refs/releases");
-    if releases_dir.is_dir() {
-        if let Ok(read) = std::fs::read_dir(&releases_dir) {
-            for ent in read.flatten() {
-                let name = ent.file_name().to_string_lossy().to_string();
-                if let Ok(txt) = std::fs::read_to_string(ent.path()) {
-                    info.releases.insert(name, txt.trim().to_string());
-                }
-            }
-        }
+    // Listed at any depth: a nested release used to be left out.
+    for (k, v) in refs
+        .list_releases()
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    {
+        info.releases.insert(k, v.to_hex());
     }
     Ok(info)
 }
@@ -742,16 +752,11 @@ fn repo_refs(s: &AppState, repo: &RepoId) -> Result<RefList, ApiError> {
     {
         out.branches.insert(k, v.to_hex());
     }
-    let releases_dir = dir.join(".levcs/refs/releases");
-    if releases_dir.is_dir() {
-        if let Ok(read) = std::fs::read_dir(&releases_dir) {
-            for ent in read.flatten() {
-                let name = ent.file_name().to_string_lossy().to_string();
-                if let Ok(txt) = std::fs::read_to_string(ent.path()) {
-                    out.releases.insert(name, txt.trim().to_string());
-                }
-            }
-        }
+    for (k, v) in refs
+        .list_releases()
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    {
+        out.releases.insert(k, v.to_hex());
     }
     Ok(out)
 }
@@ -1377,9 +1382,10 @@ fn decode_push(s: &AppState, key: &PublicKey, body: &[u8]) -> Result<Pushed, Api
         .map_err(|_| err(StatusCode::UNAUTHORIZED, "manifest signature invalid"))?;
     let manifest: levcs_protocol::PushManifest = serde_json::from_slice(manifest_json)
         .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
-    if manifest.updates.len() > MAX_UPDATES {
+    let max_updates = s.config.limits.max_ref_updates;
+    if manifest.updates.len() > max_updates {
         return Err(too_large(format!(
-            "{} ref updates in one push; at most {MAX_UPDATES}",
+            "{} ref updates in one push; at most {max_updates}",
             manifest.updates.len()
         )));
     }

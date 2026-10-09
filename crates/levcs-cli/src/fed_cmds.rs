@@ -190,8 +190,7 @@ pub fn push(args: PushArgs) -> Result<()> {
     let repo = open_repo()?;
     let url = active_instance()?;
     let (_label, sk) = load_secret(args.key.as_deref())?;
-    let pk = sk.public();
-    let _ = pk;
+    let sk = std::sync::Arc::new(sk);
 
     let refs_to_push = if args.refs.is_empty() {
         let branch = repo
@@ -204,64 +203,65 @@ pub fn push(args: PushArgs) -> Result<()> {
     if args.force {
         eprintln!("force-push: requesting non-fast-forward update; instance will require maintainer or owner role");
     }
+    let repo_id = compute_repo_id(&repo)?;
+    // Reads are signed, so that a member can push to a private repository.
+    let client = levcs_client::Client::new(url).with_reader(sk.clone());
 
+    // What the instance holds: the value each update is expected to replace,
+    // and what need not be sent. A push used to expect every ref to be
+    // absent, so each push after a ref's first was refused as stale (audit
+    // H11), and it sent the whole history every time.
+    let remote = match client.repo_info(&repo_id) {
+        Ok(info) => Some(info),
+        Err(levcs_client::ClientError::Server { status: 404, .. }) => None,
+        Err(e) => return Err(e.into()),
+    };
     let mut updates = Vec::new();
-    let mut needed: Vec<ObjectId> = Vec::new();
+    let mut tips = Vec::new();
     for r in &refs_to_push {
         let new = repo
             .refs
             .read(r)?
             .ok_or_else(|| anyhow!("local ref does not exist: {r}"))?;
-        // Build closure of objects reachable from `new`.
-        let mut stack = vec![new];
-        let mut seen = std::collections::HashSet::<ObjectId>::new();
-        while let Some(id) = stack.pop() {
-            if !seen.insert(id) {
-                continue;
-            }
-            if let Ok(raw) = repo.objects.read_object(id) {
-                match raw.object_type {
-                    ObjectType::Tree => {
-                        if let Ok(t) = levcs_core::Tree::parse_body(&raw.body) {
-                            for e in t.entries {
-                                stack.push(e.hash);
-                            }
-                        }
-                    }
-                    ObjectType::Commit => {
-                        if let Ok(c) = Commit::parse_body(&raw.body) {
-                            stack.push(c.tree);
-                            stack.push(c.authority);
-                            stack.extend(c.parents);
-                        }
-                    }
-                    ObjectType::Release => {
-                        if let Ok(rel) = levcs_core::Release::parse_body(&raw.body) {
-                            stack.push(rel.tree);
-                            stack.push(rel.predecessor);
-                            stack.push(rel.authority);
-                            if !rel.parent_release.is_zero() {
-                                stack.push(rel.parent_release);
-                            }
-                        }
-                    }
-                    ObjectType::Authority => {
-                        if let Ok(b) = AuthorityBody::parse(&raw.body) {
-                            if !b.previous_authority.is_zero() {
-                                stack.push(b.previous_authority);
-                            }
-                        }
-                    }
-                    ObjectType::Blob => {}
+        let old = match &remote {
+            Some(info) => remote_value(info, r)?,
+            None => None,
+        };
+        updates.push(PushUpdate {
+            r#ref: r.clone(),
+            old_hash: old.map(|o| o.to_hex()),
+            new_hash: new.to_hex(),
+        });
+        tips.push(new);
+    }
+    // What the instance's refs reach, as far as this repository knows it,
+    // is not sent again.
+    let mut has = std::collections::HashSet::new();
+    if let Some(info) = &remote {
+        let held = info
+            .branches
+            .values()
+            .chain(info.releases.values())
+            .chain([&info.current_authority]);
+        for hex in held {
+            if let Ok(id) = ObjectId::from_hex(hex) {
+                if repo.objects.contains(id) {
+                    walk_closure(&repo, id, &mut has);
                 }
             }
         }
-        needed.extend(seen.into_iter());
-        updates.push(PushUpdate {
-            r#ref: r.clone(),
-            old_hash: None,
-            new_hash: new.to_hex(),
-        });
+    }
+    let mut reached = has.clone();
+    for tip in &tips {
+        walk_closure(&repo, *tip, &mut reached);
+    }
+    let mut pack = Pack::new();
+    for id in reached.difference(&has) {
+        if let Ok(bytes) = repo.objects.read_raw(*id) {
+            if bytes.len() >= 5 {
+                pack.push(bytes[4], bytes);
+            }
+        }
     }
     let auth = repo
         .current_authority()?
@@ -272,36 +272,76 @@ pub fn push(args: PushArgs) -> Result<()> {
         timestamp: now_micros(),
         force: args.force,
     };
-    let mut pack = Pack::new();
-    let mut deduped = std::collections::HashSet::new();
-    for id in needed {
-        if !deduped.insert(id) {
-            continue;
+
+    // Measured before anything is sent, against what the instance says it
+    // takes, which it enforces whatever is checked here.
+    let size = levcs_client::PushSize::of(&pack, &manifest)?;
+    // A failure to ask is a failure, not a push without a check: only an
+    // instance that answers, and does not say, is pushed to unchecked.
+    let limits = client.instance_info()?.limits;
+    if args.dry_run {
+        println!(
+            "would push {} ref(s) to {}: {} object(s), {} bytes decoded, the largest {} bytes; a request of {} bytes",
+            manifest.updates.len(),
+            if remote.is_some() { "the instance" } else { "a new repository on the instance" },
+            size.objects,
+            size.decoded,
+            size.largest,
+            size.body
+        );
+        match &limits {
+            Some(l) => match size.over(l) {
+                Some(why) => println!("the instance would refuse it: {why}"),
+                None => println!(
+                    "within the instance's limits: {} bytes a request, {} objects, {} bytes decoded, {} bytes an object",
+                    l.max_push_bytes, l.max_pack_objects, l.max_pack_bytes, l.max_object_bytes
+                ),
+            },
+            None => println!("the instance does not say what it takes"),
         }
-        if let Ok(bytes) = repo.objects.read_raw(id) {
-            if bytes.len() >= 5 {
-                pack.push(bytes[4], bytes);
+        return Ok(());
+    }
+    if let Some(why) = limits.as_ref().and_then(|l| size.over(l)) {
+        bail!("{why}; nothing was sent");
+    }
+
+    if remote.is_none() {
+        let genesis = repo
+            .genesis_authority()?
+            .ok_or_else(|| anyhow!("local repo has no genesis authority"))?;
+        let bytes = repo.objects.read_raw(genesis)?;
+        eprintln!("repo not yet on instance; initialising");
+        match client.init(&sk, &repo_id, &bytes) {
+            Ok(()) => {}
+            Err(levcs_client::ClientError::Server { status: 409, .. }) => {
+                bail!("the instance holds this repository, but does not let this key read it")
             }
+            Err(e) => return Err(e.into()),
         }
     }
-    let repo_id = compute_repo_id(&repo)?;
-    let client = levcs_client::Client::new(url);
-    match client.push(&sk, &repo_id, &pack, &manifest) {
-        Ok(()) => {}
-        Err(levcs_client::ClientError::Server { status: 404, .. }) => {
-            // Repo not yet on instance; register it then retry.
-            let genesis = repo
-                .genesis_authority()?
-                .ok_or_else(|| anyhow!("local repo has no genesis authority"))?;
-            let bytes = repo.objects.read_raw(genesis)?;
-            eprintln!("repo not yet on instance; initialising");
-            client.init(&sk, &repo_id, &bytes)?;
-            client.push(&sk, &repo_id, &pack, &manifest)?;
-        }
-        Err(e) => return Err(e.into()),
-    }
-    eprintln!("pushed {} ref(s)", manifest.updates.len());
+    client.push(&sk, &repo_id, &pack, &manifest)?;
+    eprintln!(
+        "pushed {} ref(s): {} object(s)",
+        manifest.updates.len(),
+        size.objects
+    );
     Ok(())
+}
+
+/// What the instance's `info` says `name` holds: a branch or a release,
+/// named in full (`refs/branches/<b>`, `refs/releases/<r>`), where `info`
+/// names them short.
+fn remote_value(info: &levcs_protocol::InfoResponse, name: &str) -> Result<Option<ObjectId>> {
+    let held = if let Some(b) = name.strip_prefix("refs/branches/") {
+        info.branches.get(b)
+    } else if let Some(r) = name.strip_prefix("refs/releases/") {
+        info.releases.get(r)
+    } else {
+        bail!("only branches and releases are pushed, not {name}");
+    };
+    held.map(|h| ObjectId::from_hex(h))
+        .transpose()
+        .map_err(|e| anyhow!("the instance says {name} holds {e}"))
 }
 
 pub fn pull(args: PullArgs) -> Result<()> {

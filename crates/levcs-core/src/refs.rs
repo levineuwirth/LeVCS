@@ -148,17 +148,17 @@ impl Refs {
         if !dir.is_dir() {
             return Ok(out);
         }
-        walk(&dir, &dir, &mut out)?;
-        return Ok(out);
-
-        fn walk(base: &Path, dir: &Path, out: &mut Vec<(String, ObjectId)>) -> Result<()> {
-            for ent in fs::read_dir(dir).ctx(dir.to_path_buf())? {
-                let ent = ent.ctx(dir.to_path_buf())?;
+        // Walked with a stack of directories, not by recursion: a ref name
+        // can be nested deeper than a thread's stack goes.
+        let mut dirs = vec![dir.clone()];
+        while let Some(d) = dirs.pop() {
+            for ent in fs::read_dir(&d).ctx(d.clone())? {
+                let ent = ent.ctx(d.clone())?;
                 let path = ent.path();
                 if path.is_dir() {
-                    walk(base, &path, out)?;
+                    dirs.push(path);
                 } else {
-                    let rel = path.strip_prefix(base.parent().unwrap()).unwrap();
+                    let rel = path.strip_prefix(dir.parent().unwrap()).unwrap();
                     let name = rel.to_string_lossy().replace('\\', "/").to_string();
                     // A ref that cannot be read or parsed is an error, never
                     // skipped: `verify` and `gc` take their roots from here,
@@ -169,40 +169,54 @@ impl Refs {
                     out.push((name, id));
                 }
             }
-            Ok(())
         }
-    }
-
-    pub fn list_branches(&self) -> Result<Vec<(String, ObjectId)>> {
-        let dir = self.refs_dir().join("branches");
-        let mut out = Vec::new();
-        if !dir.is_dir() {
-            return Ok(out);
-        }
-        for ent in fs::read_dir(&dir).ctx(dir.clone())? {
-            let ent = ent.ctx(dir.clone())?;
-            let name = ent.file_name().to_string_lossy().to_string();
-            let txt = fs::read_to_string(ent.path()).ctx(ent.path())?;
-            if let Ok(id) = parse_ref_value(&txt) {
-                out.push((name, id));
-            }
-        }
-        out.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(out)
     }
 
+    pub fn list_branches(&self) -> Result<Vec<(String, ObjectId)>> {
+        self.list_under("branches")
+    }
+
     pub fn list_releases(&self) -> Result<Vec<(String, ObjectId)>> {
-        let dir = self.refs_dir().join("releases");
+        self.list_under("releases")
+    }
+
+    /// The refs under `refs/<kind>/`, at any depth, by their names under it:
+    /// `feature/x` for `refs/branches/feature/x`. A ref that does not parse
+    /// is left out, as it always was. Only the top level used to be read: a
+    /// nested branch's directory was read as a ref, and failed, and a nested
+    /// release was left out. A link is skipped, never followed: levcs does not
+    /// write one. Walked with a stack of directories, not by recursion: a
+    /// ref name can be nested deeper than a thread's stack goes, and the
+    /// walk recursed once per directory.
+    fn list_under(&self, kind: &str) -> Result<Vec<(String, ObjectId)>> {
+        let base = self.refs_dir().join(kind);
         let mut out = Vec::new();
-        if !dir.is_dir() {
-            return Ok(out);
+        let mut dirs = Vec::new();
+        if base.is_dir() {
+            dirs.push(base.clone());
         }
-        for ent in fs::read_dir(&dir).ctx(dir.clone())? {
-            let ent = ent.ctx(dir.clone())?;
-            let name = ent.file_name().to_string_lossy().to_string();
-            let txt = fs::read_to_string(ent.path()).ctx(ent.path())?;
-            if let Ok(id) = parse_ref_value(&txt) {
-                out.push((name, id));
+        while let Some(dir) = dirs.pop() {
+            for ent in fs::read_dir(&dir).ctx(dir.clone())? {
+                let ent = ent.ctx(dir.clone())?;
+                let path = ent.path();
+                let kind = ent.file_type().ctx(path.clone())?;
+                if kind.is_symlink() {
+                    continue;
+                }
+                if kind.is_dir() {
+                    dirs.push(path);
+                    continue;
+                }
+                let name = path
+                    .strip_prefix(&base)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let txt = fs::read_to_string(&path).ctx(path.clone())?;
+                if let Ok(id) = parse_ref_value(&txt) {
+                    out.push((name, id));
+                }
             }
         }
         out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -257,6 +271,117 @@ fn parse_head(s: &str) -> Result<Head> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Remove `root` and everything under it without recursion, however
+    /// deep it goes.
+    fn remove_deep(root: &Path) {
+        let mut stack = vec![(root.to_path_buf(), false)];
+        while let Some((path, leaving)) = stack.pop() {
+            if leaving {
+                let _ = fs::remove_dir(&path);
+                continue;
+            }
+            match fs::symlink_metadata(&path) {
+                Ok(m) if m.is_dir() => {
+                    stack.push((path.clone(), true));
+                    for e in fs::read_dir(&path).into_iter().flatten().flatten() {
+                        stack.push((e.path(), false));
+                    }
+                }
+                _ => {
+                    let _ = fs::remove_file(&path);
+                }
+            }
+        }
+    }
+
+    /// A ref nested deeper than a thread's stack goes is listed, by
+    /// `list_all` and by `list_branches`: both walks recursed once per
+    /// directory, and an instance listing a branch 1,200 directories deep
+    /// aborted. The listing runs in a child process, on a 128 KiB stack, so
+    /// that an overflow fails this test rather than aborting its binary.
+    #[test]
+    fn a_deeply_nested_ref_is_listed_without_recursion() {
+        if let Some(d) = std::env::var_os("LEVCS_DEEP_REFS_CHILD") {
+            let refs = Refs::new(std::path::PathBuf::from(d));
+            let name = format!("refs/branches/{}tip", "x/".repeat(1200));
+            refs.write(&name, ObjectId([1; 32])).unwrap();
+            let listed = std::thread::Builder::new()
+                .stack_size(128 << 10)
+                .spawn(move || {
+                    (
+                        refs.list_all().unwrap().len(),
+                        refs.list_branches().unwrap().len(),
+                    )
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+            assert_eq!(listed, (1, 1));
+            return;
+        }
+        let d = std::env::temp_dir().join(format!(
+            "levcs-refs-deep-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "refs::tests::a_deeply_nested_ref_is_listed_without_recursion",
+                "--nocapture",
+            ])
+            .env("LEVCS_DEEP_REFS_CHILD", &d)
+            .output()
+            .unwrap();
+        remove_deep(&d);
+        assert!(
+            out.status.success(),
+            "the listing failed: {}; {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Branches and releases are listed at any depth, by their names under
+    /// `refs/branches/` and `refs/releases/`; a link is skipped. Only the top
+    /// level was read: a nested branch failed the whole listing, and a nested
+    /// release was left out.
+    #[cfg(unix)]
+    #[test]
+    fn branches_and_releases_are_listed_at_any_depth() {
+        let d = std::env::temp_dir().join(format!(
+            "levcs-refs-nested-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let refs = Refs::new(&d);
+        let (a, b, c) = (ObjectId([1; 32]), ObjectId([2; 32]), ObjectId([3; 32]));
+        refs.write("refs/branches/main", a).unwrap();
+        refs.write("refs/branches/feature/deep/x", b).unwrap();
+        refs.write("refs/releases/series/test", c).unwrap();
+        refs.write("refs/releases/v1", a).unwrap();
+        std::os::unix::fs::symlink(
+            d.join("refs/branches/feature"),
+            d.join("refs/branches/linked"),
+        )
+        .unwrap();
+        assert_eq!(
+            refs.list_branches().unwrap(),
+            vec![("feature/deep/x".into(), b), ("main".into(), a)]
+        );
+        assert_eq!(
+            refs.list_releases().unwrap(),
+            vec![("series/test".into(), c), ("v1".into(), a)]
+        );
+        std::fs::remove_dir_all(d).unwrap();
+    }
 
     #[test]
     fn compare_and_write_refuses_a_moved_ref_and_leaves_it_alone() {

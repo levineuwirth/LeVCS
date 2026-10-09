@@ -38,6 +38,24 @@ pub struct InstanceInfo {
     pub allowed_handlers: Vec<String>,
     #[serde(default)]
     pub federation_peers: Vec<String>,
+    /// What one push may carry here, so that a client can measure a push
+    /// before it sends it. Advisory: the instance enforces its limits
+    /// whatever a client checked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<PushLimits>,
+}
+
+/// What one push may carry: its request body, its objects, their decoded
+/// bytes together, the largest one, and the refs it updates.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushLimits {
+    pub max_push_bytes: u64,
+    pub max_pack_objects: u64,
+    pub max_pack_bytes: u64,
+    pub max_object_bytes: u64,
+    /// Absent from an instance that does not say it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_ref_updates: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

@@ -10,6 +10,7 @@ levcs-core = { workspace = true }
 levcs-identity = { workspace = true }
 levcs-protocol = { workspace = true }
 reqwest = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 hex = { workspace = true }

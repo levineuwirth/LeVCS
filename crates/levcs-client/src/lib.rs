@@ -13,6 +13,7 @@ use thiserror::Error;
 use levcs_core::ObjectId;
 use levcs_identity::keys::SecretKey;
 use levcs_protocol::auth::{sign_request, AuthRequest};
+use levcs_protocol::pack::{DEFAULT_MAX_OBJECT_BYTES, DEFAULT_MAX_TOTAL_BYTES};
 use levcs_protocol::wire::{InfoResponse, InstanceInfo, RefList};
 use levcs_protocol::{Pack, PushManifest};
 
@@ -102,24 +103,20 @@ impl Client {
             .get(&url)
             .header("user-agent", &self.user_agent)
             .send()?;
-        check(res)?.json::<InstanceInfo>().map_err(Into::into)
+        json_within(check(res)?)
     }
 
     pub fn repo_info(&self, repo_id: &str) -> Result<InfoResponse, ClientError> {
-        self.get(&format!("/repos/{repo_id}/info"))?
-            .json::<InfoResponse>()
-            .map_err(Into::into)
+        json_within(self.get(&format!("/repos/{repo_id}/info"))?)
     }
 
     pub fn refs(&self, repo_id: &str) -> Result<RefList, ClientError> {
-        self.get(&format!("/repos/{repo_id}/refs"))?
-            .json::<RefList>()
-            .map_err(Into::into)
+        json_within(self.get(&format!("/repos/{repo_id}/refs"))?)
     }
 
     pub fn get_object(&self, repo_id: &str, id: ObjectId) -> Result<Vec<u8>, ClientError> {
         let res = self.get(&format!("/repos/{repo_id}/objects/{}", id.to_hex()))?;
-        Ok(res.bytes()?.to_vec())
+        body_within(res, DEFAULT_MAX_OBJECT_BYTES as u64)
     }
 
     pub fn get_pack(
@@ -135,7 +132,7 @@ impl Client {
             have_q.join(","),
             want_q.join(",")
         );
-        let bytes = self.get(&path)?.bytes()?;
+        let bytes = body_within(self.get(&path)?, DEFAULT_MAX_TOTAL_BYTES as u64)?;
         Pack::decode(&bytes).map_err(|e| ClientError::Decode(e.to_string()))
     }
 
@@ -218,12 +215,55 @@ impl Client {
     }
 }
 
-fn check(res: reqwest::blocking::Response) -> Result<reqwest::blocking::Response, ClientError> {
-    if res.status().is_success() {
-        Ok(res)
-    } else {
-        let status = res.status().as_u16();
-        let body = res.text().unwrap_or_default();
-        Err(ClientError::Server { status, body })
+/// A JSON answer (info, refs) is read up to this many bytes.
+const MAX_JSON_BYTES: u64 = 16 << 20;
+
+/// The body of `res`, if it is at most `max` bytes: refused from its
+/// declared length when it has one, and never read past `max`. Bodies were
+/// read whole, and a pack's decoding budget applied only after its body had
+/// been buffered, however large.
+fn body_within(res: reqwest::blocking::Response, max: u64) -> Result<Vec<u8>, ClientError> {
+    use std::io::Read;
+    let too_large = || ClientError::Decode(format!("response larger than {max} bytes"));
+    if res.content_length().is_some_and(|n| n > max) {
+        return Err(too_large());
     }
+    let mut buf = Vec::new();
+    res.take(max.saturating_add(1))
+        .read_to_end(&mut buf)
+        .map_err(|e| ClientError::Decode(e.to_string()))?;
+    if buf.len() as u64 > max {
+        return Err(too_large());
+    }
+    Ok(buf)
+}
+
+fn json_within<T: serde::de::DeserializeOwned>(
+    res: reqwest::blocking::Response,
+) -> Result<T, ClientError> {
+    serde_json::from_slice(&body_within(res, MAX_JSON_BYTES)?)
+        .map_err(|e| ClientError::Decode(e.to_string()))
+}
+
+/// An error answer's body is read up to this many bytes: enough for any
+/// message. It was read whole, past every other limit.
+const MAX_ERROR_BYTES: u64 = 64 << 10;
+
+fn check(res: reqwest::blocking::Response) -> Result<reqwest::blocking::Response, ClientError> {
+    use std::io::Read;
+    if res.status().is_success() {
+        return Ok(res);
+    }
+    let status = res.status().as_u16();
+    let mut buf = Vec::new();
+    let _ = res
+        .take(MAX_ERROR_BYTES.saturating_add(1))
+        .read_to_end(&mut buf);
+    let cut = buf.len() as u64 > MAX_ERROR_BYTES;
+    buf.truncate(MAX_ERROR_BYTES as usize);
+    let mut body = String::from_utf8_lossy(&buf).into_owned();
+    if cut {
+        body.push_str(" ... (cut off)");
+    }
+    Err(ClientError::Server { status, body })
 }

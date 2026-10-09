@@ -65,10 +65,43 @@ pub const COMPRESSION_LEVEL: i32 = 3;
 /// use `Pack::decode_prefix_with_limit` and pick their own ceiling.
 pub const DEFAULT_MAX_OBJECT_BYTES: usize = 256 * 1024 * 1024;
 
+/// Default ceiling on a whole pack's decoded size, and on its entries. The
+/// per-object ceiling alone left the total open: each zstd entry can expand
+/// a few kilobytes into its full size, so a small pack could decode to many
+/// times the memory there is. A receiver that knows its budget passes its
+/// own `PackLimits`.
+pub const DEFAULT_MAX_TOTAL_BYTES: usize = 2 * 1024 * 1024 * 1024;
+pub const DEFAULT_MAX_ENTRIES: usize = 4_000_000;
+
+/// What a decoder will take: each checked before anything is allocated or
+/// decompressed for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PackLimits {
+    /// Entries in the pack.
+    pub max_entries: usize,
+    /// One entry, decoded.
+    pub max_object_bytes: usize,
+    /// All entries together, decoded.
+    pub max_total_bytes: usize,
+}
+
+impl Default for PackLimits {
+    fn default() -> Self {
+        PackLimits {
+            max_entries: DEFAULT_MAX_ENTRIES,
+            max_object_bytes: DEFAULT_MAX_OBJECT_BYTES,
+            max_total_bytes: DEFAULT_MAX_TOTAL_BYTES,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum PackError {
     #[error("malformed pack: {0}")]
     Malformed(String),
+    /// Well formed, but past what the decoder was asked to take.
+    #[error("pack too large: {0}")]
+    TooLarge(String),
 }
 
 #[derive(Clone, Debug)]
@@ -190,7 +223,7 @@ impl Pack {
     /// used by the push wire format, which appends a manifest after the
     /// pack.
     pub fn decode_prefix(bytes: &[u8]) -> Result<(Self, usize), PackError> {
-        Self::decode_prefix_with_limit(bytes, DEFAULT_MAX_OBJECT_BYTES)
+        Self::decode_prefix_within(bytes, &PackLimits::default())
     }
 
     /// Like `decode_prefix`, but lets the caller pick the per-object size
@@ -200,6 +233,23 @@ impl Pack {
         bytes: &[u8],
         max_object_bytes: usize,
     ) -> Result<(Self, usize), PackError> {
+        Self::decode_prefix_within(
+            bytes,
+            &PackLimits {
+                max_object_bytes,
+                ..PackLimits::default()
+            },
+        )
+    }
+
+    /// Like `decode_prefix`, within `limits`: a pack with more entries, an
+    /// entry larger, or entries larger together, is refused before the
+    /// entry that would pass a limit is allocated or decompressed.
+    pub fn decode_prefix_within(
+        bytes: &[u8],
+        limits: &PackLimits,
+    ) -> Result<(Self, usize), PackError> {
+        let max_object_bytes = limits.max_object_bytes;
         if bytes.len() < 16 {
             return Err(PackError::Malformed("header truncated".into()));
         }
@@ -210,7 +260,16 @@ impl Pack {
         if version != PACK_VERSION {
             return Err(PackError::Malformed(format!("version {version}")));
         }
-        let count = LittleEndian::read_u64(&bytes[8..16]) as usize;
+        let count = LittleEndian::read_u64(&bytes[8..16]);
+        if count > limits.max_entries as u64 {
+            return Err(PackError::TooLarge(format!(
+                "{count} entries exceeds limit {}",
+                limits.max_entries
+            )));
+        }
+        let count = count as usize;
+        // Decoded so far, against `limits.max_total_bytes`.
+        let mut total: usize = 0;
         // Cap the capacity hint by the number of entries that can
         // possibly fit in the remaining bytes — each entry's minimum
         // on-wire size is 10 bytes (type+size+flags), and an empty
@@ -239,11 +298,18 @@ impl Pack {
             // explicitly on 32-bit targets where the cast below would
             // truncate.
             if size_u64 > max_object_bytes as u64 {
-                return Err(PackError::Malformed(format!(
+                return Err(PackError::TooLarge(format!(
                     "entry size {size_u64} exceeds limit {max_object_bytes}"
                 )));
             }
             let size = size_u64 as usize;
+            total = total.saturating_add(size);
+            if total > limits.max_total_bytes {
+                return Err(PackError::TooLarge(format!(
+                    "entries decode to more than the limit of {} bytes",
+                    limits.max_total_bytes
+                )));
+            }
             let flags = bytes[p];
             p += 1;
             let unknown = flags & !(FLAG_ZSTD | FLAG_DELTA);
@@ -331,6 +397,48 @@ impl Pack {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Entries of `n` zero bytes, each compressing to a few bytes: what a
+    /// small pack can claim to decode to.
+    fn zeros(entries: usize, n: usize) -> Vec<u8> {
+        let mut p = Pack::new();
+        for i in 0..entries {
+            let mut b = vec![0u8; n];
+            b[0] = i as u8; // distinct, so none is a delta of another
+            p.push(1, b);
+        }
+        p.encode()
+    }
+
+    /// The whole pack's decoded size is bounded, not only each entry's: a
+    /// pack a few kilobytes long is refused before it decodes past the
+    /// budget.
+    #[test]
+    fn a_pack_decoding_past_its_budget_is_refused() {
+        let bytes = zeros(3, 1 << 20);
+        assert!(bytes.len() < 64 * 1024, "{}", bytes.len());
+        let limits = |total| PackLimits {
+            max_entries: 10,
+            max_object_bytes: 1 << 20,
+            max_total_bytes: total,
+        };
+        assert!(Pack::decode_prefix_within(&bytes, &limits(3 << 20)).is_ok());
+        let e = Pack::decode_prefix_within(&bytes, &limits((3 << 20) - 1)).unwrap_err();
+        assert!(e.to_string().contains("more than the limit"), "{e}");
+    }
+
+    /// A pack with more entries than allowed is refused from its header.
+    #[test]
+    fn a_pack_with_too_many_entries_is_refused() {
+        let bytes = zeros(3, 16);
+        let limits = |n| PackLimits {
+            max_entries: n,
+            ..PackLimits::default()
+        };
+        assert!(Pack::decode_prefix_within(&bytes, &limits(3)).is_ok());
+        let e = Pack::decode_prefix_within(&bytes, &limits(2)).unwrap_err();
+        assert!(e.to_string().contains("entries exceeds limit"), "{e}");
+    }
 
     /// Pseudo-random byte generator (linear congruential). Produces output
     /// that defeats zstd's matching, so plain zstd compression is near-zero
@@ -428,6 +536,7 @@ mod tests {
         let err = Pack::decode(&bytes).unwrap_err();
         match err {
             PackError::Malformed(s) => assert!(s.contains("unknown flags")),
+            other => panic!("{other}"),
         }
     }
 
@@ -566,6 +675,7 @@ mod tests {
         let err = Pack::decode(&bytes).unwrap_err();
         match err {
             PackError::Malformed(s) => assert!(s.contains("zstd-framed")),
+            other => panic!("{other}"),
         }
     }
 
@@ -588,6 +698,7 @@ mod tests {
         let err = Pack::decode(&bytes).unwrap_err();
         match err {
             PackError::Malformed(s) => assert!(s.contains("delta base not in pack")),
+            other => panic!("{other}"),
         }
     }
 
@@ -608,10 +719,11 @@ mod tests {
                        // (no body needed — the size check should fire before we look)
         let err = Pack::decode(&bytes).unwrap_err();
         match err {
-            PackError::Malformed(s) => assert!(
+            PackError::TooLarge(s) => assert!(
                 s.contains("exceeds limit"),
                 "error must mention size limit: {s}"
             ),
+            other => panic!("{other}"),
         }
     }
 
@@ -631,7 +743,8 @@ mod tests {
         // Same encoded pack, decoded with a 512-byte limit, must reject.
         let err = Pack::decode_prefix_with_limit(&encoded, 512).unwrap_err();
         match err {
-            PackError::Malformed(s) => assert!(s.contains("exceeds limit")),
+            PackError::TooLarge(s) => assert!(s.contains("exceeds limit")),
+            other => panic!("{other}"),
         }
     }
 
@@ -649,6 +762,7 @@ mod tests {
         let err = Pack::decode(&bytes).unwrap_err();
         match err {
             PackError::Malformed(s) => assert!(s.contains("base hash truncated")),
+            other => panic!("{other}"),
         }
     }
 }

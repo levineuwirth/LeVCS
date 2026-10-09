@@ -47,6 +47,7 @@ async fn start(creators: Vec<String>) -> (SocketAddr, tokio::task::JoinHandle<()
         allowed_handlers: Vec::new(),
         mirrors: Vec::new(),
         creators,
+        limits: Default::default(),
     };
     let state = AppState::new(cfg);
     let app = router(state);

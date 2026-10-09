@@ -13,5 +13,5 @@ pub use auth::{
     DEFAULT_CLOCK_SKEW, NONCE_TTL_SECS,
 };
 pub use codec::{CanonicalCodec, CodecError, CodecResult};
-pub use pack::{Pack, PackEntry, PACK_MAGIC, PACK_VERSION};
+pub use pack::{Pack, PackEntry, PackError, PackLimits, PACK_MAGIC, PACK_VERSION};
 pub use wire::{InfoResponse, InstanceInfo, PushManifest, PushUpdate, RefList, RefsResponse};

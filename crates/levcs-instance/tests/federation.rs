@@ -33,6 +33,7 @@ async fn instance_info_and_init_roundtrip() {
         allowed_handlers: vec!["builtin".into()],
         mirrors: Vec::new(),
         creators: vec![sk.public().to_levcs()],
+        limits: Default::default(),
     };
     let state = AppState::new(config);
     // Bind to an ephemeral port.

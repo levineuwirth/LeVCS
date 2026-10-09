@@ -59,6 +59,7 @@ async fn start_with(
             .iter()
             .map(|s| SecretKey::from_seed(*s).public().to_levcs())
             .collect(),
+        limits: Default::default(),
     };
     let app = router(AppState::new(cfg));
     let listener = tokio::net::TcpListener::bind::<SocketAddr>("127.0.0.1:0".parse().unwrap())

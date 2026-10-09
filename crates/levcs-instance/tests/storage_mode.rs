@@ -46,6 +46,7 @@ async fn start(
         allowed_handlers: Vec::new(),
         mirrors: Vec::new(),
         creators,
+        limits: Default::default(),
     };
     let state = AppState::new(cfg);
     let app = router(state);

@@ -42,6 +42,24 @@ creators = []
 # fetching. Leave empty unless you're publishing a federation directory.
 federation_peers = []
 
+# What the instance takes on at once, and how much one request may
+# make it read, hold or decode. Every field is optional; the values
+# below are the defaults. In memory, pushes hold about
+# max_concurrent_pushes x (max_push_bytes + max_pack_bytes), and packs
+# being sent about max_concurrent_transfers x 2 x max_pack_bytes while
+# they are built, each with a few MiB of zstd context.
+[limits]
+max_in_flight = 64              # requests at once; more get 503
+max_concurrent_pushes = 2       # more get 503, before their bodies are read
+max_concurrent_transfers = 4    # packs and objects sent at once; more wait
+max_push_bytes = 33554432       # a push's body, as received (32 MiB)
+max_pack_objects = 100000       # objects in a pack, pushed or sent
+max_pack_bytes = 268435456      # a pack's objects together, decoded (256 MiB)
+max_object_bytes = 67108864     # one object, decoded (64 MiB)
+max_walk_objects = 1000000      # objects a pack being sent may walk
+body_timeout_secs = 120         # to receive a request body
+max_nonces = 100000             # signed requests remembered against replay
+
 # Per-repository mirror declarations (§5.6). Each block sets up a
 # read-only mirror of a repo hosted on another instance. The background
 # poller pulls from `source` every `poll_interval` and serves the

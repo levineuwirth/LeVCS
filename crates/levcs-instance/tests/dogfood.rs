@@ -167,6 +167,7 @@ async fn dogfood_three_instance_scenario() {
         allowed_handlers: Vec::new(),
         mirrors: Vec::new(),
         creators: vec![setup.sk.public().to_levcs()],
+        limits: Default::default(),
     };
     let b_cfg = InstanceConfig {
         root: b_root.clone(),
@@ -175,6 +176,7 @@ async fn dogfood_three_instance_scenario() {
         allowed_handlers: Vec::new(),
         mirrors: Vec::new(),
         creators: vec![setup.sk.public().to_levcs()],
+        limits: Default::default(),
     };
     let (a_addr, a_task) = start(a_cfg).await;
     let (b_addr, b_task) = start(b_cfg).await;
@@ -304,6 +306,7 @@ async fn dogfood_three_instance_scenario() {
             writeback: false,
         }],
         creators: Vec::new(),
+        limits: Default::default(),
     };
     let c_cfg_arc = Arc::new(c_cfg.clone());
     let (c_addr, c_task) = start(c_cfg).await;

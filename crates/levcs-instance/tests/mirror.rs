@@ -146,6 +146,7 @@ async fn mirror_pulls_state_from_source() {
         allowed_handlers: Vec::new(),
         mirrors: Vec::new(),
         creators: vec![setup.sk.public().to_levcs()],
+        limits: Default::default(),
     };
     let (source_addr, source_task) = start(source_cfg).await;
     let source_base = format!("http://{source_addr}/levcs/v1");
@@ -195,6 +196,7 @@ async fn mirror_pulls_state_from_source() {
             writeback: false,
         }],
         creators: Vec::new(),
+        limits: Default::default(),
     };
     let mirror_cfg_arc = Arc::new(mirror_cfg.clone());
     let (mirror_addr, mirror_task) = start(mirror_cfg).await;
@@ -314,6 +316,7 @@ async fn migrate_replays_repo_to_fresh_instance() {
         allowed_handlers: Vec::new(),
         mirrors: Vec::new(),
         creators: vec![setup.sk.public().to_levcs()],
+        limits: Default::default(),
     };
     let dst_cfg = InstanceConfig {
         root: dst_root.clone(),
@@ -322,6 +325,7 @@ async fn migrate_replays_repo_to_fresh_instance() {
         allowed_handlers: Vec::new(),
         mirrors: Vec::new(),
         creators: vec![setup.sk.public().to_levcs()],
+        limits: Default::default(),
     };
     let (src_addr, src_task) = start(src_cfg).await;
     let (dst_addr, dst_task) = start(dst_cfg).await;

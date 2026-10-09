@@ -244,6 +244,31 @@ The `TraceLayer` middleware emits one line per HTTP request at
 `info` level — method, path, status, latency. Bump to `debug` via
 `Environment=RUST_LOG=debug` in the systemd unit when diagnosing.
 
+### Limits
+
+The `[limits]` section of `instance.toml` bounds what the instance takes
+on at once and what one request can make it hold; every field has a
+default, and an unknown key stops the instance from starting.
+
+- Beyond `max_in_flight` requests, or `max_concurrent_pushes` pushes, the
+  instance answers 503 at once; packs and objects beyond
+  `max_concurrent_transfers` wait their turn. `/health` is always
+  answered.
+- A push larger than `max_push_bytes`, or whose pack decodes past
+  `max_pack_bytes`, `max_pack_objects` or `max_object_bytes`, is refused
+  (413) before it is decoded further; so is a pack request past those
+  limits or `max_walk_objects`.
+- A request body not received within `body_timeout_secs` is refused (408).
+- While `max_nonces` signed requests are remembered against replay, the
+  next is refused (503) rather than an earlier one forgotten.
+
+In memory, pushes hold about `max_concurrent_pushes` × (`max_push_bytes`
++ `max_pack_bytes`): each push's body and its decoded pack. Packs being
+sent hold about `max_concurrent_transfers` × 2 × `max_pack_bytes` while
+they are built, the objects read and the encoded pack, then the encoded
+pack until the client has received it. Each also takes a few MiB of zstd
+context. Size these to the VPS.
+
 ### Backups
 
 The instance is filesystem-only. A consistent backup is just a

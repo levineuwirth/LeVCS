@@ -92,6 +92,19 @@ impl ObjectStore {
     }
 
     pub fn read_raw(&self, id: ObjectId) -> Result<Vec<u8>> {
+        self.read_raw_within(id, u64::MAX)
+    }
+
+    /// Like `read_raw`, but only if the object is at most `max` bytes: its
+    /// size is checked before anything is allocated for it, and no more than
+    /// `max` bytes are read even if the file grows meanwhile. A reader that
+    /// serves objects to others bounds what each one can make it hold.
+    pub fn read_raw_within(&self, id: ObjectId, max: u64) -> Result<Vec<u8>> {
+        let too_large = |size| Error::TooLarge {
+            id: id.to_hex(),
+            size,
+            max,
+        };
         let path = self.path_for(id);
         let mut f = fs::File::open(&path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -103,8 +116,18 @@ impl ObjectStore {
                 }
             }
         })?;
-        let mut buf = Vec::new();
-        f.read_to_end(&mut buf).ctx(path.clone())?;
+        let size = f.metadata().ctx(path.clone())?.len();
+        if size > max {
+            return Err(too_large(size));
+        }
+        let mut buf = Vec::with_capacity(size as usize);
+        (&mut f)
+            .take(max.saturating_add(1))
+            .read_to_end(&mut buf)
+            .ctx(path.clone())?;
+        if buf.len() as u64 > max {
+            return Err(too_large(buf.len() as u64));
+        }
         // Verify integrity.
         let actual = blake3_hash(&buf);
         if actual != id {
@@ -118,6 +141,13 @@ impl ObjectStore {
 
     pub fn read_object(&self, id: ObjectId) -> Result<RawObject> {
         let bytes = self.read_raw(id)?;
+        RawObject::parse(&bytes)
+    }
+
+    /// Like `read_object`, but only if the object is at most `max` bytes
+    /// (`read_raw_within`).
+    pub fn read_object_within(&self, id: ObjectId, max: u64) -> Result<RawObject> {
+        let bytes = self.read_raw_within(id, max)?;
         RawObject::parse(&bytes)
     }
 
@@ -219,6 +249,45 @@ pub fn cleanup_temp(store: &ObjectStore) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An object larger than a read may take is refused from its size,
+    /// before it is read: here a sparse file of a terabyte, which a read
+    /// of the whole would not finish.
+    #[test]
+    fn a_read_within_a_limit_refuses_a_larger_object_unread() {
+        let dir = std::env::temp_dir().join(format!(
+            "levcs-store-within-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = ObjectStore::new(dir.join("objects"));
+        let bytes = crate::Blob::new(vec![7u8; 100]).serialize();
+        let id = store.write_raw(&bytes).unwrap();
+        let n = bytes.len() as u64;
+        assert_eq!(store.read_raw_within(id, n).unwrap(), bytes);
+        assert!(matches!(
+            store.read_raw_within(id, n - 1),
+            Err(Error::TooLarge { size, max, .. }) if size == n && max == n - 1
+        ));
+
+        let huge = ObjectId([0xEE; 32]);
+        let path = store.path_for(huge);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(1 << 40)
+            .unwrap();
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            store.read_raw_within(huge, 1 << 20),
+            Err(Error::TooLarge { .. })
+        ));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     use crate::blob::Blob;
 
     fn tempdir() -> PathBuf {

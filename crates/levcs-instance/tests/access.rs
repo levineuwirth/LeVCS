@@ -57,6 +57,7 @@ fn config(root: &Path, creators: Vec<String>) -> InstanceConfig {
         allowed_handlers: Vec::new(),
         mirrors: Vec::new(),
         creators,
+        limits: Default::default(),
     }
 }
 

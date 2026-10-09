@@ -31,6 +31,7 @@ async fn health_returns_ok_without_auth() {
         allowed_handlers: Vec::new(),
         mirrors: Vec::new(),
         creators: Vec::new(),
+        limits: Default::default(),
     };
     let state = AppState::new(cfg);
     let app = router(state);

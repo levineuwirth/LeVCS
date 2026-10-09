@@ -17,7 +17,7 @@
 //!   hooks/
 //! ```
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -253,41 +253,38 @@ impl Repository {
     /// repository-relative path, excluding `.levcs/` and ignored paths. A
     /// link is never followed, into a directory or otherwise. Anything
     /// else (a fifo, a socket) is passed over.
+    ///
+    /// Walked with a stack of directories, not by recursion: a checkout of
+    /// a received tree can nest deeper than a thread's stack goes.
     pub fn walk_workdir_entries(&self) -> Result<Vec<(String, Walked)>> {
         let mut out = Vec::new();
         let ignore = self.read_ignore();
-        walk(&self.workdir, &self.workdir, &ignore, &mut out)?;
-        out.sort();
-        return Ok(out);
-
-        fn walk(
-            base: &Path,
-            dir: &Path,
-            ig: &Ignore,
-            out: &mut Vec<(String, Walked)>,
-        ) -> Result<()> {
-            for ent in fs::read_dir(dir).ctx(dir.to_path_buf())? {
-                let ent = ent.ctx(dir.to_path_buf())?;
+        let base = &self.workdir;
+        let mut dirs = vec![base.clone()];
+        while let Some(dir) = dirs.pop() {
+            for ent in fs::read_dir(&dir).ctx(dir.clone())? {
+                let ent = ent.ctx(dir.clone())?;
                 let path = ent.path();
                 let rel = path.strip_prefix(base).unwrap();
                 if always_ignored(rel) {
                     continue;
                 }
                 let rel_str = rel.to_string_lossy().replace('\\', "/");
-                if ig.is_ignored(&rel_str) {
+                if ignore.is_ignored(&rel_str) {
                     continue;
                 }
                 let ft = ent.file_type().ctx(path.clone())?;
                 if ft.is_dir() {
-                    walk(base, &path, ig, out)?;
+                    dirs.push(path);
                 } else if ft.is_symlink() {
                     out.push((rel_str, Walked::Symlink));
                 } else if ft.is_file() {
                     out.push((rel_str, Walked::File));
                 }
             }
-            Ok(())
         }
+        out.sort();
+        Ok(out)
     }
 
     /// The regular files of [`Self::walk_workdir_entries`], as absolute
@@ -303,12 +300,13 @@ impl Repository {
             .collect())
     }
 
-    /// Build a `Tree` object for a single directory level given a sorted set
-    /// of (relative_path, blob_hash, mode) entries representing the files
-    /// staged at and below `prefix`. Recursive: returns the root tree's id.
+    /// The tree of the files the index tracks, written with every tree
+    /// beneath it; returns the root tree's id. Each directory's tree is
+    /// written before its parent's, deepest first, from a map of every
+    /// directory by path, not by recursion.
     pub fn build_tree_from_index(&self, idx: &Index) -> Result<ObjectId> {
-        // Group entries by directory, build trees bottom-up.
-        let mut node = TreeBuilder::default();
+        let mut dirs: BTreeMap<String, Tree> = BTreeMap::new();
+        dirs.insert(String::new(), Tree::new());
         for e in &idx.entries {
             if !e.flags.is_tracked() {
                 continue;
@@ -317,9 +315,84 @@ impl Repository {
             // too; this covers an index written before it did.
             worktree::components(&e.path)
                 .map_err(|err| Error::Other(format!("cannot commit: {err}")))?;
-            node.insert(&e.path, e.blob_hash, mode_from_index(e.mode));
+            let (dir, name) = split_parent(&e.path);
+            let mut d = dir;
+            while !dirs.contains_key(d) {
+                dirs.insert(d.to_string(), Tree::new());
+                d = split_parent(d).0;
+            }
+            dirs.get_mut(dir).unwrap().entries.push(TreeEntry {
+                name: name.to_string(),
+                entry_type: EntryType::Blob,
+                mode: mode_from_index(e.mode),
+                hash: e.blob_hash,
+            });
         }
-        node.write(self)
+        let mut deepest_first: Vec<String> = dirs.keys().cloned().collect();
+        deepest_first.sort_by_key(|d| std::cmp::Reverse(d.matches('/').count() + 1));
+        for d in deepest_first {
+            if d.is_empty() {
+                continue;
+            }
+            let id = write_tree(self, dirs.remove(&d).unwrap())?;
+            let (parent, name) = split_parent(&d);
+            dirs.get_mut(parent).unwrap().entries.push(TreeEntry {
+                name: name.to_string(),
+                entry_type: EntryType::Tree,
+                mode: FileMode::REGULAR,
+                hash: id,
+            });
+        }
+        return write_tree(self, dirs.remove("").unwrap());
+
+        fn write_tree(repo: &Repository, mut tree: Tree) -> Result<ObjectId> {
+            tree.sort_and_validate()?;
+            repo.objects.write_raw(&tree.serialize())
+        }
+    }
+
+    /// Each entry of `tree_id` and of every tree beneath it, depth first in
+    /// tree order, with its path below `prefix` ("" for none). `visit` says
+    /// whether to go into an entry that is a tree. Refused before it is
+    /// built: a path longer than [`worktree::MAX_PATH_BYTES`], and an entry
+    /// past [`worktree::MAX_TREE_ENTRIES`], each place a shared subtree
+    /// recurs counted.
+    ///
+    /// Walked with a stack of trees, not by recursion: a received tree can
+    /// nest deeper than a thread's stack goes.
+    pub fn walk_tree(
+        &self,
+        tree_id: ObjectId,
+        prefix: &str,
+        mut visit: impl FnMut(&str, &TreeEntry) -> Result<bool>,
+    ) -> Result<()> {
+        let entries = |id| -> Result<std::vec::IntoIter<TreeEntry>> {
+            let raw = self.objects.read_typed(id, ObjectType::Tree)?;
+            Ok(Tree::parse_body(&raw.body)?.entries.into_iter())
+        };
+        let mut stack = vec![(prefix.to_string(), entries(tree_id)?)];
+        let mut visited = 0;
+        while let Some((dir, rest)) = stack.last_mut() {
+            let Some(e) = rest.next() else {
+                stack.pop();
+                continue;
+            };
+            visited += 1;
+            if visited > worktree::MAX_TREE_ENTRIES {
+                return Err(worktree::too_many_entries(tree_id));
+            }
+            let path = if dir.is_empty() {
+                e.name.clone()
+            } else if dir.len() + 1 + e.name.len() > worktree::MAX_PATH_BYTES {
+                return Err(worktree::too_long(dir));
+            } else {
+                format!("{dir}/{}", e.name)
+            };
+            if visit(&path, &e)? && e.entry_type == EntryType::Tree {
+                stack.push((path, entries(e.hash)?));
+            }
+        }
+        Ok(())
     }
 
     /// Every file `tree_id` would put in a working tree, each path checked
@@ -330,41 +403,29 @@ impl Repository {
     /// metadata. Any other component named `.levcs` refuses the whole tree.
     pub fn tree_files(&self, tree_id: ObjectId, prefix: &str) -> Result<Vec<TreeFile>> {
         let mut out = Vec::new();
-        self.tree_files_into(tree_id, prefix, prefix.is_empty(), &mut out)?;
-        Ok(out)
-    }
-
-    fn tree_files_into(
-        &self,
-        tree_id: ObjectId,
-        prefix: &str,
-        at_root: bool,
-        out: &mut Vec<TreeFile>,
-    ) -> Result<()> {
-        let raw = self.objects.read_typed(tree_id, ObjectType::Tree)?;
-        let tree = Tree::parse_body(&raw.body)?;
-        for e in &tree.entries {
-            if at_root && e.name == ".levcs" {
-                continue;
-            }
-            let path = if prefix.is_empty() {
-                e.name.clone()
-            } else {
-                format!("{prefix}/{}", e.name)
-            };
-            worktree::components(&path)?;
-            match e.entry_type {
-                EntryType::Tree => self.tree_files_into(e.hash, &path, false, out)?,
-                EntryType::Blob => {
-                    out.push(TreeFile {
-                        path,
-                        blob: e.hash,
-                        executable: e.mode.is_executable(),
-                    });
-                }
-            }
+        if !prefix.is_empty() {
+            worktree::components(prefix)?;
         }
-        Ok(())
+        // Each name is checked where the walk reaches it, so every
+        // component of a path has been checked by the time its file is.
+        self.walk_tree(tree_id, prefix, |path, e| {
+            if path == ".levcs" {
+                return Ok(false);
+            }
+            if path.len() > worktree::MAX_PATH_BYTES {
+                return Err(worktree::too_long(path));
+            }
+            worktree::component(&e.name, path)?;
+            if e.entry_type == EntryType::Blob {
+                out.push(TreeFile {
+                    path: path.to_string(),
+                    blob: e.hash,
+                    executable: e.mode.is_executable(),
+                });
+            }
+            Ok(true)
+        })?;
+        Ok(out)
     }
 
     /// Write every file of `tree_id` into the working tree at `dest`.
@@ -388,9 +449,12 @@ impl Repository {
     pub fn checkout_files(&self, files: &[TreeFile], dest: &Path) -> Result<()> {
         let wt = Worktree::open(dest)?;
         // Read twice rather than held: a tree can be larger than memory
-        // should hold, and the second read is from the page cache.
+        // should hold, and the second read is from the page cache. The
+        // first is charged to the files' content, so a checkout of more
+        // than a working tree may hold stops before it writes.
+        let mut content = ContentBudget::default();
         for f in files {
-            self.objects.read_typed(f.blob, ObjectType::Blob)?;
+            self.charge_blob(f.blob, &mut content)?;
         }
         wt.preflight(files.iter().map(|f| f.path.as_str()))?;
         for f in files {
@@ -543,8 +607,9 @@ impl Repository {
     /// target is checked before anything changes.
     pub fn apply_checkout(&self, plan: &CheckoutPlan) -> Result<()> {
         let wt = Worktree::open(&self.workdir)?;
+        let mut content = ContentBudget::default();
         for f in &plan.write {
-            self.objects.read_typed(f.blob, ObjectType::Blob)?;
+            self.charge_blob(f.blob, &mut content)?;
         }
         wt.preflight(
             plan.write
@@ -560,6 +625,53 @@ impl Repository {
             wt.remove_file(p)?;
         }
         Ok(())
+    }
+
+    /// The size of blob `id`, charged to `content` for every place it
+    /// recurs. It is read and checked the first time only, and one larger
+    /// than what is left is refused before it is read.
+    pub fn charge_blob(&self, id: ObjectId, content: &mut ContentBudget) -> Result<u64> {
+        let size = match content.checked.get(&id) {
+            Some(size) => *size,
+            None => {
+                let size = self.read_blob_within(id, content.left)?.body.len() as u64;
+                content.checked.insert(id, size);
+                size
+            }
+        };
+        content.left = content
+            .left
+            .checked_sub(size)
+            .ok_or_else(worktree::too_much_content)?;
+        Ok(size)
+    }
+
+    /// Blob `id`, read, and charged to `content` as [`Self::charge_blob`]
+    /// charges it: a blob that recurs is charged before it is read again.
+    pub fn read_blob(&self, id: ObjectId, content: &mut ContentBudget) -> Result<RawObject> {
+        if content.checked.contains_key(&id) {
+            self.charge_blob(id, content)?;
+            return self.objects.read_typed(id, ObjectType::Blob);
+        }
+        let raw = self.read_blob_within(id, content.left)?;
+        content.checked.insert(id, raw.body.len() as u64);
+        content.left -= raw.body.len() as u64;
+        Ok(raw)
+    }
+
+    /// Blob `id`, if it is no larger than `max` bytes.
+    fn read_blob_within(&self, id: ObjectId, max: u64) -> Result<RawObject> {
+        let raw = match self.objects.read_object_within(id, max) {
+            Err(Error::TooLarge { .. }) => return Err(worktree::too_much_content()),
+            r => r?,
+        };
+        if raw.object_type != ObjectType::Blob {
+            return Err(Error::MalformedObject(format!(
+                "expected blob, got {}",
+                raw.object_type.name()
+            )));
+        }
+        Ok(raw)
     }
 
     pub fn read_signed(&self, id: ObjectId) -> Result<SignedObject> {
@@ -578,7 +690,7 @@ impl Repository {
         Ok(id)
     }
 
-    /// Find the path within a tree (recursively) and return (entry_type, hash).
+    /// Find the path within a tree and return (entry_type, hash).
     pub fn lookup_path(
         &self,
         tree_id: ObjectId,
@@ -589,26 +701,25 @@ impl Repository {
             .map(|e| (e.entry_type, e.hash)))
     }
 
-    /// The tree entry at `path` within a tree, found recursively.
+    /// The tree entry at `path` within a tree, found one component at a time.
     pub fn lookup_entry(&self, tree_id: ObjectId, path: &str) -> Result<Option<TreeEntry>> {
-        let raw = self.objects.read_typed(tree_id, ObjectType::Tree)?;
-        let tree = Tree::parse_body(&raw.body)?;
-        let mut comps = path.split('/').filter(|c| !c.is_empty());
-        let first = match comps.next() {
-            Some(c) => c,
-            None => return Ok(None),
-        };
-        let entry = match tree.find(first) {
-            Some(e) => e,
-            None => return Ok(None),
-        };
-        let rest: Vec<&str> = comps.collect();
-        if rest.is_empty() {
-            Ok(Some(entry.clone()))
-        } else {
+        let mut comps = path.split('/').filter(|c| !c.is_empty()).peekable();
+        let mut tree_id = tree_id;
+        loop {
+            let raw = self.objects.read_typed(tree_id, ObjectType::Tree)?;
+            let tree = Tree::parse_body(&raw.body)?;
+            let Some(name) = comps.next() else {
+                return Ok(None);
+            };
+            let Some(entry) = tree.find(name) else {
+                return Ok(None);
+            };
+            if comps.peek().is_none() {
+                return Ok(Some(entry.clone()));
+            }
             match entry.entry_type {
-                EntryType::Tree => self.lookup_entry(entry.hash, &rest.join("/")),
-                EntryType::Blob => Ok(None),
+                EntryType::Tree => tree_id = entry.hash,
+                EntryType::Blob => return Ok(None),
             }
         }
     }
@@ -687,52 +798,26 @@ fn mode_from_index(m: u8) -> FileMode {
     FileMode(bits)
 }
 
-#[derive(Default)]
-struct TreeBuilder {
-    files: Vec<(String, ObjectId, FileMode)>,
-    dirs: std::collections::BTreeMap<String, TreeBuilder>,
+/// What is left of [`worktree::MAX_TREE_BYTES`] for one tree's files, and
+/// the size of each blob already read and checked: see
+/// [`Repository::charge_blob`].
+pub struct ContentBudget {
+    left: u64,
+    checked: HashMap<ObjectId, u64>,
 }
 
-impl TreeBuilder {
-    fn insert(&mut self, path: &str, hash: ObjectId, mode: FileMode) {
-        let mut comps = path.splitn(2, '/');
-        let first = comps.next().unwrap();
-        match comps.next() {
-            None => {
-                self.files.push((first.to_string(), hash, mode));
-            }
-            Some(rest) => {
-                self.dirs
-                    .entry(first.to_string())
-                    .or_default()
-                    .insert(rest, hash, mode);
-            }
+impl Default for ContentBudget {
+    fn default() -> Self {
+        ContentBudget {
+            left: worktree::MAX_TREE_BYTES,
+            checked: HashMap::new(),
         }
     }
+}
 
-    fn write(self, repo: &Repository) -> Result<ObjectId> {
-        let mut tree = Tree::new();
-        for (name, hash, mode) in self.files {
-            tree.entries.push(TreeEntry {
-                name,
-                entry_type: EntryType::Blob,
-                mode,
-                hash,
-            });
-        }
-        for (name, sub) in self.dirs {
-            let sub_id = sub.write(repo)?;
-            tree.entries.push(TreeEntry {
-                name,
-                entry_type: EntryType::Tree,
-                mode: FileMode::REGULAR,
-                hash: sub_id,
-            });
-        }
-        tree.sort_and_validate()?;
-        let bytes = tree.serialize();
-        repo.objects.write_raw(&bytes)
-    }
+/// `path`'s directory and last component: `("", path)` at the top.
+fn split_parent(path: &str) -> (&str, &str) {
+    path.rsplit_once('/').unwrap_or(("", path))
 }
 
 #[allow(dead_code)]

@@ -61,17 +61,7 @@ max_ref_updates = 1024          # refs one push may update
 body_timeout_secs = 120         # to receive a request body
 max_nonces = 100000             # signed requests remembered against replay
 
-# Per-repository mirror declarations (§5.6). Each block sets up a
-# read-only mirror of a repo hosted on another instance. The background
-# poller pulls from `source` every `poll_interval` and serves the
-# replicated state to local clients. Pushes to mirrored repos are
-# rejected with 403 unless `writeback = true`.
-#
-# Uncomment to mirror a repo:
-#
-# [[mirrors]]
-# repo_id = "abcd1234..."                       # 64-hex repo_id
-# source = "https://other.example/levcs/v1"
-# mode = "full"                                 # full | release
-# poll_interval = "5m"                          # 30s | 5m | 1h | <seconds>
-# writeback = false
+# Mirrors ([[mirrors]], §5.6) are refused: the instance will not start
+# with one configured. A mirror installs its source's history without
+# checking it against the genesis its repo_id pins, and it stays refused
+# until it does (doc/authority-semantics.md, Rule R).

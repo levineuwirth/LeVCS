@@ -7,6 +7,7 @@ mod ctx;
 mod fed_cmds;
 mod identity_cmds;
 mod publish;
+mod receive;
 mod repo_cmds;
 mod rev;
 mod tree_helpers;
@@ -61,6 +62,7 @@ fn run() -> Result<()> {
         cli::Cmd::Instance(a) => fed_cmds::instance(a),
         cli::Cmd::Push(a) => fed_cmds::push(a),
         cli::Cmd::Pull(a) => fed_cmds::pull(a),
+        cli::Cmd::Clone(a) => fed_cmds::clone(a),
         cli::Cmd::Fork(a) => fed_cmds::fork(a),
         cli::Cmd::Inspect(a) => fed_cmds::inspect(a),
         cli::Cmd::Deploy(a) => fed_cmds::deploy(a),

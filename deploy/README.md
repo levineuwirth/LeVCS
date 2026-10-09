@@ -57,8 +57,8 @@ sudo cp deploy/instance.toml.example /etc/levcs/instance.toml
 sudo $EDITOR /etc/levcs/instance.toml
 ```
 
-The defaults (full storage, builtin handlers only, no mirrors, listen
-on 127.0.0.1:7117) are correct for a single-VPS install. Change `root`
+The defaults (full storage, builtin handlers only, listen on
+127.0.0.1:7117) are correct for a single-VPS install. Change `root`
 only if `/var/lib/levcs` doesn't suit your filesystem layout.
 
 Name the keys that may create repositories in `creators`, as
@@ -226,10 +226,27 @@ curl -fsS https://levcs.example.com/levcs/v1/repos/<repo_id>/info | jq
 ```
 
 A private one (`public_read` false) is served only to members of its
-current authority, in signed requests (`levcs pull --key <label>`).
-Anyone else is answered as if it did not exist.
+current authority, in signed requests (`--key <label>` to `clone`,
+`pull` and `fork`). Anyone else is answered as if it did not exist.
 
-### 6. (Optional) Verify the server-side state
+### 6. Another machine: clone and pull
+
+```sh
+levcs clone <repo_id> levcs --from https://levcs.example.com/levcs/v1
+```
+
+makes a new workspace of the instance in `levcs/`: its branches,
+releases and authority as the instance publishes them, and `main`
+checked out. Work in it is pushed as from the first machine. `levcs pull`
+in a workspace records the instance's branches under
+`refs/remote/origin/`, without moving any of its own.
+
+Both check everything they receive before writing any of it: that the
+genesis is the one the repository's id pins, and that every object the
+received refs reach is present and passes `levcs verify`'s checks
+against it. Anything that fails is refused, and nothing is written.
+
+### 7. (Optional) Verify the server-side state
 
 SSH to the VPS and look at what got persisted:
 
@@ -315,21 +332,10 @@ incompatible change, the release notes will say so.
 
 ### Mirrors
 
-To set up a read-only mirror of a repo from another instance, add a
-`[[mirrors]]` block to `/etc/levcs/instance.toml`:
-
-```toml
-[[mirrors]]
-repo_id = "abcd1234..."
-source = "https://other.example/levcs/v1"
-mode = "full"
-poll_interval = "5m"
-writeback = false
-```
-
-Then `sudo systemctl restart levcs-instance`. The background poller
-spawns at startup; `journalctl -u levcs-instance` will show the sync
-activity.
+Mirrors are refused: the instance will not start with a `[[mirrors]]`
+block in its config. A mirror installs its source's history without
+checking it against the genesis its `repo_id` pins, and it stays refused
+until it does (`doc/authority-semantics.md`, Rule R).
 
 ---
 

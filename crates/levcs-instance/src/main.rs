@@ -17,14 +17,9 @@
 //!
 //! [limits]                       # every field optional; see `Limits`
 //! max_push_bytes = 33554432
-//!
-//! [[mirrors]]
-//! repo_id = "..."
-//! source = "https://other.example/levcs/v1"
-//! mode = "full"                  # full | release
-//! poll_interval = "5m"
-//! writeback = false
 //! ```
+//!
+//! `[[mirrors]]` blocks are refused: see `InstanceConfig::validate`.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -202,9 +197,10 @@ async fn main() -> std::io::Result<()> {
     }
     let state = AppState::new(config.clone());
 
-    // Spawn one background poller per configured mirror. The handles
-    // are intentionally dropped — pollers run for the lifetime of the
-    // process, and tokio cancels them when the runtime shuts down.
+    // Spawn one background poller per configured mirror: none, while
+    // `validate` refuses mirrors. The handles are intentionally dropped —
+    // pollers run for the lifetime of the process, and tokio cancels them
+    // when the runtime shuts down.
     let cfg_arc = state.config.clone();
     for mirror in &config.mirrors {
         let interval = if mirror.poll_interval.is_empty() {

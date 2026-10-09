@@ -1,5 +1,11 @@
 //! Inter-instance mirroring (§5.6).
 //!
+//! **Refused.** The binary will not start with a mirror configured
+//! (`InstanceConfig::validate`). A sync pass compares neither the source's
+//! genesis with the configured repo_id nor what it receives with Rule H,
+//! whatever is said below (audit H3), and mirroring stays refused until it
+//! does (`doc/authority-semantics.md`, Rule R).
+//!
 //! [`sync_mirror`] is a single, blocking sync pass: it polls the source
 //! instance's `/info` and `/refs`, fetches a pack of objects this instance
 //! does not yet have, verifies their signatures locally against the

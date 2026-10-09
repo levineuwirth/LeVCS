@@ -222,9 +222,14 @@ impl InstanceConfig {
     }
 
     /// What the configuration names that is not what it should be: a
-    /// creator that is not a key, a mirror whose repository is not named by
-    /// its id. The binary refuses to start over any of it; where these are
-    /// used, an entry that does not parse authorizes and reaches nothing.
+    /// creator that is not a key, a limit of zero, any mirror. The binary
+    /// refuses to start over any of it; where these are used, an entry that
+    /// does not parse authorizes and reaches nothing.
+    ///
+    /// Mirrors are refused until they meet Rule R
+    /// (`doc/authority-semantics.md`): a mirror installs its source's
+    /// branches, releases and current authority without checking them
+    /// against the genesis its repo_id pins (audit H3).
     pub fn validate(&self) -> Result<(), String> {
         let mut bad = Vec::new();
         for c in &self.creators {
@@ -253,6 +258,11 @@ impl InstanceConfig {
             }
         }
         for m in &self.mirrors {
+            bad.push(format!(
+                "mirrors: {:?} from {}: mirroring is refused until it checks what it \
+                 receives (doc/authority-semantics.md, Rule R)",
+                m.repo_id, m.source
+            ));
             if RepoId::parse(&m.repo_id).is_none() {
                 bad.push(format!(
                     "mirrors: repo_id {:?} is not 64 lowercase hex characters",

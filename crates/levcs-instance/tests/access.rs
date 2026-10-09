@@ -466,6 +466,26 @@ fn a_mirror_reaches_only_a_repository_named_by_id() {
     assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
 }
 
+/// Any mirror is refused, one named by a valid id included: a mirror
+/// installs its source's history without checking it (Rule R), and the
+/// instance does not start with one configured.
+#[test]
+fn a_mirror_is_refused_until_it_checks_what_it_receives() {
+    let mut cfg = config(Path::new("/nonexistent"), Vec::new());
+    cfg.mirrors = vec![MirrorConfig {
+        repo_id: "ab".repeat(32),
+        source: "http://127.0.0.1:9/levcs/v1".into(),
+        mode: "full".into(),
+        poll_interval: String::new(),
+        writeback: false,
+    }];
+    let problems = cfg.validate().unwrap_err();
+    assert!(
+        problems.contains("mirroring is refused until it checks what it receives"),
+        "{problems}"
+    );
+}
+
 // Creation.
 
 /// An instance that names no creator accepts no new repository, not even

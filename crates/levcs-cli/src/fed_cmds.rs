@@ -344,51 +344,206 @@ fn remote_value(info: &levcs_protocol::InfoResponse, name: &str) -> Result<Optio
         .map_err(|e| anyhow!("the instance says {name} holds {e}"))
 }
 
-pub fn pull(args: PullArgs) -> Result<()> {
-    let (repo, _lock) = open_repo_locked()?;
-    let url = active_instance()?;
-    // A private repository is served only to its members, so its reads are
-    // signed with the key `--key` names. Without one they are anonymous,
-    // which reads a public repository.
-    let client = match args.key.as_deref() {
+/// A client for `url` that signs its reads with the key `label` names: a
+/// private repository is served only to its members. Without one, reads
+/// are anonymous, which reads a public repository.
+fn reader(url: String, label: Option<&str>) -> Result<levcs_client::Client> {
+    Ok(match label {
         Some(label) => levcs_client::Client::new(url)
             .with_reader(std::sync::Arc::new(load_secret(Some(label))?.1)),
         None => levcs_client::Client::new(url),
+    })
+}
+
+/// A repository id as given: 64 lowercase hex digits, with or without the
+/// `blake3:` this tool prints before one.
+fn repo_id_arg(given: &str) -> Result<String> {
+    let id = given.strip_prefix("blake3:").unwrap_or(given);
+    match ObjectId::from_hex(id) {
+        Ok(parsed) if parsed.to_hex() == id => Ok(id.to_string()),
+        _ => bail!("{given:?} is not a repository id (64 lowercase hex digits)"),
+    }
+}
+
+/// An id the instance gave, as `what`.
+fn id_from(what: &str, hex: &str) -> Result<ObjectId> {
+    ObjectId::from_hex(hex)
+        .map_err(|_| anyhow!("the instance gave {what} as {hex:?}, which is not an object id"))
+}
+
+/// What the instance says it holds of `repo_id`. A private repository that
+/// the reader may not read is answered as a missing one.
+fn published(
+    client: &levcs_client::Client,
+    url: &str,
+    repo_id: &str,
+) -> Result<levcs_protocol::InfoResponse> {
+    let info = match client.repo_info(repo_id) {
+        Ok(info) => info,
+        Err(levcs_client::ClientError::Server { status: 404, .. }) => bail!(
+            "{url} has no repository {repo_id}, or none it lets this reader see \
+             (a private repository is read with --key)"
+        ),
+        Err(e) => return Err(e.into()),
     };
+    if info.repo_id != repo_id {
+        bail!(
+            "asked {url} for repository {repo_id}, and it answered for {:?}",
+            info.repo_id
+        );
+    }
+    Ok(info)
+}
+
+/// Fetch what the instance's branches hold, check it (Rule R; see
+/// `receive`), and record it under `refs/remote/origin/`: a record of the
+/// instance's state, not this repository's.
+pub fn pull(args: PullArgs) -> Result<()> {
+    let (repo, _lock) = open_repo_locked()?;
+    let url = active_instance()?;
+    let client = reader(url.clone(), args.key.as_deref())?;
     let repo_id = compute_repo_id(&repo)?;
-    let remote_refs = client.refs(&repo_id)?;
-    let want_refs: Vec<String> = if args.refs.is_empty() {
-        remote_refs.branches.keys().cloned().collect()
+    let genesis = repo
+        .genesis_authority()?
+        .ok_or_else(|| anyhow!("this repository has no genesis authority"))?;
+    let info = published(&client, &url, &repo_id)?;
+    let current = id_from("its current authority", &info.current_authority)?;
+    let names: Vec<String> = if args.refs.is_empty() {
+        info.branches.keys().cloned().collect()
     } else {
-        args.refs
+        args.refs.clone()
     };
-    let mut want_ids = Vec::new();
-    for r in &want_refs {
-        if let Some(h) = remote_refs.branches.get(r) {
-            want_ids.push(ObjectId::from_hex(h)?);
-        }
+    let mut roots = Vec::new();
+    for name in &names {
+        let hex = info
+            .branches
+            .get(name)
+            .ok_or_else(|| anyhow!("{url} has no branch {name:?} in {repo_id}"))?;
+        let r = format!("refs/remote/origin/branches/{name}");
+        levcs_core::refs::validate_ref_name(&r)?;
+        roots.push((r, id_from(&format!("branch {name:?}"), hex)?));
     }
-    let have_ids: Vec<ObjectId> = repo
+    // What this repository holds already, which need not be sent again.
+    let mut have: Vec<ObjectId> = repo
         .refs
-        .list_branches()?
+        .list_all()?
         .into_iter()
+        .filter(|(n, _)| {
+            n.starts_with("refs/branches/") || n.starts_with("refs/remote/origin/branches/")
+        })
         .map(|(_, id)| id)
+        .filter(|id| repo.objects.contains(*id))
         .collect();
-    let pack = client.get_pack(&repo_id, &have_ids, &want_ids)?;
-    for ent in &pack.entries {
-        repo.objects.write_raw(&ent.bytes)?;
-    }
-    for (r, h) in remote_refs.branches {
-        if want_refs.contains(&r) {
-            let id = ObjectId::from_hex(&h)?;
-            repo.refs
-                .write(&format!("refs/remote/origin/branches/{r}"), id)?;
-        }
+    have.sort();
+    have.dedup();
+    let received = crate::receive::receive(
+        &client,
+        &repo_id,
+        genesis,
+        current,
+        &roots,
+        &have,
+        Some(&repo.objects),
+    )?;
+    received.write(&repo.objects)?;
+    for (r, id) in &roots {
+        repo.refs.write(r, *id)?;
     }
     eprintln!(
-        "pulled {} object(s) from {} ref(s)",
-        pack.entries.len(),
-        want_refs.len()
+        "pulled {} ref(s) into refs/remote/origin/: {} new object(s), all of their history \
+         verified against this repository's genesis",
+        roots.len(),
+        received.len()
+    );
+    Ok(())
+}
+
+/// A new workspace of the instance holding `repo_id`, with its branches,
+/// releases and authority as the instance publishes them, checked first
+/// (Rule R; see `receive`), and the working tree of its `main`.
+pub fn clone(args: CloneArgs) -> Result<()> {
+    let repo_id = repo_id_arg(&args.repo_id)?;
+    let url = match &args.from {
+        Some(u) => u.clone(),
+        None => active_instance()?,
+    };
+    let dest = match &args.path {
+        Some(p) => p.clone(),
+        None => std::env::current_dir()?.join(&repo_id[..8]),
+    };
+    if dest.exists() {
+        bail!("destination already exists: {}", dest.display());
+    }
+    let client = reader(url.clone(), args.key.as_deref())?;
+    let info = published(&client, &url, &repo_id)?;
+    let genesis = id_from("its genesis authority", &info.genesis_authority)?;
+    let current = id_from("its current authority", &info.current_authority)?;
+    let mut refs = Vec::new();
+    for (kind, named) in [("branches", &info.branches), ("releases", &info.releases)] {
+        for (name, hex) in named {
+            let r = format!("refs/{kind}/{name}");
+            levcs_core::refs::validate_ref_name(&r)?;
+            refs.push((r, id_from(&format!("{kind} {name:?}"), hex)?));
+        }
+    }
+    let mut roots = vec![
+        ("refs/authority/genesis".to_string(), genesis),
+        ("refs/authority/current".to_string(), current),
+    ];
+    roots.extend(refs.iter().cloned());
+    let received = crate::receive::receive(&client, &repo_id, genesis, current, &roots, &[], None)?;
+
+    // Only now is anything written. A clone that fails from here on is
+    // removed whole: it is a directory this run made.
+    struct Unfinished(Option<PathBuf>);
+    impl Drop for Unfinished {
+        fn drop(&mut self) {
+            if let Some(dir) = self.0.take() {
+                let _ = fs::remove_dir_all(dir);
+            }
+        }
+    }
+    fs::create_dir(&dest).with_context(|| format!("creating {}", dest.display()))?;
+    let mut unfinished = Unfinished(Some(dest.clone()));
+    let repo = Repository::init_skeleton(&dest)?;
+    write_instance_url(&repo, &url)?;
+    received.write(&repo.objects)?;
+    repo.set_genesis_authority(genesis)?;
+    repo.set_current_authority(current)?;
+    let head = if info.branches.contains_key("main") {
+        Some("main".to_string())
+    } else {
+        info.branches.keys().next().cloned()
+    };
+    // The working tree first, then the index and the refs, as a branch
+    // switch does: a checkout refused part way leaves no ref behind.
+    if let Some(name) = &head {
+        let tip = id_from("its head", &info.branches[name])?;
+        let tree = Commit::from_signed(&repo.read_signed(tip)?)?.tree;
+        repo.checkout_tree(tree, &dest)?;
+        repo.write_index(&crate::repo_cmds::index_of_tree(&repo, tree)?)?;
+    }
+    let updates = refs
+        .iter()
+        .map(|(r, id)| crate::publish::update(r.clone(), None, Some(*id)))
+        .collect();
+    crate::publish::prepare(&repo, None, updates, None)?.apply(&repo)?;
+    for (r, id) in &refs {
+        repo.refs
+            .write(&r.replacen("refs/", "refs/remote/origin/", 1), *id)?;
+    }
+    repo.refs.write_head(&Head::Branch(format!(
+        "refs/branches/{}",
+        head.as_deref().unwrap_or("main")
+    )))?;
+    unfinished.0 = None;
+    eprintln!(
+        "cloned {repo_id} from {url} into {}: {} branch(es), {} release(s), {} object(s), \
+         all verified against its genesis",
+        dest.display(),
+        info.branches.len(),
+        info.releases.len(),
+        received.len()
     );
     Ok(())
 }
@@ -402,10 +557,11 @@ pub fn fork(args: ForkArgs) -> Result<()> {
     let sk = std::sync::Arc::new(sk);
     let pk = sk.public();
 
+    let repo_id = repo_id_arg(&args.repo_id)?;
     let dest_name = args
         .name
         .clone()
-        .unwrap_or_else(|| format!("fork-{}", &args.repo_id[..8.min(args.repo_id.len())]));
+        .unwrap_or_else(|| format!("fork-{}", &repo_id[..8]));
     let dest = std::env::current_dir()?.join(&dest_name);
     if dest.exists() {
         bail!("destination already exists: {:?}", dest);
@@ -414,34 +570,35 @@ pub fn fork(args: ForkArgs) -> Result<()> {
     // 1. Talk to the source instance.
     // Signed, so that a member can fork a private repository.
     let client = levcs_client::Client::new(url.clone()).with_reader(sk.clone());
-    let info = client.repo_info(&args.repo_id)?;
-    if info.repo_id.is_empty() {
-        bail!("source instance returned no repo_id");
-    }
-    let refs = client.refs(&args.repo_id)?;
+    let info = published(&client, &url, &repo_id)?;
 
     // 2. Choose a source tip: prefer "main", else any branch.
-    let (source_branch, source_tip_hex) = refs
+    let (source_branch, source_tip_hex) = info
         .branches
         .iter()
         .find(|(k, _)| *k == "main")
-        .or_else(|| refs.branches.iter().next())
+        .or_else(|| info.branches.iter().next())
         .ok_or_else(|| anyhow!("source repo has no branches; nothing to fork"))?;
-    let source_tip = ObjectId::from_hex(source_tip_hex)?;
+    let source_tip = id_from(&format!("branch {source_branch:?}"), source_tip_hex)?;
 
-    // 3. Pull the closure of objects reachable from the source tip and the
-    //    current authority.
-    let mut want = vec![source_tip];
-    if !info.current_authority.is_empty() {
-        want.push(ObjectId::from_hex(&info.current_authority)?);
-    }
-    let pack = client.get_pack(&args.repo_id, &[], &want)?;
+    // 3. Receive the source tip's history, and check it against the
+    //    genesis the source's id pins (Rule R; see `receive`) before
+    //    anything is written. It used to be written as sent.
+    let source_ref = format!("refs/branches/{source_branch}");
+    levcs_core::refs::validate_ref_name(&source_ref)?;
+    let received = crate::receive::receive(
+        &client,
+        &repo_id,
+        id_from("its genesis authority", &info.genesis_authority)?,
+        id_from("its current authority", &info.current_authority)?,
+        &[(source_ref, source_tip)],
+        &[],
+        None,
+    )?;
 
-    // 4. Initialise the destination repository skeleton (no objects yet).
+    // 4. Initialise the destination repository with what was received.
     let repo = Repository::init_skeleton(&dest)?;
-    for ent in &pack.entries {
-        repo.objects.write_raw(&ent.bytes)?;
-    }
+    received.write(&repo.objects)?;
 
     // 5. Locate the source HEAD commit and its authority.
     let source_commit_signed = repo.read_signed(source_tip)?;
@@ -513,7 +670,7 @@ pub fn fork(args: ForkArgs) -> Result<()> {
         flags,
         message: format!(
             "fork from blake3:{} (branch {}, tip {})",
-            args.repo_id, source_branch, source_tip
+            repo_id, source_branch, source_tip
         ),
     };
     let fork_signed = sign_commit(fork_commit, &sk)?;
@@ -545,7 +702,7 @@ pub fn fork(args: ForkArgs) -> Result<()> {
 
     eprintln!(
         "forked {} into {:?}\n  new repo_id  = blake3:{}\n  fork commit  = {}\n  source tip   = {} ({})\n  source auth  = {}",
-        args.repo_id,
+        repo_id,
         dest,
         new_auth_body.repo_id,
         fork_id,
@@ -940,8 +1097,25 @@ fn walk_closure(repo: &Repository, start: ObjectId, out: &mut std::collections::
     }
 }
 
+/// `dial` is refused until it checks what it receives (Rule R). It wrote a
+/// repository sent over a peer connection without verifying it against the
+/// genesis its id pins, and nothing binds what the sender sends after the
+/// handshake to the handshake (audit H3). The refusal comes before a key is
+/// read, a connection opened or anything written. What follows it is kept,
+/// and compiled, for when dial meets the rule.
+fn dial_refused() -> Result<()> {
+    bail!(
+        "dial is refused until it checks what it receives: it would install a \
+         repository sent over a peer connection without verifying it against the \
+         genesis its id pins (doc/authority-semantics.md, Rule R). Clone the \
+         repository from an instance instead: levcs clone <repo_id> --from <url>"
+    )
+}
+
 pub fn dial(args: DialArgs) -> Result<()> {
     use std::net::TcpStream;
+
+    dial_refused()?;
 
     let (_label, sk) = load_secret(args.key.as_deref())?;
     let sender_pub = levcs_identity::keys::PublicKey::parse_levcs(&args.sender_key)

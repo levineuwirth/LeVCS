@@ -51,9 +51,13 @@ sudo install -m 0755 target/release/levcs-instance target/release/levcs \
 sudo useradd --system --home /var/lib/levcs --shell /usr/sbin/nologin levcs
 sudo install -d -o levcs -g levcs -m 0750 /var/lib/levcs
 sudo install -d -o root -g root -m 0755 /etc/levcs
+sudo install -d -o root -g root -m 0700 /var/backups
 sudo cp deploy/instance.toml.example /etc/levcs/instance.toml
 sudo $EDITOR /etc/levcs/instance.toml
 ```
+
+`/var/backups` is where the backups below are written, readable by root
+only. Some systems, Arch among them, have none until it is made.
 
 The defaults (full storage, builtin handlers only, listen on
 127.0.0.1:7117) are right for one VPS. Name the keys that may create
@@ -127,7 +131,11 @@ From the laptop, through SSH:
 ssh -N -L 7117:127.0.0.1:7117 vps
 ```
 
-The instance is then `http://127.0.0.1:7117/levcs/v1` on the laptop. A
+The instance is then `http://127.0.0.1:7117/levcs/v1` on the laptop,
+for as long as that command runs: keep it running whenever `levcs`
+reaches the instance. A `LocalForward 7117 127.0.0.1:7117` line under
+the VPS's `Host` in `~/.ssh/config` forwards the port only while a
+connection to the VPS is open, so it still needs one (`ssh -N vps`). A
 private network (WireGuard, Tailscale) works the same way: bind the
 instance to the VPS's address on it, in `bind`, and use that.
 
@@ -157,18 +165,32 @@ commits and every push. `--encrypt` keeps it under a passphrase.
 
 ### 2. The repository
 
-From the LeVCS source tree:
+From the LeVCS source tree, at the git revision to publish, with no
+uncommitted change to a file git tracks:
 
 ```sh
 levcs init --key primary
-levcs track --all
-levcs commit -m "initial import" --key primary
+printf '/.git\n' > .levcsignore     # and .gitignore's patterns; see below
+git ls-files -z | xargs -0 levcs track
+levcs track .levcsignore
+levcs status                         # nothing untracked that belongs in it
+levcs commit -m "initial import at git $(git rev-parse --short HEAD)" --key primary
 levcs instance --set http://127.0.0.1:7117/levcs/v1
 ```
 
 `init` writes `.levcs/` beside the source, with a genesis authority that
 names your key as the only owner; the repository's id is derived from
-it. `instance --set` makes the repository a workspace of the instance.
+it. `.gitignore` already leaves `.levcs/` out of git. `instance --set`
+makes the repository a workspace of the instance.
+
+The source tree is a git working tree, and `levcs` does not ignore
+`.git/`: `levcs track --all` there would take in git's whole store. So
+`.levcsignore` names `/.git`, and the files tracked are exactly the ones
+git tracks. Add `.gitignore`'s patterns to `.levcsignore` too, so that
+`status` stays quiet, writing each without a trailing `/`: a pattern
+matches a name, and a directory is matched by its own. Keep
+`.levcsignore` out of git with a line in `.git/info/exclude`, or commit
+it.
 
 ### 3. The first push
 
@@ -199,7 +221,24 @@ instance may read it. A private one (`public_read` false) is served only
 to members of its current authority, in requests signed with `--key`
 (`clone`, `pull`, `fork`); to anyone else it does not exist.
 
-### 4. Another machine: clone and pull
+### 4. Publishing later work
+
+The source tree now has two histories, git's and LeVCS's, kept by hand.
+`levcs commit` records the working files as they are, uncommitted edits
+included, not git's last commit; and a git branch switch changes the
+files `levcs` sees without switching any `levcs` branch. So publish from
+the git revision you mean, with the tunnel open:
+
+```sh
+git switch main && git status --short --untracked-files=no   # nothing listed
+levcs status && levcs diff     # what will be recorded
+levcs track <files git gained>
+levcs forget <files git lost>
+levcs commit -m "<what changed> at git $(git rev-parse --short HEAD)" --key primary
+levcs push --key primary
+```
+
+### 5. Another machine: clone and pull
 
 ```sh
 levcs clone <repo_id> levcs --from http://127.0.0.1:7117/levcs/v1

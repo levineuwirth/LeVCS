@@ -13,25 +13,28 @@
 //! storage_mode = "full"          # full | release | metadata
 //! allowed_handlers = ["builtin"]
 //! federation_peers = []
+//! creators = ["ed25519:..."]     # keys that may create repositories; none by default
 //!
-//! [[mirrors]]
-//! repo_id = "..."
-//! source = "https://other.example/levcs/v1"
-//! mode = "full"                  # full | release
-//! poll_interval = "5m"
-//! writeback = false
+//! [limits]                       # every field optional; see `Limits`
+//! max_push_bytes = 33554432
 //! ```
+//!
+//! `[[mirrors]]` blocks are refused: see `InstanceConfig::validate`.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use levcs_instance::mirror::spawn_poller;
-use levcs_instance::{serve, AppState, InstanceConfig, MirrorConfig};
+use levcs_instance::{serve, AppState, InstanceConfig, Limits, MirrorConfig};
 use serde::Deserialize;
 use tracing_subscriber::EnvFilter;
 
+/// A key this does not know is refused, not ignored: a misspelt key, or
+/// a top-level one written under `[limits]`, would otherwise leave its
+/// setting at the default without a word.
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FileConfig {
     #[serde(default)]
     root: Option<PathBuf>,
@@ -45,6 +48,10 @@ struct FileConfig {
     allowed_handlers: Option<Vec<String>>,
     #[serde(default)]
     mirrors: Option<Vec<MirrorConfig>>,
+    #[serde(default)]
+    creators: Option<Vec<String>>,
+    #[serde(default)]
+    limits: Option<Limits>,
 }
 
 const DEFAULT_BIND: &str = "127.0.0.1:7117";
@@ -166,13 +173,29 @@ async fn main() -> std::io::Result<()> {
             .allowed_handlers
             .unwrap_or_else(|| vec!["builtin".into()]),
         mirrors: file.mirrors.unwrap_or_default(),
+        creators: file.creators.unwrap_or_default(),
+        limits: file.limits.unwrap_or_default(),
     };
+    if let Err(problems) = config.validate() {
+        die(format!("invalid configuration:\n{problems}"));
+    }
+    if config.creators.is_empty() {
+        tracing::warn!("no creators are configured; this instance accepts no new repository");
+    }
+    if let Some(n) = levcs_instance::exit_after_ref_writes() {
+        tracing::warn!(
+            "{} is set: a push ends this process after its ref write {n}; \
+             for levcs-gate only, never on a service",
+            levcs_instance::EXIT_AFTER_REF_WRITES
+        );
+    }
 
     tracing::info!(
         addr = %bind,
         root = %config.root.display(),
         storage_mode = %config.storage_mode,
         mirrors = config.mirrors.len(),
+        limits = ?config.limits,
         "levcs instance starting"
     );
 
@@ -181,9 +204,10 @@ async fn main() -> std::io::Result<()> {
     }
     let state = AppState::new(config.clone());
 
-    // Spawn one background poller per configured mirror. The handles
-    // are intentionally dropped — pollers run for the lifetime of the
-    // process, and tokio cancels them when the runtime shuts down.
+    // Spawn one background poller per configured mirror: none, while
+    // `validate` refuses mirrors. The handles are intentionally dropped —
+    // pollers run for the lifetime of the process, and tokio cancels them
+    // when the runtime shuts down.
     let cfg_arc = state.config.clone();
     for mirror in &config.mirrors {
         let interval = if mirror.poll_interval.is_empty() {
@@ -217,6 +241,27 @@ async fn main() -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The example in `deploy/` loads as written: every key known, and each
+    /// top-level key at the top level rather than under `[limits]`.
+    #[test]
+    fn the_example_config_loads_as_written() {
+        let file: FileConfig =
+            toml::from_str(include_str!("../../../deploy/instance.toml.example")).unwrap();
+        assert_eq!(file.limits, Some(Limits::default()));
+        assert_eq!(file.creators, Some(Vec::new()));
+        assert_eq!(file.federation_peers, Some(Vec::new()));
+        assert_eq!(file.bind.as_deref(), Some(DEFAULT_BIND));
+    }
+
+    #[test]
+    fn an_unknown_key_is_refused() {
+        assert!(toml::from_str::<FileConfig>("creator = []").is_err());
+        assert!(toml::from_str::<FileConfig>("[limits]\ncreators = []").is_err());
+        assert!(toml::from_str::<FileConfig>("[limits]\nmax_push_byte = 1").is_err());
+        let ok = toml::from_str::<FileConfig>("creators = []\n[limits]\nmax_push_bytes = 1");
+        assert_eq!(ok.unwrap().limits.unwrap().max_push_bytes, 1);
+    }
 
     #[test]
     fn parse_duration_units() {

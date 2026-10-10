@@ -959,28 +959,22 @@ fn tree_index_entries(
     if tree_id.is_zero() {
         return Ok(out);
     }
-    let raw = repo.objects.read_typed(tree_id, ObjectType::Tree)?;
-    for e in Tree::parse_body(&raw.body)?.entries {
-        let path = if prefix.is_empty() {
-            e.name.clone()
-        } else {
-            format!("{prefix}/{}", e.name)
-        };
+    repo.walk_tree(tree_id, prefix, |path, e| {
         if path == ".levcs" {
-            continue;
+            return Ok(false);
         }
-        match e.entry_type {
-            levcs_core::EntryType::Blob => out.push(IndexEntry {
-                path,
+        if e.entry_type == levcs_core::EntryType::Blob {
+            out.push(IndexEntry {
+                path: path.to_string(),
                 blob_hash: e.hash,
                 mode: if e.mode.is_executable() { 0o111 } else { 0 },
                 flags: IndexEntryFlags::TRACKED,
                 mtime_micros: 0,
                 size: 0,
-            }),
-            levcs_core::EntryType::Tree => out.extend(tree_index_entries(repo, e.hash, &path)?),
+            });
         }
-    }
+        Ok(true)
+    })?;
     Ok(out)
 }
 
@@ -1103,8 +1097,9 @@ pub fn construct(args: ConstructArgs) -> Result<()> {
         // done.
         let wt = levcs_core::worktree::open(&repo.workdir)?;
         let mut stale = Vec::with_capacity(files.len());
+        let mut content = levcs_core::repo::ContentBudget::default();
         for f in files {
-            let blob = repo.objects.read_typed(f.blob, ObjectType::Blob)?;
+            let blob = repo.read_blob(f.blob, &mut content)?;
             if !wt.holds(&f.path, &blob.body, f.perms())? {
                 stale.push(f);
             }
@@ -1253,25 +1248,14 @@ fn collect_tree_files(
     if tree_id.is_zero() {
         return Ok(out);
     }
-    let raw = repo.objects.read_typed(tree_id, ObjectType::Tree)?;
-    let tree = Tree::parse_body(&raw.body)?;
-    for e in tree.entries {
-        let path = if prefix.is_empty() {
-            e.name.clone()
-        } else {
-            format!("{prefix}/{}", e.name)
-        };
-        match e.entry_type {
-            levcs_core::EntryType::Blob => {
-                let blob = repo.objects.read_typed(e.hash, ObjectType::Blob)?;
-                out.insert(path, blob.body);
-            }
-            levcs_core::EntryType::Tree => {
-                let sub = collect_tree_files(repo, e.hash, &path)?;
-                out.extend(sub);
-            }
+    let mut content = levcs_core::repo::ContentBudget::default();
+    repo.walk_tree(tree_id, prefix, |path, e| {
+        if e.entry_type == levcs_core::EntryType::Blob {
+            let blob = repo.read_blob(e.hash, &mut content)?;
+            out.insert(path.to_string(), blob.body);
         }
-    }
+        Ok(true)
+    })?;
     Ok(out)
 }
 
@@ -2237,6 +2221,13 @@ fn load_index(repo: &Repository) -> Result<Index> {
     Ok(idx)
 }
 
+/// The index of a checkout of `tree`: its files, tracked, nothing staged.
+pub(crate) fn index_of_tree(repo: &Repository, tree: ObjectId) -> Result<Index> {
+    let mut idx = Index::new();
+    rebuild_index_from_tree(repo, tree, "", &mut idx)?;
+    Ok(idx)
+}
+
 fn rebuild_index_from_tree(
     repo: &Repository,
     tree_id: ObjectId,
@@ -2246,34 +2237,24 @@ fn rebuild_index_from_tree(
     if tree_id.is_zero() {
         return Ok(());
     }
-    let raw = repo.objects.read_typed(tree_id, ObjectType::Tree)?;
-    let tree = Tree::parse_body(&raw.body)?;
-    for e in tree.entries {
-        let path = if prefix.is_empty() {
-            e.name.clone()
-        } else {
-            format!("{prefix}/{}", e.name)
-        };
+    let mut content = levcs_core::repo::ContentBudget::default();
+    repo.walk_tree(tree_id, prefix, |path, e| {
         if path.starts_with(".levcs/") || path == ".levcs" {
-            continue;
+            return Ok(false);
         }
-        match e.entry_type {
-            levcs_core::EntryType::Tree => {
-                rebuild_index_from_tree(repo, e.hash, &path, idx)?;
-            }
-            levcs_core::EntryType::Blob => {
-                let blob = repo.objects.read_typed(e.hash, ObjectType::Blob)?;
-                idx.upsert(IndexEntry {
-                    path,
-                    blob_hash: e.hash,
-                    mode: if e.mode.is_executable() { 0o111 } else { 0 },
-                    flags: IndexEntryFlags::TRACKED,
-                    mtime_micros: 0,
-                    size: blob.body.len() as u64,
-                });
-            }
+        if e.entry_type == levcs_core::EntryType::Blob {
+            let size = repo.charge_blob(e.hash, &mut content)?;
+            idx.upsert(IndexEntry {
+                path: path.to_string(),
+                blob_hash: e.hash,
+                mode: if e.mode.is_executable() { 0o111 } else { 0 },
+                flags: IndexEntryFlags::TRACKED,
+                mtime_micros: 0,
+                size,
+            });
         }
-    }
+        Ok(true)
+    })?;
     Ok(())
 }
 
@@ -2704,8 +2685,7 @@ pub fn cache(args: CacheArgs) -> Result<()> {
         // tree's descriptor like a checkout. This used to copy by joined
         // pathname, through any symlinked directory in the working tree,
         // and copied the cache's own `.message` into it.
-        let mut files = Vec::new();
-        cached_files(&src, "", &mut files)?;
+        let files = cached_files(&src)?;
         let wt = levcs_core::worktree::open(&repo.workdir)?;
         wt.preflight(files.iter().map(|(rel, _, _)| rel.as_str()))?;
         for (rel, path, perms) in &files {
@@ -2758,43 +2738,46 @@ pub fn cache(args: CacheArgs) -> Result<()> {
 }
 
 /// The files of a saved cache, as (working-tree path, cache path, perms).
-/// `save` writes regular files only, so anything else is refused.
-fn cached_files(
-    dir: &Path,
-    prefix: &str,
-    out: &mut Vec<(String, PathBuf, levcs_core::worktree::Perms)>,
-) -> Result<()> {
+/// `save` writes regular files only, so anything else is refused. Walked
+/// with a stack of directories, not by recursion: a working tree, and so a
+/// cache of one, can nest deeper than a thread's stack goes.
+fn cached_files(root: &Path) -> Result<Vec<(String, PathBuf, levcs_core::worktree::Perms)>> {
     use levcs_core::worktree::Perms;
-    for ent in fs::read_dir(dir)? {
-        let ent = ent?;
-        let name = ent.file_name();
-        let name = name
-            .to_str()
-            .ok_or_else(|| anyhow!("cache entry {:?} is not UTF-8", ent.path()))?;
-        if prefix.is_empty() && name == ".message" {
-            continue;
-        }
-        let rel = if prefix.is_empty() {
-            name.to_string()
-        } else {
-            format!("{prefix}/{name}")
-        };
-        let meta = fs::symlink_metadata(ent.path())?;
-        if meta.is_dir() {
-            cached_files(&ent.path(), &rel, out)?;
-        } else if meta.is_file() {
-            // The mode `save` copied, so a private file comes back private.
-            // Only the executable bit used to be carried.
-            #[cfg(unix)]
-            let perms = Perms::Exact(std::os::unix::fs::PermissionsExt::mode(&meta.permissions()));
-            #[cfg(not(unix))]
-            let perms = Perms::Regular;
-            out.push((rel, ent.path(), perms));
-        } else {
-            bail!("cache entry {:?} is not a regular file", ent.path());
+    let mut out = Vec::new();
+    let mut dirs = vec![(root.to_path_buf(), String::new())];
+    while let Some((dir, prefix)) = dirs.pop() {
+        for ent in fs::read_dir(&dir)? {
+            let ent = ent?;
+            let name = ent.file_name();
+            let name = name
+                .to_str()
+                .ok_or_else(|| anyhow!("cache entry {:?} is not UTF-8", ent.path()))?;
+            if prefix.is_empty() && name == ".message" {
+                continue;
+            }
+            let rel = if prefix.is_empty() {
+                name.to_string()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            let meta = fs::symlink_metadata(ent.path())?;
+            if meta.is_dir() {
+                dirs.push((ent.path(), rel));
+            } else if meta.is_file() {
+                // The mode `save` copied, so a private file comes back private.
+                // Only the executable bit used to be carried.
+                #[cfg(unix)]
+                let perms =
+                    Perms::Exact(std::os::unix::fs::PermissionsExt::mode(&meta.permissions()));
+                #[cfg(not(unix))]
+                let perms = Perms::Regular;
+                out.push((rel, ent.path(), perms));
+            } else {
+                bail!("cache entry {:?} is not a regular file", ent.path());
+            }
         }
     }
-    Ok(())
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------

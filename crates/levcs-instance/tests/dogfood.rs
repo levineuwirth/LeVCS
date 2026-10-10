@@ -154,6 +154,7 @@ fn build_commit(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn dogfood_three_instance_scenario() {
+    let setup = build_genesis();
     // ---- 1. Stand up A, B, and C. ----
     let a_root = tempdir("dogfood-a");
     let b_root = tempdir("dogfood-b");
@@ -165,6 +166,8 @@ async fn dogfood_three_instance_scenario() {
         federation_peers: Vec::new(),
         allowed_handlers: Vec::new(),
         mirrors: Vec::new(),
+        creators: vec![setup.sk.public().to_levcs()],
+        limits: Default::default(),
     };
     let b_cfg = InstanceConfig {
         root: b_root.clone(),
@@ -172,13 +175,13 @@ async fn dogfood_three_instance_scenario() {
         federation_peers: Vec::new(),
         allowed_handlers: Vec::new(),
         mirrors: Vec::new(),
+        creators: vec![setup.sk.public().to_levcs()],
+        limits: Default::default(),
     };
     let (a_addr, a_task) = start(a_cfg).await;
     let (b_addr, b_task) = start(b_cfg).await;
     let a_base = format!("http://{a_addr}/levcs/v1");
     let b_base = format!("http://{b_addr}/levcs/v1");
-
-    let setup = build_genesis();
 
     // ---- 2. Init + 3-commit chain on A. ----
     let (commit_ids, release_id) = tokio::task::spawn_blocking({
@@ -302,6 +305,8 @@ async fn dogfood_three_instance_scenario() {
             poll_interval: "60s".into(),
             writeback: false,
         }],
+        creators: Vec::new(),
+        limits: Default::default(),
     };
     let c_cfg_arc = Arc::new(c_cfg.clone());
     let (c_addr, c_task) = start(c_cfg).await;

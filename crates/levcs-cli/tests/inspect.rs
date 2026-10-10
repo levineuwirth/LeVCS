@@ -40,13 +40,18 @@ fn tempdir(prefix: &str) -> PathBuf {
     p
 }
 
-async fn start_instance(root: PathBuf) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+async fn start_instance(
+    root: PathBuf,
+    creators: Vec<String>,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let cfg = InstanceConfig {
         root,
         storage_mode: "full".into(),
         federation_peers: Vec::new(),
         allowed_handlers: Vec::new(),
         mirrors: Vec::new(),
+        creators,
+        limits: Default::default(),
     };
     let state = AppState::new(cfg);
     let app = router(state);
@@ -66,15 +71,20 @@ fn inspect_lists_branches_authority_and_tree() {
         .enable_all()
         .build()
         .unwrap();
-    let instance_root = tempdir("levcs-inspect-inst");
-    let instance_root_for_task = instance_root.clone();
-    let (addr, task) = rt.block_on(async move { start_instance(instance_root_for_task).await });
-    let base_url = format!("http://{addr}/levcs/v1");
-
     let source = tempdir("levcs-inspect-src");
     let xdg = tempdir("levcs-inspect-cfg");
 
     assert_eq!(run(&["init", "--key", "alice"], &source, &xdg).0, 0);
+    // An instance on which alice may create repositories.
+    let creators = vec![run(&["key", "show", "alice"], &source, &xdg)
+        .1
+        .trim()
+        .to_string()];
+    let instance_root = tempdir("levcs-inspect-inst");
+    let instance_root_for_task = instance_root.clone();
+    let (addr, task) =
+        rt.block_on(async move { start_instance(instance_root_for_task, creators).await });
+    let base_url = format!("http://{addr}/levcs/v1");
     std::fs::write(source.join("README"), b"hello\n").unwrap();
     std::fs::create_dir_all(source.join("nested")).unwrap();
     std::fs::write(source.join("nested/file.txt"), b"deep\n").unwrap();

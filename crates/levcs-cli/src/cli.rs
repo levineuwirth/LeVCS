@@ -55,15 +55,19 @@ pub enum Cmd {
     Instance(InstanceArgs),
     /// Push refs to the active instance.
     Push(PushArgs),
-    /// Pull updates from the active instance.
+    /// Fetch the active instance's branches, checked, into
+    /// refs/remote/origin/.
     Pull(PullArgs),
+    /// Clone a repository from an instance into a new workspace of it.
+    Clone(CloneArgs),
     /// Fork a repository.
     Fork(ForkArgs),
     /// Inspect a remote repository without pulling.
     Inspect(InspectArgs),
     /// Direct peer-to-peer transfer (sender side).
     Deploy(DeployArgs),
-    /// Direct peer-to-peer transfer (receiver side).
+    /// Direct peer-to-peer transfer (receiver side). Refused until it
+    /// checks what it receives.
     Dial(DialArgs),
     /// Move a repository to a new instance, preserving repo_id and history (§5.7).
     Migrate(MigrateArgs),
@@ -293,14 +297,34 @@ pub struct PushArgs {
     pub key: Option<String>,
     #[arg(long)]
     pub force: bool,
+    /// Measure the push, against the instance's limits, and send nothing.
+    #[arg(long)]
+    pub dry_run: bool,
     pub refs: Vec<String>,
 }
 
 #[derive(Args, Debug)]
 pub struct PullArgs {
+    /// Sign reads with this key: a private repository is served only to its
+    /// members.
     #[arg(long)]
     pub key: Option<String>,
     pub refs: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct CloneArgs {
+    /// The repository's id: 64 hex digits.
+    pub repo_id: String,
+    /// Where to put it (defaults to the id's first 8 digits).
+    pub path: Option<PathBuf>,
+    /// The instance's URL (defaults to the active instance).
+    #[arg(long)]
+    pub from: Option<String>,
+    /// Sign reads with this key: a private repository is served only to its
+    /// members.
+    #[arg(long)]
+    pub key: Option<String>,
 }
 
 #[derive(Args, Debug)]

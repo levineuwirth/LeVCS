@@ -146,8 +146,16 @@ fn a_malformed_suffix_is_rejected_and_never_panics() {
     }
     let (code, _, err) = run(&["branch", "--create", "bad", "HEAD~0x0"], &repo, &xdg);
     assert_ne!(code, 0, "{err}");
+    // No branch named `bad`: by its ref, and by name in the list, whose
+    // commit ids are hex and so can hold the letters "bad".
+    assert!(!repo.join(".levcs/refs/branches/bad").exists());
     let (_, list, _) = run(&["branch", "--list"], &repo, &xdg);
-    assert!(!list.contains("bad"), "{list}");
+    assert!(
+        !list
+            .lines()
+            .any(|l| l.trim_start_matches('*').split_whitespace().next() == Some("bad")),
+        "{list}"
+    );
 }
 
 #[test]

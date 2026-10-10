@@ -1,5 +1,11 @@
 //! Inter-instance mirroring (§5.6).
 //!
+//! **Refused.** The binary will not start with a mirror configured
+//! (`InstanceConfig::validate`). A sync pass compares neither the source's
+//! genesis with the configured repo_id nor what it receives with Rule H,
+//! whatever is said below (audit H3), and mirroring stays refused until it
+//! does (`doc/authority-semantics.md`, Rule R).
+//!
 //! [`sync_mirror`] is a single, blocking sync pass: it polls the source
 //! instance's `/info` and `/refs`, fetches a pack of objects this instance
 //! does not yet have, verifies their signatures locally against the
@@ -20,7 +26,7 @@ use levcs_core::{ObjectId, ObjectStore, Refs, Repository};
 use levcs_identity::verify::ChainVerifier;
 use thiserror::Error;
 
-use crate::{InstanceConfig, MirrorConfig};
+use crate::{InstanceConfig, MirrorConfig, RepoId};
 
 #[derive(Debug, Error)]
 pub enum MirrorError {
@@ -41,6 +47,9 @@ pub enum MirrorError {
 
     #[error("unsupported mode: {0}")]
     Mode(String),
+
+    #[error("mirror repo_id {0:?} is not 64 lowercase hex characters")]
+    RepoId(String),
 }
 
 /// What the most recent sync pass changed locally.
@@ -67,7 +76,11 @@ pub fn sync_mirror(
         return Err(MirrorError::Mode(mirror.mode.clone()));
     }
 
-    let repo_dir: PathBuf = config.root.join(&mirror.repo_id);
+    // Only an id is ever joined onto the root: a mirror's `repo_id` used to
+    // be joined as configured.
+    let repo = RepoId::parse(&mirror.repo_id)
+        .ok_or_else(|| MirrorError::RepoId(mirror.repo_id.clone()))?;
+    let repo_dir: PathBuf = config.repo_dir(&repo);
     if !repo_dir.is_dir() {
         Repository::init_skeleton(&repo_dir)?;
     }

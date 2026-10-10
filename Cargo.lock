@@ -1563,6 +1563,7 @@ dependencies = [
  "levcs-identity",
  "levcs-protocol",
  "reqwest",
+ "serde",
  "serde_json",
  "thiserror 1.0.69",
 ]
@@ -1580,6 +1581,18 @@ dependencies = [
  "rustix 1.1.4",
  "serde",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "levcs-gate"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "levcs-client",
+ "levcs-core",
+ "levcs-identity",
+ "levcs-protocol",
+ "serde_json",
 ]
 
 [[package]]

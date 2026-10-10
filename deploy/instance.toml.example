@@ -12,15 +12,17 @@
 # expects a `levcs` user that owns this path.
 root = "/var/lib/levcs"
 
-# Local listen address. Keep this on loopback when running behind a
-# reverse proxy — the proxy terminates TLS and forwards plaintext HTTP
-# here. Use `0.0.0.0:7117` only if you intentionally want to expose
-# the bare HTTP API (e.g. dev environments behind a private network).
+# Listen address. Loopback: reached through an SSH tunnel, or later
+# through a reverse proxy that terminates TLS (deploy/README.md, "Reaching
+# it"). To reach it over a private network (WireGuard, Tailscale), use
+# the VPS's address on that network. Never a public interface: the
+# instance speaks plain HTTP.
 bind = "127.0.0.1:7117"
 
-# §4.3 storage mode. "full" stores every reachable object — the right
-# choice for an authoritative source-of-truth instance. Use "release"
-# or "metadata" only on read replicas that mirror from another instance.
+# §4.3 storage mode. "full" stores every reachable object: the mode for
+# an instance that is a repository's source of truth. "release" takes
+# only release pushes; "metadata" takes no pushes, and was to be filled
+# by mirroring, which is refused.
 storage_mode = "full"
 
 # §6.6.4 merge handler policy. Pushes whose merge-records reference a
@@ -29,22 +31,39 @@ storage_mode = "full"
 # tree-sitter or plugin handler names to admit them.
 allowed_handlers = ["builtin"]
 
+# Keys that may create repositories on this instance, as
+# `levcs key show <label>` prints them. None by default: an instance
+# that names no creator accepts no new repository, and refuses to
+# start if an entry here is not a key. Name your own key to host
+# your repositories.
+creators = []
+# creators = ["ed25519:<64 hex digits>"]
+
 # Other instances this one knows about. Currently informational —
 # advertised on /levcs/v1/instance/peers but not used for cross-instance
 # fetching. Leave empty unless you're publishing a federation directory.
 federation_peers = []
 
-# Per-repository mirror declarations (§5.6). Each block sets up a
-# read-only mirror of a repo hosted on another instance. The background
-# poller pulls from `source` every `poll_interval` and serves the
-# replicated state to local clients. Pushes to mirrored repos are
-# rejected with 403 unless `writeback = true`.
-#
-# Uncomment to mirror a repo:
-#
-# [[mirrors]]
-# repo_id = "abcd1234..."                       # 64-hex repo_id
-# source = "https://other.example/levcs/v1"
-# mode = "full"                                 # full | release
-# poll_interval = "5m"                          # 30s | 5m | 1h | <seconds>
-# writeback = false
+# What the instance takes on at once, and how much one request may
+# make it read, hold or decode. Every field is optional; the values
+# below are the defaults. In memory, pushes hold about
+# max_concurrent_pushes x (max_push_bytes + max_pack_bytes), and packs
+# being sent about max_concurrent_transfers x 2 x max_pack_bytes while
+# they are built, each with a few MiB of zstd context.
+[limits]
+max_in_flight = 64              # requests at once; more get 503
+max_concurrent_pushes = 2       # more get 503, before their bodies are read
+max_concurrent_transfers = 4    # packs and objects sent at once; more wait
+max_push_bytes = 33554432       # a push's body, as received (32 MiB)
+max_pack_objects = 100000       # objects in a pack, pushed or sent
+max_pack_bytes = 268435456      # a pack's objects together, decoded (256 MiB)
+max_object_bytes = 67108864     # one object, decoded (64 MiB)
+max_walk_objects = 1000000      # objects a pack being sent may walk
+max_ref_updates = 1024          # refs one push may update
+body_timeout_secs = 120         # to receive a request body
+max_nonces = 100000             # signed requests remembered against replay
+
+# Mirrors ([[mirrors]], §5.6) are refused: the instance will not start
+# with one configured. A mirror installs its source's history without
+# checking it against the genesis its repo_id pins, and it stays refused
+# until it does (doc/authority-semantics.md, Rule R).

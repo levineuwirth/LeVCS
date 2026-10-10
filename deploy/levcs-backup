@@ -1,0 +1,40 @@
+#!/bin/sh
+# levcs-backup ARCHIVE [ROOT]
+#
+# Archive an instance's root (default /var/lib/levcs) to ARCHIVE, a
+# .tgz. Run it with the instance stopped: a copy taken while it runs can
+# hold a ref without the objects it names, or a push half applied.
+#
+# The archive is written under a temporary name of its own and read back
+# whole, then published by a hard link, which refuses a name that exists:
+# an ARCHIVE that exists is complete, and one that exists already, even one
+# that appeared while this ran, is never overwritten. Exits non-zero on any
+# failure.
+set -eu
+
+if [ $# -lt 1 ] || [ $# -gt 2 ]; then
+    echo "usage: levcs-backup ARCHIVE [ROOT]" >&2
+    exit 2
+fi
+archive=$1
+root=${2:-/var/lib/levcs}
+root=${root%/}
+
+if [ ! -d "$root" ]; then
+    echo "levcs-backup: no root at $root" >&2
+    exit 1
+fi
+if [ -e "$archive" ]; then
+    echo "levcs-backup: $archive exists; not overwriting it" >&2
+    exit 1
+fi
+
+partial=$(mktemp "$archive.partial.XXXXXX")
+trap 'rm -f "$partial"' EXIT
+tar -C "$(dirname "$root")" -czf "$partial" "$(basename "$root")"
+tar -tzf "$partial" >/dev/null
+if ! ln "$partial" "$archive"; then
+    echo "levcs-backup: could not publish $archive; if it exists now, it was not overwritten" >&2
+    exit 1
+fi
+echo "levcs-backup: $root archived to $archive"

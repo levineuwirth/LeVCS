@@ -215,18 +215,59 @@ pub fn verify_authority_chain<S: ObjectSource>(
 ///
 /// Not internally synchronized. Callers that share a verifier across
 /// threads should wrap it in `Mutex<_>`.
-#[derive(Default)]
 pub struct ChainVerifier {
     /// Maps any id along a verified chain → the chain's genesis body.
     /// The same `Arc<AuthorityBody>` is shared across every entry that
     /// belongs to one chain, so memory cost scales with the number of
     /// distinct chains, not with the number of authorities.
     verified: HashMap<ObjectId, Arc<AuthorityBody>>,
+    /// Ids kept at most: never more, whatever a chain proved adds.
+    max_cached: usize,
+    /// Authorities of a chain walked at most, beyond what is cached.
+    max_depth: usize,
+}
+
+impl Default for ChainVerifier {
+    fn default() -> Self {
+        ChainVerifier {
+            verified: HashMap::new(),
+            max_cached: usize::MAX,
+            max_depth: usize::MAX,
+        }
+    }
 }
 
 impl ChainVerifier {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A verifier that keeps at most `max_cached` ids, and walks at most
+    /// `max_depth` authorities of a chain it has not cached: a longer one is
+    /// refused, not proved. A cache that only checked its size before a
+    /// proof could take in a whole chain past its limit, and an uncached
+    /// chain was walked to its genesis however long it was.
+    pub fn bounded(max_cached: usize, max_depth: usize) -> Self {
+        ChainVerifier {
+            verified: HashMap::new(),
+            max_cached,
+            max_depth,
+        }
+    }
+
+    /// The ids this keeps at most, and the authorities it walks at most
+    /// beyond what it has cached.
+    pub fn limits(&self) -> (usize, usize) {
+        (self.max_cached, self.max_depth)
+    }
+
+    /// Authority ids cached, each of a chain already proved.
+    pub fn len(&self) -> usize {
+        self.verified.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.verified.is_empty()
     }
 
     /// Verify the authority chain rooted at `start` back to genesis.
@@ -251,6 +292,12 @@ impl ChainVerifier {
         let mut cur_body = AuthorityBody::parse(&cur_signed.body)
             .map_err(|e| VerifyError::Authority(e.to_string()))?;
         let genesis: Arc<AuthorityBody> = loop {
+            if walked.len() >= self.max_depth {
+                return Err(VerifyError::Authority(format!(
+                    "{start}: more than {} authorities to walk back to its genesis",
+                    self.max_depth
+                )));
+            }
             walked.push(cur_id);
             if cur_body.previous_authority.is_zero() {
                 break Arc::new(verify_genesis(&cur_signed)?);
@@ -275,8 +322,15 @@ impl ChainVerifier {
             cur_body = prev_body;
             cur_id = prev_id;
         };
-        for id in walked {
-            self.verified.insert(id, genesis.clone());
+        // Within the cap: a chain longer than the cap is proved and not
+        // kept; one that would pass it starts the cache over.
+        if walked.len() <= self.max_cached {
+            if self.verified.len() + walked.len() > self.max_cached {
+                self.verified.clear();
+            }
+            for id in walked {
+                self.verified.insert(id, genesis.clone());
+            }
         }
         Ok(genesis)
     }
@@ -669,6 +723,73 @@ mod tests {
     use super::*;
     use crate::keys::SecretKey;
     use crate::sign::sign_authority;
+
+    /// A chain of `n` authorities, each the successor of the one before,
+    /// signed by its owner, in a source of its own: the newest one's id.
+    fn chain(n: usize, seed: u8) -> (MemorySource, ObjectId) {
+        use crate::authority::{MemberEntry, Role};
+        let sk = SecretKey::from_seed([seed; 32]);
+        let mut src = MemorySource(HashMap::new());
+        let mut body = AuthorityBody {
+            schema_version: 1,
+            repo_id: ObjectId([0u8; 32]),
+            previous_authority: ObjectId([0u8; 32]),
+            version: 1,
+            created_micros: 1,
+            members: vec![MemberEntry {
+                key: sk.public(),
+                handle: "o".into(),
+                role: Role::Owner,
+                added_micros: 1,
+                added_by: sk.public(),
+            }],
+            policy: Vec::new(),
+        };
+        body.normalize().unwrap();
+        body.assign_genesis_repo_id().unwrap();
+        let mut current = ObjectId([0u8; 32]);
+        for i in 0..n {
+            body.previous_authority = current;
+            body.version = (i + 1) as u32;
+            body.created_micros = (i + 1) as i64;
+            let bytes = sign_authority(&body, &sk).unwrap().serialize();
+            current = levcs_core::blake3_hash(&bytes);
+            src.0.insert(current, bytes);
+        }
+        (src, current)
+    }
+
+    /// A bounded verifier never keeps more than its cap: a chain longer
+    /// than the cap is proved and not kept, and one that would pass it
+    /// starts the cache over. It checked its size only before a proof, and
+    /// one cold chain could then fill it past the cap.
+    #[test]
+    fn a_bounded_verifier_never_keeps_more_than_its_cap() {
+        let mut v = ChainVerifier::bounded(64, 1024);
+        let (long, tip) = chain(160, 1);
+        assert!(v.verify_chain(&long, tip).is_ok());
+        assert!(v.len() <= 64, "{}", v.len());
+        let (a, tip_a) = chain(40, 2);
+        v.verify_chain(&a, tip_a).unwrap();
+        assert_eq!(v.len(), 40);
+        let (b, tip_b) = chain(40, 3);
+        v.verify_chain(&b, tip_b).unwrap();
+        assert!(v.len() <= 64, "{}", v.len());
+    }
+
+    /// A chain deeper than a bounded verifier walks is refused, not walked
+    /// to its genesis.
+    #[test]
+    fn a_bounded_verifier_refuses_a_chain_deeper_than_it_walks() {
+        let (src, tip) = chain(20, 4);
+        let e = ChainVerifier::bounded(64, 10)
+            .verify_chain(&src, tip)
+            .unwrap_err();
+        assert!(e.to_string().contains("more than 10 authorities"), "{e}");
+        assert!(ChainVerifier::bounded(64, 20)
+            .verify_chain(&src, tip)
+            .is_ok());
+    }
 
     #[test]
     fn genesis_verifies() {

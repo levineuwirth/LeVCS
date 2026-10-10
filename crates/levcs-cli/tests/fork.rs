@@ -43,13 +43,18 @@ fn tempdir(prefix: &str) -> PathBuf {
 
 /// Spin up an axum instance bound to an ephemeral port. Returns (addr,
 /// shutdown_handle).
-async fn start_instance(root: PathBuf) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+async fn start_instance(
+    root: PathBuf,
+    creators: Vec<String>,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let cfg = InstanceConfig {
         root,
         storage_mode: "full".into(),
         federation_peers: Vec::new(),
         allowed_handlers: vec!["builtin".into()],
         mirrors: Vec::new(),
+        creators,
+        limits: Default::default(),
     };
     let state = AppState::new(cfg);
     let app = router(state);
@@ -70,19 +75,21 @@ fn fork_end_to_end() {
         .build()
         .unwrap();
 
-    // 1. Boot an instance.
-    let instance_root = tempdir("levcs-fork-instance");
-    let instance_root_for_task = instance_root.clone();
-    let (addr, server_task) =
-        runtime.block_on(async move { start_instance(instance_root_for_task).await });
-    let base_url = format!("http://{addr}/levcs/v1");
-
-    // 2. Source repo.
+    // 1. Source repo.
     let source = tempdir("levcs-fork-source");
     let xdg = tempdir("levcs-fork-cfg");
 
     let (code, _, e) = run(&["init", "--key", "alice"], &source, &xdg, &[]);
     assert_eq!(code, 0, "init: {e}");
+
+    // 2. Boot an instance on which alice may create repositories.
+    let (_, alice, _) = run(&["key", "show", "alice"], &source, &xdg, &[]);
+    let instance_root = tempdir("levcs-fork-instance");
+    let instance_root_for_task = instance_root.clone();
+    let creators = vec![alice.trim().to_string()];
+    let (addr, server_task) =
+        runtime.block_on(async move { start_instance(instance_root_for_task, creators).await });
+    let base_url = format!("http://{addr}/levcs/v1");
     std::fs::write(source.join("README"), b"source repo content\n").unwrap();
     let (code, _, e) = run(&["track", "--all"], &source, &xdg, &[]);
     assert_eq!(code, 0, "track: {e}");

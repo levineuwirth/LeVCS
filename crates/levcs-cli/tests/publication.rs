@@ -489,9 +489,10 @@ fn fake_source(responses: Vec<(&'static str, Vec<u8>)>) -> (String, std::thread:
     (url, handle)
 }
 
-/// A fork is its repository's first publication, and the source history
-/// behind it is checked against the source's own genesis. The fork used to
-/// sign over a source tip whose signature was invalid (the audit's probe).
+/// A fork's source history is received and checked, against the genesis
+/// the source's id pins, before anything is written (Rule R). The fork used
+/// to sign over a source tip whose signature was invalid (the audit's
+/// probe), from a source whose genesis was not the one its id names.
 #[test]
 fn a_fork_over_unverified_source_history_is_refused() {
     use levcs_core::Repository;
@@ -507,36 +508,48 @@ fn a_fork_over_unverified_source_history_is_refused() {
         pack.push(bytes[4], bytes);
     }
     let auth = source.current_authority().unwrap().unwrap().to_hex();
-    let genesis = source.genesis_authority().unwrap().unwrap().to_hex();
-    let advertised = "cd".repeat(32);
-    let info = serde_json::to_vec(&serde_json::json!({
-        "repo_id": advertised, "current_authority": auth, "genesis_authority": genesis
-    }))
-    .unwrap();
-    let refs = serde_json::to_vec(
-        &serde_json::json!({"branches": {"main": forged_tip.to_hex()}, "releases": {}}),
-    )
-    .unwrap();
-    let (url, server) = fake_source(vec![
-        ("/info", info),
-        ("/refs", refs),
-        ("/pack?", pack.encode()),
-    ]);
-    let e = v.refused(&[
-        "fork",
-        &advertised,
-        "--from",
-        &url,
-        "--name",
-        "forged-fork",
-        "--key",
-        "owner",
-    ]);
-    server.join().unwrap();
-    assert!(e.contains("signature is invalid"), "{e}");
-    let dest = v.work.join("forged-fork");
-    assert!(
-        !dest.join(".levcs/refs/branches/main").exists(),
-        "the fork published a branch over a forged source tip"
-    );
+    let genesis = source.genesis_authority().unwrap().unwrap();
+    let repo_id =
+        levcs_identity::authority::AuthorityBody::parse(&source.read_signed(genesis).unwrap().body)
+            .unwrap()
+            .repo_id
+            .to_hex();
+    for (advertised, refusal) in [
+        (
+            repo_id.clone(),
+            format!("invalid {forged_tip}: signature is invalid"),
+        ),
+        (
+            "cd".repeat(32),
+            format!("is repository {repo_id}, not {}", "cd".repeat(32)),
+        ),
+    ] {
+        let info = serde_json::to_vec(&serde_json::json!({
+            "repo_id": advertised, "current_authority": auth,
+            "genesis_authority": genesis.to_hex(),
+            "branches": {"main": forged_tip.to_hex()},
+        }))
+        .unwrap();
+        let (url, server) = fake_source(vec![("/info", info), ("/pack?", pack.encode())]);
+        let e = v.refused(&[
+            "fork",
+            &advertised,
+            "--from",
+            &url,
+            "--name",
+            "forged-fork",
+            "--key",
+            "owner",
+        ]);
+        server.join().unwrap();
+        assert!(e.contains(&refusal), "{e}");
+        assert!(
+            e.contains("wrote nothing") || e.contains("nothing was written"),
+            "{e}"
+        );
+        assert!(
+            !v.work.join("forged-fork").exists(),
+            "the fork wrote a repository from unchecked source history"
+        );
+    }
 }

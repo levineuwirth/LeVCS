@@ -38,7 +38,7 @@ fn tempdir(prefix: &str) -> PathBuf {
     p
 }
 
-async fn start() -> (SocketAddr, tokio::task::JoinHandle<()>, PathBuf) {
+async fn start(creators: Vec<String>) -> (SocketAddr, tokio::task::JoinHandle<()>, PathBuf) {
     let root = tempdir("levcs-force-push");
     let cfg = InstanceConfig {
         root: root.clone(),
@@ -46,6 +46,8 @@ async fn start() -> (SocketAddr, tokio::task::JoinHandle<()>, PathBuf) {
         federation_peers: Vec::new(),
         allowed_handlers: Vec::new(),
         mirrors: Vec::new(),
+        creators,
+        limits: Default::default(),
     };
     let state = AppState::new(cfg);
     let app = router(state);
@@ -142,9 +144,9 @@ fn build_commit(sk: &SecretKey, auth_id: ObjectId, marker: &str) -> (Pack, Objec
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn non_fast_forward_without_force_is_rejected() {
-    let (addr, task, root) = start().await;
-    let base = format!("http://{addr}/levcs/v1");
     let setup = build_genesis();
+    let (addr, task, root) = start(vec![setup.sk.public().to_levcs()]).await;
+    let base = format!("http://{addr}/levcs/v1");
 
     let result = tokio::task::spawn_blocking({
         let seed = *setup.sk.seed();
@@ -204,9 +206,9 @@ async fn non_fast_forward_without_force_is_rejected() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn non_fast_forward_with_force_and_owner_role_succeeds() {
-    let (addr, task, root) = start().await;
-    let base = format!("http://{addr}/levcs/v1");
     let setup = build_genesis();
+    let (addr, task, root) = start(vec![setup.sk.public().to_levcs()]).await;
+    let base = format!("http://{addr}/levcs/v1");
 
     let result = tokio::task::spawn_blocking({
         let seed = *setup.sk.seed();
@@ -258,9 +260,9 @@ async fn fast_forward_succeeds_without_force() {
     // Sanity check: a real fast-forward (parent-of-existing) must
     // still work without `force`. This guards against the new check
     // accidentally requiring force on every advance.
-    let (addr, task, root) = start().await;
-    let base = format!("http://{addr}/levcs/v1");
     let setup = build_genesis();
+    let (addr, task, root) = start(vec![setup.sk.public().to_levcs()]).await;
+    let base = format!("http://{addr}/levcs/v1");
 
     let result = tokio::task::spawn_blocking({
         let seed = *setup.sk.seed();

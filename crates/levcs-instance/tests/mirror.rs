@@ -131,6 +131,7 @@ fn build_simple_commit_pack(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mirror_pulls_state_from_source() {
+    let setup = build_genesis();
     // Source: authoritative for the repo. Mirror: configured to pull from
     // source. After source receives a push, sync_mirror on the mirror
     // must replicate refs and content, and the mirror's /info must
@@ -144,11 +145,11 @@ async fn mirror_pulls_state_from_source() {
         federation_peers: Vec::new(),
         allowed_handlers: Vec::new(),
         mirrors: Vec::new(),
+        creators: vec![setup.sk.public().to_levcs()],
+        limits: Default::default(),
     };
     let (source_addr, source_task) = start(source_cfg).await;
     let source_base = format!("http://{source_addr}/levcs/v1");
-
-    let setup = build_genesis();
 
     // Push a commit to source from a client.
     let result = tokio::task::spawn_blocking({
@@ -194,6 +195,8 @@ async fn mirror_pulls_state_from_source() {
             poll_interval: "60s".into(),
             writeback: false,
         }],
+        creators: Vec::new(),
+        limits: Default::default(),
     };
     let mirror_cfg_arc = Arc::new(mirror_cfg.clone());
     let (mirror_addr, mirror_task) = start(mirror_cfg).await;
@@ -297,6 +300,7 @@ async fn mirror_pulls_state_from_source() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn migrate_replays_repo_to_fresh_instance() {
+    let setup = build_genesis();
     // Spin up two authoritative instances. Init+push to the first, then
     // run the same init+push sequence against the second — the unit
     // under test is the wire path the `levcs migrate` orchestration
@@ -311,6 +315,8 @@ async fn migrate_replays_repo_to_fresh_instance() {
         federation_peers: Vec::new(),
         allowed_handlers: Vec::new(),
         mirrors: Vec::new(),
+        creators: vec![setup.sk.public().to_levcs()],
+        limits: Default::default(),
     };
     let dst_cfg = InstanceConfig {
         root: dst_root.clone(),
@@ -318,13 +324,14 @@ async fn migrate_replays_repo_to_fresh_instance() {
         federation_peers: Vec::new(),
         allowed_handlers: Vec::new(),
         mirrors: Vec::new(),
+        creators: vec![setup.sk.public().to_levcs()],
+        limits: Default::default(),
     };
     let (src_addr, src_task) = start(src_cfg).await;
     let (dst_addr, dst_task) = start(dst_cfg).await;
     let src_base = format!("http://{src_addr}/levcs/v1");
     let dst_base = format!("http://{dst_addr}/levcs/v1");
 
-    let setup = build_genesis();
     let repo_id = setup.repo_id.clone();
     let auth_id = setup.auth_id;
 

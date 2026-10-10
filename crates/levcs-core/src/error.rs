@@ -53,6 +53,11 @@ pub enum Error {
         actual: String,
     },
 
+    /// An object larger than a read was allowed to take, refused before it
+    /// was read.
+    #[error("object {id} is {size} bytes, more than the {max} allowed")]
+    TooLarge { id: String, size: u64, max: u64 },
+
     #[error("{0}")]
     Other(String),
 }

@@ -18,8 +18,49 @@
 use std::path::Path;
 
 use crate::error::{Error, Result};
+use crate::hash::ObjectId;
+
+/// The longest repository-relative path a tree may give a file, in bytes:
+/// Linux's `PATH_MAX`. A received tree can nest deeper than a working tree
+/// can hold. A walk of one holds each level's path, so refusing a path past
+/// this as it is built also bounds what the walk holds.
+pub const MAX_PATH_BYTES: usize = 4096;
+
+/// The most files and directories one tree may hold, counting every place
+/// a shared subtree recurs. A tree's objects can be shared along many
+/// paths, so a few dozen objects can name millions of files: a walk past
+/// this is refused before it holds or writes them.
+pub const MAX_TREE_ENTRIES: usize = 1 << 20;
+
+/// The most file content, in bytes, read from one tree, counting every
+/// place a shared file recurs: what a checkout writes, and what reading a
+/// tree's files whole holds.
+pub const MAX_TREE_BYTES: u64 = 1 << 30;
+
+/// A tree past [`MAX_TREE_ENTRIES`], refused.
+pub fn too_many_entries(tree: ObjectId) -> Error {
+    Error::Other(format!(
+        "tree {tree} holds more than {MAX_TREE_ENTRIES} files and directories, counting \
+         every place a shared subtree recurs: more than a working tree may hold"
+    ))
+}
+
+/// Files past [`MAX_TREE_BYTES`], refused.
+pub fn too_much_content() -> Error {
+    Error::Other(format!(
+        "the files come to more than {MAX_TREE_BYTES} bytes, counting every place a \
+         shared file recurs: more than a working tree may hold"
+    ))
+}
+
+/// A path longer than [`MAX_PATH_BYTES`], refused. It is named by its start.
+pub fn too_long(rel: &str) -> Error {
+    let start: String = rel.chars().take(64).collect();
+    Error::InvalidPath(format!("{start:?}… is longer than {MAX_PATH_BYTES} bytes"))
+}
 
 /// The components of a repository-relative path, checked.
+/// - It may be no longer than [`MAX_PATH_BYTES`].
 /// - No component may be empty, `.` or `..`, or contain NUL.
 /// - No component may name `.levcs` as any file system would read it (see
 ///   [`names_metadata`]). At the root that would write into repository
@@ -27,19 +68,30 @@ use crate::error::{Error, Result};
 ///   repository. A tree's own top-level `.levcs` entry is synthetic history
 ///   and is skipped before paths get here.
 pub fn components(rel: &str) -> Result<Vec<&str>> {
+    if rel.len() > MAX_PATH_BYTES {
+        return Err(too_long(rel));
+    }
     let parts: Vec<&str> = rel.split('/').collect();
     for p in &parts {
-        if p.is_empty() || *p == "." || *p == ".." || p.contains('\0') {
-            return Err(Error::InvalidPath(format!("{p:?} in {rel:?}")));
-        }
-        if names_metadata(p) {
-            return Err(Error::InvalidPath(format!(
-                "{p:?} in {rel:?} would write into repository metadata or \
-                 create a nested repository"
-            )));
-        }
+        component(p, rel)?;
     }
     Ok(parts)
+}
+
+/// One component `name` of the path `rel`, checked as [`components`]
+/// checks each. A walk checks each name it reaches once, rather than every
+/// component of every path again.
+pub fn component(name: &str, rel: &str) -> Result<()> {
+    if name.is_empty() || name == "." || name == ".." || name.contains(['\0', '/']) {
+        return Err(Error::InvalidPath(format!("{name:?} in {rel:?}")));
+    }
+    if names_metadata(name) {
+        return Err(Error::InvalidPath(format!(
+            "{name:?} in {rel:?} would write into repository metadata or \
+             create a nested repository"
+        )));
+    }
+    Ok(())
 }
 
 /// Whether a file system could take this name for `.levcs`: in any letter

@@ -1,0 +1,126 @@
+#!/bin/sh
+# levcs-restore ARCHIVE [ROOT]
+#
+# Put an archive levcs-backup made in place of an instance's root
+# (default /var/lib/levcs). Run it with the instance stopped.
+#
+# The archive is extracted beside the root, and everything in its root is
+# checked first. Each entry, hidden ones too, must be a repository the
+# instance would serve: a directory named by a repository id, holding its
+# metadata (.levcs), that `levcs verify` passes and whose id is that name.
+# If any entry is not, nothing is changed: the root stays as it was, this
+# exits non-zero, and the extracted copy is left to look at. Otherwise the
+# current root is kept as ROOT.before-restore and the archive's takes its
+# place. Each is moved by a rename that cannot merge into a directory
+# that holds anything.
+#
+# Run as root, it checks each repository as the user that owns it. LEVCS
+# names the levcs binary; by default, levcs on PATH.
+set -eu
+
+if [ $# -lt 1 ] || [ $# -gt 2 ]; then
+    echo "usage: levcs-restore ARCHIVE [ROOT]" >&2
+    exit 2
+fi
+archive=$1
+root=${2:-/var/lib/levcs}
+root=${root%/}
+parent=$(dirname "$root")
+name=$(basename "$root")
+aside="$root.before-restore"
+
+if ! levcs=$(command -v "${LEVCS:-levcs}"); then
+    echo "levcs-restore: no levcs binary; name it with LEVCS" >&2
+    exit 1
+fi
+if [ ! -f "$archive" ]; then
+    echo "levcs-restore: no archive at $archive" >&2
+    exit 1
+fi
+if [ -e "$aside" ]; then
+    echo "levcs-restore: $aside exists, from an earlier restore; move it away first" >&2
+    exit 1
+fi
+
+staging=$(mktemp -d "$parent/.$name.restore.XXXXXX")
+# Readable by the owners the repositories are checked as.
+chmod 0755 "$staging"
+tar -C "$staging" -xzf "$archive"
+restored="$staging/$name"
+if [ -L "$restored" ] || [ ! -d "$restored" ]; then
+    echo "levcs-restore: $archive holds no $name/ directory; nothing was changed" >&2
+    echo "levcs-restore: what it holds is in $staging" >&2
+    exit 1
+fi
+
+# `levcs ARGS` in the repository at DIR, as the user that owns it when
+# this runs as root.
+levcs_in() {
+    dir=$1
+    shift
+    if [ "$(id -u)" -eq 0 ]; then
+        (cd "$dir" && runuser -u "$(stat -c %U "$dir")" -- "$levcs" "$@")
+    else
+        (cd "$dir" && "$levcs" "$@")
+    fi
+}
+
+# Why the entry ENTRY of the restored root is not a repository the
+# instance would serve, or nothing.
+refusal() {
+    entry=$1
+    dir="$restored/$entry"
+    case $entry in
+        *[!0-9a-f]*)
+            echo "not named by a repository id"
+            return
+            ;;
+    esac
+    if [ ${#entry} -ne 64 ]; then
+        echo "not named by a repository id"
+    elif [ -L "$dir" ] || [ ! -d "$dir" ]; then
+        echo "not a directory"
+    elif [ -L "$dir/.levcs" ] || [ ! -d "$dir/.levcs" ]; then
+        echo "no repository metadata (.levcs)"
+    elif ! levcs_in "$dir" verify >&2; then
+        echo "does not verify"
+    elif [ "$(levcs_in "$dir" authority show |
+        sed -n 's/^repo_id = "blake3:\([0-9a-f]*\)"$/\1/p')" != "$entry" ]; then
+        echo "holds a repository other than the one it is named for"
+    fi
+}
+
+# Entries, hidden ones too, not named by a repository id; then each one
+# that is, checked. A repository id holds nothing that splits or globs.
+failed=$(find "$restored" -mindepth 1 -maxdepth 1 -regextype posix-extended \
+    ! -regex '.*/[0-9a-f]{64}' -printf '\n  %f: not named by a repository id')
+for dir in "$restored"/*; do
+    entry=$(basename "$dir")
+    case $entry in *[!0-9a-f]*) continue ;; esac
+    [ ${#entry} -eq 64 ] || continue
+    why=$(refusal "$entry")
+    if [ -n "$why" ]; then
+        failed="$failed
+  $entry: $why"
+    fi
+done
+if [ -n "$failed" ]; then
+    echo "levcs-restore: these entries are not repositories that verify:$failed" >&2
+    echo "levcs-restore: nothing was changed; the extracted archive is in $staging" >&2
+    exit 1
+fi
+
+replaced=""
+if [ -e "$root" ]; then
+    mv -T "$root" "$aside"
+    replaced="; the root it replaced is $aside"
+fi
+if ! mv -T "$restored" "$root"; then
+    if [ -n "$replaced" ]; then
+        mv -T "$aside" "$root"
+    fi
+    echo "levcs-restore: could not move the restored root into place; nothing was changed" >&2
+    exit 1
+fi
+rmdir "$staging"
+echo "levcs-restore: $root restored from $archive$replaced"

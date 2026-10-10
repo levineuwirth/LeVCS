@@ -1,6 +1,6 @@
 [Unit]
 Description=LeVCS federation instance (§5.2)
-Documentation=https://github.com/lneuwirth/levcs
+Documentation=https://github.com/levineuwirth/LeVCS/blob/main/deploy/README.md
 After=network-online.target
 Wants=network-online.target
 
@@ -11,6 +11,11 @@ Group=levcs
 ExecStart=/usr/local/bin/levcs-instance --config /etc/levcs/instance.toml
 Restart=on-failure
 RestartSec=5
+# A stop sends SIGTERM: the instance takes no new request and finishes
+# those in flight. A push can take body_timeout_secs (120 by default) to
+# arrive, so it gets longer than that before it is killed; a push killed
+# part way is rolled back at the next start.
+TimeoutStopSec=150
 
 # tracing-subscriber respects RUST_LOG. info-level is reasonable for
 # production (one line per request via the TraceLayer); bump to debug

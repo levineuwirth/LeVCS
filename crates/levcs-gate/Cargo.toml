@@ -1,0 +1,20 @@
+[package]
+name = "levcs-gate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+description = "The deployment gate: checks a levcs-instance binary, with the levcs CLI, before it is relied on."
+
+[dependencies]
+levcs-core = { workspace = true }
+levcs-identity = { workspace = true }
+levcs-protocol = { workspace = true }
+levcs-client = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+
+[[bin]]
+name = "levcs-gate"
+path = "src/main.rs"

@@ -182,6 +182,13 @@ async fn main() -> std::io::Result<()> {
     if config.creators.is_empty() {
         tracing::warn!("no creators are configured; this instance accepts no new repository");
     }
+    if let Some(n) = levcs_instance::exit_after_ref_writes() {
+        tracing::warn!(
+            "{} is set: a push ends this process after its ref write {n}; \
+             for levcs-gate only, never on a service",
+            levcs_instance::EXIT_AFTER_REF_WRITES
+        );
+    }
 
     tracing::info!(
         addr = %bind,

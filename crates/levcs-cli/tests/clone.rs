@@ -74,6 +74,37 @@ fn levcs(cwd: &Path, xdg: &Path, limits: Option<&str>, args: &[&str]) -> (ExitSt
     )
 }
 
+/// `levcs args` as [`levcs`] runs it, killed after `secs` seconds: a bound
+/// on the work a command does, where its outcome alone would not show it.
+fn levcs_within(
+    cwd: &Path,
+    xdg: &Path,
+    secs: u32,
+    limits: Option<&str>,
+    args: &[&str],
+) -> (ExitStatus, String) {
+    let limits = limits
+        .map(|l| format!("ulimit {l} && "))
+        .unwrap_or_default();
+    let out = Command::new("timeout")
+        .args([&secs.to_string(), "sh", "-c"])
+        .arg(format!("{limits}exec \"$0\" \"$@\""))
+        .arg(env!("CARGO_BIN_EXE_levcs"))
+        .args(args)
+        .current_dir(cwd)
+        .env("XDG_CONFIG_HOME", xdg)
+        .output()
+        .unwrap();
+    (
+        out.status,
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    )
+}
+
 /// A working repository, and the keychain alice's key is in.
 struct Local {
     work: PathBuf,
@@ -782,10 +813,14 @@ fn trees_that_recur_past_a_working_tree_are_refused() {
     assert!(out.contains(bytes), "{out}");
     big.repo().write_index(&levcs_core::Index::new()).unwrap();
     let main = big.main();
-    for args in [&["diff", &main][..], &["construct", &main, "d"][..]] {
-        let out = big.refused(args);
-        assert!(out.contains(bytes), "{args:?}: {out}");
-    }
+    // diff holds what it reads: it is refused once it has read what a
+    // working tree may hold, well within a minute. Without the bound it
+    // read and held 2 GiB, and was still diffing them minutes later.
+    let (status, out) = levcs_within(&big.work, &keys.xdg, 60, None, &["diff", &main]);
+    assert_eq!(status.code(), Some(1), "{status}: {out}");
+    assert!(out.contains(bytes), "{out}");
+    let out = big.refused(&["construct", &main, "d"]);
+    assert!(out.contains(bytes), "{out}");
     assert!(!big.work.join("d").exists(), "a refused construct wrote");
 
     // A construct is refused once it has read what a working tree may
@@ -796,16 +831,13 @@ fn trees_that_recur_past_a_working_tree_are_refused() {
     });
     huge.repo().write_index(&levcs_core::Index::new()).unwrap();
     let main = huge.main();
-    let out = Command::new("timeout")
-        .args(["60", "sh", "-c"])
-        .arg(format!("ulimit {SMALL_MEMORY} && exec \"$0\" \"$@\""))
-        .arg(env!("CARGO_BIN_EXE_levcs"))
-        .args(["construct", &main, "d"])
-        .current_dir(&huge.work)
-        .env("XDG_CONFIG_HOME", &keys.xdg)
-        .output()
-        .unwrap();
-    let text = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(1), "{}: {text}", out.status);
-    assert!(text.contains(bytes), "{text}");
+    let (status, out) = levcs_within(
+        &huge.work,
+        &keys.xdg,
+        60,
+        Some(SMALL_MEMORY),
+        &["construct", &main, "d"],
+    );
+    assert_eq!(status.code(), Some(1), "{status}: {out}");
+    assert!(out.contains(bytes), "{out}");
 }

@@ -1,278 +1,239 @@
-# Hosting a LeVCS instance on a VPS
+# Hosting a LeVCS instance
 
-This walkthrough takes you from "I have a VPS" to "the LeVCS source code
-lives on my LeVCS instance" using the artifacts in this directory.
+This takes you from a VPS to the LeVCS source living on your own
+instance, with the artifacts in this directory.
 
-The instance terminates HTTP, not TLS, so you'll run it behind a reverse
-proxy (Caddy or nginx). Federation requests are signed at the
-application layer, so the proxy is just transport security + rate
-limiting — there's no auth handoff between layers.
+The first milestone is narrow on purpose:
 
-## Architecture (one-liner)
+- **Source repositories only.** Vault hosting, mirrors and peer-to-peer
+  transfer are outside it; mirrors and `dial` are refused outright.
+- **Restricted access.** The instance listens on 127.0.0.1 and is reached
+  through an SSH tunnel (or a private network), with no public route.
+  The server-side protections hold regardless: confined paths, named
+  creators, enforced read policy, bounded work, checked history.
+- **Relied on only after the gate passes** on the VPS, with the binaries
+  it will run (step 3).
 
 ```
-laptop  --HTTPS-->  Caddy/nginx (TLS)  --HTTP--> levcs-instance (127.0.0.1:7117)
-                                                       |
-                                                       v
-                                                 /var/lib/levcs
+laptop --ssh tunnel--> VPS 127.0.0.1:7117 levcs-instance --> /var/lib/levcs
 ```
 
 ## What's in this directory
 
 | File | Purpose |
 |---|---|
-| `instance.toml.example` | Annotated config — copy to `/etc/levcs/instance.toml`. |
-| `levcs-instance.service` | systemd unit. Runs as a `levcs` user, hardened. |
-| `Caddyfile.example` | Caddy reverse-proxy block (auto-TLS via Let's Encrypt). |
-| `nginx.conf.example` | nginx alternative (use if you already run nginx). |
+| `instance.toml.example` | Annotated config; copy to `/etc/levcs/instance.toml`. |
+| `levcs-instance.service` | systemd unit: runs as a `levcs` user, hardened. |
+| `levcs-backup`, `levcs-restore` | Back an instance up, and restore it, checked (see "Backups"). |
+| `Caddyfile.example`, `nginx.conf.example` | Reverse proxies, for when the instance gets a public route. |
 
 ---
 
-## VPS-side install
+## On the VPS
 
-### 1. Build the binary
+### 1. Build
 
-On a build host (the VPS itself or a beefier dev machine cross-compiled
-to its target), build a release binary:
+Build all three binaries for the VPS, on it or for its target:
 
 ```sh
-cargo build --release -p levcs-instance --bin levcs-instance
+cargo build --release -p levcs-instance -p levcs-cli -p levcs-gate
 ```
 
-The binary lands at `target/release/levcs-instance`. Copy it to
-`/usr/local/bin/levcs-instance` on the VPS.
+They land in `target/release/`: `levcs-instance` (the server), `levcs`
+(the client, which the gate drives and which checks restored backups),
+and `levcs-gate`.
 
-### 2. Create the service user and directories
+### 2. Install
 
 ```sh
+sudo install -m 0755 target/release/levcs-instance target/release/levcs \
+    target/release/levcs-gate deploy/levcs-backup deploy/levcs-restore /usr/local/bin/
 sudo useradd --system --home /var/lib/levcs --shell /usr/sbin/nologin levcs
-sudo install -d -o levcs -g levcs -m 0755 /var/lib/levcs
+sudo install -d -o levcs -g levcs -m 0750 /var/lib/levcs
 sudo install -d -o root -g root -m 0755 /etc/levcs
-```
-
-### 3. Drop the config in place
-
-```sh
 sudo cp deploy/instance.toml.example /etc/levcs/instance.toml
 sudo $EDITOR /etc/levcs/instance.toml
 ```
 
 The defaults (full storage, builtin handlers only, listen on
-127.0.0.1:7117) are correct for a single-VPS install. Change `root`
-only if `/var/lib/levcs` doesn't suit your filesystem layout.
+127.0.0.1:7117) are right for one VPS. Name the keys that may create
+repositories in `creators`, as `levcs key show <label>` prints them on
+the laptop; with none named, the instance accepts no new repository. An
+unknown key, a zero limit, a creator that is not a key or any mirror
+stops the instance from starting.
 
-Name the keys that may create repositories in `creators`, as
-`levcs key show <label>` prints them. With none named, the instance
-accepts no new repository.
+### 3. Run the gate
 
-### 4. Install the systemd unit
+As any unprivileged user, on the VPS:
+
+```sh
+levcs-gate --levcs /usr/local/bin/levcs --instance /usr/local/bin/levcs-instance
+```
+
+The gate starts that `levcs-instance` on a throwaway root and a free
+port, from a config file as the service reads one, and drives it. It
+never touches `/var/lib/levcs` or the service. It checks, in order:
+
+1. a bad config is refused at startup;
+2. the instance starts and says what it takes;
+3. two pushes and a clone, then work pushed from the clone and pulled
+   back;
+4. paths that would leave the root reach nothing;
+5. a key not named in `creators` creates nothing;
+6. a private repository is read by its members only;
+7. a stale compare-and-swap is refused;
+8. a malformed history is refused;
+9. an incomplete history is refused;
+10. a pack that decodes past the limit is refused, by the client before
+    it sends and by the instance when sent anyway;
+11. the instance recovers from being killed;
+12. a push of two refs, cut off by the instance's own writer between its
+    ref writes, leaves its journal and is rolled back when the instance
+    starts;
+13. a backup made and restored by `levcs-backup` and `levcs-restore`, as
+    under "Backups" below, and a damaged backup refused with nothing
+    changed;
+14. the instance stops gracefully;
+15. this guide's own backup, restore and update commands, run as written
+    with stand-ins for `sudo` and `systemctl`: a damaged backup's restore
+    stops before the service is started, and a failed gate stops an
+    update before anything is replaced.
+
+It prints `ok` or `FAIL` for each, stops at the first failure, and keeps
+its directory, with the instance's log, to look at. Rely on the instance
+only once it ends with `every check passed`, and exits 0. Run it again
+whenever either binary changes.
+
+For check 12 the gate sets `LEVCS_INSTANCE_EXIT_AFTER_REF_WRITES` on the
+instance it starts, which makes a push end the process after that many
+ref writes. Never set it on the service; the instance warns at startup
+when it is set.
+
+### 4. Start the service
 
 ```sh
 sudo cp deploy/levcs-instance.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now levcs-instance
-sudo systemctl status levcs-instance
-```
-
-Verify it's listening:
-
-```sh
 curl -fsS http://127.0.0.1:7117/health
 # {"status":"ok"}
 ```
 
-### 5. Reverse proxy
+### 5. Reaching it
 
-#### Option A — Caddy (recommended)
-
-If Caddy isn't installed yet:
+From the laptop, through SSH:
 
 ```sh
-sudo apt install caddy        # or your distro's package
+ssh -N -L 7117:127.0.0.1:7117 vps
 ```
 
-Edit `Caddyfile.example`, replace `levcs.example.com` with your real
-hostname, then either drop it in as `/etc/caddy/Caddyfile` or import it
-from your existing one. Reload Caddy:
+The instance is then `http://127.0.0.1:7117/levcs/v1` on the laptop. A
+private network (WireGuard, Tailscale) works the same way: bind the
+instance to the VPS's address on it, in `bind`, and use that.
+
+Keep 7117 closed to the internet; the firewall needs nothing for it:
 
 ```sh
-sudo cp deploy/Caddyfile.example /etc/caddy/Caddyfile
-sudo $EDITOR /etc/caddy/Caddyfile
-sudo systemctl reload caddy
+sudo ufw status   # 7117 is not listed
 ```
 
-Caddy will fetch a Let's Encrypt cert automatically on the first
-request. Confirm:
-
-```sh
-curl -fsS https://levcs.example.com/health
-# {"status":"ok"}
-```
-
-#### Option B — nginx (if you already run it)
-
-If your VPS already runs nginx (e.g. fronting Forgejo), use a server
-block alongside the existing ones rather than introducing Caddy. Make
-sure you have a TLS cert for the new hostname (certbot:
-`sudo certbot --nginx -d levcs.example.com`).
-
-```sh
-sudo cp deploy/nginx.conf.example /etc/nginx/sites-available/levcs
-sudo $EDITOR /etc/nginx/sites-available/levcs
-sudo ln -s ../sites-available/levcs /etc/nginx/sites-enabled/
-sudo nginx -t && sudo systemctl reload nginx
-```
-
-The example block handles both 80→443 redirect and the proxy itself.
-The location regex (`/levcs/v1` and `/health`) ensures everything else
-returns 404 — there is no web UI yet, and the instance shouldn't appear
-to host one.
-
-### 6. Firewall
-
-Open 80 and 443 on the VPS, keep 7117 closed from the public internet:
-
-```sh
-sudo ufw allow 80/tcp
-sudo ufw allow 443/tcp
-# 7117 stays closed — only Caddy/nginx talk to it.
-```
+A public route comes later, behind TLS: `Caddyfile.example` and
+`nginx.conf.example` proxy `/levcs/v1` and `/health` and return 404 for
+everything else.
 
 ---
 
-## Laptop-side bootstrap
+## From the laptop
 
-Now make the LeVCS source code itself a LeVCS repository hosted on the
-new instance. This is the dogfood claim: you're running the protocol on
-your own code from this point on.
-
-### 1. Build the CLI locally
+### 1. A key
 
 ```sh
-cargo build --release -p levcs-cli --bin levcs
-sudo install -m 0755 target/release/levcs /usr/local/bin/levcs
+levcs key generate primary --encrypt
+levcs key show primary     # the line to name in `creators` on the VPS
 ```
 
-### 2. Generate or import an identity key
+The key is your membership: it signs the repository's authority, its
+commits and every push. `--encrypt` keeps it under a passphrase.
 
-If you don't already have a LeVCS key:
+### 2. The repository
 
-```sh
-levcs key generate --label primary
-levcs key list
-```
-
-The label is yours to choose (`alice`, `primary`, your handle — anything).
-This key is your authority membership credential; it signs every
-authority object and every push.
-
-### 3. Init the repo locally
-
-From inside the LeVCS source tree:
+From the LeVCS source tree:
 
 ```sh
 levcs init --key primary
 levcs track --all
-levcs commit -m "initial import"
+levcs commit -m "initial import" --key primary
+levcs instance --set http://127.0.0.1:7117/levcs/v1
 ```
 
-`init` writes a `.levcs/` directory next to your source, with a genesis
-authority object that names your key as the sole Owner. The repo_id is
-the BLAKE3 hash of that authority — globally unique by construction.
+`init` writes `.levcs/` beside the source, with a genesis authority that
+names your key as the only owner; the repository's id is derived from
+it. `instance --set` makes the repository a workspace of the instance.
 
-### 4. Point the local repo at the VPS instance
+### 3. The first push
 
-```sh
-levcs instance --set https://levcs.example.com/levcs/v1
-levcs instance --info
-```
-
-The `--set` value is what the federation client uses for every push and
-pull on this repo.
-
-### 5. First push (auto-init)
-
-Measure it first. A dry run reports what the push would send, against
+Measure it first. A dry run reports what the push would send against
 what the instance says it takes, and sends nothing:
 
 ```sh
-levcs push --dry-run refs/branches/main
+levcs push --dry-run --key primary
+levcs push --key primary
 ```
 
-The LeVCS source itself is about 300 objects, under 5 MB decoded and
-under 2 MB as a request: far inside the defaults. Then push:
-
-```sh
-levcs push refs/branches/main
-```
-
-The client asks the instance what it holds first. A repository it does
-not hold yet is created from its genesis authority, which takes a key
-named in `creators`, and then pushed. Output looks like:
+The LeVCS source is about 300 objects, under 5 MB decoded and under 2 MB
+as a request: far inside the defaults. A repository the instance does
+not hold yet is created from its genesis, which takes a key named in
+`creators`, and then pushed:
 
 ```
 repo not yet on instance; initialising
 pushed 1 ref(s): 313 object(s)
 ```
 
-Each later push expects what the instance holds for each ref, and sends
-only what the instance's refs do not already reach.
+Each later push expects what the instance holds for each ref and sends
+only what the instance's refs do not already reach. A push behind the
+instance is refused unless forced.
 
-That's it. The repo is now hosted on the VPS. `levcs init` makes a
-public repository, which anyone who can reach the instance may read:
+`levcs init` makes a public repository: anyone who can reach the
+instance may read it. A private one (`public_read` false) is served only
+to members of its current authority, in requests signed with `--key`
+(`clone`, `pull`, `fork`); to anyone else it does not exist.
 
-```sh
-curl -fsS https://levcs.example.com/levcs/v1/repos/<repo_id>/info | jq
-```
-
-A private one (`public_read` false) is served only to members of its
-current authority, in signed requests (`--key <label>` to `clone`,
-`pull` and `fork`). Anyone else is answered as if it did not exist.
-
-### 6. Another machine: clone and pull
+### 4. Another machine: clone and pull
 
 ```sh
-levcs clone <repo_id> levcs --from https://levcs.example.com/levcs/v1
+levcs clone <repo_id> levcs --from http://127.0.0.1:7117/levcs/v1
 ```
 
-makes a new workspace of the instance in `levcs/`: its branches,
-releases and authority as the instance publishes them, and `main`
-checked out. Work in it is pushed as from the first machine. `levcs pull`
-in a workspace records the instance's branches under
-`refs/remote/origin/`, without moving any of its own.
+makes a workspace of the instance in `levcs/`: its branches, releases
+and authority as the instance publishes them, and `main` checked out.
+Work in it is pushed as from the first machine. `levcs pull` in a
+workspace records the instance's branches under `refs/remote/origin/`,
+without moving any of its own.
 
-Both check everything they receive before writing any of it: that the
-genesis is the one the repository's id pins, and that every object the
+Both check everything they receive before writing any of it: the
+genesis is the one the repository's id pins, and every object the
 received refs reach is present and passes `levcs verify`'s checks
-against it. Anything that fails is refused, and nothing is written.
-
-### 7. (Optional) Verify the server-side state
-
-SSH to the VPS and look at what got persisted:
-
-```sh
-sudo ls /var/lib/levcs/
-sudo ls /var/lib/levcs/<repo_id>/.levcs/refs/branches/
-sudo cat /var/lib/levcs/<repo_id>/.levcs/refs/authority/current
-```
-
-You should see your repo_id directory, a `main` ref pointing at your
-head commit hash, and a current-authority pointer matching the genesis.
+against it. Where the workspace already holds an object, its own copy is
+what is checked. What fails is refused, and nothing is written. A tree
+that would expand past what a working tree may hold (paths of 4,096
+bytes, 1,048,576 files and directories, 1 GiB of content, each counted
+every place a shared subtree or file recurs) is refused before anything
+is written for it.
 
 ---
 
-## Operating notes
+## Operating
 
 ### Logs
 
 ```sh
-sudo journalctl -u levcs-instance -f         # live
-sudo journalctl -u levcs-instance -p warning # warnings + errors only
+sudo journalctl -u levcs-instance -f
+sudo journalctl -u levcs-instance -p warning
 ```
 
-The `TraceLayer` middleware emits one line per HTTP request at
-`info` level — method, path, status, latency. Bump to `debug` via
-`Environment=RUST_LOG=debug` in the systemd unit when diagnosing.
+One line per request at `info`; set `Environment=RUST_LOG=debug` in the
+unit when diagnosing.
 
 ### Limits
 
@@ -302,54 +263,105 @@ they are built, the objects read and the encoded pack, then the encoded
 pack until the client has received it. Each also takes a few MiB of zstd
 context. Size these to the VPS.
 
+### Stopping and restarting
+
+`systemctl stop` sends SIGTERM: the instance takes no new request and
+finishes those in flight, then exits. The unit gives it 150 seconds,
+more than a push's `body_timeout_secs`, before systemd kills it.
+
+If it is killed part way through a push (SIGKILL, power loss), the push
+is rolled back when the instance next starts, before it serves anything,
+and the log says so:
+
+```
+<repo_id>: rolled back an interrupted push (refs/branches/main)
+```
+
+A push the client saw succeed was complete; one it saw fail, or never
+heard back from, may be pushed again.
+
 ### Backups
 
-The instance is filesystem-only. A consistent backup is just a
-snapshot of `/var/lib/levcs`. Per-push atomicity is per-object plus a
-serializing per-repo mutex (see `crates/levcs-instance/src/lib.rs`),
-which means a snapshot taken at any moment is internally consistent
-even without quiescing the service. `rsync --link-dest` for incremental
-hardlink snapshots works well.
-
-### Storage growth
-
-There's no automatic GC on the instance. Run `levcs gc` from a client
-that has the repo locally; instance-side GC is a future feature. For
-now, "GC" on the VPS is "delete entire `<repo_id>/` directories of repos
-you no longer want."
-
-### Updating the binary
+Back up with the service stopped: a copy taken while it runs can hold a
+ref without the objects it names, or a push half applied.
 
 ```sh
-sudo systemctl stop levcs-instance
-sudo install -m 0755 target/release/levcs-instance /usr/local/bin/levcs-instance
+sudo systemctl stop levcs-instance &&
+    sudo levcs-backup /var/backups/levcs-$(date +%F).tgz /var/lib/levcs
 sudo systemctl start levcs-instance
 ```
 
-The on-disk format is content-addressed and forward-compatible — there's
-no migration step between versions. If a future release introduces an
-incompatible change, the release notes will say so.
+`levcs-backup` writes the archive under a temporary name of its own,
+reads it back whole, and publishes it by a hard link, which refuses a
+name that exists: an archive that exists is whole, and none is ever
+overwritten, even one that appeared while it ran. It exits non-zero on
+any failure. The start runs
+either way: a failed backup changes nothing. The stop takes seconds, and
+clients see a refused connection meanwhile. Keep the archives off the
+VPS too.
 
-### Mirrors
+### Restoring
 
-Mirrors are refused: the instance will not start with a `[[mirrors]]`
-block in its config. A mirror installs its source's history without
-checking it against the genesis its `repo_id` pins, and it stays refused
-until it does (`doc/authority-semantics.md`, Rule R).
+```sh
+sudo systemctl stop levcs-instance &&
+    sudo levcs-restore /var/backups/levcs-<date>.tgz /var/lib/levcs &&
+    sudo systemctl start levcs-instance
+```
+
+`levcs-restore` extracts the archive beside the root and checks every
+entry in it, hidden ones too, as the user that owns it. Each must be a
+repository the instance would serve: a directory named by a repository
+id, holding its metadata, that `levcs verify` passes (every object every
+ref reaches, and every rule of its history) and whose id is that name. If
+any entry is not, it changes nothing, says which and why, leaves the
+extracted copy to look at, and exits non-zero, so the service is not
+started on it; start it again on the root as it was with `sudo systemctl
+start levcs-instance`. Otherwise the current root is kept as
+`/var/lib/levcs.before-restore` and the archive's takes its place.
+
+The instance then serves the backup's state. A workspace holding work
+pushed after the backup is ahead of it, and its next push lands that work
+again. The gate runs both scripts, and a damaged backup (check 13), and
+these commands as written (check 15).
+
+### Updating the binary
+
+Run the gate on the new binaries first, keep the running binary for a
+rollback, then replace it. Each step runs only if the one before it
+succeeded:
+
+```sh
+levcs-gate --levcs target/release/levcs --instance target/release/levcs-instance &&
+    sudo cp /usr/local/bin/levcs-instance /usr/local/bin/levcs-instance.previous &&
+    sudo systemctl stop levcs-instance &&
+    sudo install -m 0755 target/release/levcs-instance /usr/local/bin/levcs-instance &&
+    sudo systemctl start levcs-instance
+```
+
+To roll back, stop the service, put `levcs-instance.previous` back, and
+start it. The on-disk format has not changed between versions; a release
+that changes it will say so.
+
+### Storage growth
+
+There is no garbage collection on the instance yet. A repository's
+objects only grow; one no longer wanted is removed by stopping the
+service and deleting its `/var/lib/levcs/<repo_id>/` directory.
+
+### Refused for now
+
+- **Mirrors.** The instance will not start with a `[[mirrors]]` block. A
+  mirror installs its source's history without checking it against the
+  genesis its `repo_id` pins, and stays refused until it does
+  (`doc/authority-semantics.md`, Rule R).
+- **`levcs dial`.** Refused for the same reason; clone from an instance
+  instead.
 
 ---
 
-## What's missing (workflow honesty)
+## What's missing
 
-The protocol surface this instance exposes is just refs + objects + auth.
-There is **no** web UI, issue tracker, PR/review surface, comment thread,
-notification hub, or branch-protection layer yet. If you're migrating
-from Forgejo for the LeVCS source, you'll lose:
-
-- The web frontend for browsing code, blame, and history.
-- Issues and PR discussions (and any Forgejo-specific automations).
-- CI integration (no webhooks yet — you'd need to poll the refs from
-  your CI).
-
-That's the spec gap that comes next. This deployment is the substrate
-the workflow layer will sit on top of.
+The instance serves refs, objects and signed pushes, nothing more: no web
+UI, issues, review or notifications, and no webhooks for CI, which has to
+poll the refs. This deployment is the substrate the workflow layer will
+sit on.

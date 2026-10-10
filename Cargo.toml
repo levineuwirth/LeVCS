@@ -10,6 +10,7 @@ members = [
     "crates/levcs-instance",
     "crates/levcs-cli",
     "crates/levcs-tui",
+    "crates/levcs-gate",
 ]
 
 [workspace.package]

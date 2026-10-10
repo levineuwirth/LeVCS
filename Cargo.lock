@@ -1584,6 +1584,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "levcs-gate"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "levcs-client",
+ "levcs-core",
+ "levcs-identity",
+ "levcs-protocol",
+ "serde_json",
+]
+
+[[package]]
 name = "levcs-identity"
 version = "0.1.0"
 dependencies = [

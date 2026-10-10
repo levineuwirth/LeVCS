@@ -32,6 +32,11 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
+      # The deployment gate, on the binaries just built: deploy/README.md,
+      # "Run the gate".
+      - name: Deployment gate
+        run: target/debug/levcs-gate
+
       - name: Compile-check benches
         run: cargo build --workspace --benches
 

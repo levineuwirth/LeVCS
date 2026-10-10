@@ -12,15 +12,17 @@
 # expects a `levcs` user that owns this path.
 root = "/var/lib/levcs"
 
-# Local listen address. Keep this on loopback when running behind a
-# reverse proxy — the proxy terminates TLS and forwards plaintext HTTP
-# here. Use `0.0.0.0:7117` only if you intentionally want to expose
-# the bare HTTP API (e.g. dev environments behind a private network).
+# Listen address. Loopback: reached through an SSH tunnel, or later
+# through a reverse proxy that terminates TLS (deploy/README.md, "Reaching
+# it"). To reach it over a private network (WireGuard, Tailscale), use
+# the VPS's address on that network. Never a public interface: the
+# instance speaks plain HTTP.
 bind = "127.0.0.1:7117"
 
-# §4.3 storage mode. "full" stores every reachable object — the right
-# choice for an authoritative source-of-truth instance. Use "release"
-# or "metadata" only on read replicas that mirror from another instance.
+# §4.3 storage mode. "full" stores every reachable object: the mode for
+# an instance that is a repository's source of truth. "release" takes
+# only release pushes; "metadata" takes no pushes, and was to be filled
+# by mirroring, which is refused.
 storage_mode = "full"
 
 # §6.6.4 merge handler policy. Pushes whose merge-records reference a

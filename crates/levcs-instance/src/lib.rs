@@ -1566,13 +1566,82 @@ fn apply_push(
             new: Some(a1),
         });
     }
-    levcs_core::ref_tx::apply(&refs, &changes).map_err(|e| {
+    levcs_core::ref_tx::apply(&PushRefs::new(&refs), &changes).map_err(|e| {
         err(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("push not applied: {e}"),
         )
     })?;
     Ok(StatusCode::OK)
+}
+
+/// Set in the instance's environment, a push ends the process right after
+/// its n-th ref write, without returning: how `levcs-gate` stops a push of
+/// this binary between its ref writes, to check that the push's journal is
+/// on disk and the next start rolls it back. Never set it on a service.
+pub const EXIT_AFTER_REF_WRITES: &str = "LEVCS_INSTANCE_EXIT_AFTER_REF_WRITES";
+
+/// The status the process ends with at [`EXIT_AFTER_REF_WRITES`].
+pub const EXITED_AFTER_REF_WRITES: i32 = 86;
+
+/// [`EXIT_AFTER_REF_WRITES`], read once.
+pub fn exit_after_ref_writes() -> Option<usize> {
+    static N: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var(EXIT_AFTER_REF_WRITES)
+            .ok()
+            .and_then(|v| v.parse().ok())
+    })
+}
+
+/// The refs a push moves, counting its ref writes for
+/// [`EXIT_AFTER_REF_WRITES`].
+struct PushRefs<'a> {
+    refs: &'a levcs_core::Refs,
+    written: std::cell::Cell<usize>,
+}
+
+impl<'a> PushRefs<'a> {
+    fn new(refs: &'a levcs_core::Refs) -> Self {
+        PushRefs {
+            refs,
+            written: std::cell::Cell::new(0),
+        }
+    }
+
+    fn wrote(&self) {
+        let n = self.written.get() + 1;
+        self.written.set(n);
+        if exit_after_ref_writes() == Some(n) {
+            tracing::warn!("exiting after a push's ref write {n}, as {EXIT_AFTER_REF_WRITES} says");
+            std::process::exit(EXITED_AFTER_REF_WRITES);
+        }
+    }
+}
+
+impl levcs_core::ref_tx::RefStore for PushRefs<'_> {
+    fn read(&self, name: &str) -> levcs_core::Result<Option<ObjectId>> {
+        self.refs.read(name)
+    }
+    fn write(&self, name: &str, id: ObjectId) -> levcs_core::Result<()> {
+        levcs_core::ref_tx::RefStore::write(self.refs, name, id)?;
+        self.wrote();
+        Ok(())
+    }
+    fn delete(&self, name: &str) -> levcs_core::Result<()> {
+        levcs_core::ref_tx::RefStore::delete(self.refs, name)?;
+        self.wrote();
+        Ok(())
+    }
+    fn begin(&self, changes: &[levcs_core::ref_tx::RefChange]) -> levcs_core::Result<()> {
+        self.refs.begin(changes)
+    }
+    fn pending(&self) -> levcs_core::Result<Option<Vec<levcs_core::ref_tx::RefChange>>> {
+        self.refs.pending()
+    }
+    fn end(&self) -> levcs_core::Result<()> {
+        self.refs.end()
+    }
 }
 
 /// The pushed objects over the store, read by admission before anything is
@@ -1739,10 +1808,43 @@ pub fn recover_interrupted_pushes(root: &std::path::Path) -> Vec<String> {
 }
 
 /// Helper used by tests and the binary's `main` to bind and serve.
+/// Serve until stopped. On SIGTERM, which `systemctl stop` sends, or
+/// Ctrl-C, no new request is taken and those in flight finish: a push the
+/// signal used to cut short was left for the next start to roll back.
 pub async fn serve(state: AppState, addr: std::net::SocketAddr) -> std::io::Result<()> {
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await
+    axum::serve(listener, app)
+        .with_graceful_shutdown(stop_requested())
+        .await?;
+    tracing::info!("stopped");
+    Ok(())
+}
+
+/// The first SIGTERM or Ctrl-C.
+async fn stop_requested() {
+    let interrupt = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                term.recv().await;
+            }
+            // Without the handler, SIGTERM still stops the process, as
+            // it always did; only the finishing of requests is lost.
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = interrupt => {}
+        _ = terminate => {}
+    }
+    tracing::info!("stopping: no new requests; finishing those in flight");
 }
 
 /// Walk into `tree_id` looking for `.levcs/merge-record` and return the blob

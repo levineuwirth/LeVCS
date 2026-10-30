@@ -130,6 +130,23 @@ The lock orders repository changes; it cannot say who wrote which lines of a
 file that several sessions edit at once, so scope each commit to the files its
 author wrote.
 
+When writers do share a file, such as an append-only log, a writer commits its
+own version of it instead of the working tree's:
+
+```sh
+head=$(levcs status --format json | jq -r .head)
+{ levcs show "${head}:log.md"; cat my-lines; } > /tmp/mine
+levcs commit --expect-head "$head" --content log.md=/tmp/mine -m "my entries"
+```
+
+`--content PATH=FILE` commits FILE's bytes as PATH, a tracked file, and leaves
+the working tree's PATH as it is. Other writers' lines stay uncommitted there,
+for them to commit under their own keys. `--expect-head` refuses the commit,
+under the repository lock, unless HEAD is still the commit the version was
+built from. Without it, a commit that landed in between would be undone. A
+refusal commits nothing and exits with status 5, so a caller can rebuild its
+version from the new HEAD and try again.
+
 `levcs verify` checks everything the repository keeps, not just HEAD.
 Every object reachable from any ref is hash-checked, and every commit and
 release is checked against the authority rules in

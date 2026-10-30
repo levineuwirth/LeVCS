@@ -114,6 +114,20 @@ pub struct CommitArgs {
     /// explicit spelling of it, and cannot be combined with paths.
     #[arg(long, conflicts_with = "paths")]
     pub all: bool,
+    /// Refuse unless HEAD is this commit, checked under the repository
+    /// lock. Nothing is committed, and the exit status is 5, if another
+    /// commit has landed since the caller read HEAD.
+    #[arg(long = "expect-head", value_name = "REV")]
+    pub expect_head: Option<String>,
+    /// Commit FILE's bytes as PATH, a tracked file, in place of what the
+    /// working tree holds there, and leave the working tree's PATH as it
+    /// is. A writer sharing a file commits its own version (HEAD's, plus
+    /// its own lines) and leaves other writers' lines uncommitted. Use with
+    /// --expect-head set to the commit the version was built from.
+    /// Repeatable; the commit is scoped to these paths and any others
+    /// named. The first `=` ends PATH.
+    #[arg(long = "content", value_name = "PATH=FILE", conflicts_with = "all")]
+    pub content: Vec<String>,
     /// Restrict the commit to these files or directories. Everything else
     /// keeps the content it has in HEAD and stays uncommitted.
     pub paths: Vec<PathBuf>,

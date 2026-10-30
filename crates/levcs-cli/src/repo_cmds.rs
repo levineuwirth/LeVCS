@@ -844,8 +844,22 @@ pub fn commit(args: CommitArgs) -> Result<()> {
     let (label, sk) = load_secret(args.key.as_deref())?;
     let pk = sk.public();
     let _ = label;
+    let mut content = given_content(&repo, &args.content)?;
     // Everything from here to the ref write reads and writes shared state.
     let _lock = lock_repo(&repo)?;
+
+    // A caller that built its commit from a HEAD it read earlier (with
+    // --content, HEAD's version of a file plus its own lines) names that
+    // HEAD. Checked under the lock, so nothing cooperating can move HEAD
+    // between here and the ref write; a commit landed since would otherwise
+    // be undone by this one.
+    if let Some(spec) = &args.expect_head {
+        let expected = crate::rev::resolve_rev(&repo, spec)?;
+        let actual = repo.refs.resolve_head()?;
+        if actual != Some(expected) {
+            return Err(HeadMoved { expected, actual }.into());
+        }
+    }
 
     // Authority is checked BEFORE the index is written. It used to be checked
     // after, which meant a rejected commit still persisted the staged index:
@@ -898,7 +912,25 @@ pub fn commit(args: CommitArgs) -> Result<()> {
     // Attribution is the entire point of signing a commit, and a commit that
     // had to sweep up someone else's unfinished edits in order to exist
     // attributes their work to you.
-    let restrict = normalize_paths(&repo, &args.paths)?;
+    let mut restrict = normalize_paths(&repo, &args.paths)?;
+    let given: Vec<String> = content.keys().cloned().collect();
+    for p in &given {
+        // Given content is for one file, which must be tracked: it replaces
+        // that file's version and adds nothing new.
+        if idx.find(p).is_none() {
+            if idx
+                .entries
+                .iter()
+                .any(|e| path_under(std::slice::from_ref(p), &e.path))
+            {
+                bail!("--content names a file, and '{p}' is a directory");
+            }
+            bail!("nothing tracked at '{p}'; `levcs track` it first");
+        }
+        if !restrict.contains(p) {
+            restrict.push(p.clone());
+        }
+    }
     for r in &restrict {
         // A path matching nothing tracked is an error rather than an empty
         // scope. A mistyped path that quietly commits nothing is the same
@@ -946,6 +978,27 @@ pub fn commit(args: CommitArgs) -> Result<()> {
     for e in &idx.entries {
         if !path_under(&restrict, &e.path) {
             new_entries.push(e.clone());
+            continue;
+        }
+        // Given content is committed in place of the working tree's, which
+        // is not read. The tracked executable bit is kept.
+        if let Some(bytes) = content.remove(&e.path) {
+            if has_conflict_markers(&bytes) {
+                bail!(
+                    "the content given for {} contains conflict markers; resolve before committing",
+                    e.path
+                );
+            }
+            let size = bytes.len() as u64;
+            let blob_id = repo.objects.write_raw(&Blob::new(bytes).serialize())?;
+            new_entries.push(IndexEntry {
+                path: e.path.clone(),
+                blob_hash: blob_id,
+                mode: e.mode,
+                flags: IndexEntryFlags::TRACKED,
+                mtime_micros: 0,
+                size,
+            });
             continue;
         }
         // Read without following a link. A tracked path that is now a link
@@ -1116,6 +1169,12 @@ pub fn commit(args: CommitArgs) -> Result<()> {
         // have been said.
         println!("scoped to {}", restrict.join(", "));
     }
+    if !given.is_empty() {
+        println!(
+            "committed the given content for {}; the working tree's copy is as it was",
+            given.join(", ")
+        );
+    }
     // Merge state goes before the index: left behind, it would make the next
     // commit a second merge; a stale index only makes `status` overstate.
     let mut problems = Vec::new();
@@ -1136,6 +1195,44 @@ pub fn commit(args: CommitArgs) -> Result<()> {
     }
     Ok(())
 }
+
+/// `commit --content PATH=FILE`, read: each repository-relative path and
+/// the bytes to commit as it. PATH resolves as every path argument does.
+fn given_content(repo: &Repository, specs: &[String]) -> Result<HashMap<String, Vec<u8>>> {
+    let mut out = HashMap::new();
+    for spec in specs {
+        let (path, file) = spec
+            .split_once('=')
+            .filter(|(p, f)| !p.is_empty() && !f.is_empty())
+            .ok_or_else(|| anyhow!("--content takes PATH=FILE, not '{spec}'"))?;
+        let rel = normalize_paths(repo, &[PathBuf::from(path)])?.remove(0);
+        let bytes = fs::read(file).with_context(|| format!("reading {file} for --content"))?;
+        if out.insert(rel.clone(), bytes).is_some() {
+            bail!("--content names '{rel}' more than once");
+        }
+    }
+    Ok(out)
+}
+
+/// `commit --expect-head` found HEAD at another commit. Nothing was
+/// committed.
+#[derive(Debug)]
+pub struct HeadMoved {
+    expected: ObjectId,
+    actual: Option<ObjectId>,
+}
+
+impl std::fmt::Display for HeadMoved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.actual {
+            Some(a) => write!(f, "HEAD is {a}, not {}", self.expected)?,
+            None => write!(f, "HEAD has no commits, not {}", self.expected)?,
+        }
+        write!(f, " as --expect-head expects; nothing was committed")
+    }
+}
+
+impl std::error::Error for HeadMoved {}
 
 /// The files of a tree as index entries, for building a tree that mixes
 /// HEAD's content with staged content. `.levcs/` is skipped: an index never

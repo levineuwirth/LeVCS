@@ -375,3 +375,201 @@ fn a_failed_commit_leaves_status_dirty() {
         "status claims clean after a failed commit:\n{status}"
     );
 }
+
+// --- writers sharing one file (issue #13) ------------------------------------
+//
+// A commit scoped to a path takes that path's whole working-tree content, so
+// when several writers append to one log, one writer's commit took another's
+// uncommitted lines, signed with the first writer's key. A writer now commits
+// its own version (`--content`), built from a HEAD it names
+// (`--expect-head`), and leaves the others' lines pending.
+
+/// HEAD's id, as `status --format json` gives it.
+fn head(work: &Path, cfg: &Path) -> String {
+    let s: serde_json::Value =
+        serde_json::from_str(&ok(work, cfg, &["status", "--format", "json"]))
+            .expect("status --format json");
+    s["head"].as_str().expect("HEAD").to_string()
+}
+
+/// Commit HEAD's `log.md` plus `line` as `log.md`, from the HEAD read first.
+fn append_commit(work: &Path, cfg: &Path, tag: &str, line: &str) -> Output {
+    let h = head(work, cfg);
+    let mut version = ok(work, cfg, &["show", &format!("{h}:log.md")]);
+    version.push_str(line);
+    let file = work.join(format!("../{tag}.version"));
+    std::fs::write(&file, version).unwrap();
+    levcs(
+        work,
+        cfg,
+        &[
+            "commit",
+            "--key",
+            "agent",
+            "-m",
+            tag,
+            "--expect-head",
+            &h,
+            "--content",
+            &format!("log.md={}", file.display()),
+        ],
+    )
+}
+
+fn shared_log(tag: &str) -> (PathBuf, PathBuf) {
+    let (work, cfg) = setup(tag);
+    std::fs::write(work.join("log.md"), "base\n").unwrap();
+    ok(&work, &cfg, &["track", "log.md"]);
+    ok(&work, &cfg, &["commit", "-m", "base", "--key", "owner"]);
+    (work, cfg)
+}
+
+#[test]
+fn a_writer_commits_its_own_lines_and_leaves_anothers_pending() {
+    let (work, cfg) = shared_log("own-lines");
+    // B appended and has not committed; then A appends.
+    std::fs::write(work.join("log.md"), "base\nB's line\nA's line\n").unwrap();
+    let o = append_commit(&work, &cfg, "a", "A's line\n");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    assert_eq!(
+        ok(&work, &cfg, &["show", "HEAD:log.md"]),
+        "base\nA's line\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(work.join("log.md")).unwrap(),
+        "base\nB's line\nA's line\n",
+        "the working tree's file was rewritten"
+    );
+    // B's line is still pending, and only B's line.
+    let d: serde_json::Value =
+        serde_json::from_str(&ok(&work, &cfg, &["diff", "--format", "json"])).unwrap();
+    let lines: Vec<(&str, &str)> = d["files"][0]["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| (l["op"].as_str().unwrap(), l["text"].as_str().unwrap()))
+        .collect();
+    assert_eq!(lines, [("+", "B's line\n")]);
+    let s: serde_json::Value =
+        serde_json::from_str(&ok(&work, &cfg, &["status", "--format", "json"])).unwrap();
+    assert_eq!(s["modified"], serde_json::json!(["log.md"]));
+}
+
+#[test]
+fn expect_head_refuses_a_commit_built_on_a_head_that_has_moved() {
+    let (work, cfg) = shared_log("moved");
+    let stale = head(&work, &cfg);
+    std::fs::write(work.join("log.md"), "base\nlanded\n").unwrap();
+    ok(&work, &cfg, &["commit", "-m", "landed", "--key", "owner"]);
+    let landed = head(&work, &cfg);
+
+    // A version built from the stale HEAD would drop the landed line.
+    let file = work.join("../stale.version");
+    std::fs::write(&file, "base\nmine\n").unwrap();
+    let o = levcs(
+        &work,
+        &cfg,
+        &[
+            "commit",
+            "--key",
+            "agent",
+            "-m",
+            "stale",
+            "--expect-head",
+            &stale,
+            "--content",
+            &format!("log.md={}", file.display()),
+        ],
+    );
+    assert_eq!(
+        o.status.code(),
+        Some(5),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(String::from_utf8_lossy(&o.stderr).contains("nothing was committed"));
+    assert_eq!(head(&work, &cfg), landed);
+    assert_eq!(ok(&work, &cfg, &["show", "HEAD:log.md"]), "base\nlanded\n");
+}
+
+#[test]
+fn concurrent_writers_appending_to_one_log_each_commit_exactly_their_line() {
+    let (work, cfg) = shared_log("append");
+    const N: usize = 4;
+    let handles: Vec<_> = (0..N)
+        .map(|i| {
+            let (w, c) = (work.clone(), cfg.clone());
+            std::thread::spawn(move || {
+                let line = format!("writer {i}\n");
+                {
+                    use std::io::Write;
+                    let mut f = std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(w.join("log.md"))
+                        .unwrap();
+                    f.write_all(line.as_bytes()).unwrap();
+                }
+                // Retry from the new HEAD for as long as another writer's
+                // commit lands first.
+                for _ in 0..50 {
+                    let o = append_commit(&w, &c, &format!("w{i}"), &line);
+                    match o.status.code() {
+                        Some(0) => return Ok(()),
+                        Some(5) => continue,
+                        _ => return Err(String::from_utf8_lossy(&o.stderr).into_owned()),
+                    }
+                }
+                Err("HEAD kept moving".into())
+            })
+        })
+        .collect();
+    for (i, h) in handles.into_iter().enumerate() {
+        if let Err(e) = h.join().unwrap() {
+            panic!("writer {i}: {e}");
+        }
+    }
+    let committed = ok(&work, &cfg, &["show", "HEAD:log.md"]);
+    let mut lines: Vec<&str> = committed.lines().collect();
+    lines.sort();
+    let mut want = vec!["base".to_string()];
+    want.extend((0..N).map(|i| format!("writer {i}")));
+    want.sort();
+    assert_eq!(
+        lines, want,
+        "each line committed exactly once:\n{committed}"
+    );
+    // One commit per writer, each touching only the log.
+    let log = ok(&work, &cfg, &["log", "--name-status"]);
+    assert_eq!(log.matches("M\tlog.md").count(), N, "{log}");
+}
+
+#[test]
+fn content_is_refused_for_what_it_cannot_replace() {
+    let (work, cfg) = shared_log("refused");
+    std::fs::create_dir(work.join("dir")).unwrap();
+    std::fs::write(work.join("dir/x.md"), "x\n").unwrap();
+    ok(&work, &cfg, &["track", "dir/x.md"]);
+    let file = work.join("../given");
+    std::fs::write(&file, "given\n").unwrap();
+    let f = file.display().to_string();
+    for (spec, why) in [
+        (
+            format!("untracked.md={f}"),
+            "nothing tracked at 'untracked.md'",
+        ),
+        (format!("dir={f}"), "'dir' is a directory"),
+        ("log.md".to_string(), "takes PATH=FILE"),
+        (format!("log.md={f}.missing"), "for --content"),
+    ] {
+        let o = levcs(
+            &work,
+            &cfg,
+            &["commit", "--key", "agent", "-m", "x", "--content", &spec],
+        );
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(!o.status.success(), "{spec} was committed");
+        assert!(err.contains(why), "{spec}: {err}");
+    }
+    assert_eq!(ok(&work, &cfg, &["show", "HEAD:log.md"]), "base\n");
+}

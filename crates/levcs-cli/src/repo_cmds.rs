@@ -340,44 +340,84 @@ pub fn forget(args: ForgetArgs) -> Result<()> {
 // status / log
 // ---------------------------------------------------------------------------
 
-pub fn status() -> Result<()> {
+/// Whether `--format` asks for JSON. Anything but `text` and `json` is
+/// refused, so a typo is not read as a request for the human format.
+fn is_json(format: &str) -> Result<bool> {
+    match format {
+        "text" => Ok(false),
+        "json" => Ok(true),
+        other => bail!("unknown --format value: {other} (allowed: text, json)"),
+    }
+}
+
+/// `status --format json`. The groups are `status`'s, by the same names; a
+/// path can be in more than one (staged, and modified since).
+#[derive(serde::Serialize)]
+struct JsonStatus<'a> {
+    /// Schema tag — bumped when the output format changes incompatibly.
+    schema_version: u32,
+    /// None when HEAD is detached.
+    branch: Option<&'a str>,
+    /// None before the first commit.
+    head: Option<String>,
+    release: Option<JsonRelease>,
+    merge: Option<JsonMerge>,
+    conflicted: Vec<&'a str>,
+    new: &'a [String],
+    staged: &'a [String],
+    forgotten: &'a [String],
+    modified: &'a [String],
+    deleted: &'a [String],
+    replaced: &'a [String],
+    untracked: &'a [String],
+    symlinks: &'a [String],
+    clean: bool,
+}
+
+#[derive(serde::Serialize)]
+struct JsonRelease {
+    label: String,
+    id: String,
+}
+
+#[derive(serde::Serialize)]
+struct JsonMerge {
+    theirs: String,
+    /// True when the merge is already in HEAD and only its state is left.
+    committed: bool,
+}
+
+pub fn status(args: StatusArgs) -> Result<()> {
+    let json = is_json(&args.format)?;
     let repo = open_repo()?;
     let idx = load_index(&repo)?;
     let head = repo.refs.resolve_head()?;
     let branch_ref = repo.current_branch()?;
     let branch = branch_ref
         .as_deref()
-        .map(|s| s.trim_start_matches("refs/branches/").to_string())
-        .unwrap_or_else(|| "(detached)".into());
-    println!("On branch {branch}");
+        .map(|s| s.trim_start_matches("refs/branches/"));
     let mut head_tree = None;
+    let mut subject = String::new();
     if let Some(h) = head {
         let signed = repo.read_signed(h)?;
         let commit = Commit::from_signed(&signed)?;
         head_tree = Some(commit.tree);
-        let subject = commit.message.lines().next().unwrap_or("").to_string();
-        println!("HEAD       {h}");
-        if !subject.is_empty() {
-            println!("           {subject}");
-        }
-    } else {
-        println!("(no commits yet)");
+        subject = commit.message.lines().next().unwrap_or("").to_string();
     }
     let releases = repo.refs.list_releases()?;
-    if let Some((label, id)) = releases.last() {
-        println!("Release    {label} ({id})");
-    }
-    if repo.levcs_dir.join("MERGE_HEAD").exists() {
+    let release = releases.last().map(|(label, id)| JsonRelease {
+        label: label.clone(),
+        id: id.to_hex(),
+    });
+    let merge = if repo.levcs_dir.join("MERGE_HEAD").exists() {
         let mh = fs::read_to_string(repo.levcs_dir.join("MERGE_HEAD"))?;
-        if stale_merge_head(&repo)?.is_some() {
-            println!(
-                "Merge      already committed in HEAD (theirs={}); the next commit or merge clears its leftover state",
-                mh.trim()
-            );
-        } else {
-            println!("Merge      in progress (theirs={})", mh.trim());
-        }
-    }
+        Some(JsonMerge {
+            theirs: mh.trim().to_string(),
+            committed: stale_merge_head(&repo)?.is_some(),
+        })
+    } else {
+        None
+    };
     // Every tracked path is read where it is, ignored or not, and nothing is
     // read through a link. Only the ignore-filtered walk used to be looked
     // at, so a tracked file matching an ignore pattern was reported deleted.
@@ -428,6 +468,58 @@ pub fn status() -> Result<()> {
         .map(|e| e.path.as_str())
         .collect();
     conflicted.sort();
+    let clean = new.is_empty()
+        && staged.is_empty()
+        && forgotten.is_empty()
+        && modified.is_empty()
+        && deleted.is_empty()
+        && replaced.is_empty()
+        && untracked.is_empty()
+        && links.is_empty()
+        && conflicted.is_empty();
+    if json {
+        let report = JsonStatus {
+            schema_version: 1,
+            branch,
+            head: head.map(|h| h.to_hex()),
+            release,
+            merge,
+            conflicted,
+            new: &new,
+            staged: &staged,
+            forgotten: &forgotten,
+            modified: &modified,
+            deleted: &deleted,
+            replaced: &replaced,
+            untracked: &untracked,
+            symlinks: &links,
+            clean,
+        };
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    println!("On branch {}", branch.unwrap_or("(detached)"));
+    match head {
+        Some(h) => {
+            println!("HEAD       {h}");
+            if !subject.is_empty() {
+                println!("           {subject}");
+            }
+        }
+        None => println!("(no commits yet)"),
+    }
+    if let Some(r) = &release {
+        println!("Release    {} ({})", r.label, r.id);
+    }
+    match &merge {
+        Some(m) if m.committed => println!(
+            "Merge      already committed in HEAD (theirs={}); the next commit or merge clears its leftover state",
+            m.theirs
+        ),
+        Some(m) => println!("Merge      in progress (theirs={})", m.theirs),
+        None => {}
+    }
     if !conflicted.is_empty() {
         println!("\nunresolved conflicts (commit refuses until each is resolved):");
         for c in &conflicted {
@@ -483,16 +575,7 @@ pub fn status() -> Result<()> {
             println!("  {l}");
         }
     }
-    if new.is_empty()
-        && staged.is_empty()
-        && forgotten.is_empty()
-        && modified.is_empty()
-        && deleted.is_empty()
-        && replaced.is_empty()
-        && untracked.is_empty()
-        && links.is_empty()
-        && conflicted.is_empty()
-    {
+    if clean {
         println!("\nworking tree clean.");
     }
     Ok(())
@@ -1112,6 +1195,7 @@ pub fn construct(args: ConstructArgs) -> Result<()> {
 }
 
 pub fn diff(args: DiffArgs) -> Result<()> {
+    let json = is_json(&args.format)?;
     let repo = open_repo()?;
     let head = repo.refs.resolve_head()?;
     // Fold a non-hex "commit" positional into the path restriction list.
@@ -1206,23 +1290,81 @@ pub fn diff(args: DiffArgs) -> Result<()> {
     let mut keys: Vec<&String> = baseline.keys().chain(work.keys()).collect();
     keys.sort();
     keys.dedup();
-    for k in &unreadable {
-        if path_matches(k) {
-            println!(
-                "--- a/{k}\n+++ b/{k}\n# not a regular file now; levcs neither follows nor \
-                 records links"
+    // A file is changed if either side's content differs or it is on one
+    // side only. Comparing contents alone passed over an empty file added
+    // or deleted.
+    keys.retain(|k| path_matches(k) && !unreadable.contains(k) && baseline.get(*k) != work.get(*k));
+    unreadable.retain(|k| path_matches(k));
+
+    if json {
+        let blob_id = |b: Option<&Vec<u8>>| b.map(|b| Blob::new(b.clone()).object_id().to_hex());
+        let mut files: Vec<JsonDiffFile> = unreadable
+            .iter()
+            .map(|k| JsonDiffFile {
+                path: k.clone(),
+                change: "not_regular",
+                old_blob: blob_id(baseline.get(k)),
+                new_blob: None,
+                binary: false,
+                lines: Vec::new(),
+            })
+            .collect();
+        for k in keys {
+            let (a, b) = (baseline.get(k), work.get(k));
+            let change = match (a, b) {
+                (None, _) => "added",
+                (_, None) => "deleted",
+                _ => "modified",
+            };
+            let empty = Vec::new();
+            let (a_s, b_s) = (
+                std::str::from_utf8(a.unwrap_or(&empty)),
+                std::str::from_utf8(b.unwrap_or(&empty)),
             );
+            let mut lines = Vec::new();
+            if let (Ok(a_s), Ok(b_s)) = (a_s, b_s) {
+                for change in TextDiff::from_lines(a_s, b_s).iter_all_changes() {
+                    let op = match change.tag() {
+                        ChangeTag::Equal => continue,
+                        ChangeTag::Insert => "+",
+                        ChangeTag::Delete => "-",
+                    };
+                    lines.push(JsonDiffLine {
+                        op,
+                        old_line: change.old_index().map(|i| i + 1),
+                        new_line: change.new_index().map(|i| i + 1),
+                        text: change.value().to_string(),
+                    });
+                }
+            }
+            files.push(JsonDiffFile {
+                path: k.clone(),
+                change,
+                old_blob: blob_id(a),
+                new_blob: blob_id(b),
+                binary: a_s.is_err() || b_s.is_err(),
+                lines,
+            });
         }
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        let report = JsonDiff {
+            schema_version: 1,
+            baseline: (!baseline_tree.is_zero()).then(|| baseline_tree.to_hex()),
+            files,
+        };
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    for k in &unreadable {
+        println!(
+            "--- a/{k}\n+++ b/{k}\n# not a regular file now; levcs neither follows nor \
+             records links"
+        );
     }
     for k in keys {
-        if !path_matches(k) || unreadable.contains(k) {
-            continue;
-        }
         let a = baseline.get(k).cloned().unwrap_or_default();
         let b = work.get(k).cloned().unwrap_or_default();
-        if a == b {
-            continue;
-        }
         println!("--- a/{k}\n+++ b/{k}");
         let a_s = String::from_utf8_lossy(&a);
         let b_s = String::from_utf8_lossy(&b);
@@ -1234,9 +1376,54 @@ pub fn diff(args: DiffArgs) -> Result<()> {
                 ChangeTag::Delete => "-",
             };
             print!("{prefix}{}", change.value());
+            // Every printed line ends. A file's last line that has no
+            // ending used to run into the next line, or the next file's
+            // header, so `-b` and `+b` printed as `-b+b`. It is marked on a
+            // line of its own instead, as unified diff marks it.
+            if change.missing_newline() {
+                println!("\n\\ No newline at end of file");
+            }
         }
     }
     Ok(())
+}
+
+/// `diff --format json`.
+#[derive(serde::Serialize)]
+struct JsonDiff {
+    /// Schema tag — bumped when the output format changes incompatibly.
+    schema_version: u32,
+    /// The tree the working tree is compared with; None before the first
+    /// commit.
+    baseline: Option<String>,
+    files: Vec<JsonDiffFile>,
+}
+
+#[derive(serde::Serialize)]
+struct JsonDiffFile {
+    path: String,
+    /// One of "added", "deleted", "modified", "not_regular" (a link or
+    /// other non-file where the baseline or the index has a file).
+    change: &'static str,
+    /// The blob id of each side's content; None on the side without it.
+    old_blob: Option<String>,
+    new_blob: Option<String>,
+    /// Either side is not UTF-8, so `lines` is empty.
+    binary: bool,
+    /// The lines added and removed, in order. Unchanged lines are left out.
+    lines: Vec<JsonDiffLine>,
+}
+
+#[derive(serde::Serialize)]
+struct JsonDiffLine {
+    /// "+" or "-".
+    op: &'static str,
+    /// 1-based line numbers in the baseline and in the working tree; each
+    /// is None on the side the line is not on.
+    old_line: Option<usize>,
+    new_line: Option<usize>,
+    /// The line as it is in the file, with its line ending if it has one.
+    text: String,
 }
 
 fn collect_tree_files(
@@ -1558,13 +1745,7 @@ fn merge_run(args: MergeArgs) -> Result<()> {
         paths.insert(k.clone());
     }
 
-    let json_mode = args.format == "json";
-    if !json_mode && args.format != "text" {
-        bail!(
-            "unknown --format value: {} (allowed: text, json)",
-            args.format
-        );
-    }
+    let json_mode = is_json(&args.format)?;
     let mut auto_resolved = 0usize;
     let mut conflict_count = 0usize;
     let mut merged_files: HashMap<String, Vec<u8>> = HashMap::new();

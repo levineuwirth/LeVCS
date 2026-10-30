@@ -52,7 +52,7 @@ fn run() -> Result<()> {
         cli::Cmd::Merge(a) => repo_cmds::merge(a),
         cli::Cmd::Release(a) => repo_cmds::release(a),
         cli::Cmd::Cache(a) => repo_cmds::cache(a),
-        cli::Cmd::Status => repo_cmds::status(),
+        cli::Cmd::Status(a) => repo_cmds::status(a),
         cli::Cmd::Log(a) => repo_cmds::log(a),
         cli::Cmd::Root => repo_cmds::root(),
         cli::Cmd::Verify => repo_cmds::verify(),

@@ -34,7 +34,7 @@ pub enum Cmd {
     /// Manage cached working-tree states.
     Cache(CacheArgs),
     /// Show working-tree status.
-    Status,
+    Status(StatusArgs),
     /// Show commit history.
     Log(LogArgs),
     /// Print the absolute path of the repository root.
@@ -130,8 +130,21 @@ pub struct ConstructArgs {
 pub struct DiffArgs {
     #[arg(long)]
     pub release: bool,
+    /// Output format. `text` (default) is for people. `json` is one object
+    /// on stdout: each changed file, its blob ids, and each line added or
+    /// removed with its line number and its line ending, if it has one.
+    #[arg(long = "format", default_value = "text")]
+    pub format: String,
     pub commit: Option<String>,
     pub paths: Vec<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct StatusArgs {
+    /// Output format. `text` (default) is for people. `json` is one object
+    /// on stdout, with HEAD's id and each group of paths `text` lists.
+    #[arg(long = "format", default_value = "text")]
+    pub format: String,
 }
 
 #[derive(Args, Debug)]

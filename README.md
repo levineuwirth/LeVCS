@@ -265,6 +265,13 @@ path, and so is a name like `notes~` whose base is not a ref. If a bare prefix
 matches a commit *and* a file in the current directory, the command refuses
 and asks you to write `./name` for the file.
 
+`status --format json` and `diff --format json` print one JSON object for
+tools, as `merge --format json` does. `status` gives HEAD's id and each group
+of paths it lists. `diff` gives each changed file, the blob id of each side,
+and each line added or removed, with its line number and its line ending, if
+it has one. The text `diff` ends every line, and marks a last line without an
+ending with `\ No newline at end of file`.
+
 Branch and merge — note that creating a branch and switching to it are
 separate operations, so a commit cannot land on a branch you only meant to
 make:

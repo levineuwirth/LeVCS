@@ -37,6 +37,9 @@ pub enum Cmd {
     Status(StatusArgs),
     /// Show commit history.
     Log(LogArgs),
+    /// Print a file as it is at a revision, or a commit and the paths it
+    /// changed. Writes nothing.
+    Show(ShowArgs),
     /// Print the absolute path of the repository root.
     Root,
     /// Verify every object reachable from any ref, and the authority rules
@@ -217,6 +220,20 @@ pub struct LogArgs {
     pub release: bool,
     #[arg(long)]
     pub since: Option<String>,
+    /// List each commit's paths against its first parent, marked A (added),
+    /// M (modified) or D (deleted).
+    #[arg(long = "name-status")]
+    pub name_status: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct ShowArgs {
+    /// `<rev>`: a commit's metadata and its paths against its first parent,
+    /// marked A, M or D (a release's metadata; a blob's content).
+    /// `<rev>:<path>`: the file's content at that revision, byte for byte,
+    /// or a directory's entries. The path is relative to the current
+    /// directory, as every path argument is. Defaults to HEAD.
+    pub spec: Option<String>,
 }
 
 #[derive(Args, Debug)]

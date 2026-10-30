@@ -54,6 +54,7 @@ fn run() -> Result<()> {
         cli::Cmd::Cache(a) => repo_cmds::cache(a),
         cli::Cmd::Status(a) => repo_cmds::status(a),
         cli::Cmd::Log(a) => repo_cmds::log(a),
+        cli::Cmd::Show(a) => repo_cmds::show(a),
         cli::Cmd::Root => repo_cmds::root(),
         cli::Cmd::Verify => repo_cmds::verify(),
         cli::Cmd::Gc(a) => repo_cmds::gc(a),

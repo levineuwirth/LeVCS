@@ -581,7 +581,7 @@ pub fn status(args: StatusArgs) -> Result<()> {
     Ok(())
 }
 
-pub fn log(_args: LogArgs) -> Result<()> {
+pub fn log(args: LogArgs) -> Result<()> {
     let repo = open_repo()?;
     let head = repo
         .refs
@@ -592,26 +592,133 @@ pub fn log(_args: LogArgs) -> Result<()> {
     while count < 100 {
         let signed = repo.read_signed(id)?;
         let commit = Commit::from_signed(&signed)?;
-        let pk = PublicKey(commit.author_key);
-        println!("commit {}", id);
-        println!("Author: {}", pk);
-        println!("Date:   {} (us since epoch)", commit.timestamp_micros);
-        if commit.flags.modifies_authority() {
-            println!("Flags:  authority-modifying");
+        print_commit(id, &commit);
+        if args.name_status && print_name_status(&repo, &commit)? {
+            println!();
         }
-        if commit.flags.is_fork() {
-            println!("Flags:  fork");
-        }
-        println!();
-        for line in commit.message.lines() {
-            println!("    {line}");
-        }
-        println!();
         if commit.parents.is_empty() {
             break;
         }
         id = commit.parents[0];
         count += 1;
+    }
+    Ok(())
+}
+
+/// A commit as `log` and `show` print it: id, the parents of a merge,
+/// author, date, flags, and message.
+fn print_commit(id: ObjectId, commit: &Commit) {
+    println!("commit {}", id);
+    if commit.parents.len() > 1 {
+        let parents: Vec<String> = commit.parents.iter().map(|p| p.to_hex()).collect();
+        println!("Merge:  {}", parents.join(" "));
+    }
+    println!("Author: {}", PublicKey(commit.author_key));
+    println!("Date:   {} (us since epoch)", commit.timestamp_micros);
+    if commit.flags.modifies_authority() {
+        println!("Flags:  authority-modifying");
+    }
+    if commit.flags.is_fork() {
+        println!("Flags:  fork");
+    }
+    println!();
+    for line in commit.message.lines() {
+        println!("    {line}");
+    }
+    println!();
+}
+
+/// Print the files `commit` changed against its first parent (against
+/// nothing for a root commit), one `<A|M|D>\t<path>` line each; whether it
+/// printed any. A merge is compared with its first parent, so it lists what
+/// the merge brought into the branch.
+fn print_name_status(repo: &Repository, commit: &Commit) -> Result<bool> {
+    let parent_tree = match commit.parents.first() {
+        Some(p) => Some(Commit::from_signed(&repo.read_signed(*p)?)?.tree),
+        None => None,
+    };
+    let changes = repo.diff_trees(parent_tree, Some(commit.tree))?;
+    for (path, change) in &changes {
+        println!("{}\t{path}", change.letter());
+    }
+    Ok(!changes.is_empty())
+}
+
+/// `show [<rev>[:<path>]]`. It reads the object store only: nothing in the
+/// working tree, the index or a ref is written. `construct` was the only
+/// way to see a file at a revision, and it writes that revision into the
+/// working tree, over whatever uncommitted work the file held.
+pub fn show(args: ShowArgs) -> Result<()> {
+    use std::io::Write;
+    let repo = open_repo()?;
+    let spec = args.spec.as_deref().unwrap_or("HEAD");
+    // The first `:` ends the revision, and the path may hold more. A branch
+    // whose name holds a `:` is named here by its id.
+    let (rev, path) = match spec.split_once(':') {
+        Some((rev, path)) => (rev, Some(path)),
+        None => (spec, None),
+    };
+    let id = crate::rev::resolve_rev(&repo, rev)?;
+    let raw = repo.read_raw_object(id)?;
+    let tree = match (raw.object_type, path) {
+        (ObjectType::Commit, None) => {
+            let commit = Commit::parse_body(&raw.body)?;
+            print_commit(id, &commit);
+            print_name_status(&repo, &commit)?;
+            return Ok(());
+        }
+        (ObjectType::Release, None) => {
+            let release = Release::parse_body(&raw.body)?;
+            println!("release {id}");
+            println!("Label:  {}", release.label);
+            println!("Commit: {}", release.predecessor);
+            println!("Author: {}", PublicKey(release.declarer_key));
+            println!("Date:   {} (us since epoch)", release.timestamp_micros);
+            println!();
+            for line in release.notes.lines() {
+                println!("    {line}");
+            }
+            return Ok(());
+        }
+        (ObjectType::Blob, None) => {
+            std::io::stdout().write_all(&raw.body)?;
+            return Ok(());
+        }
+        (ObjectType::Commit, Some(_)) => Commit::parse_body(&raw.body)?.tree,
+        (ObjectType::Release, Some(_)) => Release::parse_body(&raw.body)?.tree,
+        (ObjectType::Tree, _) => id,
+        (other, _) => bail!("cannot show a {} object", other.name()),
+    };
+    let rel = match path {
+        Some(p) => normalize_paths(&repo, &[PathBuf::from(p)])?.remove(0),
+        None => String::new(),
+    };
+    let (kind, hash) = if rel.is_empty() {
+        (levcs_core::EntryType::Tree, tree)
+    } else {
+        let e = repo
+            .lookup_entry(tree, &rel)?
+            .ok_or_else(|| anyhow!("nothing at '{rel}' in {rev}"))?;
+        (e.entry_type, e.hash)
+    };
+    match kind {
+        levcs_core::EntryType::Blob => {
+            let blob = repo.read_blob(hash, &mut levcs_core::repo::ContentBudget::default())?;
+            std::io::stdout().write_all(&blob.body)?;
+        }
+        // A directory's entries, one level, a subdirectory marked with `/`.
+        levcs_core::EntryType::Tree => {
+            let raw = repo.objects.read_typed(hash, ObjectType::Tree)?;
+            for e in Tree::parse_body(&raw.body)?.entries {
+                if rel.is_empty() && e.name == ".levcs" {
+                    continue;
+                }
+                match e.entry_type {
+                    levcs_core::EntryType::Tree => println!("{}/", e.name),
+                    levcs_core::EntryType::Blob => println!("{}", e.name),
+                }
+            }
+        }
     }
     Ok(())
 }

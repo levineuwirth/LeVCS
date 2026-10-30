@@ -184,11 +184,21 @@ A switch carries over edits to files both branches have alike, and removes
 the committed files the target lacks. The refusal names each path and why
 it is not committed.
 
+`construct` refuses in the same way. A file is safe to write if it is
+missing, holds what HEAD has, or already holds the revision's version.
+Anything else is work only the working tree holds: an edit, a staged
+version, a change to the executable bit, an untracked file, or a link. The
+refusal names each such path, whether it was named or is part of a
+whole-tree construct, and nothing is written. `--force` overwrites them
+and lists what it overwrote. This includes going back to HEAD after
+constructing an older version: that version is in history, but it is not
+HEAD's, and `status` reports the file as modified too.
+
 `status` lists the same work. First comes what the index holds that HEAD
 does not: new files, staged changes, and files no longer tracked. Then come
 edits and deletions since a file was last tracked or committed. A staged
 path stays refused until it is committed, or put back with
-`levcs construct HEAD <path>` and staged as committed with
+`levcs construct --force HEAD <path>` and staged as committed with
 `levcs track <path>`.
 
 Symlinks are never followed and never recorded. A link committed as its
@@ -285,12 +295,13 @@ path, and so is a name like `notes~` whose base is not a ref. If a bare prefix
 matches a commit *and* a file in the current directory, the command refuses
 and asks you to write `./name` for the file.
 
-`construct` writes the working tree, over whatever uncommitted work the file
-holds; to read history, use `show`, which writes nothing. `show <rev>:<path>`
-prints the file's bytes as they are at that revision, or a directory's
-entries. `show <rev>` prints the commit and the paths it changed against its
-first parent, marked `A`, `M` or `D`; `log --name-status` does the same for
-each commit in the log. A change to the executable bit alone is an `M`.
+`construct` writes the working tree, and without `--force` refuses to write
+over work that is not committed; to read history, use `show`, which writes
+nothing. `show <rev>:<path>` prints the file's bytes as they are at that
+revision, or a directory's entries. `show <rev>` prints the commit and the
+paths it changed against its first parent, marked `A`, `M` or `D`;
+`log --name-status` does the same for each commit in the log. A change to
+the executable bit alone is an `M`.
 
 `status --format json` and `diff --format json` print one JSON object for
 tools, as `merge --format json` does. `status` gives HEAD's id and each group

@@ -5,6 +5,8 @@
 //!   A fast-forward wrote over untracked files and staged changes. A merge
 //!   wrote over an untracked file where the other side added one. These
 //!   are the audit's `audit_worktree` reproductions.
+//!   `construct` wrote a revision over all of these, and over links,
+//!   without a word; it now refuses unless told `--force`.
 //! - **Symlinks.** Every read followed them, so a link to a file outside
 //!   the repository committed that file's bytes. levcs now neither follows
 //!   nor records links (the author's decision, after Fossil's).
@@ -160,7 +162,7 @@ fn a_switch_refuses_to_overwrite_an_uncommitted_edit() {
     assert_eq!(r.read("data.json"), "uncommitted valuable work");
     assert_eq!(r.head(), head);
     // Put back as committed, the same switch goes through.
-    r.ok(&["construct", "HEAD", "data.json"]);
+    r.ok(&["construct", "--force", "HEAD", "data.json"]);
     r.ok(&["branch", "--switch", "feature"]);
     assert_eq!(r.read("data.json"), "{\"v\":1}\n");
 }
@@ -206,7 +208,7 @@ fn a_switch_refuses_staged_work_it_would_overwrite_and_carries_the_rest() {
     assert!(e.contains("data.json") && e.contains("staged"), "{e}");
     assert_eq!(r.read("data.json"), "{\"v\":\"staged\"}\n");
 
-    r.ok(&["construct", "HEAD", "data.json"]);
+    r.ok(&["construct", "--force", "HEAD", "data.json"]);
     r.ok(&["track", "data.json"]);
     r.write("notes.md", "staged notes\n");
     r.ok(&["track", "notes.md"]);
@@ -279,6 +281,87 @@ fn a_three_way_merge_refuses_to_overwrite_an_untracked_file() {
     assert!(e.contains("new.txt") && e.contains("untracked"), "{e}");
     assert_eq!(r.read("new.txt"), "mine, untracked\n");
     assert!(!r.work.join(".levcs/MERGE_HEAD").exists());
+}
+
+/// `construct` wrote a revision over whatever the file held. It was also
+/// the only way to read a file at a revision, so reading history destroyed
+/// work (issue #12).
+#[test]
+fn construct_refuses_to_overwrite_an_uncommitted_edit() {
+    let r = diverged("construct-edit");
+    r.write("data.json", "uncommitted valuable work");
+    let e = r.refused(&["construct", "feature^0", "data.json"]);
+    assert_eq!(named(&e), ["data.json"], "{e}");
+    assert!(
+        e.contains("changed and not committed") && e.contains("--force"),
+        "{e}"
+    );
+    assert_eq!(r.read("data.json"), "uncommitted valuable work");
+
+    let out = r.ok(&["construct", "--force", "feature^0", "data.json"]);
+    assert_eq!(r.read("data.json"), "{\"v\":1}\n");
+    assert!(
+        out.contains("overwrote") && out.contains("data.json"),
+        "{out}"
+    );
+}
+
+/// The whole-tree form is checked whole: one edited file refuses it, and
+/// nothing else is written.
+#[test]
+fn a_whole_tree_construct_refuses_and_writes_nothing() {
+    let r = diverged("construct-tree");
+    r.write("notes.md", "edited, not committed\n");
+    let e = r.refused(&["construct", "feature^0"]);
+    assert_eq!(named(&e), ["notes.md"], "{e}");
+    assert_eq!(r.read("notes.md"), "edited, not committed\n");
+    assert_eq!(
+        r.read("data.json"),
+        "{\"v\":0}\n",
+        "a refused construct wrote"
+    );
+    assert!(
+        !r.work.join("new.txt").exists(),
+        "a refused construct wrote"
+    );
+}
+
+/// Staged work, an untracked file where the revision has one, and a link
+/// are refused as a switch refuses them.
+#[test]
+fn construct_refuses_staged_work_an_untracked_file_and_a_link() {
+    let r = diverged("construct-kinds");
+    r.write("data.json", "{\"v\":\"staged\"}\n");
+    r.ok(&["track", "data.json"]);
+    r.write("new.txt", "mine, untracked\n");
+    std::fs::write(r.outside.join("secret"), "outside\n").unwrap();
+    std::fs::remove_file(r.work.join("notes.md")).unwrap();
+    symlink(r.outside.join("secret"), r.work.join("notes.md")).unwrap();
+    let e = r.refused(&["construct", "feature^0", "data.json", "new.txt", "notes.md"]);
+    assert_eq!(named(&e), ["data.json", "new.txt", "notes.md"], "{e}");
+    assert!(e.contains("not in HEAD") && e.contains("symlink"), "{e}");
+    assert_eq!(r.read("data.json"), "{\"v\":\"staged\"}\n");
+    assert_eq!(r.read("new.txt"), "mine, untracked\n");
+    assert!(std::fs::symlink_metadata(r.work.join("notes.md"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+/// What loses nothing needs no --force: a file as HEAD has it, a file
+/// already as the revision has it, and a missing file.
+#[test]
+fn construct_writes_without_force_where_nothing_is_lost() {
+    let r = diverged("construct-free");
+    r.ok(&["construct", "feature^0", "data.json"]);
+    assert_eq!(r.read("data.json"), "{\"v\":1}\n");
+    r.ok(&["construct", "feature^0", "data.json"]);
+    std::fs::remove_file(r.work.join("notes.md")).unwrap();
+    r.ok(&["construct", "HEAD", "notes.md"]);
+    assert_eq!(r.read("notes.md"), "notes\n");
+    // data.json now holds feature's version, which HEAD does not have.
+    let e = r.refused(&["construct", "HEAD", "data.json"]);
+    assert_eq!(named(&e), ["data.json"], "{e}");
 }
 
 // Symlinks: never followed, never recorded.

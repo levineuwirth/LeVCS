@@ -52,8 +52,8 @@ fn construct_restricted_to_paths_only_rewrites_those_files() {
     std::fs::write(work.join("a.txt"), b"a dirty\n").unwrap();
     std::fs::write(work.join("b.txt"), b"b dirty\n").unwrap();
 
-    // Restore only a.txt from HEAD.
-    let (code, _, e) = run(&["construct", "a.txt"], &work, &xdg);
+    // Restore only a.txt from HEAD, discarding its edit.
+    let (code, _, e) = run(&["construct", "--force", "a.txt"], &work, &xdg);
     assert_eq!(code, 0, "construct a.txt: {e}");
     assert_eq!(
         std::fs::read_to_string(work.join("a.txt")).unwrap(),
@@ -77,9 +77,9 @@ fn construct_release_default_uses_latest_release() {
     std::fs::write(work.join("a.txt"), b"v2\n").unwrap();
     assert_eq!(run(&["commit", "-m", "v2"], &work, &xdg).0, 0);
 
-    // Dirty the working tree, then construct --release: should restore to 1.0.0.
+    // Dirty the working tree, then construct --force --release: should restore to 1.0.0.
     std::fs::write(work.join("a.txt"), b"dirty\n").unwrap();
-    let (code, _, e) = run(&["construct", "--release"], &work, &xdg);
+    let (code, _, e) = run(&["construct", "--force", "--release"], &work, &xdg);
     assert_eq!(code, 0, "construct --release: {e}");
     assert_eq!(std::fs::read_to_string(work.join("a.txt")).unwrap(), "v1\n");
 }

@@ -527,6 +527,45 @@ impl Repository {
         Ok(out)
     }
 
+    /// The work not committed that writing `files` into the working tree
+    /// would destroy, by path: a file whose bytes or executable bit are
+    /// neither HEAD's (`head_tree`, or none) nor the ones to be written,
+    /// and a link or a directory where a file would go. A missing file, one
+    /// as HEAD has it, and one already as it is to be written lose nothing.
+    /// The index is not read: writing a file does not change it.
+    pub fn would_overwrite(
+        &self,
+        head_tree: Option<ObjectId>,
+        files: &[TreeFile],
+    ) -> Result<Vec<Unsaved>> {
+        let wt = Worktree::open(&self.workdir)?;
+        let head = self.files_by_path(head_tree)?;
+        let mut lost = Vec::new();
+        for f in files {
+            let why = match wt.read(&f.path)? {
+                Found::Missing => continue,
+                Found::File { bytes, executable } => {
+                    let held = (crate::blob::Blob::new(bytes).object_id(), executable);
+                    let holds = |t: &TreeFile| (t.blob, t.executable) == held;
+                    if holds(f) || head.get(&f.path).is_some_and(holds) {
+                        continue;
+                    }
+                    if head.contains_key(&f.path) {
+                        "changed and not committed"
+                    } else {
+                        "not in HEAD, and the revision has a file there"
+                    }
+                }
+                found => changed(&found),
+            };
+            lost.push(Unsaved {
+                path: f.path.clone(),
+                why,
+            });
+        }
+        Ok(lost)
+    }
+
     /// The changes staged in `index` against `head_tree` (HEAD's tree, or
     /// none), by path: the staged work a move refuses to overwrite, as
     /// `status` reports it.

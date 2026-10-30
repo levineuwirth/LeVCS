@@ -140,6 +140,10 @@ pub struct ConstructArgs {
     pub all: bool,
     #[arg(long)]
     pub release: bool,
+    /// Overwrite files that hold changes not committed. Without it,
+    /// construct refuses, names each one, and writes nothing.
+    #[arg(long)]
+    pub force: bool,
     pub paths: Vec<PathBuf>,
 }
 

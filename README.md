@@ -20,8 +20,11 @@ BLAKE3, signed with Ed25519, and built to fix what git can't.
   (Reader/Contributor/Maintainer/Owner). Force-push enforcement and
   push authorization are protocol-level, not server policy.
 - **Federation is first-class.** Every repo has a global `repo_id`
-  (BLAKE3 of its genesis authority); instances mirror each other in
-  three storage modes (full / release-only / metadata-only).
+  (BLAKE3 of its genesis authority), so it is the same repository on any
+  instance that holds it, and `migrate` moves it between instances with
+  its id and history intact. Mirroring between instances is designed, in
+  three storage modes (full / release-only / metadata-only), but refused
+  until a mirror checks what it receives.
 - **Merge is configurable per file.** By default every file merges with a
   line-level three-way diff. A repository's `.levcs/merge.toml` can opt
   paths into format-aware handlers (JSON / YAML / TOML / XML / Markdown /
@@ -49,12 +52,15 @@ tree-sitter grammars' runtime) and a C compiler for the grammars.
 cargo build --release
 ```
 
-Two binaries land in `target/release/`:
+Three binaries land in `target/release/`:
 
 - `levcs` — the user-facing CLI.
 - `levcs-instance` — the federation HTTP server.
+- `levcs-gate` — the deployment gate, which checks a `levcs` and a
+  `levcs-instance` together before an instance is relied on (see
+  [`deploy/README.md`](deploy/README.md)).
 
-Install them somewhere on `PATH`:
+For local use, install the first two somewhere on `PATH`:
 
 ```sh
 sudo install -m 0755 \
@@ -82,6 +88,29 @@ levcs log
 ```
 
 That's a fully working LeVCS repo.
+
+`track --all` takes every file that is not ignored. A `.levcsignore` at
+the top of the repository lists glob patterns, one per line. A pattern
+starting with `/` matches a path from the top; any other matches a whole
+path or any one name in it, so `build` ignores every directory called
+`build`. Write a directory's pattern without a trailing `/`. `!` takes a
+path back in, `#` starts a comment, and the last pattern that matches a
+path decides it. `.levcs/` is always ignored, but `.git/` is not: in a
+git checkout, put `/.git` in `.levcsignore` before `track --all`.
+
+Keys live in the keychain, `$XDG_CONFIG_HOME/levcs/keys.toml`. `key list`
+names them, and `key show <label>` prints a public key in the form an
+instance's `creators` and `authority add` take. `key export <label>
+<file>` writes a key to a file for `key import <label> <file>` on another
+machine. The file holds the secret key, under its passphrase only if the
+key was generated with `--encrypt`. `key rename` and `key remove` do what
+they say.
+
+A repository's members are in its authority. `authority list` prints each
+member's role, handle and key, and `authority show` prints the whole
+authority, its `repo_id` included. `authority add <key> --role <role>`,
+`promote` and `remove` change it, signed by an owner. The roles, in
+order, are `reader`, `contributor`, `maintainer` and `owner`.
 
 With one key in the keychain, commands sign with it, whatever its role, and
 `init` with an empty keychain creates a key called `personal`. With several
@@ -163,7 +192,7 @@ damaged: unreadable, malformed, or not the type its link requires.
 
 Commands that write the working tree (`branch --switch`, `merge`, `merge
 --abort`, `merge --review`, `construct`, `forget --delete`, `cache --restore`,
-`fork` and `dial`) write only inside it. Each walks a path one directory at a
+`clone` and `fork`) write only inside it. Each walks a path one directory at a
 time without following symlinks, and replaces a file by renaming a new one
 over it, so neither a symlinked directory nor a symlinked or hard-linked file
 can carry a write outside the repository. A tree is checked whole before
@@ -236,12 +265,8 @@ instance, the instance checks each push.
 - **Roles.** A protected branch needs a Maintainer. So does a rewrite of
   published history, which must also be forced. Deleting a branch whose
   commits nothing else reaches counts as one (`branch --delete --force`).
-- **Not yet publishable:**
-  - Work made under an older authority, until adoption (D1) has a defined
-    record format.
-  - A repository received by `dial`, until an owner's bootstrap statement
-    exists (D6). Until then it keeps the received history under
-    `refs/remote/` and has no current authority.
+- **Not yet publishable:** work made under an older authority, until
+  adoption (D1) has a defined record format.
 - **Interrupted publications.** A publication's ref changes land together
   or not at all. They are recorded in `.levcs/ref-transaction/` before any
   ref moves. One stopped part way, by an error or by the process being
@@ -333,15 +358,20 @@ levcs branch --switch main
 levcs merge feature/x
 ```
 
-`merge` reports each file and the handler that resolved it:
+`merge` prints a line for each file both sides changed, naming the handler
+that merged it, then a summary that counts every file either side
+changed:
 
 ```
 AUTO     note.md  (textual)
 
 merge summary:
-  auto-resolved: 1
+  auto-resolved: 3
   conflicts:     0
 ```
+
+`merge` takes a revision as well as a branch, so `levcs merge <commit-id>`
+merges a commit no local branch names, such as one fetched by `pull`.
 
 A merge with conflicts cannot be committed until each conflicted file is
 resolved explicitly. Some conflicts have no markers: a binary file keeps
@@ -361,16 +391,46 @@ refused: finish the merge with `commit`, or abandon it with `merge --abort`.
 Files containing NUL bytes, or that are not UTF-8, are never line-merged:
 divergent edits to them are always a conflict.
 
-To step through a merge rather than take it wholesale, and to abandon one
-that went badly:
+To step through a merge in progress, file by file, in the terminal UI, or
+to abandon one that went badly:
 
 ```sh
-levcs merge feature/x --review
+levcs merge feature/x
+levcs merge --review      # the merge in progress; refused when there is none
 levcs merge --abort
 ```
 
-`--explain` prints why each file went to the handler it did, and
-`--format json` emits one structured object per §6.7 for scripting.
+`merge --explain` shows the same view read-only, for the merge in progress
+or, when there is none, the merge HEAD records, with the handler each file
+went to. `--no-auto` merges nothing automatically: every file the merged
+branch changed is left as a conflict to resolve by hand. `--format json` emits
+one structured object per §6.7 for scripting.
+
+Which handler merges a file is set in `.levcs/merge.toml`. Without it,
+every file merges textually. Rules are tried in order, and the first glob
+that matches a path picks its handler. A glob is matched against the whole
+repository-relative path, and `*` crosses directories, so `*.json` takes
+JSON files at any depth:
+
+```toml
+[[rule]]
+glob = "*.json"
+handler = "json"
+
+[[rule]]
+glob = "src/**/*.rs"
+handler = "tree-sitter:rust"
+```
+
+The handlers are `textual`, `json`, `yaml`, `toml`, `xml`, `markdown`,
+`prose`, and `tree-sitter:` followed by `rust`, `python`, `javascript`,
+`typescript`, `go`, `c`, `cpp`, `java`, `ruby` or `shell`. An unknown
+handler, or a malformed file, makes `merge` refuse rather than fall back.
+`[policy] allowed_handlers = [...]` limits the handlers a merge may use.
+`.levcs/merge.local.toml`, in the same form, is one user's override: its
+rules may only keep the handler `merge.toml` gives the same glob, or
+choose `textual`. Both files live in `.levcs/`, so neither is committed or
+cloned: each copy of a repository sets its own.
 
 Cut a release:
 
@@ -378,35 +438,67 @@ Cut a release:
 levcs release v0.1.0 -m "first release"
 ```
 
+A release is declared by a maintainer or owner. `construct --release` and
+`diff --release` take the newest release in place of HEAD.
+
+`gc` keeps an object written in the last 14 days (`--grace-days`) even if
+nothing reaches it, since an operation still running may not have linked
+it yet. `levcs root` prints the repository's top directory.
+
 ---
 
 ## Hosting an instance
 
-To dogfood the federation surface, run `levcs-instance` on a VPS behind
-nginx or Caddy. The full walkthrough is in
-[`deploy/README.md`](deploy/README.md): build, systemd unit, reverse
-proxy templates, firewall, and the laptop-side bootstrap.
+`levcs-instance` holds repositories for `push`, `pull` and `clone`.
+[`deploy/README.md`](deploy/README.md) takes it from a VPS to a running
+service: build and install, the gate that checks the binaries before the
+instance is relied on, the systemd unit, logs, limits, backups, restores
+and updates. For now the instance listens on 127.0.0.1 and is reached
+through an SSH tunnel; the Caddy and nginx templates are for when it gets
+a public route.
 
-The compressed version:
-
-```sh
-sudo cp deploy/levcs-instance.service /etc/systemd/system/
-sudo cp deploy/instance.toml.example /etc/levcs/instance.toml
-sudo $EDITOR /etc/levcs/instance.toml
-sudo systemctl enable --now levcs-instance
-# ... then drop deploy/Caddyfile.example into /etc/caddy/Caddyfile
-```
-
-From your laptop, point the local repo at the instance and push:
+An instance creates a repository only for a key its config names in
+`creators`. The example config names none, so it accepts no new
+repository until you add yours (`levcs key show <label>` prints it). Then,
+with the tunnel open (`ssh -N -L 7117:127.0.0.1:7117 vps`), from the
+repository:
 
 ```sh
-levcs instance --set https://levcs.example.com/levcs/v1
-levcs push refs/branches/main
+levcs instance --set http://127.0.0.1:7117/levcs/v1
+levcs push --dry-run    # measured against the instance's limits; sends nothing
+levcs push              # the current branch; or name refs, such as refs/branches/main
 ```
 
-The first push to a fresh instance auto-inits the repo with your
-genesis authority. Subsequent pushes are role-checked against the
-authority chain.
+The first push of a repository the instance does not hold creates it
+there from its genesis authority. Every push is checked against the
+authority (Rule P above), and one behind the instance is refused unless
+`--force`d by a maintainer. `instance --set` makes the repository a
+workspace of the instance.
+
+Elsewhere, `clone` makes a new workspace from the instance, with its
+branches, releases and authority and `main` checked out. Its argument is
+the repository id, which `levcs authority show` prints as `repo_id`.
+`pull` fetches the instance's branches into `refs/remote/origin/`,
+without moving any of yours. Both check everything they receive against
+the genesis the id pins before writing any of it. A revision names only
+local branches, so merge what you pulled by its id:
+
+```sh
+levcs clone <repo_id> levcs --from http://127.0.0.1:7117/levcs/v1
+
+# later, at the top of a workspace:
+levcs pull
+levcs merge "$(cat .levcs/refs/remote/origin/branches/main)"
+```
+
+`inspect <repo_id> --from <url>` lists a repository's branches and its
+top-level tree without fetching it, and `migrate <url>` moves a
+repository to another instance with its id and history. The authority's
+policy can protect branches (`protected_branches`, globs that need a
+maintainer to update) and make a repository private (`public_read`
+false, read only by members in requests signed with `--key`). The
+instance enforces both, but no command sets either yet: `init` makes a
+public repository with no protected branch.
 
 ---
 
@@ -422,10 +514,15 @@ crates/
   levcs-protocol/    Pack codec, wire types, request signing, P2P.
   levcs-client/      Thin HTTP client over the federation API.
   levcs-instance/    Axum HTTP server (the federation peer).
+  levcs-store/       Durable transaction spine (journal, group commit,
+                     recovery) for a future instance; not yet used by it.
+  levcs-gate/        The deployment gate: drives a real instance with the
+                     binaries it is given.
   levcs-cli/         The `levcs` user-facing CLI.
   levcs-tui/         Conflict-resolution terminal UI.
 
-deploy/              Production deployment artifacts (systemd, Caddy, nginx).
+deploy/              Deployment artifacts: systemd unit, example config,
+                     backup and restore scripts, Caddy and nginx templates.
 scripts/             Reproducible benchmark and ops scripts.
 doc/                 Technical report and architecture docs.
 .github/workflows/   CI configuration.
@@ -441,8 +538,16 @@ cargo test --workspace
 
 Runs the full suite — unit tests, integration tests, federation
 end-to-end tests including the three-instance "dogfood" scenario, the
-merge conformance corpus, and property-based fuzz tests. ~194 tests at
-v0.1.0; full run is well under a minute on a modern laptop.
+merge conformance corpus, and property-based fuzz tests: about a
+thousand tests.
+
+The deployment gate drives a real instance with the binaries just built,
+as CI does after the tests:
+
+```sh
+cargo build --workspace
+target/debug/levcs-gate
+```
 
 Useful subsets:
 
@@ -493,6 +598,9 @@ zstd level 3 on incompressible data.
   document. What LeVCS is, how to use it, and how it differs from /
   improves upon git. Targets technical evaluators and the workflow-spec
   reader.
+- **[`doc/authority-semantics.md`](doc/authority-semantics.md)** — The
+  rules for valid history, replication and publication (Rules H, R and
+  P), which `verify`, `pull`, `clone`, `push` and the instance enforce.
 - **[`deploy/README.md`](deploy/README.md)** — Comprehensive VPS
   deployment walkthrough.
 - **`spec/`** — The protocol specification and trust-root revision.

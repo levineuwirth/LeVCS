@@ -104,7 +104,9 @@ never touches `/var/lib/levcs` or the service. It checks, in order:
     update before anything is replaced.
 
 It prints `ok` or `FAIL` for each, stops at the first failure, and keeps
-its directory, with the instance's log, to look at. Rely on the instance
+its directory, with the instance's log, to look at. `--dir DIR` makes
+that directory under `DIR` instead of the temp directory, and `--keep`
+keeps it when every check passes too. Rely on the instance
 only once it ends with `every check passed`, and exits 0. Run it again
 whenever either binary changes.
 
@@ -219,7 +221,10 @@ instance is refused unless forced.
 `levcs init` makes a public repository: anyone who can reach the
 instance may read it. A private one (`public_read` false) is served only
 to members of its current authority, in requests signed with `--key`
-(`clone`, `pull`, `fork`); to anyone else it does not exist.
+(`clone`, `pull`, `fork`); to anyone else it does not exist. No `levcs`
+command makes a repository private yet: `init` sets `public_read` true,
+and no command changes an authority's policy. The same goes for
+protected branches (`protected_branches`).
 
 ### 4. Publishing later work
 
@@ -246,9 +251,17 @@ levcs clone <repo_id> levcs --from http://127.0.0.1:7117/levcs/v1
 
 makes a workspace of the instance in `levcs/`: its branches, releases
 and authority as the instance publishes them, and `main` checked out.
-Work in it is pushed as from the first machine. `levcs pull` in a
-workspace records the instance's branches under `refs/remote/origin/`,
-without moving any of its own.
+The repository id is the `repo_id` that `levcs init` printed, and that
+`levcs authority show` prints in the first workspace. Work in it is
+pushed as from the first machine. `levcs pull` in a workspace records
+the instance's branches under `refs/remote/origin/`, without moving any
+of its own. A revision names only local branches, so merge what was
+pulled by its id:
+
+```sh
+levcs pull
+levcs merge "$(cat .levcs/refs/remote/origin/branches/main)"
+```
 
 Both check everything they receive before writing any of it: the
 genesis is the one the repository's id pins, and every object the
@@ -271,8 +284,11 @@ sudo journalctl -u levcs-instance -f
 sudo journalctl -u levcs-instance -p warning
 ```
 
-One line per request at `info`; set `Environment=RUST_LOG=debug` in the
-unit when diagnosing.
+At `info`, the default, the log has the instance's startup and its
+configuration, each refused request at `warn` with its status and
+reason, and each failed one at `error`, but no line for a request that
+succeeds. Set `Environment=RUST_LOG=debug` in the unit for a line per
+request and response when diagnosing.
 
 ### Limits
 
@@ -358,6 +374,11 @@ started on it; start it again on the root as it was with `sudo systemctl
 start levcs-instance`. Otherwise the current root is kept as
 `/var/lib/levcs.before-restore` and the archive's takes its place.
 
+A restore refuses to begin while `/var/lib/levcs.before-restore` exists,
+left by an earlier restore: move it away, or delete it once the restored
+instance has been checked. `levcs-restore` checks with the `levcs` on
+`PATH`, or with the binary the `LEVCS` environment variable names.
+
 The instance then serves the backup's state. A workspace holding work
 pushed after the backup is ahead of it, and its next push lands that work
 again. The gate runs both scripts, and a damaged backup (check 13), and
@@ -380,6 +401,11 @@ levcs-gate --levcs target/release/levcs --instance target/release/levcs-instance
 To roll back, stop the service, put `levcs-instance.previous` back, and
 start it. The on-disk format has not changed between versions; a release
 that changes it will say so.
+
+This replaces the server only. Install the new `levcs` into
+`/usr/local/bin` as well, as in step 2, since `levcs-restore` checks
+backups with it; and the new `levcs-gate`, so that the next update is
+checked by this version's gate.
 
 ### Storage growth
 

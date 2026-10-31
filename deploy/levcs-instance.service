@@ -18,8 +18,9 @@ RestartSec=5
 TimeoutStopSec=150
 
 # tracing-subscriber respects RUST_LOG. info-level is reasonable for
-# production (one line per request via the TraceLayer); bump to debug
-# while diagnosing.
+# production: startup, and each refused or failed request, but no line
+# for one that succeeds. Bump to debug for a line per request and
+# response (the TraceLayer) while diagnosing.
 Environment=RUST_LOG=info
 
 # Hardening. The instance reads its config and writes only to its

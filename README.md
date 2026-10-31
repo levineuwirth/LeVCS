@@ -130,6 +130,25 @@ The lock orders repository changes; it cannot say who wrote which lines of a
 file that several sessions edit at once, so scope each commit to the files its
 author wrote.
 
+When writers do share a file, such as an append-only log, a writer commits its
+own version of it instead of the working tree's:
+
+```sh
+head=$(levcs status --format json | jq -r .head)
+{ levcs show "${head}:log.md"; cat my-lines; } > /tmp/mine
+levcs commit --expect-head "$head" --content log.md=/tmp/mine -m "my entries"
+```
+
+`--content PATH=FILE` commits FILE's bytes as PATH, a tracked file, and leaves
+the working tree's PATH as it is. Other writers' lines stay uncommitted there,
+for them to commit under their own keys. `--expect-head` refuses the commit,
+under the repository lock, unless HEAD is still the commit the version was
+built from. Without it, a commit that landed in between would be undone. A
+refusal commits nothing and exits with status 5, so a caller can rebuild its
+version from the new HEAD and try again. An id that is not a commit here, such
+as a release or a mistyped hash, exits with status 1, since trying again
+would not change it.
+
 `levcs verify` checks everything the repository keeps, not just HEAD.
 Every object reachable from any ref is hash-checked, and every commit and
 release is checked against the authority rules in
@@ -242,12 +261,13 @@ the alternative, deleting by default and refusing when the content is not yet
 in a commit, would make the tool answer "is this recoverable?" on every call,
 with deletion as the price of being wrong.
 
-Commands that take a commit (`diff`, `construct`, `merge`, `branch --create`)
-accept a revision, not just a full hash:
+Commands that take a commit (`diff`, `construct`, `show`, `merge`,
+`branch --create`) accept a revision, not just a full hash:
 
 ```sh
 levcs diff HEAD~1            # against the previous commit
-levcs construct HEAD~3 a.txt # a.txt as it was three commits ago
+levcs construct HEAD~3 a.txt # a.txt as it was three commits ago, written back
+levcs show HEAD~3:a.txt      # a.txt as it was three commits ago, printed
 levcs diff 3fa9c1            # a unique hex prefix (4+ characters)
 levcs merge main^2           # the second parent of main's tip
 ```
@@ -264,6 +284,23 @@ resolved conservatively: a bare branch name or an unmatched hex word is a
 path, and so is a name like `notes~` whose base is not a ref. If a bare prefix
 matches a commit *and* a file in the current directory, the command refuses
 and asks you to write `./name` for the file.
+
+`construct` writes the working tree, over whatever uncommitted work the file
+holds; to read history, use `show`, which writes nothing. `show <rev>:<path>`
+prints the file's bytes as they are at that revision, or a directory's
+entries. `show <rev>` prints the commit and the paths it changed against its
+first parent, marked `A`, `M` or `D`; `log --name-status` does the same for
+each commit in the log. A change to the executable bit alone is an `M`.
+
+`status --format json` and `diff --format json` print one JSON object for
+tools, as `merge --format json` does. `status` gives HEAD's id and each group
+of paths it lists, and the newest release. `diff` gives each changed file, the
+blob id of each side, and each line added or removed, with its line number and
+its line ending, if it has one. `show <blob-id>` prints the old side's blob,
+which history holds. The new side's id is only a hash of the working tree's
+file: `show` prints it only if that content was tracked or committed. The
+text `diff` ends every line, and marks a last line without an ending with
+`\ No newline at end of file`.
 
 Branch and merge — note that creating a branch and switching to it are
 separate operations, so a commit cannot land on a branch you only meant to

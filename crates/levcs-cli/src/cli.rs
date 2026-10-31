@@ -34,9 +34,12 @@ pub enum Cmd {
     /// Manage cached working-tree states.
     Cache(CacheArgs),
     /// Show working-tree status.
-    Status,
+    Status(StatusArgs),
     /// Show commit history.
     Log(LogArgs),
+    /// Print a file as it is at a revision, or a commit and the paths it
+    /// changed. Writes nothing.
+    Show(ShowArgs),
     /// Print the absolute path of the repository root.
     Root,
     /// Verify every object reachable from any ref, and the authority rules
@@ -111,6 +114,20 @@ pub struct CommitArgs {
     /// explicit spelling of it, and cannot be combined with paths.
     #[arg(long, conflicts_with = "paths")]
     pub all: bool,
+    /// Refuse unless HEAD is this commit, checked under the repository
+    /// lock. Nothing is committed, and the exit status is 5, if another
+    /// commit has landed since the caller read HEAD.
+    #[arg(long = "expect-head", value_name = "REV")]
+    pub expect_head: Option<String>,
+    /// Commit FILE's bytes as PATH, a tracked file, in place of what the
+    /// working tree holds there, and leave the working tree's PATH as it
+    /// is. A writer sharing a file commits its own version (HEAD's, plus
+    /// its own lines) and leaves other writers' lines uncommitted. Use with
+    /// --expect-head set to the commit the version was built from.
+    /// Repeatable; the commit is scoped to these paths and any others
+    /// named. The first `=` ends PATH.
+    #[arg(long = "content", value_name = "PATH=FILE", conflicts_with = "all")]
+    pub content: Vec<String>,
     /// Restrict the commit to these files or directories. Everything else
     /// keeps the content it has in HEAD and stays uncommitted.
     pub paths: Vec<PathBuf>,
@@ -130,8 +147,21 @@ pub struct ConstructArgs {
 pub struct DiffArgs {
     #[arg(long)]
     pub release: bool,
+    /// Output format. `text` (default) is for people. `json` is one object
+    /// on stdout: each changed file, its blob ids, and each line added or
+    /// removed with its line number and its line ending, if it has one.
+    #[arg(long = "format", default_value = "text")]
+    pub format: String,
     pub commit: Option<String>,
     pub paths: Vec<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct StatusArgs {
+    /// Output format. `text` (default) is for people. `json` is one object
+    /// on stdout, with HEAD's id and each group of paths `text` lists.
+    #[arg(long = "format", default_value = "text")]
+    pub format: String,
 }
 
 #[derive(Args, Debug)]
@@ -204,6 +234,20 @@ pub struct LogArgs {
     pub release: bool,
     #[arg(long)]
     pub since: Option<String>,
+    /// List each commit's paths against its first parent, marked A (added),
+    /// M (modified) or D (deleted).
+    #[arg(long = "name-status")]
+    pub name_status: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct ShowArgs {
+    /// `<rev>`: a commit's metadata and its paths against its first parent,
+    /// marked A, M or D (a release's metadata; a blob's content).
+    /// `<rev>:<path>`: the file's content at that revision, byte for byte,
+    /// or a directory's entries. The path is relative to the current
+    /// directory, as every path argument is. Defaults to HEAD.
+    pub spec: Option<String>,
 }
 
 #[derive(Args, Debug)]

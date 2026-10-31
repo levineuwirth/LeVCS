@@ -83,6 +83,27 @@ pub enum Staged {
     Forgotten,
 }
 
+/// How a file differs from one tree to another: see
+/// [`Repository::diff_trees`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TreeChange {
+    Added,
+    /// Other bytes, or another executable bit.
+    Modified,
+    Deleted,
+}
+
+impl TreeChange {
+    /// `A`, `M` or `D`.
+    pub fn letter(self) -> char {
+        match self {
+            TreeChange::Added => 'A',
+            TreeChange::Modified => 'M',
+            TreeChange::Deleted => 'D',
+        }
+    }
+}
+
 /// A move of the working tree from one tree to another, checked whole by
 /// [`Repository::plan_checkout`] before anything is written.
 #[derive(Clone, Debug, Default)]
@@ -527,6 +548,78 @@ impl Repository {
             })
             .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
+
+    /// The files that differ from tree `from` to tree `to` (none, or the
+    /// zero id, for an empty tree), sorted by path. A file that becomes a
+    /// directory, or the reverse, is deleted at one path and added at the
+    /// others. A subtree with the same id on both sides is not read, so a
+    /// commit's changes cost what it changed, not the size of its tree. The
+    /// top-level `.levcs` entry is history (an authority, a merge record),
+    /// not a file, and is left out, as [`Self::tree_files`] leaves it out.
+    pub fn diff_trees(
+        &self,
+        from: Option<ObjectId>,
+        to: Option<ObjectId>,
+    ) -> Result<Vec<(String, TreeChange)>> {
+        let entries = |id: Option<ObjectId>| -> Result<BTreeMap<String, TreeEntry>> {
+            Ok(match id {
+                Some(id) if !id.is_zero() => {
+                    let raw = self.objects.read_typed(id, ObjectType::Tree)?;
+                    Tree::parse_body(&raw.body)?
+                        .entries
+                        .into_iter()
+                        .map(|e| (e.name.clone(), e))
+                        .collect()
+                }
+                _ => BTreeMap::new(),
+            })
+        };
+        let blob = |e: Option<&TreeEntry>| {
+            e.filter(|e| e.entry_type == EntryType::Blob)
+                .map(|e| (e.hash, e.mode.is_executable()))
+        };
+        let subtree = |e: Option<&TreeEntry>| {
+            e.filter(|e| e.entry_type == EntryType::Tree)
+                .map(|e| e.hash)
+        };
+        let mut out = Vec::new();
+        // Walked with a stack, as `walk_tree` is, and bounded as it is.
+        let mut stack = vec![(String::new(), from, to)];
+        let mut visited = 0;
+        while let Some((dir, a, b)) = stack.pop() {
+            let (a, b) = (entries(a)?, entries(b)?);
+            let names: BTreeSet<&String> = a.keys().chain(b.keys()).collect();
+            for name in names {
+                visited += 1;
+                if visited > worktree::MAX_TREE_ENTRIES {
+                    return Err(worktree::too_many_entries(to.unwrap_or_default()));
+                }
+                if dir.is_empty() && name == LEVCS_DIR {
+                    continue;
+                }
+                let path = if dir.is_empty() {
+                    name.clone()
+                } else if dir.len() + 1 + name.len() > worktree::MAX_PATH_BYTES {
+                    return Err(worktree::too_long(&dir));
+                } else {
+                    format!("{dir}/{name}")
+                };
+                let (ea, eb) = (a.get(name), b.get(name));
+                match (blob(ea), blob(eb)) {
+                    (Some(x), Some(y)) if x != y => out.push((path.clone(), TreeChange::Modified)),
+                    (Some(_), None) => out.push((path.clone(), TreeChange::Deleted)),
+                    (None, Some(_)) => out.push((path.clone(), TreeChange::Added)),
+                    _ => {}
+                }
+                let (ta, tb) = (subtree(ea), subtree(eb));
+                if ta != tb {
+                    stack.push((path, ta, tb));
+                }
+            }
+        }
+        out.sort_by(|x, y| x.0.cmp(&y.0));
         Ok(out)
     }
 

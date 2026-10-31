@@ -1,6 +1,6 @@
 //! Repository-side commands: init, track, forget, commit, etc.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -340,44 +340,100 @@ pub fn forget(args: ForgetArgs) -> Result<()> {
 // status / log
 // ---------------------------------------------------------------------------
 
-pub fn status() -> Result<()> {
+/// Whether `--format` asks for JSON. Anything but `text` and `json` is
+/// refused, so a typo is not read as a request for the human format.
+fn is_json(format: &str) -> Result<bool> {
+    match format {
+        "text" => Ok(false),
+        "json" => Ok(true),
+        other => bail!("unknown --format value: {other} (allowed: text, json)"),
+    }
+}
+
+/// `status --format json`. The groups are `status`'s, by the same names; a
+/// path can be in more than one (staged, and modified since).
+#[derive(serde::Serialize)]
+struct JsonStatus<'a> {
+    /// Schema tag — bumped when the output format changes incompatibly.
+    schema_version: u32,
+    /// None when HEAD is detached.
+    branch: Option<&'a str>,
+    /// None before the first commit.
+    head: Option<String>,
+    release: Option<JsonRelease>,
+    merge: Option<JsonMerge>,
+    conflicted: Vec<&'a str>,
+    new: &'a [String],
+    staged: &'a [String],
+    forgotten: &'a [String],
+    modified: &'a [String],
+    deleted: &'a [String],
+    replaced: &'a [String],
+    untracked: &'a [String],
+    symlinks: &'a [String],
+    clean: bool,
+}
+
+#[derive(serde::Serialize)]
+struct JsonRelease {
+    label: String,
+    id: String,
+}
+
+#[derive(serde::Serialize)]
+struct JsonMerge {
+    theirs: String,
+    /// True when the merge is already in HEAD and only its state is left.
+    committed: bool,
+}
+
+/// The newest release, by the time it records, with its label: the release
+/// `status` reports and `construct --release` and `diff --release` use.
+/// `status` took the label that sorts last, which is not the newest once
+/// labels outgrow their digits (`v9.0` sorts after `v10.0`). A release that
+/// cannot be read counts as the oldest; of equal times, the last label wins.
+fn latest_release(repo: &Repository) -> Result<Option<(String, ObjectId)>> {
+    let mut releases = repo.refs.list_releases()?;
+    releases.sort_by_key(|(_, id)| {
+        repo.read_signed(*id)
+            .ok()
+            .and_then(|s| Release::parse_body(&s.body).ok())
+            .map(|r| r.timestamp_micros)
+            .unwrap_or(0)
+    });
+    Ok(releases.pop())
+}
+
+pub fn status(args: StatusArgs) -> Result<()> {
+    let json = is_json(&args.format)?;
     let repo = open_repo()?;
     let idx = load_index(&repo)?;
     let head = repo.refs.resolve_head()?;
     let branch_ref = repo.current_branch()?;
     let branch = branch_ref
         .as_deref()
-        .map(|s| s.trim_start_matches("refs/branches/").to_string())
-        .unwrap_or_else(|| "(detached)".into());
-    println!("On branch {branch}");
+        .map(|s| s.trim_start_matches("refs/branches/"));
     let mut head_tree = None;
+    let mut subject = String::new();
     if let Some(h) = head {
         let signed = repo.read_signed(h)?;
         let commit = Commit::from_signed(&signed)?;
         head_tree = Some(commit.tree);
-        let subject = commit.message.lines().next().unwrap_or("").to_string();
-        println!("HEAD       {h}");
-        if !subject.is_empty() {
-            println!("           {subject}");
-        }
-    } else {
-        println!("(no commits yet)");
+        subject = commit.message.lines().next().unwrap_or("").to_string();
     }
-    let releases = repo.refs.list_releases()?;
-    if let Some((label, id)) = releases.last() {
-        println!("Release    {label} ({id})");
-    }
-    if repo.levcs_dir.join("MERGE_HEAD").exists() {
+    let release = latest_release(&repo)?.map(|(label, id)| JsonRelease {
+        label,
+        id: id.to_hex(),
+    });
+    let merge = if repo.levcs_dir.join("MERGE_HEAD").exists() {
         let mh = fs::read_to_string(repo.levcs_dir.join("MERGE_HEAD"))?;
-        if stale_merge_head(&repo)?.is_some() {
-            println!(
-                "Merge      already committed in HEAD (theirs={}); the next commit or merge clears its leftover state",
-                mh.trim()
-            );
-        } else {
-            println!("Merge      in progress (theirs={})", mh.trim());
-        }
-    }
+        Some(JsonMerge {
+            theirs: mh.trim().to_string(),
+            committed: stale_merge_head(&repo)?.is_some(),
+        })
+    } else {
+        None
+    };
     // Every tracked path is read where it is, ignored or not, and nothing is
     // read through a link. Only the ignore-filtered walk used to be looked
     // at, so a tracked file matching an ignore pattern was reported deleted.
@@ -428,6 +484,58 @@ pub fn status() -> Result<()> {
         .map(|e| e.path.as_str())
         .collect();
     conflicted.sort();
+    let clean = new.is_empty()
+        && staged.is_empty()
+        && forgotten.is_empty()
+        && modified.is_empty()
+        && deleted.is_empty()
+        && replaced.is_empty()
+        && untracked.is_empty()
+        && links.is_empty()
+        && conflicted.is_empty();
+    if json {
+        let report = JsonStatus {
+            schema_version: 1,
+            branch,
+            head: head.map(|h| h.to_hex()),
+            release,
+            merge,
+            conflicted,
+            new: &new,
+            staged: &staged,
+            forgotten: &forgotten,
+            modified: &modified,
+            deleted: &deleted,
+            replaced: &replaced,
+            untracked: &untracked,
+            symlinks: &links,
+            clean,
+        };
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    println!("On branch {}", branch.unwrap_or("(detached)"));
+    match head {
+        Some(h) => {
+            println!("HEAD       {h}");
+            if !subject.is_empty() {
+                println!("           {subject}");
+            }
+        }
+        None => println!("(no commits yet)"),
+    }
+    if let Some(r) = &release {
+        println!("Release    {} ({})", r.label, r.id);
+    }
+    match &merge {
+        Some(m) if m.committed => println!(
+            "Merge      already committed in HEAD (theirs={}); the next commit or merge clears its leftover state",
+            m.theirs
+        ),
+        Some(m) => println!("Merge      in progress (theirs={})", m.theirs),
+        None => {}
+    }
     if !conflicted.is_empty() {
         println!("\nunresolved conflicts (commit refuses until each is resolved):");
         for c in &conflicted {
@@ -483,22 +591,13 @@ pub fn status() -> Result<()> {
             println!("  {l}");
         }
     }
-    if new.is_empty()
-        && staged.is_empty()
-        && forgotten.is_empty()
-        && modified.is_empty()
-        && deleted.is_empty()
-        && replaced.is_empty()
-        && untracked.is_empty()
-        && links.is_empty()
-        && conflicted.is_empty()
-    {
+    if clean {
         println!("\nworking tree clean.");
     }
     Ok(())
 }
 
-pub fn log(_args: LogArgs) -> Result<()> {
+pub fn log(args: LogArgs) -> Result<()> {
     let repo = open_repo()?;
     let head = repo
         .refs
@@ -509,26 +608,133 @@ pub fn log(_args: LogArgs) -> Result<()> {
     while count < 100 {
         let signed = repo.read_signed(id)?;
         let commit = Commit::from_signed(&signed)?;
-        let pk = PublicKey(commit.author_key);
-        println!("commit {}", id);
-        println!("Author: {}", pk);
-        println!("Date:   {} (us since epoch)", commit.timestamp_micros);
-        if commit.flags.modifies_authority() {
-            println!("Flags:  authority-modifying");
+        print_commit(id, &commit);
+        if args.name_status && print_name_status(&repo, &commit)? {
+            println!();
         }
-        if commit.flags.is_fork() {
-            println!("Flags:  fork");
-        }
-        println!();
-        for line in commit.message.lines() {
-            println!("    {line}");
-        }
-        println!();
         if commit.parents.is_empty() {
             break;
         }
         id = commit.parents[0];
         count += 1;
+    }
+    Ok(())
+}
+
+/// A commit as `log` and `show` print it: id, the parents of a merge,
+/// author, date, flags, and message.
+fn print_commit(id: ObjectId, commit: &Commit) {
+    println!("commit {}", id);
+    if commit.parents.len() > 1 {
+        let parents: Vec<String> = commit.parents.iter().map(|p| p.to_hex()).collect();
+        println!("Merge:  {}", parents.join(" "));
+    }
+    println!("Author: {}", PublicKey(commit.author_key));
+    println!("Date:   {} (us since epoch)", commit.timestamp_micros);
+    if commit.flags.modifies_authority() {
+        println!("Flags:  authority-modifying");
+    }
+    if commit.flags.is_fork() {
+        println!("Flags:  fork");
+    }
+    println!();
+    for line in commit.message.lines() {
+        println!("    {line}");
+    }
+    println!();
+}
+
+/// Print the files `commit` changed against its first parent (against
+/// nothing for a root commit), one `<A|M|D>\t<path>` line each; whether it
+/// printed any. A merge is compared with its first parent, so it lists what
+/// the merge brought into the branch.
+fn print_name_status(repo: &Repository, commit: &Commit) -> Result<bool> {
+    let parent_tree = match commit.parents.first() {
+        Some(p) => Some(Commit::from_signed(&repo.read_signed(*p)?)?.tree),
+        None => None,
+    };
+    let changes = repo.diff_trees(parent_tree, Some(commit.tree))?;
+    for (path, change) in &changes {
+        println!("{}\t{path}", change.letter());
+    }
+    Ok(!changes.is_empty())
+}
+
+/// `show [<rev>[:<path>]]`. It reads the object store only: nothing in the
+/// working tree, the index or a ref is written. `construct` was the only
+/// way to see a file at a revision, and it writes that revision into the
+/// working tree, over whatever uncommitted work the file held.
+pub fn show(args: ShowArgs) -> Result<()> {
+    use std::io::Write;
+    let repo = open_repo()?;
+    let spec = args.spec.as_deref().unwrap_or("HEAD");
+    // The first `:` ends the revision, and the path may hold more. A branch
+    // whose name holds a `:` is named here by its id.
+    let (rev, path) = match spec.split_once(':') {
+        Some((rev, path)) => (rev, Some(path)),
+        None => (spec, None),
+    };
+    let id = crate::rev::resolve_rev(&repo, rev)?;
+    let raw = repo.read_raw_object(id)?;
+    let tree = match (raw.object_type, path) {
+        (ObjectType::Commit, None) => {
+            let commit = Commit::parse_body(&raw.body)?;
+            print_commit(id, &commit);
+            print_name_status(&repo, &commit)?;
+            return Ok(());
+        }
+        (ObjectType::Release, None) => {
+            let release = Release::parse_body(&raw.body)?;
+            println!("release {id}");
+            println!("Label:  {}", release.label);
+            println!("Commit: {}", release.predecessor);
+            println!("Author: {}", PublicKey(release.declarer_key));
+            println!("Date:   {} (us since epoch)", release.timestamp_micros);
+            println!();
+            for line in release.notes.lines() {
+                println!("    {line}");
+            }
+            return Ok(());
+        }
+        (ObjectType::Blob, None) => {
+            std::io::stdout().write_all(&raw.body)?;
+            return Ok(());
+        }
+        (ObjectType::Commit, Some(_)) => Commit::parse_body(&raw.body)?.tree,
+        (ObjectType::Release, Some(_)) => Release::parse_body(&raw.body)?.tree,
+        (ObjectType::Tree, _) => id,
+        (other, _) => bail!("cannot show a {} object", other.name()),
+    };
+    let rel = match path {
+        Some(p) => normalize_paths(&repo, &[PathBuf::from(p)])?.remove(0),
+        None => String::new(),
+    };
+    let (kind, hash) = if rel.is_empty() {
+        (levcs_core::EntryType::Tree, tree)
+    } else {
+        let e = repo
+            .lookup_entry(tree, &rel)?
+            .ok_or_else(|| anyhow!("nothing at '{rel}' in {rev}"))?;
+        (e.entry_type, e.hash)
+    };
+    match kind {
+        levcs_core::EntryType::Blob => {
+            let blob = repo.read_blob(hash, &mut levcs_core::repo::ContentBudget::default())?;
+            std::io::stdout().write_all(&blob.body)?;
+        }
+        // A directory's entries, one level, a subdirectory marked with `/`.
+        levcs_core::EntryType::Tree => {
+            let raw = repo.objects.read_typed(hash, ObjectType::Tree)?;
+            for e in Tree::parse_body(&raw.body)?.entries {
+                if rel.is_empty() && e.name == ".levcs" {
+                    continue;
+                }
+                match e.entry_type {
+                    levcs_core::EntryType::Tree => println!("{}/", e.name),
+                    levcs_core::EntryType::Blob => println!("{}", e.name),
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -654,8 +860,35 @@ pub fn commit(args: CommitArgs) -> Result<()> {
     let (label, sk) = load_secret(args.key.as_deref())?;
     let pk = sk.public();
     let _ = label;
+    let mut content = given_content(&repo, &args.content)?;
     // Everything from here to the ref write reads and writes shared state.
     let _lock = lock_repo(&repo)?;
+
+    // A caller that built its commit from a HEAD it read earlier (with
+    // --content, HEAD's version of a file plus its own lines) names that
+    // HEAD. Checked under the lock, so nothing cooperating can move HEAD
+    // between here and the ref write; a commit landed since would otherwise
+    // be undone by this one.
+    if let Some(spec) = &args.expect_head {
+        let expected = crate::rev::resolve_rev(&repo, spec)?;
+        // Only a commit can be HEAD. Any other id, a release or a hash that
+        // names nothing here, was refused as HEAD having moved, with the
+        // status that tells a caller to rebuild and try again, so a caller
+        // that did would retry forever. It is refused as a failure instead.
+        let raw = repo
+            .read_raw_object(expected)
+            .with_context(|| format!("--expect-head {spec}: no such commit here"))?;
+        if raw.object_type != ObjectType::Commit {
+            bail!(
+                "--expect-head {spec} is a {}, not a commit; nothing was committed",
+                raw.object_type.name()
+            );
+        }
+        let actual = repo.refs.resolve_head()?;
+        if actual != Some(expected) {
+            return Err(HeadMoved { expected, actual }.into());
+        }
+    }
 
     // Authority is checked BEFORE the index is written. It used to be checked
     // after, which meant a rejected commit still persisted the staged index:
@@ -708,7 +941,25 @@ pub fn commit(args: CommitArgs) -> Result<()> {
     // Attribution is the entire point of signing a commit, and a commit that
     // had to sweep up someone else's unfinished edits in order to exist
     // attributes their work to you.
-    let restrict = normalize_paths(&repo, &args.paths)?;
+    let mut restrict = normalize_paths(&repo, &args.paths)?;
+    let given: Vec<String> = content.keys().cloned().collect();
+    for p in &given {
+        // Given content is for one file, which must be tracked: it replaces
+        // that file's version and adds nothing new.
+        if idx.find(p).is_none() {
+            if idx
+                .entries
+                .iter()
+                .any(|e| path_under(std::slice::from_ref(p), &e.path))
+            {
+                bail!("--content names a file, and '{p}' is a directory");
+            }
+            bail!("nothing tracked at '{p}'; `levcs track` it first");
+        }
+        if !restrict.contains(p) {
+            restrict.push(p.clone());
+        }
+    }
     for r in &restrict {
         // A path matching nothing tracked is an error rather than an empty
         // scope. A mistyped path that quietly commits nothing is the same
@@ -756,6 +1007,27 @@ pub fn commit(args: CommitArgs) -> Result<()> {
     for e in &idx.entries {
         if !path_under(&restrict, &e.path) {
             new_entries.push(e.clone());
+            continue;
+        }
+        // Given content is committed in place of the working tree's, which
+        // is not read. The tracked executable bit is kept.
+        if let Some(bytes) = content.remove(&e.path) {
+            if has_conflict_markers(&bytes) {
+                bail!(
+                    "the content given for {} contains conflict markers; resolve before committing",
+                    e.path
+                );
+            }
+            let size = bytes.len() as u64;
+            let blob_id = repo.objects.write_raw(&Blob::new(bytes).serialize())?;
+            new_entries.push(IndexEntry {
+                path: e.path.clone(),
+                blob_hash: blob_id,
+                mode: e.mode,
+                flags: IndexEntryFlags::TRACKED,
+                mtime_micros: 0,
+                size,
+            });
             continue;
         }
         // Read without following a link. A tracked path that is now a link
@@ -926,6 +1198,12 @@ pub fn commit(args: CommitArgs) -> Result<()> {
         // have been said.
         println!("scoped to {}", restrict.join(", "));
     }
+    if !given.is_empty() {
+        println!(
+            "committed the given content for {}; the working tree's copy is as it was",
+            given.join(", ")
+        );
+    }
     // Merge state goes before the index: left behind, it would make the next
     // commit a second merge; a stale index only makes `status` overstate.
     let mut problems = Vec::new();
@@ -946,6 +1224,46 @@ pub fn commit(args: CommitArgs) -> Result<()> {
     }
     Ok(())
 }
+
+/// `commit --content PATH=FILE`, read: each repository-relative path and
+/// the bytes to commit as it. PATH resolves as every path argument does.
+/// `--content`'s files by path. Ordered by path, so that the paths a commit
+/// is scoped to, and the lines that list them, come out the same each run.
+fn given_content(repo: &Repository, specs: &[String]) -> Result<BTreeMap<String, Vec<u8>>> {
+    let mut out = BTreeMap::new();
+    for spec in specs {
+        let (path, file) = spec
+            .split_once('=')
+            .filter(|(p, f)| !p.is_empty() && !f.is_empty())
+            .ok_or_else(|| anyhow!("--content takes PATH=FILE, not '{spec}'"))?;
+        let rel = normalize_paths(repo, &[PathBuf::from(path)])?.remove(0);
+        let bytes = fs::read(file).with_context(|| format!("reading {file} for --content"))?;
+        if out.insert(rel.clone(), bytes).is_some() {
+            bail!("--content names '{rel}' more than once");
+        }
+    }
+    Ok(out)
+}
+
+/// `commit --expect-head` found HEAD at another commit. Nothing was
+/// committed.
+#[derive(Debug)]
+pub struct HeadMoved {
+    expected: ObjectId,
+    actual: Option<ObjectId>,
+}
+
+impl std::fmt::Display for HeadMoved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.actual {
+            Some(a) => write!(f, "HEAD is {a}, not {}", self.expected)?,
+            None => write!(f, "HEAD has no commits, not {}", self.expected)?,
+        }
+        write!(f, " as --expect-head expects; nothing was committed")
+    }
+}
+
+impl std::error::Error for HeadMoved {}
 
 /// The files of a tree as index entries, for building a tree that mixes
 /// HEAD's content with staged content. `.levcs/` is skipped: an index never
@@ -1032,20 +1350,9 @@ pub fn construct(args: ConstructArgs) -> Result<()> {
             .resolve_head()?
             .ok_or_else(|| anyhow!("HEAD has no commits"))?,
         (None, true) => {
-            let mut releases = repo.refs.list_releases()?;
-            // Newest by timestamp_micros within the release object body.
-            releases.sort_by_key(|(_, id)| {
-                repo.read_signed(*id)
-                    .ok()
-                    .and_then(|s| Release::parse_body(&s.body).ok())
-                    .map(|r| r.timestamp_micros)
-                    .unwrap_or(0)
-            });
-            let (_, id) = releases
-                .into_iter()
-                .last()
-                .ok_or_else(|| anyhow!("no releases on this repository"))?;
-            id
+            latest_release(&repo)?
+                .ok_or_else(|| anyhow!("no releases on this repository"))?
+                .1
         }
     };
     let raw = repo.read_raw_object(target_id)?;
@@ -1112,6 +1419,7 @@ pub fn construct(args: ConstructArgs) -> Result<()> {
 }
 
 pub fn diff(args: DiffArgs) -> Result<()> {
+    let json = is_json(&args.format)?;
     let repo = open_repo()?;
     let head = repo.refs.resolve_head()?;
     // Fold a non-hex "commit" positional into the path restriction list.
@@ -1135,18 +1443,8 @@ pub fn diff(args: DiffArgs) -> Result<()> {
             _ => bail!("not a commit/release/tree"),
         }
     } else if args.release {
-        let mut releases = repo.refs.list_releases()?;
-        releases.sort_by_key(|(_, id)| {
-            repo.read_signed(*id)
-                .ok()
-                .and_then(|s| Release::parse_body(&s.body).ok())
-                .map(|r| r.timestamp_micros)
-                .unwrap_or(0)
-        });
-        let (_, id) = releases
-            .into_iter()
-            .last()
-            .ok_or_else(|| anyhow!("no releases on this repository"))?;
+        let (_, id) =
+            latest_release(&repo)?.ok_or_else(|| anyhow!("no releases on this repository"))?;
         Release::parse_body(&repo.read_signed(id)?.body)?.tree
     } else if let Some(h) = head {
         Commit::from_signed(&repo.read_signed(h)?)?.tree
@@ -1206,23 +1504,81 @@ pub fn diff(args: DiffArgs) -> Result<()> {
     let mut keys: Vec<&String> = baseline.keys().chain(work.keys()).collect();
     keys.sort();
     keys.dedup();
-    for k in &unreadable {
-        if path_matches(k) {
-            println!(
-                "--- a/{k}\n+++ b/{k}\n# not a regular file now; levcs neither follows nor \
-                 records links"
+    // A file is changed if either side's content differs or it is on one
+    // side only. Comparing contents alone passed over an empty file added
+    // or deleted.
+    keys.retain(|k| path_matches(k) && !unreadable.contains(k) && baseline.get(*k) != work.get(*k));
+    unreadable.retain(|k| path_matches(k));
+
+    if json {
+        let blob_id = |b: Option<&Vec<u8>>| b.map(|b| Blob::new(b.clone()).object_id().to_hex());
+        let mut files: Vec<JsonDiffFile> = unreadable
+            .iter()
+            .map(|k| JsonDiffFile {
+                path: k.clone(),
+                change: "not_regular",
+                old_blob: blob_id(baseline.get(k)),
+                new_blob: None,
+                binary: false,
+                lines: Vec::new(),
+            })
+            .collect();
+        for k in keys {
+            let (a, b) = (baseline.get(k), work.get(k));
+            let change = match (a, b) {
+                (None, _) => "added",
+                (_, None) => "deleted",
+                _ => "modified",
+            };
+            let empty = Vec::new();
+            let (a_s, b_s) = (
+                std::str::from_utf8(a.unwrap_or(&empty)),
+                std::str::from_utf8(b.unwrap_or(&empty)),
             );
+            let mut lines = Vec::new();
+            if let (Ok(a_s), Ok(b_s)) = (a_s, b_s) {
+                for change in TextDiff::from_lines(a_s, b_s).iter_all_changes() {
+                    let op = match change.tag() {
+                        ChangeTag::Equal => continue,
+                        ChangeTag::Insert => "+",
+                        ChangeTag::Delete => "-",
+                    };
+                    lines.push(JsonDiffLine {
+                        op,
+                        old_line: change.old_index().map(|i| i + 1),
+                        new_line: change.new_index().map(|i| i + 1),
+                        text: change.value().to_string(),
+                    });
+                }
+            }
+            files.push(JsonDiffFile {
+                path: k.clone(),
+                change,
+                old_blob: blob_id(a),
+                new_blob: blob_id(b),
+                binary: a_s.is_err() || b_s.is_err(),
+                lines,
+            });
         }
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        let report = JsonDiff {
+            schema_version: 1,
+            baseline: (!baseline_tree.is_zero()).then(|| baseline_tree.to_hex()),
+            files,
+        };
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    for k in &unreadable {
+        println!(
+            "--- a/{k}\n+++ b/{k}\n# not a regular file now; levcs neither follows nor \
+             records links"
+        );
     }
     for k in keys {
-        if !path_matches(k) || unreadable.contains(k) {
-            continue;
-        }
         let a = baseline.get(k).cloned().unwrap_or_default();
         let b = work.get(k).cloned().unwrap_or_default();
-        if a == b {
-            continue;
-        }
         println!("--- a/{k}\n+++ b/{k}");
         let a_s = String::from_utf8_lossy(&a);
         let b_s = String::from_utf8_lossy(&b);
@@ -1234,9 +1590,54 @@ pub fn diff(args: DiffArgs) -> Result<()> {
                 ChangeTag::Delete => "-",
             };
             print!("{prefix}{}", change.value());
+            // Every printed line ends. A file's last line that has no
+            // ending used to run into the next line, or the next file's
+            // header, so `-b` and `+b` printed as `-b+b`. It is marked on a
+            // line of its own instead, as unified diff marks it.
+            if change.missing_newline() {
+                println!("\n\\ No newline at end of file");
+            }
         }
     }
     Ok(())
+}
+
+/// `diff --format json`.
+#[derive(serde::Serialize)]
+struct JsonDiff {
+    /// Schema tag — bumped when the output format changes incompatibly.
+    schema_version: u32,
+    /// The tree the working tree is compared with; None before the first
+    /// commit.
+    baseline: Option<String>,
+    files: Vec<JsonDiffFile>,
+}
+
+#[derive(serde::Serialize)]
+struct JsonDiffFile {
+    path: String,
+    /// One of "added", "deleted", "modified", "not_regular" (a link or
+    /// other non-file where the baseline or the index has a file).
+    change: &'static str,
+    /// The blob id of each side's content; None on the side without it.
+    old_blob: Option<String>,
+    new_blob: Option<String>,
+    /// Either side is not UTF-8, so `lines` is empty.
+    binary: bool,
+    /// The lines added and removed, in order. Unchanged lines are left out.
+    lines: Vec<JsonDiffLine>,
+}
+
+#[derive(serde::Serialize)]
+struct JsonDiffLine {
+    /// "+" or "-".
+    op: &'static str,
+    /// 1-based line numbers in the baseline and in the working tree; each
+    /// is None on the side the line is not on.
+    old_line: Option<usize>,
+    new_line: Option<usize>,
+    /// The line as it is in the file, with its line ending if it has one.
+    text: String,
 }
 
 fn collect_tree_files(
@@ -1558,13 +1959,7 @@ fn merge_run(args: MergeArgs) -> Result<()> {
         paths.insert(k.clone());
     }
 
-    let json_mode = args.format == "json";
-    if !json_mode && args.format != "text" {
-        bail!(
-            "unknown --format value: {} (allowed: text, json)",
-            args.format
-        );
-    }
+    let json_mode = is_json(&args.format)?;
     let mut auto_resolved = 0usize;
     let mut conflict_count = 0usize;
     let mut merged_files: HashMap<String, Vec<u8>> = HashMap::new();

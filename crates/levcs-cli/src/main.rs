@@ -34,6 +34,13 @@ fn main() {
             eprintln!("levcs: {c}");
             std::process::exit(4);
         }
+        // HEAD is not the commit the caller built on. Nothing was
+        // committed, and a caller retrying from the new HEAD needs to tell
+        // this apart from a failure.
+        if let Some(h) = e.downcast_ref::<repo_cmds::HeadMoved>() {
+            eprintln!("levcs: {h}");
+            std::process::exit(5);
+        }
         eprintln!("levcs: {e:#}");
         std::process::exit(1);
     }
@@ -52,8 +59,9 @@ fn run() -> Result<()> {
         cli::Cmd::Merge(a) => repo_cmds::merge(a),
         cli::Cmd::Release(a) => repo_cmds::release(a),
         cli::Cmd::Cache(a) => repo_cmds::cache(a),
-        cli::Cmd::Status => repo_cmds::status(),
+        cli::Cmd::Status(a) => repo_cmds::status(a),
         cli::Cmd::Log(a) => repo_cmds::log(a),
+        cli::Cmd::Show(a) => repo_cmds::show(a),
         cli::Cmd::Root => repo_cmds::root(),
         cli::Cmd::Verify => repo_cmds::verify(),
         cli::Cmd::Gc(a) => repo_cmds::gc(a),

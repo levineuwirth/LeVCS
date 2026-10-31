@@ -1,6 +1,6 @@
 //! Repository-side commands: init, track, forget, commit, etc.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -387,6 +387,23 @@ struct JsonMerge {
     committed: bool,
 }
 
+/// The newest release, by the time it records, with its label: the release
+/// `status` reports and `construct --release` and `diff --release` use.
+/// `status` took the label that sorts last, which is not the newest once
+/// labels outgrow their digits (`v9.0` sorts after `v10.0`). A release that
+/// cannot be read counts as the oldest; of equal times, the last label wins.
+fn latest_release(repo: &Repository) -> Result<Option<(String, ObjectId)>> {
+    let mut releases = repo.refs.list_releases()?;
+    releases.sort_by_key(|(_, id)| {
+        repo.read_signed(*id)
+            .ok()
+            .and_then(|s| Release::parse_body(&s.body).ok())
+            .map(|r| r.timestamp_micros)
+            .unwrap_or(0)
+    });
+    Ok(releases.pop())
+}
+
 pub fn status(args: StatusArgs) -> Result<()> {
     let json = is_json(&args.format)?;
     let repo = open_repo()?;
@@ -404,9 +421,8 @@ pub fn status(args: StatusArgs) -> Result<()> {
         head_tree = Some(commit.tree);
         subject = commit.message.lines().next().unwrap_or("").to_string();
     }
-    let releases = repo.refs.list_releases()?;
-    let release = releases.last().map(|(label, id)| JsonRelease {
-        label: label.clone(),
+    let release = latest_release(&repo)?.map(|(label, id)| JsonRelease {
+        label,
         id: id.to_hex(),
     });
     let merge = if repo.levcs_dir.join("MERGE_HEAD").exists() {
@@ -855,6 +871,19 @@ pub fn commit(args: CommitArgs) -> Result<()> {
     // be undone by this one.
     if let Some(spec) = &args.expect_head {
         let expected = crate::rev::resolve_rev(&repo, spec)?;
+        // Only a commit can be HEAD. Any other id, a release or a hash that
+        // names nothing here, was refused as HEAD having moved, with the
+        // status that tells a caller to rebuild and try again, so a caller
+        // that did would retry forever. It is refused as a failure instead.
+        let raw = repo
+            .read_raw_object(expected)
+            .with_context(|| format!("--expect-head {spec}: no such commit here"))?;
+        if raw.object_type != ObjectType::Commit {
+            bail!(
+                "--expect-head {spec} is a {}, not a commit; nothing was committed",
+                raw.object_type.name()
+            );
+        }
         let actual = repo.refs.resolve_head()?;
         if actual != Some(expected) {
             return Err(HeadMoved { expected, actual }.into());
@@ -1198,8 +1227,10 @@ pub fn commit(args: CommitArgs) -> Result<()> {
 
 /// `commit --content PATH=FILE`, read: each repository-relative path and
 /// the bytes to commit as it. PATH resolves as every path argument does.
-fn given_content(repo: &Repository, specs: &[String]) -> Result<HashMap<String, Vec<u8>>> {
-    let mut out = HashMap::new();
+/// `--content`'s files by path. Ordered by path, so that the paths a commit
+/// is scoped to, and the lines that list them, come out the same each run.
+fn given_content(repo: &Repository, specs: &[String]) -> Result<BTreeMap<String, Vec<u8>>> {
+    let mut out = BTreeMap::new();
     for spec in specs {
         let (path, file) = spec
             .split_once('=')
@@ -1319,20 +1350,9 @@ pub fn construct(args: ConstructArgs) -> Result<()> {
             .resolve_head()?
             .ok_or_else(|| anyhow!("HEAD has no commits"))?,
         (None, true) => {
-            let mut releases = repo.refs.list_releases()?;
-            // Newest by timestamp_micros within the release object body.
-            releases.sort_by_key(|(_, id)| {
-                repo.read_signed(*id)
-                    .ok()
-                    .and_then(|s| Release::parse_body(&s.body).ok())
-                    .map(|r| r.timestamp_micros)
-                    .unwrap_or(0)
-            });
-            let (_, id) = releases
-                .into_iter()
-                .last()
-                .ok_or_else(|| anyhow!("no releases on this repository"))?;
-            id
+            latest_release(&repo)?
+                .ok_or_else(|| anyhow!("no releases on this repository"))?
+                .1
         }
     };
     let raw = repo.read_raw_object(target_id)?;
@@ -1423,18 +1443,8 @@ pub fn diff(args: DiffArgs) -> Result<()> {
             _ => bail!("not a commit/release/tree"),
         }
     } else if args.release {
-        let mut releases = repo.refs.list_releases()?;
-        releases.sort_by_key(|(_, id)| {
-            repo.read_signed(*id)
-                .ok()
-                .and_then(|s| Release::parse_body(&s.body).ok())
-                .map(|r| r.timestamp_micros)
-                .unwrap_or(0)
-        });
-        let (_, id) = releases
-            .into_iter()
-            .last()
-            .ok_or_else(|| anyhow!("no releases on this repository"))?;
+        let (_, id) =
+            latest_release(&repo)?.ok_or_else(|| anyhow!("no releases on this repository"))?;
         Release::parse_body(&repo.read_signed(id)?.body)?.tree
     } else if let Some(h) = head {
         Commit::from_signed(&repo.read_signed(h)?)?.tree

@@ -573,3 +573,80 @@ fn content_is_refused_for_what_it_cannot_replace() {
     }
     assert_eq!(ok(&work, &cfg, &["show", "HEAD:log.md"]), "base\n");
 }
+
+#[test]
+fn expect_head_naming_no_commit_fails_rather_than_asking_for_a_retry() {
+    // Status 5 tells a caller that HEAD moved, to rebuild and try again. An
+    // id that is not a commit can never be HEAD, and was refused with 5, so
+    // a caller that did as told retried forever.
+    let (work, cfg) = shared_log("not-a-commit");
+    ok(&work, &cfg, &["release", "v1", "--key", "owner"]);
+    let s: serde_json::Value =
+        serde_json::from_str(&ok(&work, &cfg, &["status", "--format", "json"])).unwrap();
+    let release = s["release"]["id"].as_str().expect("a release").to_string();
+    let before = head(&work, &cfg);
+    let file = work.join("../mine.version");
+    std::fs::write(&file, "base\nmine\n").unwrap();
+    let nothing = "ab".repeat(32);
+    for (spec, why) in [
+        (release.as_str(), "is a release, not a commit"),
+        (nothing.as_str(), "no such commit"),
+    ] {
+        let o = levcs(
+            &work,
+            &cfg,
+            &[
+                "commit",
+                "--key",
+                "agent",
+                "-m",
+                "mine",
+                "--expect-head",
+                spec,
+                "--content",
+                &format!("log.md={}", file.display()),
+            ],
+        );
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert_eq!(o.status.code(), Some(1), "{spec}: {err}");
+        assert!(err.contains(why), "{spec}: {err}");
+    }
+    assert_eq!(head(&work, &cfg), before);
+}
+
+#[test]
+fn given_content_is_listed_in_path_order() {
+    // The paths came from a hash map, so their order, in the scope and in
+    // the lines that list them, changed from one run to the next. Each
+    // commit is a new process with a new hash seed: eight in path order by
+    // chance is one in 256.
+    let (work, cfg) = shared_log("order");
+    std::fs::write(work.join("a.md"), "a\n").unwrap();
+    ok(&work, &cfg, &["track", "a.md"]);
+    ok(&work, &cfg, &["commit", "-m", "a", "--key", "owner"]);
+    let (log, a) = (work.join("../log.version"), work.join("../a.version"));
+    for i in 0..8 {
+        std::fs::write(&log, format!("base\n{i}\n")).unwrap();
+        std::fs::write(&a, format!("a\n{i}\n")).unwrap();
+        let out = ok(
+            &work,
+            &cfg,
+            &[
+                "commit",
+                "--key",
+                "agent",
+                "-m",
+                "both",
+                "--content",
+                &format!("log.md={}", log.display()),
+                "--content",
+                &format!("a.md={}", a.display()),
+            ],
+        );
+        assert!(out.contains("scoped to a.md, log.md"), "{out}");
+        assert!(
+            out.contains("committed the given content for a.md, log.md"),
+            "{out}"
+        );
+    }
+}

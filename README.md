@@ -145,7 +145,9 @@ for them to commit under their own keys. `--expect-head` refuses the commit,
 under the repository lock, unless HEAD is still the commit the version was
 built from. Without it, a commit that landed in between would be undone. A
 refusal commits nothing and exits with status 5, so a caller can rebuild its
-version from the new HEAD and try again.
+version from the new HEAD and try again. An id that is not a commit here, such
+as a release or a mistyped hash, exits with status 1, since trying again
+would not change it.
 
 `levcs verify` checks everything the repository keeps, not just HEAD.
 Every object reachable from any ref is hash-checked, and every commit and
@@ -292,10 +294,13 @@ each commit in the log. A change to the executable bit alone is an `M`.
 
 `status --format json` and `diff --format json` print one JSON object for
 tools, as `merge --format json` does. `status` gives HEAD's id and each group
-of paths it lists. `diff` gives each changed file, the blob id of each side
-(which `show <blob-id>` prints), and each line added or removed, with its line
-number and its line ending, if it has one. The text `diff` ends every line,
-and marks a last line without an ending with `\ No newline at end of file`.
+of paths it lists, and the newest release. `diff` gives each changed file, the
+blob id of each side, and each line added or removed, with its line number and
+its line ending, if it has one. `show <blob-id>` prints the old side's blob,
+which history holds. The new side's id is only a hash of the working tree's
+file: `show` prints it only if that content was tracked or committed. The
+text `diff` ends every line, and marks a last line without an ending with
+`\ No newline at end of file`.
 
 Branch and merge — note that creating a branch and switching to it are
 separate operations, so a commit cannot land on a branch you only meant to

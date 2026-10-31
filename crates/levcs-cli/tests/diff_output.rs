@@ -162,3 +162,18 @@ fn an_unknown_format_is_refused() {
         assert!(String::from_utf8_lossy(&o.stderr).contains("allowed: text, json"));
     }
 }
+
+#[test]
+fn status_reports_the_newest_release_not_the_last_label() {
+    // Labels sort as text, so `v9.0` comes after the newer `v10.0`. Status
+    // reported the last label, while `construct --release` built the newest.
+    let (work, cfg) = setup("release");
+    ok(&work, &cfg, &["release", "v9.0"]);
+    std::fs::write(work.join("two.md"), "y\n").unwrap();
+    ok(&work, &cfg, &["commit", "-m", "next"]);
+    ok(&work, &cfg, &["release", "v10.0"]);
+    let s = json(&work, &cfg, &["status", "--format", "json"]);
+    assert_eq!(s["release"]["label"], "v10.0");
+    let text = ok(&work, &cfg, &["status"]);
+    assert!(text.contains("Release    v10.0"), "{text}");
+}

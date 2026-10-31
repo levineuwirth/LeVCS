@@ -3,9 +3,22 @@
 **Status: ratified by the owner on 2026-10-04.** Ratified: the terms;
 rules H, R and P; decisions D1, D2, D4 and D5 as written. D3 and D6 are
 deferred. D6 needs an independent trust decision, so its recommendation
-below is a proposal only. Nothing here is implemented. This note is the
-specification that `verify`, replication and admission will enforce (audit
-2026-10-03, revised: step 7; findings C1, C2).
+below is a proposal only. This note is the specification that `verify`,
+replication and admission enforce (audit 2026-10-03, revised: step 7;
+findings C1, C2).
+
+**Implementation.**
+- **Rule H** is `levcs-identity/src/history.rs`. `verify` applies it to
+  everything a repository keeps, and so does everything that receives
+  history.
+- **Rule R** is applied by `pull`, `clone` and the read side of `fork`.
+  Mirroring and `dial` are refused until they apply it.
+- **Rule P** is `levcs-identity/src/admission.rs`. The instance applies
+  it to every push, and the local commands that publish apply it in a
+  repository with no instance.
+- **Decisions.** D2, D4 and D5 are implemented. D1 and D6 are not, so
+  work that needs adoption is refused, and nothing can bootstrap a
+  received repository.
 
 **Relation to the frozen v2 contract.** For publication, the push
 contract in `doc/instance-throughput-rewrite-plan.md` §6.1 governs:
@@ -64,7 +77,7 @@ the authoritative state reach it and `R0` does not contain it.
 
 Why `A(C)` and `E(C)` differ: an authority-changing commit cites the old
 authority and installs the new one only in its tree
-(`identity_cmds.rs:253-262`). A rule comparing only cited authorities
+(`identity_cmds.rs:248-258`). A rule comparing only cited authorities
 lets a revoked author's commit sit directly on the revoking commit, since
 both cite the old authority.
 
@@ -116,8 +129,8 @@ distinct:
 ## Rule R: replication
 
 Replication is receiving history that was already published elsewhere:
-`pull`, `mirror`, the read side of `fork`, and the receiving side of
-`dial`.
+`pull`, `clone`, the read side of `fork`, mirroring, and the receiving
+side of `dial`. The last two are refused until they apply this rule.
 
 1. **Every received commit and release passes Rule H** against the
    genesis pinned by the expected `repo_id`. If a chain ends at a
@@ -242,14 +255,16 @@ exists.
 and in `authority remove` and `promote`.
 
 **D5. Release declarers.** Adopt: `Maintainer` or above in `A(release)`.
-Today any member, a Reader included, passes (finding H13).
+Implemented in Rule H's release check, so `verify` and every admission
+refuse a release declared by a Contributor or Reader (finding H13).
 
 **D6. Bootstrapping an authoritative replica under v1.** Deferred: it
 needs an independent trust decision. The recommendation below is a
 proposal, not ratified policy.
 - **The case:** a repository with no instance copied whole to a second
-  machine, for example by `dial`. The copy becomes authoritative for itself,
-  but it starts with an empty `R0` and no `A0`.
+  machine, as `dial` was built to do (it is refused until it applies Rule
+  R). The copy becomes authoritative for itself, but it starts with an
+  empty `R0` and no `A0`.
 - **The gap:** under P, every received commit is newly exposed. Under v1,
   nothing establishes that the history was published at the source. Any
   history spanning a membership change therefore cannot be promoted.

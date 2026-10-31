@@ -18,11 +18,12 @@ the workflow tooling that will sit on top of it.
 - **It is a substrate, not a workflow tool.** There is no PR review
   surface, no issue tracker, no CI integration, no web UI today. Those
   are the next layer up.
-- **You can host an instance on a small VPS** behind nginx or Caddy. The
-  protocol terminates over HTTP; signing is at the application layer.
-- **The codebase is small** (~10 crates) and runs `cargo test` in under a
-  minute on a laptop. 194 tests pass at v0.1.0; baseline benchmarks are
-  in the repo.
+- **You can host an instance on a small VPS.** The protocol runs over
+  HTTP, with signing at the application layer. For now an instance
+  listens on loopback and is reached through an SSH tunnel; templates for
+  a TLS reverse proxy are ready for when it gets a public route.
+- **The codebase is small** (10 crates), with about a thousand tests and
+  a reproducible benchmark runner.
 
 ---
 
@@ -63,7 +64,7 @@ LeVCS is layered:
 ├───────────────────────────────────────────────────────┤
 │ CLI: `levcs init / commit / push / merge / release`    │
 ├───────────────────────────────────────────────────────┤
-│ Federation HTTP API (instances, mirrors, releases)     │
+│ Federation HTTP API (instances, refs, packs, pushes)   │
 ├───────────────────────────────────────────────────────┤
 │ Object model: Blob / Tree / Commit / Release / Authority │
 │ Merge engine: textual → format-aware → tree-sitter     │
@@ -98,8 +99,8 @@ construction, no central registrar needed.
 | Identity | Author string in commit | Signed authority object with explicit roles |
 | Push authorization | Server-side hook or hosting platform | Protocol-level role check (Reader/Contributor/Maintainer/Owner) |
 | Force-push rule | Server policy (off-protocol) | Protocol enforces maintainer-or-owner role |
-| Federation | URL-bound remotes | Global `repo_id` + replicating instances |
-| Mirror replication | `git fetch --mirror` (best-effort) | First-class with three storage modes |
+| Federation | URL-bound remotes | Global `repo_id`; any instance can hold the repository |
+| Mirror replication | `git fetch --mirror` (best-effort) | Designed, in three storage modes; refused until a mirror checks what it receives |
 | Tags / releases | Mutable string refs (often) | Signed objects with predecessor + parent_release chain |
 | Merge granularity | Line-level (myers / patience) | Cascade: textual → format → tree-sitter → plugin |
 | Merge audit | No artifact | `.levcs/merge-record` TOML, signed with the commit |
@@ -144,9 +145,13 @@ LeVCS has a **global repo_id**. It is the BLAKE3 of the genesis
 authority object, so two clones of the same project have the same
 `repo_id` even if they live on instances on opposite continents. An
 instance is a federation peer: it serves `/levcs/v1/repos/<repo_id>/...`
-endpoints and replicates state from other instances when configured to.
-Mirroring is the protocol's normal mode, not a `git fetch --mirror` cron
-job.
+endpoints. Replication between instances is designed into the protocol
+rather than left to a `git fetch --mirror` cron job, but an instance
+refuses to run as a mirror until mirroring checks what it receives
+against the genesis the `repo_id` pins (Rule R in
+`doc/authority-semantics.md`). Today a repository moves to another
+instance with `migrate`, which pushes its history there, and to another
+machine with `clone`, which checks what it receives.
 
 This composes with three **storage modes** (§4.3 of the spec):
 
@@ -159,7 +164,7 @@ This composes with three **storage modes** (§4.3 of the spec):
 
 The instance enforces these on push: a release-mode replica refuses
 pushes that update branches; a metadata-mode replica refuses all
-pushes (it's populated by mirroring).
+pushes, since only mirroring was to fill it.
 
 ### 3.3 The merge cascade
 
@@ -225,8 +230,8 @@ Git uses SHA-1. SHAttered (2017) was a practical collision. The
 SHA-256 transition is still incomplete in 2026 and is unlikely to ever
 finish for the long tail of git infrastructure.
 
-LeVCS uses BLAKE3 from day one. Faster than SHA-256 in practice (the
-benchmarks in `bench-results/` show ~5 GiB/s on a laptop for blob
+LeVCS uses BLAKE3 from day one. Faster than SHA-256 in practice
+(`scripts/bench.sh` measures ~5 GiB/s on a laptop for blob
 serialize+hash), tree-hashed, no commitment to a specific length-tag
 convention. Object IDs are 32 bytes everywhere.
 
@@ -248,8 +253,8 @@ notes           release notes (UTF-8, up to 4 GiB)
 ```
 
 The chain `parent_release → parent_release → ...` gives you a clean
-release history independent of branch topology. The replica modes
-above can replicate just releases (and their trees and authority) for
+release history independent of branch topology. The release storage
+mode above holds just releases (and their trees and authority), for
 archive instances that don't need the inter-release commit history.
 
 ---
@@ -259,7 +264,7 @@ archive instances that don't need the inter-release commit history.
 ### 4.1 Bootstrap
 
 ```sh
-levcs key generate --label primary
+levcs key generate primary
 levcs init --key primary
 levcs track --all
 levcs commit -m "initial import"
@@ -267,51 +272,70 @@ levcs commit -m "initial import"
 
 After `init`, `.levcs/` exists alongside your tree. The genesis authority
 names your key as the sole Owner; the `repo_id` is fixed forever. After
-`commit`, you have one commit on `refs/branches/main`.
+`commit`, you have one commit on `refs/branches/main`. In a git checkout,
+put `/.git` in `.levcsignore` before `track --all`: levcs does not skip
+git's store on its own.
 
 ### 4.2 Branch and merge
 
+Creating a branch and switching to it are separate commands, so a commit
+cannot land on a branch you only meant to make:
+
 ```sh
-levcs branch feature/x
+levcs branch --create feature/x
+levcs branch --switch feature/x
 # ... edit files ...
 levcs commit -m "wip on x"
-levcs branch main          # switch back
+levcs branch --switch main
 levcs merge feature/x
 ```
 
-If the merge produces conflicts, drop into the resolution TUI:
+If the merge produces conflicts, step through them in the resolution TUI:
 
 ```sh
-levcs merge --resolve
+levcs merge --review
 ```
 
-The TUI shows each conflicted file with the ours/base/theirs panes the
-handler emitted, plus the cascade decision (which handler ran, why it
-fell through if it did). On accept, it writes the resolved file and a
-signed `.levcs/merge-record` entry.
+The TUI shows each file of the merge in progress with the ours, base and
+theirs versions and the handler that merged it, and writes the version
+you choose for each into the working tree. A conflict is then resolved
+by naming it: `levcs track <path>` once the file is edited, or `levcs
+forget --delete <path>` to resolve it by deletion. `levcs commit` then
+records the merge, with its `.levcs/merge-record` in the signed tree, and
+`levcs merge --abort` abandons it.
 
 ### 4.3 Release
 
 ```sh
-levcs release v1.0.0 --notes "first release"
+levcs release v1.0.0 -m "first release"
 ```
 
 Writes a Release object with the current commit as `predecessor`, signs
-it with your active key, and adds `refs/releases/v1.0.0`. If you've cut
-prior releases, `parent_release` chains to the most recent one
-automatically.
+it with your key (named with `--key` when the keychain holds several),
+and adds `refs/releases/v1.0.0`. The declarer must be a maintainer or
+owner. If you've cut prior releases, `parent_release` chains to the most
+recent one automatically.
 
 ### 4.4 Federation
 
 ```sh
-levcs instance --set https://levcs.example.com/levcs/v1
-levcs push refs/branches/main
+levcs instance --set http://127.0.0.1:7117/levcs/v1   # through an SSH tunnel
+levcs push --dry-run
+levcs push
 ```
 
-The first push to a fresh instance auto-inits the repo using your
-genesis authority. Subsequent pushes are role-checked. Pulls are
-public-read by default (the `public_read` policy bit on the genesis
-authority).
+The first push of a repository the instance does not hold creates it
+there from your genesis authority, if the instance names your key in
+`creators`; otherwise it is refused. Every push is checked against the
+repository's current authority (Rule P). Reads are open to anyone by
+default: the `public_read` policy of the *current* authority, which
+`init` sets. When it is false, only members can read, in requests signed
+with `--key`, though no command sets it false yet.
+
+Another machine gets the repository with `levcs clone <repo_id> --from
+<url>`, and later work with `levcs pull`, which records the instance's
+branches under `refs/remote/origin/`. Both check everything they receive
+against the genesis the `repo_id` pins before writing any of it.
 
 To migrate to a new home:
 
@@ -323,15 +347,39 @@ levcs migrate https://new-host.example.com/levcs/v1 --set-active
 points your local repo at it. The `repo_id` is unchanged — it's the
 same project at a new location.
 
+### 4.5 Several writers, scripts, and uncommitted work
+
+The README covers each of these in full; in brief:
+
+- **Revisions.** Commands that take a commit accept `HEAD~2`, `main^2`
+  and unique hex prefixes as well as full ids. `levcs show <rev>:<path>`
+  prints a file as it was, and writes nothing.
+- **Scoped commits.** `levcs commit -m ... <paths>` commits only the
+  named paths. Writers sharing one file commit their own version of it
+  with `--content PATH=FILE`, and `--expect-head <id>` refuses the commit,
+  with exit status 5, if another landed since the version was built.
+  Every command that changes the repository holds a lock on it, so
+  concurrent commands queue rather than race.
+- **Uncommitted work.** Switching branches, merging, `construct`, `cache
+  --restore` and `forget --delete` refuse to overwrite or delete work that
+  is not committed, and name each file. The last three take `--force`.
+- **For tools.** `status`, `diff` and `merge` take `--format json`.
+- **Checking.** `levcs verify` checks every object any ref reaches and
+  the authority rules over all history. It exits 1 if anything is
+  invalid, and 4 if history is valid but on an authority lineage that
+  conflicts with this repository's.
+
 ---
 
 ## 5. Operating an instance
 
 A single binary, `levcs-instance`, reads a TOML config and listens on
-HTTP. Production deployments terminate TLS at a reverse proxy; the
-instance binds to localhost. See `deploy/README.md` for a full
-walkthrough — systemd unit, Caddy and nginx examples, firewall, and the
-laptop-side bootstrap.
+HTTP. The first deployment binds it to localhost and reaches it through
+an SSH tunnel; the Caddy and nginx templates put TLS in front of it for
+when it gets a public route. It creates a repository only for a key its
+config names in `creators`. See `deploy/README.md` for a full
+walkthrough: the deployment gate, systemd unit, backups, restores,
+updates, and the laptop-side bootstrap.
 
 The protocol surface is small:
 
@@ -350,12 +398,16 @@ POST /levcs/v1/repos/<repo_id>/push
 That's it. No admin endpoints, no users-and-passwords table, no web UI
 to firewall. POSTs require a signed `LeVCS-Signature` header
 (Ed25519-over-canonical-request, with timestamp and nonce for replay
-protection). GETs are public unless the genesis authority's policy
-turned that off.
+protection). GETs are public unless the repository's current authority
+sets `public_read` false; then each must be signed by a member.
 
 Storage is a directory tree. Per-object atomic writes via temp-then-
-rename, per-repo serializing mutex on push. A consistent backup is just
-a snapshot of `/var/lib/levcs`.
+rename, per-repo serializing mutex on push, and a journal that rolls
+back a push interrupted between its ref writes. A copy taken while the
+instance runs can hold a ref without the objects it names, so back up
+with the service stopped, using `levcs-backup`, and restore with
+`levcs-restore`, which checks every repository in the archive before
+replacing anything (`deploy/README.md`, "Backups").
 
 ---
 
@@ -377,25 +429,32 @@ does not provide:
 
 If your use case requires any of the above today, run LeVCS *parallel*
 to your existing platform. Forgejo, GitHub, Gitea continue to host the
-workflow; the LeVCS instance acts as a dogfood replica that gets the
-same commits via a `push-both` wrapper. When the workflow surface
-lands, the migration story flips.
+workflow; the LeVCS instance holds a copy you commit and push to
+alongside it, as `deploy/README.md` ("Publishing later work") does for
+LeVCS's own source. When the workflow surface lands, the migration story
+flips.
 
 ---
 
 ## 7. What is true today (and how we know)
 
-The repo at v0.1.0 has 194 passing tests covering:
+The repository has about a thousand passing tests, covering:
 
 - The full §2-§7 object model and protocol surface.
 - A 14-scenario merge conformance corpus, eight of which are git-
-  false-conflict cases the cascade resolves cleanly.
+  false-conflict cases the cascade resolves cleanly when each scenario's
+  handler is selected (the structural handlers are opt-in; §3.3).
 - Property tests on the pack codec and object parsers (fuzz + structured
   proptest round-trip).
 - An end-to-end "dogfood" integration test that stands up three
   instances (source-of-truth, peer, mirror), pushes a chain of commits
   plus a release, replicates via mirror sync, migrates to the peer,
-  and asserts byte-for-byte object equality across all three.
+  and asserts byte-for-byte object equality across all three. The test
+  drives the mirror's sync directly; a running instance refuses to be a
+  mirror (§3.2).
+- The deployment gate, `levcs-gate`, which CI runs on the binaries it
+  builds: it drives a real instance through pushes, clones, refusals,
+  a crash, and a backup and restore.
 
 A baseline microbenchmark suite is checked in (`scripts/bench.sh`). On
 a Ryzen 7 laptop:
@@ -454,7 +513,7 @@ sudo install -m 0755 target/release/levcs target/release/levcs-instance /usr/loc
 Local single-machine tour:
 
 ```sh
-levcs key generate --label me
+levcs key generate me
 levcs init --key me /tmp/demo
 cd /tmp/demo
 echo "hello" > a.txt

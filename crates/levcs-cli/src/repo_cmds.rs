@@ -1363,26 +1363,68 @@ pub fn construct(args: ConstructArgs) -> Result<()> {
         other => bail!("cannot construct from {} object", other.name()),
     };
 
-    if paths.is_empty() {
-        // Whole-tree reconstruction.
-        if args.all {
-            // No-op: --all only matters when restricting paths; full tree is
-            // always rewritten.
-        }
-        repo.checkout_tree(tree_id, &repo.workdir)?;
-        eprintln!("constructed tree {} into {:?}", tree_id, repo.workdir);
-        return Ok(());
-    }
+    // Whole-tree reconstruction writes every file of the tree, so --all
+    // changes nothing there.
+    let whole = paths.is_empty();
+    let files = if whole {
+        repo.tree_files(tree_id, "")?
+    } else {
+        construct_selection(&repo, tree_id, &paths, args.all)?
+    };
 
-    // Path-restricted reconstruction. The whole selection is listed and
-    // checked before anything is written, as a checkout is, and written
-    // through the working tree's own descriptor: a directory on the way that
-    // is a symlink is refused, and a file that is one is replaced, not
-    // written through. Each path used to be checked and written in turn, by
-    // joined pathname, so `construct a.txt dir/b.txt` overwrote `a.txt`
-    // before finding `dir` was a symlink.
+    // Work that is not committed is not overwritten unless --force says to.
+    // `construct` used to write over it silently, and it was the only way to
+    // read a file at a revision, so reading history destroyed work.
+    let head_tree = match repo.refs.resolve_head()? {
+        Some(h) => Some(Commit::from_signed(&repo.read_signed(h)?)?.tree),
+        None => None,
+    };
+    let lost = repo.would_overwrite(head_tree, &files)?;
+    if !lost.is_empty() && !args.force {
+        return Err(refuse_overwrite(&lost));
+    }
+    repo.checkout_files(&files, &repo.workdir)?;
+    if !lost.is_empty() {
+        let paths: Vec<&str> = lost.iter().map(|u| u.path.as_str()).collect();
+        eprintln!(
+            "overwrote changes that were not committed: {}",
+            paths.join(", ")
+        );
+    }
+    if whole {
+        eprintln!("constructed tree {} into {:?}", tree_id, repo.workdir);
+    } else {
+        eprintln!("constructed paths from tree {}", tree_id);
+    }
+    Ok(())
+}
+
+/// `construct`'s refusal: what it would overwrite, and how to go on.
+fn refuse_overwrite(lost: &[levcs_core::repo::Unsaved]) -> anyhow::Error {
+    anyhow!(
+        "this construct would overwrite changes that are not committed:\n{}\n\
+         commit them, or pass --force to overwrite them (`levcs cache --save` keeps a \
+         copy first). `levcs show <rev>:<path>` reads a file at a revision without \
+         writing it. Nothing was changed.",
+        unsaved_listing(lost)
+    )
+}
+
+/// The files a path-restricted `construct` writes. The whole selection is
+/// listed and checked before anything is written, as a checkout is, and
+/// written through the working tree's own descriptor: a directory on the
+/// way that is a symlink is refused, and a file that is one is replaced,
+/// not written through. Each path used to be checked and written in turn,
+/// by joined pathname, so `construct a.txt dir/b.txt` overwrote `a.txt`
+/// before finding `dir` was a symlink.
+fn construct_selection(
+    repo: &Repository,
+    tree_id: ObjectId,
+    paths: &[PathBuf],
+    all: bool,
+) -> Result<Vec<levcs_core::repo::TreeFile>> {
     let mut files: Vec<levcs_core::repo::TreeFile> = Vec::new();
-    for rel_str in normalize_paths(&repo, &paths)? {
+    for rel_str in normalize_paths(repo, paths)? {
         let entry = repo
             .lookup_entry(tree_id, &rel_str)?
             .ok_or_else(|| anyhow!("path not in tree: {rel_str}"))?;
@@ -1397,7 +1439,7 @@ pub fn construct(args: ConstructArgs) -> Result<()> {
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
     files.dedup_by(|a, b| a.path == b.path);
-    if !args.all {
+    if !all {
         // A file is left alone only if it is a regular file that already
         // holds the blob, with the mode the tree gives it. Comparing
         // contents alone left a mode-only change unrestored, reported as
@@ -1413,9 +1455,7 @@ pub fn construct(args: ConstructArgs) -> Result<()> {
         }
         files = stale;
     }
-    repo.checkout_files(&files, &repo.workdir)?;
-    eprintln!("constructed paths from tree {}", tree_id);
-    Ok(())
+    Ok(files)
 }
 
 pub fn diff(args: DiffArgs) -> Result<()> {
@@ -1825,24 +1865,28 @@ fn current_in_worktree(repo: &Repository, path: &str) -> Vec<u8> {
 /// A refusal that names the work `action` would destroy and why each is
 /// not committed.
 fn refuse_unsaved(action: &str, lost: &[levcs_core::repo::Unsaved]) -> anyhow::Error {
-    let listing = lost
+    anyhow!(
+        "{action} would overwrite or remove uncommitted changes:\n{}\n\
+         commit them, or put each back as committed and try again: `levcs construct \
+         --force HEAD <path>` restores a file, and `levcs track <path>` then stages it \
+         as committed; an untracked file has to be moved aside (`levcs cache --save` \
+         keeps a copy first). Nothing was changed.",
+        unsaved_listing(lost)
+    )
+}
+
+/// Each path of `lost` and why, one indented line each, the first 20.
+fn unsaved_listing(lost: &[levcs_core::repo::Unsaved]) -> String {
+    let mut listing = lost
         .iter()
         .take(20)
         .map(|u| format!("  {}  ({})", u.path, u.why))
         .collect::<Vec<_>>()
         .join("\n");
-    let more = if lost.len() > 20 {
-        format!("\n  ... and {} more", lost.len() - 20)
-    } else {
-        String::new()
-    };
-    anyhow!(
-        "{action} would overwrite or remove uncommitted changes:\n{listing}{more}\n\
-         commit them, or put each back as committed and try again: `levcs construct \
-         HEAD <path>` restores a file, and `levcs track <path>` then stages it as \
-         committed; an untracked file has to be moved aside (`levcs cache --save` \
-         keeps a copy first). Nothing was changed."
-    )
+    if lost.len() > 20 {
+        listing.push_str(&format!("\n  ... and {} more", lost.len() - 20));
+    }
+    listing
 }
 
 fn merge_run(args: MergeArgs) -> Result<()> {

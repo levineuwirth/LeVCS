@@ -293,9 +293,9 @@ fn construct_paths_do_not_follow_symlinks() {
     let f = setup("construct");
     f.commit(&[("a.txt", b"a\n"), ("dir/f.txt", b"f\n")], "base");
     f.link_dir_outside("dir");
-    f.refused(&["construct", "dir/f.txt"]);
-    f.refused(&["construct", "dir"]);
-    f.refused(&["construct"]);
+    f.refused(&["construct", "--force", "dir/f.txt"]);
+    f.refused(&["construct", "--force", "dir"]);
+    f.refused(&["construct", "--force"]);
     f.outside_is_empty();
 
     std::fs::remove_file(f.work.join("dir")).unwrap();
@@ -303,14 +303,14 @@ fn construct_paths_do_not_follow_symlinks() {
     std::fs::write(&target, b"protected").unwrap();
     std::fs::remove_file(f.work.join("a.txt")).unwrap();
     symlink(&target, f.work.join("a.txt")).unwrap();
-    f.ok(&["construct", "a.txt"]);
+    f.ok(&["construct", "--force", "a.txt"]);
     assert_eq!(std::fs::read(&target).unwrap(), b"protected");
     assert_eq!(f.read("a.txt"), b"a\n");
     // A symlink is replaced even when its target already holds the blob.
     std::fs::write(&target, b"a\n").unwrap();
     std::fs::remove_file(f.work.join("a.txt")).unwrap();
     symlink(&target, f.work.join("a.txt")).unwrap();
-    f.ok(&["construct", "a.txt"]);
+    f.ok(&["construct", "--force", "a.txt"]);
     assert!(std::fs::symlink_metadata(f.work.join("a.txt"))
         .unwrap()
         .is_file());
@@ -331,9 +331,16 @@ fn construct_checks_every_path_before_writing_any() {
     f.write("a.txt", b"local edit\n");
     f.link_dir_outside("dir");
     for args in [
-        &["construct", "HEAD", "a.txt", "dir/b.txt"][..],
-        &["construct", "HEAD", "a.txt", "dir"],
-        &["construct", "--all", "HEAD", "a.txt", "dir/b.txt"],
+        &["construct", "--force", "HEAD", "a.txt", "dir/b.txt"][..],
+        &["construct", "--force", "HEAD", "a.txt", "dir"],
+        &[
+            "construct",
+            "--force",
+            "--all",
+            "HEAD",
+            "a.txt",
+            "dir/b.txt",
+        ],
     ] {
         f.refused(args);
         assert_eq!(
@@ -348,8 +355,15 @@ fn construct_checks_every_path_before_writing_any() {
     std::fs::remove_file(f.work.join("dir")).unwrap();
     std::fs::create_dir_all(f.work.join("dir/b.txt/inner")).unwrap();
     for args in [
-        &["construct", "HEAD", "a.txt", "dir/b.txt"][..],
-        &["construct", "--all", "HEAD", "a.txt", "dir/b.txt"],
+        &["construct", "--force", "HEAD", "a.txt", "dir/b.txt"][..],
+        &[
+            "construct",
+            "--force",
+            "--all",
+            "HEAD",
+            "a.txt",
+            "dir/b.txt",
+        ],
     ] {
         f.refused(args);
         assert_eq!(
@@ -384,7 +398,7 @@ fn construct_restores_a_changed_mode() {
 
     chmod("script.sh", 0o644);
     chmod("plain.txt", 0o755);
-    f.ok(&["construct", "HEAD", "script.sh", "plain.txt"]);
+    f.ok(&["construct", "--force", "HEAD", "script.sh", "plain.txt"]);
     assert_eq!(mode("script.sh"), 0o755);
     assert_eq!(mode("plain.txt"), 0o644);
 }

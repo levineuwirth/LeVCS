@@ -6,7 +6,9 @@
 //!   wrote over an untracked file where the other side added one. These
 //!   are the audit's `audit_worktree` reproductions.
 //!   `construct` wrote a revision over all of these, and over links,
-//!   without a word; it now refuses unless told `--force`.
+//!   without a word; it now refuses unless told `--force`. So do
+//!   `cache --restore`, which wrote a cache over them, and
+//!   `forget --delete`, which deleted a file holding an edit.
 //! - **Symlinks.** Every read followed them, so a link to a file outside
 //!   the repository committed that file's bytes. levcs now neither follows
 //!   nor records links (the author's decision, after Fossil's).
@@ -362,6 +364,88 @@ fn construct_writes_without_force_where_nothing_is_lost() {
     // data.json now holds feature's version, which HEAD does not have.
     let e = r.refused(&["construct", "HEAD", "data.json"]);
     assert_eq!(named(&e), ["data.json"], "{e}");
+}
+
+/// `forget --delete` deleted a tracked file whatever it held, and exited 0;
+/// `construct` then brought back only what history had, so an edit was
+/// gone. A file that is not as HEAD has it, a tracked file never committed
+/// included, is now refused, and nothing is changed: not even untracked.
+#[test]
+fn forget_delete_refuses_a_file_holding_work_not_committed() {
+    let r = diverged("forget-edit");
+    r.write("notes.md", "notes\nuncommitted valuable work\n");
+    r.write("fresh.txt", "tracked, never committed\n");
+    r.ok(&["track", "fresh.txt"]);
+    let e = r.refused(&["forget", "--delete", "notes.md", "fresh.txt"]);
+    assert_eq!(named(&e), ["fresh.txt", "notes.md"], "{e}");
+    assert!(
+        e.contains("changed and not committed") && e.contains("not in HEAD"),
+        "{e}"
+    );
+    assert!(
+        e.contains("--force") && e.contains("Nothing was changed"),
+        "{e}"
+    );
+    assert_eq!(r.read("notes.md"), "notes\nuncommitted valuable work\n");
+    assert_eq!(r.read("fresh.txt"), "tracked, never committed\n");
+    let status = r.ok(&["status"]);
+    assert!(
+        section(&status, "no longer tracked").is_empty(),
+        "a refused forget untracked: {status}"
+    );
+
+    // --force goes only with --delete.
+    r.refused(&["forget", "--force", "notes.md"]);
+    let out = r.ok(&["forget", "--delete", "--force", "notes.md"]);
+    assert!(!r.work.join("notes.md").exists());
+    assert!(
+        out.contains("deleted changes that were not committed: notes.md"),
+        "{out}"
+    );
+}
+
+/// A file as HEAD has it loses nothing, so it is deleted without --force,
+/// and `construct` brings it back.
+#[test]
+fn forget_delete_deletes_a_file_as_committed_without_force() {
+    let r = diverged("forget-free");
+    r.ok(&["forget", "--delete", "notes.md"]);
+    assert!(!r.work.join("notes.md").exists());
+    r.ok(&["construct", "HEAD", "notes.md"]);
+    assert_eq!(r.read("notes.md"), "notes\n");
+}
+
+/// `cache --restore` wrote the cache over whatever the working tree held,
+/// an edit made since the save included. It now refuses as `construct`
+/// does, and writes without --force where nothing is lost.
+#[test]
+fn cache_restore_refuses_to_overwrite_work_not_committed() {
+    let r = diverged("cache-edit");
+    r.write("notes.md", "notes\ncached\n");
+    let saved = r.ok(&["cache", "--save"]);
+    let id = saved
+        .lines()
+        .find_map(|l| l.strip_prefix("saved cache "))
+        .expect("a cache id")
+        .trim()
+        .to_string();
+    r.write("notes.md", "notes\nwritten after the save\n");
+    let e = r.refused(&["cache", "--restore", &id]);
+    assert_eq!(named(&e), ["notes.md"], "{e}");
+    assert!(e.contains("Nothing was changed"), "{e}");
+    assert_eq!(r.read("notes.md"), "notes\nwritten after the save\n");
+
+    let out = r.ok(&["cache", "--force", "--restore", &id]);
+    assert_eq!(r.read("notes.md"), "notes\ncached\n");
+    assert!(
+        out.contains("overwrote changes that were not committed: notes.md"),
+        "{out}"
+    );
+    // Already as the cache has it, then as HEAD has it: nothing is lost.
+    r.ok(&["cache", "--restore", &id]);
+    r.ok(&["construct", "--force", "HEAD", "notes.md"]);
+    r.ok(&["cache", "--restore", &id]);
+    assert_eq!(r.read("notes.md"), "notes\ncached\n");
 }
 
 // Symlinks: never followed, never recorded.

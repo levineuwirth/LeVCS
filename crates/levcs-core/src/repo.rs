@@ -542,26 +542,37 @@ impl Repository {
         let head = self.files_by_path(head_tree)?;
         let mut lost = Vec::new();
         for f in files {
-            let why = match wt.read(&f.path)? {
-                Found::Missing => continue,
-                Found::File { bytes, executable } => {
-                    let held = (crate::blob::Blob::new(bytes).object_id(), executable);
-                    let holds = |t: &TreeFile| (t.blob, t.executable) == held;
-                    if holds(f) || head.get(&f.path).is_some_and(holds) {
-                        continue;
-                    }
-                    if head.contains_key(&f.path) {
-                        "changed and not committed"
-                    } else {
-                        "not in HEAD, and the revision has a file there"
-                    }
-                }
-                found => changed(&found),
-            };
-            lost.push(Unsaved {
-                path: f.path.clone(),
-                why,
-            });
+            if let Some(why) = unsaved_at(&wt, &head, &f.path, Some(f))? {
+                lost.push(Unsaved {
+                    path: f.path.clone(),
+                    why,
+                });
+            }
+        }
+        Ok(lost)
+    }
+
+    /// The work not committed that removing `paths` from the working tree
+    /// would destroy, by path: a file whose bytes or executable bit are not
+    /// HEAD's (`head_tree`, or none), whether HEAD has the file or not, and
+    /// a link or a directory there. A missing file and one as HEAD has it
+    /// lose nothing; `levcs construct` brings the second back. A version
+    /// only the index holds is not committed either, and is lost with it.
+    pub fn would_remove(
+        &self,
+        head_tree: Option<ObjectId>,
+        paths: &[String],
+    ) -> Result<Vec<Unsaved>> {
+        let wt = Worktree::open(&self.workdir)?;
+        let head = self.files_by_path(head_tree)?;
+        let mut lost = Vec::new();
+        for path in paths {
+            if let Some(why) = unsaved_at(&wt, &head, path, None)? {
+                lost.push(Unsaved {
+                    path: path.clone(),
+                    why,
+                });
+            }
         }
         Ok(lost)
     }
@@ -873,6 +884,34 @@ fn holds(found: &Found, f: &TreeFile) -> bool {
         }
         _ => false,
     }
+}
+
+/// Why what the working tree holds at `path` is work that writing `to` there
+/// (or, for `None`, removing it) would destroy; `None` if nothing would be
+/// lost. Nothing is lost if the file is missing, holds what HEAD (`head`)
+/// has, or already holds `to`.
+fn unsaved_at(
+    wt: &Worktree,
+    head: &BTreeMap<String, TreeFile>,
+    path: &str,
+    to: Option<&TreeFile>,
+) -> Result<Option<&'static str>> {
+    Ok(Some(match wt.read(path)? {
+        Found::Missing => return Ok(None),
+        Found::File { bytes, executable } => {
+            let held = (crate::blob::Blob::new(bytes).object_id(), executable);
+            let holds = |t: &TreeFile| (t.blob, t.executable) == held;
+            if to.is_some_and(holds) || head.get(path).is_some_and(holds) {
+                return Ok(None);
+            }
+            if head.contains_key(path) {
+                "changed and not committed"
+            } else {
+                "not in HEAD, so not committed"
+            }
+        }
+        found => changed(&found),
+    }))
 }
 
 /// How a path that is not as committed differs.

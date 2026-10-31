@@ -20,6 +20,9 @@ hex = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [[bin]]
 name = "levcs"
 path = "src/main.rs"

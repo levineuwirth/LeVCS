@@ -448,7 +448,9 @@ fn forget_delete_does_not_follow_symlinks() {
     f.commit(&[("dir/f.txt", b"f\n")], "base");
     f.link_dir_outside("dir");
     std::fs::write(f.outside.join("f.txt"), b"protected").unwrap();
-    let err = f.refused(&["forget", "--delete", "dir/f.txt"]);
+    // --force, so the delete itself is reached: the link is work not
+    // committed, and without it the check before deleting refuses first.
+    let err = f.refused(&["forget", "--delete", "--force", "dir/f.txt"]);
     assert!(err.contains("could not delete"), "{err}");
     assert_eq!(
         std::fs::read(f.outside.join("f.txt")).unwrap(),
@@ -470,7 +472,9 @@ fn cache_restore_does_not_follow_symlinks() {
         .into_string()
         .unwrap();
     f.link_dir_outside("dir");
-    f.refused(&["cache", "--restore", &id]);
+    // --force, so the write itself is reached, as for `construct`.
+    let err = f.refused(&["cache", "--force", "--restore", &id]);
+    assert!(err.contains("symlink or not a directory"), "{err}");
     f.outside_is_empty();
 
     std::fs::remove_file(f.work.join("dir")).unwrap();

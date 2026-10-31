@@ -97,10 +97,15 @@ pub struct TrackArgs {
 #[derive(Args, Debug)]
 pub struct ForgetArgs {
     /// Also delete the file from disk. Off by default: `forget` means stop
-    /// tracking, and only tracked files can be named, so anything deleted
-    /// here is recoverable from history.
+    /// tracking. Only tracked files can be named, and a file that holds
+    /// changes not committed is refused, so anything deleted here comes
+    /// back with `levcs construct`.
     #[arg(long)]
     pub delete: bool,
+    /// With --delete, delete files that hold changes not committed too.
+    /// Without it, forget refuses, names each one, and changes nothing.
+    #[arg(long, requires = "delete")]
+    pub force: bool,
     pub paths: Vec<PathBuf>,
 }
 
@@ -228,6 +233,10 @@ pub struct CacheArgs {
     pub list: bool,
     #[arg(long)]
     pub restore: Option<String>,
+    /// With --restore, overwrite files that hold changes not committed.
+    /// Without it, restore refuses, names each one, and writes nothing.
+    #[arg(long, requires = "restore")]
+    pub force: bool,
     #[arg(long)]
     pub drop: Option<String>,
 }

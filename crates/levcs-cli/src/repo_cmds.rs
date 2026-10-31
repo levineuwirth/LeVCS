@@ -260,12 +260,13 @@ pub fn track(args: TrackArgs) -> Result<()> {
 ///
 /// So the verb is bounded to the index. Only tracked paths can be named, a
 /// directory expands to the tracked files beneath it, and a path matching
-/// nothing tracked is refused. `--delete` is therefore safe by construction
-/// rather than by analysis: everything it can reach has a blob in the store,
-/// and the alternative — deleting by default and refusing when the content
-/// is not already in a commit — would require the tool to answer "is this
-/// recoverable?" correctly on every call, with deletion as the price of
-/// being wrong.
+/// nothing tracked is refused. That was taken to make `--delete` safe by
+/// construction, everything it could reach having a blob in the store. It
+/// did not: a tracked file holding an edit has no blob for the edit, and was
+/// deleted with it. So `--delete` also deletes only a file that is missing
+/// or holds what HEAD has, which `construct` brings back, and refuses any
+/// other, naming each, unless `--force`. Nothing is deleted by default, so
+/// "is this recoverable?" is asked only of files named for deletion.
 pub fn forget(args: ForgetArgs) -> Result<()> {
     let (repo, _lock) = open_repo_locked()?;
     let mut idx = load_index(&repo)?;
@@ -301,6 +302,28 @@ pub fn forget(args: ForgetArgs) -> Result<()> {
     targets.sort();
     targets.dedup();
 
+    // Checked before anything is untracked, so a refusal changes nothing. A
+    // conflicted file is exempt: it is only ever named on purpose, and
+    // deleting it is how a conflict is resolved by deletion.
+    let mut forced = Vec::new();
+    if args.delete {
+        let checked: Vec<String> = targets
+            .iter()
+            .filter(|p| idx.find(p).is_none_or(|e| !e.flags.is_conflicted()))
+            .cloned()
+            .collect();
+        let lost = repo.would_remove(tree_at_head(&repo)?, &checked)?;
+        if !lost.is_empty() && !args.force {
+            return Err(refuse_destroying(
+                "forget --delete",
+                "delete",
+                &lost,
+                " Without --delete, forget leaves the file as it is.",
+            ));
+        }
+        forced = lost;
+    }
+
     let wt = levcs_core::worktree::open(&repo.workdir)?;
     // Untrack first and persist that, so the reported state is the state on
     // disk even if a delete then fails. The index write is the part that must
@@ -328,6 +351,13 @@ pub fn forget(args: ForgetArgs) -> Result<()> {
             } else {
                 "untracked"
             }
+        );
+    }
+    if !forced.is_empty() {
+        let paths: Vec<&str> = forced.iter().map(|u| u.path.as_str()).collect();
+        eprintln!(
+            "deleted changes that were not committed: {}",
+            paths.join(", ")
         );
     }
     if !failed.is_empty() {
@@ -1375,11 +1405,7 @@ pub fn construct(args: ConstructArgs) -> Result<()> {
     // Work that is not committed is not overwritten unless --force says to.
     // `construct` used to write over it silently, and it was the only way to
     // read a file at a revision, so reading history destroyed work.
-    let head_tree = match repo.refs.resolve_head()? {
-        Some(h) => Some(Commit::from_signed(&repo.read_signed(h)?)?.tree),
-        None => None,
-    };
-    let lost = repo.would_overwrite(head_tree, &files)?;
+    let lost = repo.would_overwrite(tree_at_head(&repo)?, &files)?;
     if !lost.is_empty() && !args.force {
         return Err(refuse_overwrite(&lost));
     }
@@ -1401,13 +1427,37 @@ pub fn construct(args: ConstructArgs) -> Result<()> {
 
 /// `construct`'s refusal: what it would overwrite, and how to go on.
 fn refuse_overwrite(lost: &[levcs_core::repo::Unsaved]) -> anyhow::Error {
+    refuse_destroying(
+        "construct",
+        "overwrite",
+        lost,
+        " `levcs show <rev>:<path>` reads a file at a revision without writing it.",
+    )
+}
+
+/// A refusal to `verb` work that is not committed, as `action` would: each
+/// path and why, the ways on, and `hint`. `construct`, `cache --restore` and
+/// `forget --delete` refuse alike.
+fn refuse_destroying(
+    action: &str,
+    verb: &str,
+    lost: &[levcs_core::repo::Unsaved],
+    hint: &str,
+) -> anyhow::Error {
     anyhow!(
-        "this construct would overwrite changes that are not committed:\n{}\n\
-         commit them, or pass --force to overwrite them (`levcs cache --save` keeps a \
-         copy first). `levcs show <rev>:<path>` reads a file at a revision without \
-         writing it. Nothing was changed.",
+        "this {action} would {verb} changes that are not committed:\n{}\n\
+         commit them, or pass --force to {verb} them (`levcs cache --save` keeps a \
+         copy first).{hint} Nothing was changed.",
         unsaved_listing(lost)
     )
+}
+
+/// HEAD's tree, or none before the first commit.
+fn tree_at_head(repo: &Repository) -> Result<Option<ObjectId>> {
+    Ok(match repo.refs.resolve_head()? {
+        Some(h) => Some(Commit::from_signed(&repo.read_signed(h)?)?.tree),
+        None => None,
+    })
 }
 
 /// The files a path-restricted `construct` writes. The whole selection is
@@ -3125,10 +3175,39 @@ pub fn cache(args: CacheArgs) -> Result<()> {
         // pathname, through any symlinked directory in the working tree,
         // and copied the cache's own `.message` into it.
         let files = cached_files(&src)?;
+        // Work that is not committed is not overwritten unless --force says
+        // to, as `construct` refuses. A restore used to write the cache over
+        // whatever the working tree held, an edit made since the save
+        // included. A file already as the cache has it loses nothing.
+        let as_cached = files
+            .iter()
+            .map(|(rel, path, perms)| {
+                Ok(levcs_core::repo::TreeFile {
+                    path: rel.clone(),
+                    blob: Blob::new(fs::read(path)?).object_id(),
+                    executable: match perms {
+                        levcs_core::worktree::Perms::Exact(m) => m & 0o111 != 0,
+                        levcs_core::worktree::Perms::Executable => true,
+                        _ => false,
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let lost = repo.would_overwrite(tree_at_head(&repo)?, &as_cached)?;
+        if !lost.is_empty() && !args.force {
+            return Err(refuse_destroying("cache --restore", "overwrite", &lost, ""));
+        }
         let wt = levcs_core::worktree::open(&repo.workdir)?;
         wt.preflight(files.iter().map(|(rel, _, _)| rel.as_str()))?;
         for (rel, path, perms) in &files {
             wt.write_file(rel, &fs::read(path)?, *perms)?;
+        }
+        if !lost.is_empty() {
+            let paths: Vec<&str> = lost.iter().map(|u| u.path.as_str()).collect();
+            eprintln!(
+                "overwrote changes that were not committed: {}",
+                paths.join(", ")
+            );
         }
         eprintln!("restored {id}");
         return Ok(());

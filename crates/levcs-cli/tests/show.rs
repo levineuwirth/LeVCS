@@ -209,3 +209,42 @@ fn show_prints_a_blob_that_diff_names() {
     let old = d["files"][0]["old_blob"].as_str().unwrap();
     assert_eq!(ok(&work, &cfg, &["show", old]), "two\n");
 }
+
+/// A reader that stops early, as `levcs log | head` does, made levcs panic
+/// on the closed pipe. Commands that only read now end as any filter does.
+#[cfg(unix)]
+#[test]
+fn a_reader_that_stops_early_does_not_make_levcs_panic() {
+    use std::io::Read;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Stdio;
+
+    let (work, cfg) = setup("pipe");
+    // More than a pipe holds, so levcs is still writing when the reader
+    // goes: a 256 KiB file, and a 100 kB commit message for `log`.
+    let line = format!("{}\n", "x".repeat(99));
+    std::fs::write(work.join("big.txt"), line.repeat(2621)).unwrap();
+    ok(&work, &cfg, &["track", "big.txt"]);
+    ok(&work, &cfg, &["commit", "-m", &line.repeat(1000)]);
+    for args in [&["log"][..], &["show", "HEAD:big.txt"]] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_levcs"))
+            .current_dir(&work)
+            .env("XDG_CONFIG_HOME", &cfg)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        stdout.read_exact(&mut [0u8; 16]).unwrap();
+        drop(stdout);
+        let o = child.wait_with_output().unwrap();
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(!err.contains("panicked"), "{args:?}: {err}");
+        assert!(
+            o.status.success() || o.status.signal() == Some(13),
+            "{args:?}: {:?} {err}",
+            o.status
+        );
+    }
+}

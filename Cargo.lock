@@ -1546,6 +1546,7 @@ dependencies = [
  "levcs-merge",
  "levcs-protocol",
  "levcs-tui",
+ "libc",
  "serde",
  "serde_json",
  "similar",

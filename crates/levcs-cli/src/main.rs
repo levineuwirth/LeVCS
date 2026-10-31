@@ -48,6 +48,16 @@ fn main() {
 
 fn run() -> Result<()> {
     let args = cli::Cli::parse();
+    if matches!(
+        args.command,
+        cli::Cmd::Status(_)
+            | cli::Cmd::Log(_)
+            | cli::Cmd::Show(_)
+            | cli::Cmd::Diff(_)
+            | cli::Cmd::Root
+    ) {
+        end_when_output_closes();
+    }
     match args.command {
         cli::Cmd::Init(a) => repo_cmds::init(a),
         cli::Cmd::Track(a) => repo_cmds::track(a),
@@ -76,5 +86,18 @@ fn run() -> Result<()> {
         cli::Cmd::Deploy(a) => fed_cmds::deploy(a),
         cli::Cmd::Dial(a) => fed_cmds::dial(a),
         cli::Cmd::Migrate(a) => fed_cmds::migrate(a),
+    }
+}
+
+/// For commands that only read and print: end as any Unix filter does when
+/// its reader stops early (`levcs log | head`), by SIGPIPE. Rust ignores
+/// SIGPIPE, so the write failed instead and `println!` panicked. Commands
+/// that write the repository keep ignoring it, so a closed output cannot end
+/// one between two of its writes.
+fn end_when_output_closes() {
+    #[cfg(unix)]
+    // SAFETY: called once, at startup, before any other thread exists.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
 }

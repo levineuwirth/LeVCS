@@ -194,6 +194,13 @@ and lists what it overwrote. This includes going back to HEAD after
 constructing an older version: that version is in history, but it is not
 HEAD's, and `status` reports the file as modified too.
 
+`cache --restore <id>` refuses in the same way, and `--force` overwrites. A
+file already as the cache has it loses nothing. `forget --delete` deletes
+only a file that is missing or holds what HEAD has, which `construct` brings
+back. It refuses any other, a tracked file never committed included, and
+untracks nothing. `--force` deletes them. A conflicted file is exempt, since
+deleting it is how a conflict is resolved by deletion.
+
 `status` lists the same work. First comes what the index holds that HEAD
 does not: new files, staged changes, and files no longer tracked. Then come
 edits and deletions since a file was last tracked or committed. A staged
@@ -264,12 +271,11 @@ levcs forget --delete build/output.bin # untrack and remove it
 
 This is a deliberate divergence from `git rm`. The verb only ever acts on
 paths that are already tracked — an untracked path is refused, and a directory
-expands to the tracked files beneath it — so everything `--delete` can reach
-has a blob in the object store and comes back with `levcs construct`. Bounding
-the verb is what makes deletion safe by construction rather than by analysis;
-the alternative, deleting by default and refusing when the content is not yet
-in a commit, would make the tool answer "is this recoverable?" on every call,
-with deletion as the price of being wrong.
+expands to the tracked files beneath it. Nothing is deleted by default.
+`--delete` deletes a file only if it holds what HEAD has, so whatever it
+deletes comes back with `levcs construct`. A file holding an edit, or tracked
+but never committed, is refused unless `--force`. Being tracked was once taken
+to be enough, but a tracked file's edit has no blob until it is committed.
 
 Commands that take a commit (`diff`, `construct`, `show`, `merge`,
 `branch --create`) accept a revision, not just a full hash:

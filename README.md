@@ -42,8 +42,8 @@ For a deeper comparison and context, see the
 ## Building
 
 LeVCS is a Rust workspace. You'll need a recent stable toolchain
-(workspace MSRV is 1.89, for `std::fs::File::lock`) and a C compiler for the
-tree-sitter grammars.
+(workspace MSRV is 1.90: 1.89 for `std::fs::File::lock`, and 1.90 for the
+tree-sitter grammars' runtime) and a C compiler for the grammars.
 
 ```sh
 cargo build --release

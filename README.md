@@ -4,7 +4,7 @@ A distributed version control system with first-class federation, signed
 authority chains, and a cascading merge engine. Content-addressed by
 BLAKE3, signed with Ed25519, and built to fix what git can't.
 
-> **Status: v0.1.0 — protocol substrate complete, workflow surface deferred.**
+> **Status: v0.2.0 — protocol substrate complete, workflow surface deferred.**
 > The object model, federation API, merge cascade, and instance server
 > all work end-to-end. There is no PR review surface, issue tracker, or
 > web UI yet — those are the next layer up. See
@@ -638,6 +638,6 @@ full text.
 
 ## Citation
 
-If LeVCS supports academic work, please cite the v0.1.0 release. A
-formal citation entry will land with the workflow spec; in the meantime
-a repository-URL reference is fine.
+If LeVCS supports academic work, please cite the release you used, by
+its tag. A formal citation entry will land with the workflow spec; in
+the meantime a repository-URL reference with the tag is fine.

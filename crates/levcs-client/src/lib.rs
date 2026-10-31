@@ -59,7 +59,7 @@ impl Client {
                 .timeout(Duration::from_secs(60))
                 .build()
                 .expect("build reqwest client"),
-            user_agent: "levcs-client/0.1.0".into(),
+            user_agent: concat!("levcs-client/", env!("CARGO_PKG_VERSION")).into(),
             reader: None,
         }
     }

@@ -18,7 +18,7 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Levi J. Neuwirth <ln@levineuwirth.org>"]
-rust-version = "1.89"
+rust-version = "1.90"
 
 [workspace.dependencies]
 levcs-core = { path = "crates/levcs-core" }
@@ -55,11 +55,11 @@ tree-sitter-java = "0.23"
 tree-sitter-ruby = "0.23"
 tree-sitter-bash = "0.25"
 serde_yaml = "0.9"
-quick-xml = { version = "0.39", features = ["serialize"] }
+quick-xml = { version = "0.42", features = ["serialize"] }
 pulldown-cmark = "0.13"
-wasmtime = { version = "25", default-features = false, features = ["cranelift", "runtime"] }
+wasmtime = { version = "36", default-features = false, features = ["cranelift", "runtime"] }
 wat = "1"
-zstd = "0.13"
+zstd = "0.14"
 clap = { version = "4.5", features = ["derive"] }
 argon2 = "0.5"
 chacha20poly1305 = "0.10"

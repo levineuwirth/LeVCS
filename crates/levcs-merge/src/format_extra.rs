@@ -502,8 +502,14 @@ enum XmlNode {
 }
 
 fn xml_parse(src: &[u8]) -> Option<Vec<XmlNode>> {
+    use quick_xml::escape::unescape;
     use quick_xml::events::Event;
     use quick_xml::Reader;
+    // Names and text come out as `str`: input that is not UTF-8 fails
+    // `read_event_into`, and so this parse, as `from_utf8` on them did.
+    // Attribute values are unescaped and nothing more. `unescape_value`
+    // also normalizes them as of quick-xml 0.42, turning a tab or a line
+    // break into a space, so a merge would rewrite values it did not touch.
     let mut reader = Reader::from_reader(src);
     reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
@@ -512,11 +518,11 @@ fn xml_parse(src: &[u8]) -> Option<Vec<XmlNode>> {
     loop {
         match reader.read_event_into(&mut buf).ok()? {
             Event::Start(e) => {
-                let name = std::str::from_utf8(e.name().as_ref()).ok()?.to_string();
+                let name = e.name().0.to_string();
                 let mut attrs = Vec::new();
                 for a in e.attributes().with_checks(false).flatten() {
-                    let k = std::str::from_utf8(a.key.as_ref()).ok()?.to_string();
-                    let v = a.unescape_value().ok()?.to_string();
+                    let k = a.key.0.to_string();
+                    let v = unescape(&a.value).ok()?.to_string();
                     attrs.push((k, v));
                 }
                 attrs.sort();
@@ -536,11 +542,11 @@ fn xml_parse(src: &[u8]) -> Option<Vec<XmlNode>> {
                 }
             }
             Event::Empty(e) => {
-                let name = std::str::from_utf8(e.name().as_ref()).ok()?.to_string();
+                let name = e.name().0.to_string();
                 let mut attrs = Vec::new();
                 for a in e.attributes().with_checks(false).flatten() {
-                    let k = std::str::from_utf8(a.key.as_ref()).ok()?.to_string();
-                    let v = a.unescape_value().ok()?.to_string();
+                    let k = a.key.0.to_string();
+                    let v = unescape(&a.value).ok()?.to_string();
                     attrs.push((k, v));
                 }
                 attrs.sort();
@@ -556,7 +562,7 @@ fn xml_parse(src: &[u8]) -> Option<Vec<XmlNode>> {
                 }
             }
             Event::Text(t) => {
-                let s = std::str::from_utf8(t.as_ref()).ok()?.to_string();
+                let s = String::from(&*t);
                 let node = XmlNode::Text(s);
                 if let Some(parent) = stack.last_mut() {
                     parent.2.push(node);
@@ -917,6 +923,25 @@ mod tests {
                 let s = String::from_utf8_lossy(&content);
                 assert!(s.contains("y=\"2\""));
                 assert!(s.contains("z=\"3\""));
+            }
+            other => panic!("expected merged, got {other:?}"),
+        }
+    }
+
+    /// A value neither side changed comes out as it went in: a tab, a line
+    /// break and an escaped `&` included.
+    #[test]
+    fn xml_merge_keeps_attribute_values_as_they_were() {
+        let h = XmlHandler;
+        let base = b"<root><a v=\"x\ty\nz &amp; w\"/></root>";
+        let ours = b"<root><a v=\"x\ty\nz &amp; w\" y=\"2\"/></root>";
+        let theirs = b"<root><a v=\"x\ty\nz &amp; w\" z=\"3\"/></root>";
+        let r = h.merge(Path::new("x.xml"), base, ours, theirs);
+        match r.status {
+            MergeStatus::Merged { content, .. } => {
+                let s = String::from_utf8_lossy(&content);
+                assert!(s.contains("v=\"x\ty\nz &amp; w\""), "{s}");
+                assert!(s.contains("y=\"2\"") && s.contains("z=\"3\""), "{s}");
             }
             other => panic!("expected merged, got {other:?}"),
         }

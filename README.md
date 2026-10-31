@@ -510,9 +510,11 @@ This is a young project. The most useful contributions right now are:
    spec — PR/review surface, issues, CI conventions. Discussion welcome.
 3. **Plugin handlers.** The wasm plugin protocol exists; concrete
    handlers (e.g. protobuf, SQL migrations) are needed to validate it.
-4. **Tightening CI.** The `fmt` and `clippy` GitHub jobs are
-   informational; flipping them to gating would close a small but real
-   quality gap.
+4. **Tightening CI.** CI builds and tests the workspace, runs the
+   deployment gate, and checks formatting, a build on the declared
+   `rust-version`, and the lockfile against the RustSec advisory
+   database. `clippy` is still informational: about 55 warnings stand
+   between it and a gate.
 
 Please open an issue or reach out before starting non-trivial work so
 we can coordinate.

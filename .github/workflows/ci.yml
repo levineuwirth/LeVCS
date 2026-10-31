@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly, so that an advisory published against a locked crate fails a
+  # run even in a week with no pushes.
+  schedule:
+    - cron: "23 5 * * 1"
 
 env:
   CARGO_TERM_COLOR: always
@@ -13,12 +17,14 @@ jobs:
   # Gate: workspace must build and the full test suite must pass.
   # Includes a compile-check of the criterion benches so a broken
   # bench doesn't go unnoticed between manual `cargo bench` runs.
+  # --locked: a Cargo.toml change committed without its Cargo.lock fails
+  # here, rather than CI building a lockfile nobody committed.
   test:
     name: build + test
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -27,10 +33,10 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build workspace
-        run: cargo build --workspace --all-targets
+        run: cargo build --workspace --all-targets --locked
 
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
       # The deployment gate, on the binaries just built: deploy/README.md,
       # "Run the gate".
@@ -38,14 +44,54 @@ jobs:
         run: target/debug/levcs-gate
 
       - name: Compile-check benches
-        run: cargo build --workspace --benches
+        run: cargo build --workspace --benches --locked
+
+  # Gate: the workspace builds on the rust-version Cargo.toml declares. The
+  # version is read from Cargo.toml, so the two cannot drift apart.
+  msrv:
+    name: msrv
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Read rust-version
+        id: msrv
+        run: |
+          v=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+          test -n "$v"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust ${{ steps.msrv.outputs.version }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo check --workspace --all-targets --locked
+
+  # Gate: no locked crate has a known vulnerability in the RustSec
+  # database. Unmaintained and unsound crates are reported as warnings and
+  # do not fail the job.
+  audit:
+    name: audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - run: cargo audit
 
   # Gate: codebase is fmt-clean as of v0.1.0; keep it that way.
   fmt:
     name: fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -59,7 +105,7 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy

@@ -86,7 +86,7 @@ jobs:
 
       - run: cargo audit
 
-  # Gate: codebase is fmt-clean as of v0.1.0; keep it that way.
+  # Gate: the codebase is fmt-clean; keep it that way.
   fmt:
     name: fmt
     runs-on: ubuntu-latest

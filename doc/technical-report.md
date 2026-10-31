@@ -1,6 +1,6 @@
 # LeVCS: A Technical Report
 
-**Status:** v0.1.0 — protocol substrate complete, workflow surface deferred.
+**Status:** v0.2.0 — protocol substrate complete, workflow surface deferred.
 **Audience:** engineers evaluating LeVCS for their own projects, or designing
 the workflow tooling that will sit on top of it.
 

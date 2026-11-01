@@ -3466,6 +3466,12 @@ pub fn verify() -> Result<()> {
 }
 
 pub fn gc(args: GcArgs) -> Result<()> {
+    if args.aggressive {
+        eprintln!(
+            "levcs: gc --aggressive does nothing more than gc; it is accepted only \
+             so that scripts passing it keep working"
+        );
+    }
     let (repo, _lock) = open_repo_locked()?;
     // What gc keeps is exactly what `verify`'s typed walk reaches, from the
     // same roots and through the same links, each checked for its type. Any
@@ -3522,7 +3528,6 @@ pub fn gc(args: GcArgs) -> Result<()> {
         "gc: removed {deleted} unreachable object(s); kept {kept_young} within grace ({}d)",
         args.grace_days
     );
-    let _ = args.aggressive; // honored via the same delete loop today
     Ok(())
 }
 

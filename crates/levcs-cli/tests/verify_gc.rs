@@ -348,3 +348,32 @@ fn gc_refuses_before_deleting_behind_an_undecodable_authority() {
         "gc deleted the predecessor of an undecodable authority"
     );
 }
+
+/// `gc --aggressive` was listed in `--help` and did nothing (`let _ =
+/// args.aggressive`). Nothing says what it should do, and the grace period
+/// it might skip is what keeps a writer's objects not yet linked. It is
+/// hidden, still accepted so that a script passing it keeps working, and
+/// says it does nothing more than `gc`.
+#[test]
+fn gc_aggressive_is_hidden_and_says_it_does_nothing_more() {
+    let (work, cfg) = setup("aggressive");
+    std::fs::write(work.join("a.txt"), "a\n").unwrap();
+    ok(&work, &cfg, &["track", "a.txt"]);
+    ok(&work, &cfg, &["commit", "-m", "a"]);
+    let help = ok(&work, &cfg, &["gc", "--help"]);
+    assert!(!help.contains("aggressive"), "{help}");
+
+    let sorted = |mut v: Vec<PathBuf>| {
+        v.sort();
+        v
+    };
+    let before = sorted(objects(&work));
+    let o = levcs(&work, &cfg, &["gc", "--aggressive"]);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success(), "{err}");
+    assert!(err.contains("--aggressive does nothing"), "{err}");
+    assert_eq!(sorted(objects(&work)), before);
+    let plain = levcs(&work, &cfg, &["gc"]);
+    assert!(plain.status.success());
+    assert!(!String::from_utf8_lossy(&plain.stderr).contains("aggressive"));
+}

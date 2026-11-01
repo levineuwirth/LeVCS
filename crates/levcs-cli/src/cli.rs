@@ -268,7 +268,10 @@ pub struct ShowArgs {
 
 #[derive(Args, Debug)]
 pub struct GcArgs {
-    #[arg(long)]
+    /// Does nothing beyond a plain `gc`, and says so. Hidden, and accepted
+    /// only so that a script passing it keeps working: it was listed and
+    /// never did anything, and nothing says what it should do.
+    #[arg(long, hide = true)]
     pub aggressive: bool,
     /// Grace period in days. Loose objects modified within this window
     /// are kept regardless of reachability — they may belong to an

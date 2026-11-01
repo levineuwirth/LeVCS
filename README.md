@@ -328,7 +328,7 @@ alone is `~1`); `^N` takes the Nth parent, counting from 1, which is how you
 reach the other side of a merge (`^0` is the commit itself). Suffixes chain:
 `HEAD~2^2`. A release followed by a suffix starts from the commit it was
 declared on, so `v1.0^0` is that commit and `v1.0~1` the one before it.
-Where a commit is required, by `merge` and `branch --create`,
+Where a commit is required, by `merge`, `branch --create` and `log --since`,
 a release stands for that commit too. A
 branch beats a release of the same name, either beats a prefix of the same
 spelling, and a prefix matching more than one commit is refused with the
@@ -347,6 +347,14 @@ revision, or a directory's entries. `show <rev>` prints the commit and the
 paths it changed against its first parent, marked `A`, `M` or `D`;
 `log --name-status` does the same for each commit in the log. A change to
 the executable bit alone is an `M`.
+
+`log` lists HEAD's first-parent line, newest first, all of it.
+`log --since <rev>` lists only what `<rev>` does not already contain: it stops
+at the first commit that is `<rev>` or behind it, through any of its parents.
+A release stands for the commit it was declared on, so `log --since v1.0` is
+the work since that release. `log --release` lists the releases instead,
+newest first, each followed by the one it was declared after, whatever its
+label; with `--since <release>` it stops before that release.
 
 `status --format json` and `diff --format json` print one JSON object for
 tools, as `merge --format json` does. `status` gives HEAD's id and each group

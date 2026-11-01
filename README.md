@@ -304,6 +304,10 @@ expands to the tracked files beneath it. Nothing is deleted by default.
 deletes comes back with `levcs construct`. A file holding an edit, or tracked
 but never committed, is refused unless `--force`. Being tracked was once taken
 to be enough, but a tracked file's edit has no blob until it is committed.
+Untracking also drops the version the index holds. A version staged and then
+edited again is in neither HEAD nor the working file, so `forget` refuses it,
+with or without `--delete`, and names its blob: `levcs show <blob>` prints it.
+`--force` drops it and names it again.
 
 Commands that take a commit (`diff`, `construct`, `show`, `merge`,
 `branch --create`) accept a revision, not just a full hash:

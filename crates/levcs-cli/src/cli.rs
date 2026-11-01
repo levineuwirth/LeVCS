@@ -102,9 +102,11 @@ pub struct ForgetArgs {
     /// back with `levcs construct`.
     #[arg(long)]
     pub delete: bool,
-    /// With --delete, delete files that hold changes not committed too.
-    /// Without it, forget refuses, names each one, and changes nothing.
-    #[arg(long, requires = "delete")]
+    /// Forget what holds work not committed too: a version only the index
+    /// holds (staged, then edited again), and with --delete a file's
+    /// changes. Without it, forget refuses, names each one, and changes
+    /// nothing.
+    #[arg(long)]
     pub force: bool,
     pub paths: Vec<PathBuf>,
 }

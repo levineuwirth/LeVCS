@@ -305,23 +305,30 @@ pub fn forget(args: ForgetArgs) -> Result<()> {
     // Checked before anything is untracked, so a refusal changes nothing. A
     // conflicted file is exempt: it is only ever named on purpose, and
     // deleting it is how a conflict is resolved by deletion.
-    let mut forced = Vec::new();
-    if args.delete {
-        let checked: Vec<String> = targets
-            .iter()
-            .filter(|p| idx.find(p).is_none_or(|e| !e.flags.is_conflicted()))
-            .cloned()
-            .collect();
-        let lost = repo.would_remove(tree_at_head(&repo)?, &checked)?;
-        if !lost.is_empty() && !args.force {
-            return Err(refuse_destroying(
-                "forget --delete",
-                "delete",
-                &lost,
-                " Without --delete, forget leaves the file as it is.",
-            ));
-        }
-        forced = lost;
+    let checked: Vec<String> = targets
+        .iter()
+        .filter(|p| idx.find(p).is_none_or(|e| !e.flags.is_conflicted()))
+        .cloned()
+        .collect();
+    let head_tree = tree_at_head(&repo)?;
+    // Untracking drops the index's entry, and a version staged there that
+    // neither HEAD nor the working file holds is kept nowhere else.
+    let dropped = repo.staged_only(head_tree, &idx, &checked)?;
+    let forced = if args.delete {
+        repo.would_remove(head_tree, &checked)?
+    } else {
+        Vec::new()
+    };
+    if !args.force && !dropped.is_empty() {
+        return Err(refuse_dropping_staged(&dropped, &forced));
+    }
+    if !args.force && !forced.is_empty() {
+        return Err(refuse_destroying(
+            "forget --delete",
+            "delete",
+            &forced,
+            " Without --delete, forget leaves the file as it is.",
+        ));
     }
 
     let wt = levcs_core::worktree::open(&repo.workdir)?;
@@ -360,10 +367,53 @@ pub fn forget(args: ForgetArgs) -> Result<()> {
             paths.join(", ")
         );
     }
+    if !dropped.is_empty() {
+        let staged: Vec<String> = dropped
+            .iter()
+            .map(|d| format!("{} (staged as {})", d.path, d.blob))
+            .collect();
+        eprintln!(
+            "dropped versions only the index held: {}; `levcs show <blob>` prints \
+             each until `levcs gc` removes it",
+            staged.join(", ")
+        );
+    }
     if !failed.is_empty() {
         bail!("untracked, but could not delete: {}", failed.join(", "));
     }
     Ok(())
+}
+
+/// `forget` refusing to drop versions only the index holds, `dropped`, and,
+/// with --delete, files holding changes not committed, `lost`. A staged
+/// version is not the working file, so neither a commit nor `cache --save`
+/// keeps it; each is named by its blob, which `levcs show` prints.
+fn refuse_dropping_staged(
+    dropped: &[levcs_core::repo::StagedOnly],
+    lost: &[levcs_core::repo::Unsaved],
+) -> anyhow::Error {
+    let mut listing: Vec<String> = dropped
+        .iter()
+        .map(|d| {
+            format!(
+                "  {}  (staged as {}, {}; `levcs show {}` prints it)",
+                d.path, d.blob, d.why, d.blob
+            )
+        })
+        .collect();
+    let mut also = String::new();
+    if !lost.is_empty() {
+        also = format!(
+            "\nand would delete changes that are not committed:\n{}",
+            unsaved_listing(lost)
+        );
+    }
+    listing.sort();
+    anyhow!(
+        "this forget would drop versions only the index holds, staged and not committed:\n\
+         {}{also}\npass --force to forget them anyway. Nothing was changed.",
+        listing.join("\n")
+    )
 }
 
 // ---------------------------------------------------------------------------

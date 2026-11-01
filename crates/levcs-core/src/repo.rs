@@ -70,6 +70,15 @@ pub struct Unsaved {
     pub why: &'static str,
 }
 
+/// A version only the index holds, as [`Repository::staged_only`] finds it:
+/// its path, its blob, and why the working tree is not known to hold it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StagedOnly {
+    pub path: String,
+    pub blob: ObjectId,
+    pub why: &'static str,
+}
+
 /// How the index differs from HEAD at a path: a change staged and not
 /// committed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -575,6 +584,51 @@ impl Repository {
             }
         }
         Ok(lost)
+    }
+
+    /// The versions only `index` holds at `paths`: a tracked path whose
+    /// staged blob and executable bit are neither HEAD's (`head_tree`, or
+    /// none) nor what the working tree holds there. Untracking such a path
+    /// drops the one reference to that version, and a later `gc` removes
+    /// it. A path not tracked holds none. A working file that cannot be
+    /// read cannot be shown to hold the version, so its path is listed.
+    pub fn staged_only(
+        &self,
+        head_tree: Option<ObjectId>,
+        index: &Index,
+        paths: &[String],
+    ) -> Result<Vec<StagedOnly>> {
+        let wt = Worktree::open(&self.workdir)?;
+        let head = self.files_by_path(head_tree)?;
+        let mut out = Vec::new();
+        for path in paths {
+            let Some(e) = index.find(path).filter(|e| e.flags.is_tracked()) else {
+                continue;
+            };
+            let staged_as = (e.blob_hash, e.mode & 0o111 != 0);
+            if head.get(path).map(|f| (f.blob, f.executable)) == Some(staged_as) {
+                continue;
+            }
+            let why = match wt.read(path) {
+                Ok(Found::File { bytes, executable }) => {
+                    if (crate::blob::Blob::new(bytes).object_id(), executable) == staged_as {
+                        continue;
+                    }
+                    "in neither HEAD nor the working file"
+                }
+                Ok(_) => "in neither HEAD nor the working file",
+                Err(e) => match unreadable(e)? {
+                    Unreadable::Permission => "the working file is unreadable (permission denied)",
+                    Unreadable::Io => "the working file is unreadable (an I/O error)",
+                },
+            };
+            out.push(StagedOnly {
+                path: path.clone(),
+                blob: e.blob_hash,
+                why,
+            });
+        }
+        Ok(out)
     }
 
     /// The changes staged in `index` against `head_tree` (HEAD's tree, or

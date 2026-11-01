@@ -889,14 +889,28 @@ fn holds(found: &Found, f: &TreeFile) -> bool {
 /// Why what the working tree holds at `path` is work that writing `to` there
 /// (or, for `None`, removing it) would destroy; `None` if nothing would be
 /// lost. Nothing is lost if the file is missing, holds what HEAD (`head`)
-/// has, or already holds `to`.
+/// has, or already holds `to`. A file that cannot be read cannot be shown
+/// to hold either, so it counts as work: refused without `--force`, and
+/// overwritten or removed with it. Its read error used to stop the command
+/// before `--force` was looked at.
 fn unsaved_at(
     wt: &Worktree,
     head: &BTreeMap<String, TreeFile>,
     path: &str,
     to: Option<&TreeFile>,
 ) -> Result<Option<&'static str>> {
-    Ok(Some(match wt.read(path)? {
+    let found = match wt.read(path) {
+        Ok(found) => found,
+        Err(e) => {
+            return Ok(Some(match unreadable(e)? {
+                Unreadable::Permission => {
+                    "unreadable (permission denied), so not known to be committed"
+                }
+                Unreadable::Io => "unreadable (an I/O error), so not known to be committed",
+            }))
+        }
+    };
+    Ok(Some(match found {
         Found::Missing => return Ok(None),
         Found::File { bytes, executable } => {
             let held = (crate::blob::Blob::new(bytes).object_id(), executable);
@@ -912,6 +926,25 @@ fn unsaved_at(
         }
         found => changed(&found),
     }))
+}
+
+/// What stopped a read of the working tree, when the file stopped it.
+enum Unreadable {
+    Permission,
+    Io,
+}
+
+/// A read error that is the file's doing, permission or I/O, as
+/// [`Unreadable`]. Any other, such as a path refused as such, is returned
+/// as the error it is.
+fn unreadable(e: Error) -> Result<Unreadable> {
+    match e {
+        Error::Io { source, .. } if source.kind() == std::io::ErrorKind::PermissionDenied => {
+            Ok(Unreadable::Permission)
+        }
+        Error::Io { .. } => Ok(Unreadable::Io),
+        other => Err(other),
+    }
 }
 
 /// How a path that is not as committed differs.

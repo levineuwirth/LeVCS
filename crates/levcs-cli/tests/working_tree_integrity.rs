@@ -404,6 +404,44 @@ fn forget_delete_refuses_a_file_holding_work_not_committed() {
     );
 }
 
+/// A file that could not be read stopped the checks that keep uncommitted
+/// work with its read error, before --force was looked at: `forget --delete
+/// --force` and `construct --force` failed with "Permission denied". Such a
+/// file cannot be shown to hold what HEAD has, so it counts as work: refused
+/// with why, and passed with --force. Skipped where an unreadable file is
+/// read anyway, as by root.
+#[test]
+fn an_unreadable_file_is_refused_without_force_and_passes_with_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = diverged("unreadable");
+    let mode = |path: &str, m: u32| {
+        std::fs::set_permissions(r.work.join(path), std::fs::Permissions::from_mode(m)).unwrap()
+    };
+    mode("notes.md", 0o000);
+    if std::fs::read(r.work.join("notes.md")).is_ok() {
+        eprintln!("skipped: an unreadable file is read anyway here");
+        return;
+    }
+
+    // A committed file, deleted.
+    let e = r.refused(&["forget", "--delete", "notes.md"]);
+    assert_eq!(named(&e), ["notes.md"], "{e}");
+    assert!(e.contains("unreadable (permission denied)"), "{e}");
+    r.ok(&["forget", "--delete", "--force", "notes.md"]);
+    assert!(!r.work.join("notes.md").exists());
+
+    // A committed file, written over.
+    mode("data.json", 0o000);
+    let e = r.refused(&["construct", "HEAD", "data.json"]);
+    assert_eq!(named(&e), ["data.json"], "{e}");
+    assert!(e.contains("unreadable (permission denied)"), "{e}");
+    r.ok(&["construct", "--force", "HEAD", "data.json"]);
+    // HEAD's bytes, under the mode it had: a write over a file keeps all
+    // but the executable bits, which levcs alone records.
+    mode("data.json", 0o644);
+    assert_eq!(r.read("data.json"), "{\"v\":0}\n");
+}
+
 /// A file as HEAD has it loses nothing, so it is deleted without --force,
 /// and `construct` brings it back.
 #[test]

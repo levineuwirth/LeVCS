@@ -228,7 +228,10 @@ file already as the cache has it loses nothing. `forget --delete` deletes
 only a file that is missing or holds what HEAD has, which `construct` brings
 back. It refuses any other, a tracked file never committed included, and
 untracks nothing. `--force` deletes them. A conflicted file is exempt, since
-deleting it is how a conflict is resolved by deletion.
+deleting it is how a conflict is resolved by deletion. A file levcs cannot
+read cannot be shown to hold what HEAD has, so all three count it as work:
+the refusal says it is unreadable, and `--force` goes ahead. A write over a
+file keeps its permission bits other than the executable bit.
 
 `status` lists the same work. First comes what the index holds that HEAD
 does not: new files, staged changes, and files no longer tracked. Then come

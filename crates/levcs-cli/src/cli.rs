@@ -246,9 +246,15 @@ pub struct CacheArgs {
 
 #[derive(Args, Debug)]
 pub struct LogArgs {
-    #[arg(long)]
+    /// List the releases instead, newest first, each followed by the one it
+    /// was declared after.
+    #[arg(long, conflicts_with = "name_status")]
     pub release: bool,
-    #[arg(long)]
+    /// Only what REV does not already contain: the commits on HEAD's
+    /// first-parent line that are not REV or behind it. A release stands
+    /// for the commit it was declared on. With --release, REV names a
+    /// release, and the list stops before it.
+    #[arg(long, value_name = "REV")]
     pub since: Option<String>,
     /// List each commit's paths against its first parent, marked A (added),
     /// M (modified) or D (deleted).

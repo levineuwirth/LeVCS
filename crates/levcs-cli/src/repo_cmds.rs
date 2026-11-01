@@ -677,28 +677,113 @@ pub fn status(args: StatusArgs) -> Result<()> {
     Ok(())
 }
 
+/// HEAD's first-parent line, newest first, all of it: it stopped after 100
+/// commits, and `--since` and `--release` were read by nothing.
 pub fn log(args: LogArgs) -> Result<()> {
     let repo = open_repo()?;
+    if args.release {
+        return log_releases(&repo, args.since.as_deref());
+    }
     let head = repo
         .refs
         .resolve_head()?
         .ok_or_else(|| anyhow!("no commits yet"))?;
+    // What `--since` already contains ends the list: once the line reaches
+    // one of those commits, every one behind it is contained too.
+    let contained = match &args.since {
+        Some(spec) => {
+            let since = crate::rev::resolve_commit(&repo, spec).context("--since")?;
+            commit_and_ancestors(&repo, since)?
+        }
+        None => HashSet::new(),
+    };
     let mut id = head;
-    let mut count = 0;
-    while count < 100 {
+    while !contained.contains(&id) {
         let signed = repo.read_signed(id)?;
         let commit = Commit::from_signed(&signed)?;
         print_commit(id, &commit);
         if args.name_status && print_name_status(&repo, &commit)? {
             println!();
         }
-        if commit.parents.is_empty() {
-            break;
+        match commit.parents.first() {
+            Some(parent) => id = *parent,
+            None => break,
         }
-        id = commit.parents[0];
-        count += 1;
     }
     Ok(())
+}
+
+/// `id` and every commit behind it, through every parent.
+fn commit_and_ancestors(repo: &Repository, id: ObjectId) -> Result<HashSet<ObjectId>> {
+    let mut seen = HashSet::from([id]);
+    let mut stack = vec![id];
+    while let Some(id) = stack.pop() {
+        for parent in Commit::from_signed(&repo.read_signed(id)?)?.parents {
+            if seen.insert(parent) {
+                stack.push(parent);
+            }
+        }
+    }
+    Ok(seen)
+}
+
+/// `log --release`: from the newest release back along each one's
+/// `parent_release`, the release history apart from the branches. With
+/// `since`, a release, the list stops before it, and one the chain does not
+/// reach is refused before anything is printed.
+fn log_releases(repo: &Repository, since: Option<&str>) -> Result<()> {
+    let (_, newest) =
+        latest_release(repo)?.ok_or_else(|| anyhow!("no releases on this repository"))?;
+    let stop = match since {
+        Some(spec) => {
+            let id = crate::rev::resolve_rev(repo, spec)?;
+            let kind = repo.read_raw_object(id)?.object_type;
+            if kind != ObjectType::Release {
+                bail!(
+                    "with --release, --since names a release; {spec} is a {}",
+                    kind.name()
+                );
+            }
+            Some((spec, id))
+        }
+        None => None,
+    };
+    let mut chain = Vec::new();
+    let mut id = newest;
+    let reached = loop {
+        if stop.is_some_and(|(_, s)| s == id) {
+            break true;
+        }
+        let release = Release::parse_body(&repo.read_signed(id)?.body)?;
+        let parent = release.parent_release;
+        chain.push((id, release));
+        if parent.is_zero() {
+            break false;
+        }
+        id = parent;
+    };
+    if let Some((spec, _)) = stop.filter(|_| !reached) {
+        bail!("{spec} is not on the release chain back from the newest release, {newest}");
+    }
+    for (id, release) in &chain {
+        print_release(*id, release);
+        println!();
+    }
+    Ok(())
+}
+
+/// A release as `show` and `log --release` print it: id, label, the commit
+/// it was declared on, declarer, date, and notes.
+fn print_release(id: ObjectId, release: &Release) {
+    println!("release {id}");
+    println!("Label:  {}", release.label);
+    println!("Commit: {}", release.predecessor);
+    println!("Author: {}", PublicKey(release.declarer_key));
+    println!("Date:   {} (us since epoch)", release.timestamp_micros);
+    println!();
+    for line in release.notes.lines() {
+        println!("    {line}");
+    }
 }
 
 /// A commit as `log` and `show` print it: id, the parents of a merge,
@@ -764,16 +849,7 @@ pub fn show(args: ShowArgs) -> Result<()> {
             return Ok(());
         }
         (ObjectType::Release, None) => {
-            let release = Release::parse_body(&raw.body)?;
-            println!("release {id}");
-            println!("Label:  {}", release.label);
-            println!("Commit: {}", release.predecessor);
-            println!("Author: {}", PublicKey(release.declarer_key));
-            println!("Date:   {} (us since epoch)", release.timestamp_micros);
-            println!();
-            for line in release.notes.lines() {
-                println!("    {line}");
-            }
+            print_release(id, &Release::parse_body(&raw.body)?);
             return Ok(());
         }
         (ObjectType::Blob, None) => {
@@ -1850,7 +1926,7 @@ pub fn branch(args: BranchArgs) -> Result<()> {
     }
     if let Some(name) = args.create {
         let from = match args.from {
-            Some(s) => crate::rev::resolve_rev(&repo, &s)?,
+            Some(s) => crate::rev::resolve_commit(&repo, &s)?,
             None => repo
                 .refs
                 .resolve_head()?
@@ -2035,7 +2111,9 @@ fn merge_run(args: MergeArgs) -> Result<()> {
     if !lost.is_empty() {
         return Err(refuse_unsaved("this merge", &lost));
     }
-    let theirs_id = crate::rev::resolve_rev(&repo, &branch_name)?;
+    // A release merges as the commit it was declared on: taken as itself,
+    // it was "no common ancestor" with HEAD.
+    let theirs_id = crate::rev::resolve_commit(&repo, &branch_name)?;
     if head == theirs_id {
         eprintln!("already up to date.");
         return Ok(());
@@ -3162,10 +3240,13 @@ pub fn release(args: ReleaseArgs) -> Result<()> {
         .resolve_head()?
         .ok_or_else(|| anyhow!("no HEAD"))?;
     let head_commit = Commit::from_signed(&repo.read_signed(head)?)?;
-    let parent_release = repo
-        .refs
-        .read(&format!("refs/releases/{}", args.label))?
-        .unwrap_or(ZERO_ID);
+    // A release follows the newest release, whatever its label: the chain
+    // is the release history, apart from the branches. It followed only an
+    // earlier release of the same label, so releases under different labels
+    // were never linked. The label's ref moves from its own value.
+    let label_ref = format!("refs/releases/{}", args.label);
+    let expected = repo.refs.read(&label_ref)?;
+    let parent_release = latest_release(&repo)?.map_or(ZERO_ID, |(_, id)| id);
     let release = Release {
         tree: head_commit.tree,
         parent_release,
@@ -3181,15 +3262,10 @@ pub fn release(args: ReleaseArgs) -> Result<()> {
     // Publishing the release publishes its predecessor too, if that is not
     // already published: a release from a detached HEAD on received
     // history is checked like the history itself.
-    let expected = Some(parent_release).filter(|p| !p.is_zero());
     crate::publish::prepare(
         &repo,
         Some(&pk),
-        vec![crate::publish::update(
-            format!("refs/releases/{}", args.label),
-            expected,
-            Some(id),
-        )],
+        vec![crate::publish::update(label_ref, expected, Some(id))],
         None,
     )?
     .apply(&repo)?;

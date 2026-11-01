@@ -1,7 +1,9 @@
-//! Revision specs: `HEAD`, a branch, a full hex id or a unique hex prefix of a
-//! commit or release, each optionally followed
+//! Revision specs: `HEAD`, a branch, a release by its label, a full hex id
+//! or a unique hex prefix of a commit or release, each optionally followed
 //! by `~N` (first parent, N times) and `^N` (the Nth parent, 1-based; `^0`
-//! is the commit itself). Suffixes chain: `HEAD~2^2`.
+//! is the commit itself). Suffixes chain: `HEAD~2^2`. A release followed by
+//! a suffix starts from the commit it was declared on, so `v1^0` is that
+//! commit.
 
 use std::path::Path;
 
@@ -9,7 +11,7 @@ use anyhow::{anyhow, bail, Result};
 
 use levcs_core::object::ObjectType;
 use levcs_core::refs::validate_ref_name;
-use levcs_core::{Commit, ObjectId, Repository};
+use levcs_core::{Commit, ObjectId, Release, Repository};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum Step {
@@ -131,9 +133,9 @@ fn resolve_prefix(repo: &Repository, prefix: &str) -> Result<Option<ObjectId>> {
     }
 }
 
-/// Resolve the base of a spec: `HEAD`, a branch, a full hex id, or a hex
-/// prefix. A branch wins over a prefix. `Ok(None)` means the text is none
-/// of those.
+/// Resolve the base of a spec: `HEAD`, a branch, a release by its label, a
+/// full hex id, or a hex prefix. A branch wins over a release of the same
+/// name, and both over a prefix. `Ok(None)` means the text is none of those.
 fn resolve_base(repo: &Repository, base: &str) -> Result<Option<ObjectId>> {
     if base == "HEAD" {
         return repo
@@ -145,10 +147,25 @@ fn resolve_base(repo: &Repository, base: &str) -> Result<Option<ObjectId>> {
     // Text that is not a legal ref name (`./notes`, `../x`, `/abs`) is a path
     // or nothing, never a branch, so it must not reach the ref lookup, which
     // rejects it with an error instead of a miss.
-    let name = format!("refs/branches/{base}");
-    if validate_ref_name(&name).is_ok() {
-        if let Some(id) = repo.refs.read(&name)? {
-            return Ok(Some(id));
+    for namespace in ["refs/branches", "refs/releases"] {
+        let name = format!("{namespace}/{base}");
+        if validate_ref_name(&name).is_err() {
+            continue;
+        }
+        match repo.refs.read(&name) {
+            Ok(Some(id)) => return Ok(Some(id)),
+            Ok(None) => {}
+            // A name this namespace holds in another shape is not a ref
+            // here: a directory of refs (`series` beside a branch
+            // `series/next`), or a path under one (`stable/v1` beside a
+            // branch `stable`). It is a miss, so that the next namespace
+            // is looked at; it used to stop resolution with the error.
+            Err(levcs_core::Error::Io { source, .. })
+                if matches!(
+                    source.kind(),
+                    std::io::ErrorKind::IsADirectory | std::io::ErrorKind::NotADirectory
+                ) => {}
+            Err(e) => return Err(e.into()),
         }
     }
     if let Ok(id) = ObjectId::from_hex(base) {
@@ -161,6 +178,17 @@ fn resolve_base(repo: &Repository, base: &str) -> Result<Option<ObjectId>> {
 }
 
 fn walk_repo(repo: &Repository, base: ObjectId, steps: &[Step]) -> Result<ObjectId> {
+    // A release has no parents; with a suffix it stands for the commit it
+    // was declared on.
+    let base = if steps.is_empty() {
+        base
+    } else {
+        let raw = repo.read_raw_object(base)?;
+        match raw.object_type {
+            ObjectType::Release => Release::parse_body(&raw.body)?.predecessor,
+            _ => base,
+        }
+    };
     walk(base, steps, |id| {
         Ok(Commit::from_signed(&repo.read_signed(id)?)?.parents)
     })
@@ -172,6 +200,19 @@ pub fn resolve_rev(repo: &Repository, spec: &str) -> Result<ObjectId> {
     let id =
         resolve_base(repo, base)?.ok_or_else(|| anyhow!("unknown branch or commit: {base}"))?;
     walk_repo(repo, id, &steps)
+}
+
+/// Resolve `spec` where a commit is required: a release stands for the
+/// commit it was declared on, and anything else that is not a commit is
+/// refused, naming what it is.
+pub fn resolve_commit(repo: &Repository, spec: &str) -> Result<ObjectId> {
+    let id = resolve_rev(repo, spec)?;
+    let raw = repo.read_raw_object(id)?;
+    match raw.object_type {
+        ObjectType::Commit => Ok(id),
+        ObjectType::Release => Ok(Release::parse_body(&raw.body)?.predecessor),
+        other => bail!("{spec} is a {}, not a commit or a release", other.name()),
+    }
 }
 
 /// For positionals that may be a revision *or* a path (`diff`, `construct`).

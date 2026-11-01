@@ -1850,7 +1850,7 @@ pub fn branch(args: BranchArgs) -> Result<()> {
     }
     if let Some(name) = args.create {
         let from = match args.from {
-            Some(s) => crate::rev::resolve_rev(&repo, &s)?,
+            Some(s) => crate::rev::resolve_commit(&repo, &s)?,
             None => repo
                 .refs
                 .resolve_head()?
@@ -2035,7 +2035,9 @@ fn merge_run(args: MergeArgs) -> Result<()> {
     if !lost.is_empty() {
         return Err(refuse_unsaved("this merge", &lost));
     }
-    let theirs_id = crate::rev::resolve_rev(&repo, &branch_name)?;
+    // A release merges as the commit it was declared on: taken as itself,
+    // it was "no common ancestor" with HEAD.
+    let theirs_id = crate::rev::resolve_commit(&repo, &branch_name)?;
     if head == theirs_id {
         eprintln!("already up to date.");
         return Ok(());

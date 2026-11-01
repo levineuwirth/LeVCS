@@ -322,12 +322,17 @@ levcs diff 3fa9c1            # a unique hex prefix (4+ characters)
 levcs merge main^2           # the second parent of main's tip
 ```
 
-The base is `HEAD`, a branch, a full hash, or a hex prefix of a commit or
-release. `~N` follows the first parent N times (`~` alone is `~1`); `^N` takes
-the Nth parent, counting from 1, which is how you reach the other side of a
-merge (`^0` is the commit itself). Suffixes chain: `HEAD~2^2`. A branch beats
-a prefix of the same spelling, and a prefix matching more than one commit is
-refused with the candidates listed rather than guessed at.
+The base is `HEAD`, a branch, a release by its label, a full hash, or a hex
+prefix of a commit or release. `~N` follows the first parent N times (`~`
+alone is `~1`); `^N` takes the Nth parent, counting from 1, which is how you
+reach the other side of a merge (`^0` is the commit itself). Suffixes chain:
+`HEAD~2^2`. A release followed by a suffix starts from the commit it was
+declared on, so `v1.0^0` is that commit and `v1.0~1` the one before it.
+Where a commit is required, by `merge` and `branch --create`,
+a release stands for that commit too. A
+branch beats a release of the same name, either beats a prefix of the same
+spelling, and a prefix matching more than one commit is refused with the
+candidates listed rather than guessed at.
 
 `diff` and `construct` also take paths, so a word that could be either is
 resolved conservatively: a bare branch name or an unmatched hex word is a

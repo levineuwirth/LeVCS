@@ -546,3 +546,78 @@ fn explain_dumps_merge_record() {
     assert!(o.contains("schema_version"));
     assert!(o.contains("a.txt"));
 }
+
+/// Merges that read a merge commit's tree: ours a merge commit (the same
+/// branch merged again right after), then a merge commit as the base. Such
+/// a tree holds `.levcs/merge-record`, history rather than a file; a merge
+/// reconciles files only, so the entry is neither merged, nor written over
+/// the record of the merge in progress, nor listed in it. `merge` used to
+/// filter the entry out itself; it is now left out where every tree is read
+/// for comparison, which `diff` shares.
+#[test]
+fn merges_over_merge_commits_reconcile_files_only() {
+    let (work, xdg) = init_repo();
+    let ok = |args: &[&str]| {
+        let (code, out, e) = run(args, &work, &xdg);
+        assert_eq!(code, 0, "{args:?}: {e}");
+        out + &e
+    };
+    let id_of = |printed: String| {
+        printed
+            .split(['[', ']'])
+            .nth(1)
+            .expect("commit prints [id]")
+            .to_string()
+    };
+    let record = || std::fs::read_to_string(work.join(".levcs").join("merge-record")).unwrap();
+    std::fs::write(work.join("a.txt"), b"a\n").unwrap();
+    std::fs::write(work.join("b.txt"), b"b\n").unwrap();
+    ok(&["track", "--all"]);
+    ok(&["commit", "-m", "first"]);
+    ok(&["branch", "--create", "side"]);
+    ok(&["branch", "--switch", "side"]);
+    std::fs::write(work.join("b.txt"), b"b side\n").unwrap();
+    ok(&["commit", "-m", "side"]);
+    ok(&["branch", "--switch", "main"]);
+    std::fs::write(work.join("a.txt"), b"a main\n").unwrap();
+    ok(&["commit", "-m", "main"]);
+    ok(&["merge", "side"]);
+    ok(&["commit", "-m", "first merge"]);
+
+    // ours is the merge commit just made.
+    ok(&["branch", "--switch", "side"]);
+    std::fs::write(work.join("b.txt"), b"b side again\n").unwrap();
+    ok(&["commit", "-m", "side again"]);
+    ok(&["branch", "--switch", "main"]);
+    let out = ok(&["merge", "side"]);
+    assert!(out.contains("clean merge"), "{out}");
+    assert!(!out.contains(".levcs"), "{out}");
+    let r = record();
+    assert!(r.contains("b.txt") && !r.contains("merge-record"), "{r}");
+    let second = id_of(ok(&["commit", "-m", "second merge"]));
+    assert_eq!(
+        std::fs::read(work.join("b.txt")).unwrap(),
+        b"b side again\n"
+    );
+
+    // The merge commit is the base: both lines of work go on from it.
+    ok(&["branch", "--create", "later", &second]);
+    ok(&["branch", "--switch", "later"]);
+    std::fs::write(work.join("b.txt"), b"b later\n").unwrap();
+    ok(&["commit", "-m", "later"]);
+    ok(&["branch", "--switch", "main"]);
+    std::fs::write(work.join("a.txt"), b"a main again\n").unwrap();
+    ok(&["commit", "-m", "main again"]);
+    let out = ok(&["merge", "later"]);
+    assert!(out.contains("clean merge"), "{out}");
+    assert!(!out.contains(".levcs"), "{out}");
+    let r = record();
+    assert!(r.contains("b.txt") && !r.contains("merge-record"), "{r}");
+    ok(&["commit", "-m", "third merge"]);
+    assert_eq!(
+        std::fs::read(work.join("a.txt")).unwrap(),
+        b"a main again\n"
+    );
+    assert_eq!(std::fs::read(work.join("b.txt")).unwrap(), b"b later\n");
+    ok(&["verify"]);
+}

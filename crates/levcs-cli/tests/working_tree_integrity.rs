@@ -394,14 +394,116 @@ fn forget_delete_refuses_a_file_holding_work_not_committed() {
         "a refused forget untracked: {status}"
     );
 
-    // --force goes only with --delete.
-    r.refused(&["forget", "--force", "notes.md"]);
     let out = r.ok(&["forget", "--delete", "--force", "notes.md"]);
     assert!(!r.work.join("notes.md").exists());
     assert!(
         out.contains("deleted changes that were not committed: notes.md"),
         "{out}"
     );
+}
+
+/// `forget` dropped the index's entry, and with it a version staged there:
+/// `track` a file, edit it again, `forget` it, and the tracked version was in
+/// neither HEAD nor the working file, kept nowhere, with exit 0. A version
+/// only the index holds is now refused, with or without --delete, and named
+/// by its blob, which `levcs show` prints: committing or `cache --save` keep
+/// the working file, not it. --force drops it and names it again. A staged
+/// version HEAD or the working file holds loses nothing, and is not refused.
+#[test]
+fn forget_refuses_to_drop_a_version_only_the_index_holds() {
+    let r = diverged("forget-staged");
+    r.write("draft.md", "the staged version\n");
+    r.ok(&["track", "draft.md"]);
+    r.write("draft.md", "a later edit\n");
+    let blob_in = |e: &str| -> String {
+        let at = e.find("levcs show ").expect("names the blob") + "levcs show ".len();
+        e[at..]
+            .chars()
+            .take_while(char::is_ascii_hexdigit)
+            .collect()
+    };
+    let mut blobs = Vec::new();
+    for args in [
+        &["forget", "draft.md"][..],
+        &["forget", "--delete", "draft.md"],
+    ] {
+        let e = r.refused(args);
+        assert!(named(&e).contains(&"draft.md".to_string()), "{e}");
+        assert!(
+            e.contains("only the index holds") && e.contains("--force"),
+            "{e}"
+        );
+        assert!(e.contains("Nothing was changed"), "{e}");
+        let blob = blob_in(&e);
+        assert_eq!(r.ok(&["show", &blob]), "the staged version\n", "{e}");
+        blobs.push(blob);
+    }
+    assert_eq!(blobs[0], blobs[1]);
+    assert_eq!(r.read("draft.md"), "a later edit\n");
+    assert_eq!(section(&r.ok(&["status"]), "new"), ["draft.md"]);
+
+    // Staged as the working file holds it, or as HEAD has it: nothing lost.
+    r.write("kept.md", "the same\n");
+    r.ok(&["track", "kept.md"]);
+    r.ok(&["forget", "kept.md"]);
+    r.write("notes.md", "notes\nan edit not staged\n");
+    r.ok(&["forget", "notes.md"]);
+
+    let out = r.ok(&["forget", "--force", "draft.md"]);
+    assert!(out.contains("draft.md") && out.contains(&blobs[0]), "{out}");
+    assert_eq!(r.read("draft.md"), "a later edit\n");
+    assert!(section(&r.ok(&["status"]), "untracked").contains(&"draft.md".to_string()));
+}
+
+/// A file that could not be read stopped the checks that keep uncommitted
+/// work with its read error, before --force was looked at: `forget`,
+/// `forget --delete --force` and `construct --force` all failed with
+/// "Permission denied", and plain `forget` had not read the working tree
+/// before. Such a file cannot be shown to hold what HEAD has, or the staged
+/// version, so it counts as work: refused with why, and passed with --force.
+/// Skipped where an unreadable file is read anyway, as by root.
+#[test]
+fn an_unreadable_file_is_refused_without_force_and_passes_with_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = diverged("unreadable");
+    let mode = |path: &str, m: u32| {
+        std::fs::set_permissions(r.work.join(path), std::fs::Permissions::from_mode(m)).unwrap()
+    };
+    r.write("u.txt", "staged\n");
+    r.ok(&["track", "u.txt"]);
+    mode("u.txt", 0o000);
+    if std::fs::read(r.work.join("u.txt")).is_ok() {
+        eprintln!("skipped: an unreadable file is read anyway here");
+        return;
+    }
+
+    // A staged file, untracked.
+    let e = r.refused(&["forget", "u.txt"]);
+    assert_eq!(named(&e), ["u.txt"], "{e}");
+    assert!(e.contains("unreadable (permission denied)"), "{e}");
+    r.ok(&["forget", "--force", "u.txt"]);
+    mode("u.txt", 0o644);
+    assert_eq!(r.read("u.txt"), "staged\n");
+    assert!(section(&r.ok(&["status"]), "untracked").contains(&"u.txt".to_string()));
+
+    // A committed file, deleted.
+    mode("notes.md", 0o000);
+    let e = r.refused(&["forget", "--delete", "notes.md"]);
+    assert_eq!(named(&e), ["notes.md"], "{e}");
+    assert!(e.contains("unreadable (permission denied)"), "{e}");
+    r.ok(&["forget", "--delete", "--force", "notes.md"]);
+    assert!(!r.work.join("notes.md").exists());
+
+    // A committed file, written over.
+    mode("data.json", 0o000);
+    let e = r.refused(&["construct", "HEAD", "data.json"]);
+    assert_eq!(named(&e), ["data.json"], "{e}");
+    assert!(e.contains("unreadable (permission denied)"), "{e}");
+    r.ok(&["construct", "--force", "HEAD", "data.json"]);
+    // HEAD's bytes, under the mode it had: a write over a file keeps all
+    // but the executable bits, which levcs alone records.
+    mode("data.json", 0o644);
+    assert_eq!(r.read("data.json"), "{\"v\":0}\n");
 }
 
 /// A file as HEAD has it loses nothing, so it is deleted without --force,

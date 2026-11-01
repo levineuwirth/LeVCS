@@ -176,7 +176,9 @@ built from. Without it, a commit that landed in between would be undone. A
 refusal commits nothing and exits with status 5, so a caller can rebuild its
 version from the new HEAD and try again. An id that is not a commit here, such
 as a release or a mistyped hash, exits with status 1, since trying again
-would not change it.
+would not change it. Before a repository's first commit `status` reports no
+head (`null`), and `--expect-head none` guards that first commit: it refuses
+with status 5 once any commit has landed.
 
 `levcs verify` checks everything the repository keeps, not just HEAD.
 Every object reachable from any ref is hash-checked, and every commit and
@@ -228,7 +230,10 @@ file already as the cache has it loses nothing. `forget --delete` deletes
 only a file that is missing or holds what HEAD has, which `construct` brings
 back. It refuses any other, a tracked file never committed included, and
 untracks nothing. `--force` deletes them. A conflicted file is exempt, since
-deleting it is how a conflict is resolved by deletion.
+deleting it is how a conflict is resolved by deletion. A file levcs cannot
+read cannot be shown to hold what HEAD has, so all three count it as work:
+the refusal says it is unreadable, and `--force` goes ahead. A write over a
+file keeps its permission bits other than the executable bit.
 
 `status` lists the same work. First comes what the index holds that HEAD
 does not: new files, staged changes, and files no longer tracked. Then come
@@ -301,6 +306,10 @@ expands to the tracked files beneath it. Nothing is deleted by default.
 deletes comes back with `levcs construct`. A file holding an edit, or tracked
 but never committed, is refused unless `--force`. Being tracked was once taken
 to be enough, but a tracked file's edit has no blob until it is committed.
+Untracking also drops the version the index holds. A version staged and then
+edited again is in neither HEAD nor the working file, so `forget` refuses it,
+with or without `--delete`, and names its blob: `levcs show <blob>` prints it.
+`--force` drops it and names it again.
 
 Commands that take a commit (`diff`, `construct`, `show`, `merge`,
 `branch --create`) accept a revision, not just a full hash:

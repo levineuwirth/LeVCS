@@ -70,6 +70,15 @@ pub struct Unsaved {
     pub why: &'static str,
 }
 
+/// A version only the index holds, as [`Repository::staged_only`] finds it:
+/// its path, its blob, and why the working tree is not known to hold it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StagedOnly {
+    pub path: String,
+    pub blob: ObjectId,
+    pub why: &'static str,
+}
+
 /// How the index differs from HEAD at a path: a change staged and not
 /// committed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -577,6 +586,51 @@ impl Repository {
         Ok(lost)
     }
 
+    /// The versions only `index` holds at `paths`: a tracked path whose
+    /// staged blob and executable bit are neither HEAD's (`head_tree`, or
+    /// none) nor what the working tree holds there. Untracking such a path
+    /// drops the one reference to that version, and a later `gc` removes
+    /// it. A path not tracked holds none. A working file that cannot be
+    /// read cannot be shown to hold the version, so its path is listed.
+    pub fn staged_only(
+        &self,
+        head_tree: Option<ObjectId>,
+        index: &Index,
+        paths: &[String],
+    ) -> Result<Vec<StagedOnly>> {
+        let wt = Worktree::open(&self.workdir)?;
+        let head = self.files_by_path(head_tree)?;
+        let mut out = Vec::new();
+        for path in paths {
+            let Some(e) = index.find(path).filter(|e| e.flags.is_tracked()) else {
+                continue;
+            };
+            let staged_as = (e.blob_hash, e.mode & 0o111 != 0);
+            if head.get(path).map(|f| (f.blob, f.executable)) == Some(staged_as) {
+                continue;
+            }
+            let why = match wt.read(path) {
+                Ok(Found::File { bytes, executable }) => {
+                    if (crate::blob::Blob::new(bytes).object_id(), executable) == staged_as {
+                        continue;
+                    }
+                    "in neither HEAD nor the working file"
+                }
+                Ok(_) => "in neither HEAD nor the working file",
+                Err(e) => match unreadable(e)? {
+                    Unreadable::Permission => "the working file is unreadable (permission denied)",
+                    Unreadable::Io => "the working file is unreadable (an I/O error)",
+                },
+            };
+            out.push(StagedOnly {
+                path: path.clone(),
+                blob: e.blob_hash,
+                why,
+            });
+        }
+        Ok(out)
+    }
+
     /// The changes staged in `index` against `head_tree` (HEAD's tree, or
     /// none), by path: the staged work a move refuses to overwrite, as
     /// `status` reports it.
@@ -889,14 +943,28 @@ fn holds(found: &Found, f: &TreeFile) -> bool {
 /// Why what the working tree holds at `path` is work that writing `to` there
 /// (or, for `None`, removing it) would destroy; `None` if nothing would be
 /// lost. Nothing is lost if the file is missing, holds what HEAD (`head`)
-/// has, or already holds `to`.
+/// has, or already holds `to`. A file that cannot be read cannot be shown
+/// to hold either, so it counts as work: refused without `--force`, and
+/// overwritten or removed with it. Its read error used to stop the command
+/// before `--force` was looked at.
 fn unsaved_at(
     wt: &Worktree,
     head: &BTreeMap<String, TreeFile>,
     path: &str,
     to: Option<&TreeFile>,
 ) -> Result<Option<&'static str>> {
-    Ok(Some(match wt.read(path)? {
+    let found = match wt.read(path) {
+        Ok(found) => found,
+        Err(e) => {
+            return Ok(Some(match unreadable(e)? {
+                Unreadable::Permission => {
+                    "unreadable (permission denied), so not known to be committed"
+                }
+                Unreadable::Io => "unreadable (an I/O error), so not known to be committed",
+            }))
+        }
+    };
+    Ok(Some(match found {
         Found::Missing => return Ok(None),
         Found::File { bytes, executable } => {
             let held = (crate::blob::Blob::new(bytes).object_id(), executable);
@@ -912,6 +980,25 @@ fn unsaved_at(
         }
         found => changed(&found),
     }))
+}
+
+/// What stopped a read of the working tree, when the file stopped it.
+enum Unreadable {
+    Permission,
+    Io,
+}
+
+/// A read error that is the file's doing, permission or I/O, as
+/// [`Unreadable`]. Any other, such as a path refused as such, is returned
+/// as the error it is.
+fn unreadable(e: Error) -> Result<Unreadable> {
+    match e {
+        Error::Io { source, .. } if source.kind() == std::io::ErrorKind::PermissionDenied => {
+            Ok(Unreadable::Permission)
+        }
+        Error::Io { .. } => Ok(Unreadable::Io),
+        other => Err(other),
+    }
 }
 
 /// How a path that is not as committed differs.

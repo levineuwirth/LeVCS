@@ -305,23 +305,30 @@ pub fn forget(args: ForgetArgs) -> Result<()> {
     // Checked before anything is untracked, so a refusal changes nothing. A
     // conflicted file is exempt: it is only ever named on purpose, and
     // deleting it is how a conflict is resolved by deletion.
-    let mut forced = Vec::new();
-    if args.delete {
-        let checked: Vec<String> = targets
-            .iter()
-            .filter(|p| idx.find(p).is_none_or(|e| !e.flags.is_conflicted()))
-            .cloned()
-            .collect();
-        let lost = repo.would_remove(tree_at_head(&repo)?, &checked)?;
-        if !lost.is_empty() && !args.force {
-            return Err(refuse_destroying(
-                "forget --delete",
-                "delete",
-                &lost,
-                " Without --delete, forget leaves the file as it is.",
-            ));
-        }
-        forced = lost;
+    let checked: Vec<String> = targets
+        .iter()
+        .filter(|p| idx.find(p).is_none_or(|e| !e.flags.is_conflicted()))
+        .cloned()
+        .collect();
+    let head_tree = tree_at_head(&repo)?;
+    // Untracking drops the index's entry, and a version staged there that
+    // neither HEAD nor the working file holds is kept nowhere else.
+    let dropped = repo.staged_only(head_tree, &idx, &checked)?;
+    let forced = if args.delete {
+        repo.would_remove(head_tree, &checked)?
+    } else {
+        Vec::new()
+    };
+    if !args.force && !dropped.is_empty() {
+        return Err(refuse_dropping_staged(&dropped, &forced));
+    }
+    if !args.force && !forced.is_empty() {
+        return Err(refuse_destroying(
+            "forget --delete",
+            "delete",
+            &forced,
+            " Without --delete, forget leaves the file as it is.",
+        ));
     }
 
     let wt = levcs_core::worktree::open(&repo.workdir)?;
@@ -360,10 +367,53 @@ pub fn forget(args: ForgetArgs) -> Result<()> {
             paths.join(", ")
         );
     }
+    if !dropped.is_empty() {
+        let staged: Vec<String> = dropped
+            .iter()
+            .map(|d| format!("{} (staged as {})", d.path, d.blob))
+            .collect();
+        eprintln!(
+            "dropped versions only the index held: {}; `levcs show <blob>` prints \
+             each until `levcs gc` removes it",
+            staged.join(", ")
+        );
+    }
     if !failed.is_empty() {
         bail!("untracked, but could not delete: {}", failed.join(", "));
     }
     Ok(())
+}
+
+/// `forget` refusing to drop versions only the index holds, `dropped`, and,
+/// with --delete, files holding changes not committed, `lost`. A staged
+/// version is not the working file, so neither a commit nor `cache --save`
+/// keeps it; each is named by its blob, which `levcs show` prints.
+fn refuse_dropping_staged(
+    dropped: &[levcs_core::repo::StagedOnly],
+    lost: &[levcs_core::repo::Unsaved],
+) -> anyhow::Error {
+    let mut listing: Vec<String> = dropped
+        .iter()
+        .map(|d| {
+            format!(
+                "  {}  (staged as {}, {}; `levcs show {}` prints it)",
+                d.path, d.blob, d.why, d.blob
+            )
+        })
+        .collect();
+    let mut also = String::new();
+    if !lost.is_empty() {
+        also = format!(
+            "\nand would delete changes that are not committed:\n{}",
+            unsaved_listing(lost)
+        );
+    }
+    listing.sort();
+    anyhow!(
+        "this forget would drop versions only the index holds, staged and not committed:\n\
+         {}{also}\npass --force to forget them anyway. Nothing was changed.",
+        listing.join("\n")
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -900,22 +950,30 @@ pub fn commit(args: CommitArgs) -> Result<()> {
     // between here and the ref write; a commit landed since would otherwise
     // be undone by this one.
     if let Some(spec) = &args.expect_head {
-        let expected = crate::rev::resolve_rev(&repo, spec)?;
-        // Only a commit can be HEAD. Any other id, a release or a hash that
-        // names nothing here, was refused as HEAD having moved, with the
-        // status that tells a caller to rebuild and try again, so a caller
-        // that did would retry forever. It is refused as a failure instead.
-        let raw = repo
-            .read_raw_object(expected)
-            .with_context(|| format!("--expect-head {spec}: no such commit here"))?;
-        if raw.object_type != ObjectType::Commit {
-            bail!(
-                "--expect-head {spec} is a {}, not a commit; nothing was committed",
-                raw.object_type.name()
-            );
-        }
+        // `none`: HEAD has no commits yet, which no id can say, so that a
+        // repository's first commit can be guarded too.
+        let expected = if spec == EXPECT_NO_COMMITS {
+            None
+        } else {
+            let expected = crate::rev::resolve_rev(&repo, spec)?;
+            // Only a commit can be HEAD. Any other id, a release or a hash
+            // that names nothing here, was refused as HEAD having moved,
+            // with the status that tells a caller to rebuild and try again,
+            // so a caller that did would retry forever. It is refused as a
+            // failure instead.
+            let raw = repo
+                .read_raw_object(expected)
+                .with_context(|| format!("--expect-head {spec}: no such commit here"))?;
+            if raw.object_type != ObjectType::Commit {
+                bail!(
+                    "--expect-head {spec} is a {}, not a commit; nothing was committed",
+                    raw.object_type.name()
+                );
+            }
+            Some(expected)
+        };
         let actual = repo.refs.resolve_head()?;
-        if actual != Some(expected) {
+        if actual != expected {
             return Err(HeadMoved { expected, actual }.into());
         }
     }
@@ -1275,21 +1333,29 @@ fn given_content(repo: &Repository, specs: &[String]) -> Result<BTreeMap<String,
     Ok(out)
 }
 
-/// `commit --expect-head` found HEAD at another commit. Nothing was
-/// committed.
+/// What `commit --expect-head` takes for "HEAD has no commits yet".
+const EXPECT_NO_COMMITS: &str = "none";
+
+/// `commit --expect-head` found HEAD at another commit, or at one when it
+/// expected none (`expected` is `None`). Nothing was committed.
 #[derive(Debug)]
 pub struct HeadMoved {
-    expected: ObjectId,
+    expected: Option<ObjectId>,
     actual: Option<ObjectId>,
 }
 
 impl std::fmt::Display for HeadMoved {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.actual {
-            Some(a) => write!(f, "HEAD is {a}, not {}", self.expected)?,
-            None => write!(f, "HEAD has no commits, not {}", self.expected)?,
+        match (self.actual, self.expected) {
+            (Some(a), Some(e)) => write!(f, "HEAD is {a}, not {e} as --expect-head expects")?,
+            (Some(a), None) => write!(
+                f,
+                "HEAD is {a}, where --expect-head {EXPECT_NO_COMMITS} expects no commits yet"
+            )?,
+            (None, Some(e)) => write!(f, "HEAD has no commits, not {e} as --expect-head expects")?,
+            (None, None) => write!(f, "HEAD has no commits, as --expect-head expects")?,
         }
-        write!(f, " as --expect-head expects; nothing was committed")
+        write!(f, "; nothing was committed")
     }
 }
 
@@ -1741,6 +1807,12 @@ fn collect_tree_files(
     }
     let mut content = levcs_core::repo::ContentBudget::default();
     repo.walk_tree(tree_id, prefix, |path, e| {
+        // The root's `.levcs` entry is synthetic history (an authority, a
+        // merge record), never a file, as for `tree_files`: a caller that
+        // looked for it in the working tree was refused there.
+        if path == ".levcs" {
+            return Ok(false);
+        }
         if e.entry_type == levcs_core::EntryType::Blob {
             let blob = repo.read_blob(e.hash, &mut content)?;
             out.insert(path.to_string(), blob.body);
@@ -2039,19 +2111,14 @@ fn merge_run(args: MergeArgs) -> Result<()> {
         theirs: format!("blake3:{}", theirs_id),
         files: Vec::new(),
     };
-    let mut paths: BTreeSet<String> = BTreeSet::new();
-    for k in base_files
+    // `collect_tree_files` leaves out the synthetic `.levcs` entries
+    // (authority, merge-record), which live in commits but never on disk.
+    let paths: BTreeSet<String> = base_files
         .keys()
         .chain(ours_files.keys())
         .chain(theirs_files.keys())
-    {
-        // .levcs/* synthetic tree entries (authority, merge-record) live in
-        // commits but never on disk; skip them when reconciling files.
-        if k.starts_with(".levcs/") || k == ".levcs" {
-            continue;
-        }
-        paths.insert(k.clone());
-    }
+        .cloned()
+        .collect();
 
     let json_mode = is_json(&args.format)?;
     let mut auto_resolved = 0usize;
@@ -3399,6 +3466,12 @@ pub fn verify() -> Result<()> {
 }
 
 pub fn gc(args: GcArgs) -> Result<()> {
+    if args.aggressive {
+        eprintln!(
+            "levcs: gc --aggressive does nothing more than gc; it is accepted only \
+             so that scripts passing it keep working"
+        );
+    }
     let (repo, _lock) = open_repo_locked()?;
     // What gc keeps is exactly what `verify`'s typed walk reaches, from the
     // same roots and through the same links, each checked for its type. Any
@@ -3455,7 +3528,6 @@ pub fn gc(args: GcArgs) -> Result<()> {
         "gc: removed {deleted} unreachable object(s); kept {kept_young} within grace ({}d)",
         args.grace_days
     );
-    let _ = args.aggressive; // honored via the same delete loop today
     Ok(())
 }
 

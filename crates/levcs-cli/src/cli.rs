@@ -102,9 +102,11 @@ pub struct ForgetArgs {
     /// back with `levcs construct`.
     #[arg(long)]
     pub delete: bool,
-    /// With --delete, delete files that hold changes not committed too.
-    /// Without it, forget refuses, names each one, and changes nothing.
-    #[arg(long, requires = "delete")]
+    /// Forget what holds work not committed too: a version only the index
+    /// holds (staged, then edited again), and with --delete a file's
+    /// changes. Without it, forget refuses, names each one, and changes
+    /// nothing.
+    #[arg(long)]
     pub force: bool,
     pub paths: Vec<PathBuf>,
 }
@@ -119,9 +121,10 @@ pub struct CommitArgs {
     /// explicit spelling of it, and cannot be combined with paths.
     #[arg(long, conflicts_with = "paths")]
     pub all: bool,
-    /// Refuse unless HEAD is this commit, checked under the repository
-    /// lock. Nothing is committed, and the exit status is 5, if another
-    /// commit has landed since the caller read HEAD.
+    /// Refuse unless HEAD is this commit, or with `none` unless HEAD has no
+    /// commits yet, checked under the repository lock. Nothing is
+    /// committed, and the exit status is 5, if another commit has landed
+    /// since the caller read HEAD.
     #[arg(long = "expect-head", value_name = "REV")]
     pub expect_head: Option<String>,
     /// Commit FILE's bytes as PATH, a tracked file, in place of what the
@@ -265,7 +268,10 @@ pub struct ShowArgs {
 
 #[derive(Args, Debug)]
 pub struct GcArgs {
-    #[arg(long)]
+    /// Does nothing beyond a plain `gc`, and says so. Hidden, and accepted
+    /// only so that a script passing it keeps working: it was listed and
+    /// never did anything, and nothing says what it should do.
+    #[arg(long, hide = true)]
     pub aggressive: bool,
     /// Grace period in days. Loose objects modified within this window
     /// are kept regardless of reachability — they may belong to an

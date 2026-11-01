@@ -615,6 +615,51 @@ fn expect_head_naming_no_commit_fails_rather_than_asking_for_a_retry() {
 }
 
 #[test]
+fn expect_head_none_guards_a_repositorys_first_commit() {
+    // Before the first commit `status --format json` gives `head: null`, and
+    // nothing `--expect-head` took meant "no commits yet": a writer could not
+    // guard the first commit, and `null` was refused as naming no commit.
+    // `none` says it, and a second writer that also read no HEAD is told
+    // HEAD moved, with status 5, as any other is.
+    let base = std::env::temp_dir().join(format!(
+        "levcs-concurrent-first-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let (work, cfg) = (base.join("w"), base.join("cfg"));
+    std::fs::create_dir_all(&work).unwrap();
+    ok(&work, &cfg, &["init", "--key", "owner"]);
+    let s: serde_json::Value =
+        serde_json::from_str(&ok(&work, &cfg, &["status", "--format", "json"])).unwrap();
+    assert!(s["head"].is_null(), "{s}");
+    std::fs::write(work.join("log.md"), "first\n").unwrap();
+    ok(&work, &cfg, &["track", "log.md"]);
+    let first = |message: &str| {
+        levcs(
+            &work,
+            &cfg,
+            &["commit", "-m", message, "--expect-head", "none"],
+        )
+    };
+    let o = first("first");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let landed = head(&work, &cfg);
+
+    std::fs::write(work.join("log.md"), "first\nsecond\n").unwrap();
+    let o = first("also first");
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(o.status.code(), Some(5), "{err}");
+    assert!(
+        err.contains(&landed) && err.contains("--expect-head none"),
+        "{err}"
+    );
+    assert_eq!(head(&work, &cfg), landed);
+}
+
+#[test]
 fn given_content_is_listed_in_path_order() {
     // The paths came from a hash map, so their order, in the scope and in
     // the lines that list them, changed from one run to the next. Each

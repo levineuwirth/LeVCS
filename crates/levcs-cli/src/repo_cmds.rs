@@ -950,22 +950,30 @@ pub fn commit(args: CommitArgs) -> Result<()> {
     // between here and the ref write; a commit landed since would otherwise
     // be undone by this one.
     if let Some(spec) = &args.expect_head {
-        let expected = crate::rev::resolve_rev(&repo, spec)?;
-        // Only a commit can be HEAD. Any other id, a release or a hash that
-        // names nothing here, was refused as HEAD having moved, with the
-        // status that tells a caller to rebuild and try again, so a caller
-        // that did would retry forever. It is refused as a failure instead.
-        let raw = repo
-            .read_raw_object(expected)
-            .with_context(|| format!("--expect-head {spec}: no such commit here"))?;
-        if raw.object_type != ObjectType::Commit {
-            bail!(
-                "--expect-head {spec} is a {}, not a commit; nothing was committed",
-                raw.object_type.name()
-            );
-        }
+        // `none`: HEAD has no commits yet, which no id can say, so that a
+        // repository's first commit can be guarded too.
+        let expected = if spec == EXPECT_NO_COMMITS {
+            None
+        } else {
+            let expected = crate::rev::resolve_rev(&repo, spec)?;
+            // Only a commit can be HEAD. Any other id, a release or a hash
+            // that names nothing here, was refused as HEAD having moved,
+            // with the status that tells a caller to rebuild and try again,
+            // so a caller that did would retry forever. It is refused as a
+            // failure instead.
+            let raw = repo
+                .read_raw_object(expected)
+                .with_context(|| format!("--expect-head {spec}: no such commit here"))?;
+            if raw.object_type != ObjectType::Commit {
+                bail!(
+                    "--expect-head {spec} is a {}, not a commit; nothing was committed",
+                    raw.object_type.name()
+                );
+            }
+            Some(expected)
+        };
         let actual = repo.refs.resolve_head()?;
-        if actual != Some(expected) {
+        if actual != expected {
             return Err(HeadMoved { expected, actual }.into());
         }
     }
@@ -1325,21 +1333,29 @@ fn given_content(repo: &Repository, specs: &[String]) -> Result<BTreeMap<String,
     Ok(out)
 }
 
-/// `commit --expect-head` found HEAD at another commit. Nothing was
-/// committed.
+/// What `commit --expect-head` takes for "HEAD has no commits yet".
+const EXPECT_NO_COMMITS: &str = "none";
+
+/// `commit --expect-head` found HEAD at another commit, or at one when it
+/// expected none (`expected` is `None`). Nothing was committed.
 #[derive(Debug)]
 pub struct HeadMoved {
-    expected: ObjectId,
+    expected: Option<ObjectId>,
     actual: Option<ObjectId>,
 }
 
 impl std::fmt::Display for HeadMoved {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.actual {
-            Some(a) => write!(f, "HEAD is {a}, not {}", self.expected)?,
-            None => write!(f, "HEAD has no commits, not {}", self.expected)?,
+        match (self.actual, self.expected) {
+            (Some(a), Some(e)) => write!(f, "HEAD is {a}, not {e} as --expect-head expects")?,
+            (Some(a), None) => write!(
+                f,
+                "HEAD is {a}, where --expect-head {EXPECT_NO_COMMITS} expects no commits yet"
+            )?,
+            (None, Some(e)) => write!(f, "HEAD has no commits, not {e} as --expect-head expects")?,
+            (None, None) => write!(f, "HEAD has no commits, as --expect-head expects")?,
         }
-        write!(f, " as --expect-head expects; nothing was committed")
+        write!(f, "; nothing was committed")
     }
 }
 

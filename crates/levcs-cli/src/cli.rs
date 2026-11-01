@@ -121,9 +121,10 @@ pub struct CommitArgs {
     /// explicit spelling of it, and cannot be combined with paths.
     #[arg(long, conflicts_with = "paths")]
     pub all: bool,
-    /// Refuse unless HEAD is this commit, checked under the repository
-    /// lock. Nothing is committed, and the exit status is 5, if another
-    /// commit has landed since the caller read HEAD.
+    /// Refuse unless HEAD is this commit, or with `none` unless HEAD has no
+    /// commits yet, checked under the repository lock. Nothing is
+    /// committed, and the exit status is 5, if another commit has landed
+    /// since the caller read HEAD.
     #[arg(long = "expect-head", value_name = "REV")]
     pub expect_head: Option<String>,
     /// Commit FILE's bytes as PATH, a tracked file, in place of what the

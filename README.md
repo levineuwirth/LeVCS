@@ -176,7 +176,9 @@ built from. Without it, a commit that landed in between would be undone. A
 refusal commits nothing and exits with status 5, so a caller can rebuild its
 version from the new HEAD and try again. An id that is not a commit here, such
 as a release or a mistyped hash, exits with status 1, since trying again
-would not change it.
+would not change it. Before a repository's first commit `status` reports no
+head (`null`), and `--expect-head none` guards that first commit: it refuses
+with status 5 once any commit has landed.
 
 `levcs verify` checks everything the repository keeps, not just HEAD.
 Every object reachable from any ref is hash-checked, and every commit and

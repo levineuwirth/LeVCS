@@ -36,7 +36,11 @@ fn tempdir(prefix: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    p.push(format!("{prefix}-{n}-{}", std::process::id()));
+    // Tests run in parallel; a timestamp alone can repeat, and a root
+    // two tests share is removed under one by the other's cleanup.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let k = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    p.push(format!("{prefix}-{n}-{k}-{}", std::process::id()));
     std::fs::create_dir_all(&p).unwrap();
     p
 }

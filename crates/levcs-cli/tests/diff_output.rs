@@ -177,3 +177,46 @@ fn status_reports_the_newest_release_not_the_last_label() {
     let text = ok(&work, &cfg, &["status"]);
     assert!(text.contains("Release    v10.0"), "{text}");
 }
+
+/// A merge commit's tree holds `.levcs/merge-record`, history rather than a
+/// file. `diff <merge>` read every baseline path from the working tree, that
+/// one included, and refused the whole diff as a write into the repository's
+/// metadata, so no merge commit could be diffed against. `merge` and
+/// checkout already skipped the entry.
+#[test]
+fn a_merge_commit_is_a_baseline_like_any_other() {
+    let (work, cfg) = setup("merge");
+    ok(&work, &cfg, &["branch", "--create", "side"]);
+    ok(&work, &cfg, &["branch", "--switch", "side"]);
+    std::fs::write(work.join("two.md"), "x\nside\n").unwrap();
+    ok(&work, &cfg, &["commit", "-m", "side"]);
+    ok(&work, &cfg, &["branch", "--switch", "main"]);
+    std::fs::write(work.join("one.md"), "a\nb\nmain\n").unwrap();
+    ok(&work, &cfg, &["commit", "-m", "main"]);
+    ok(&work, &cfg, &["merge", "side"]);
+    ok(&work, &cfg, &["commit", "-m", "merge"]);
+    let merge = json(&work, &cfg, &["status", "--format", "json"])["head"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        ok(&work, &cfg, &["show", &merge]).contains("Merge:"),
+        "the baseline is a merge commit"
+    );
+
+    // HEAD is the merge commit, so a plain `diff` reads it too.
+    assert_eq!(ok(&work, &cfg, &["diff"]), "");
+    assert_eq!(ok(&work, &cfg, &["diff", &merge]), "");
+    std::fs::write(work.join("two.md"), "x\nside\nafter\n").unwrap();
+    let out = ok(&work, &cfg, &["diff", &merge]);
+    assert!(out.contains("+after\n"), "{out}");
+    assert!(!out.contains(".levcs"), "{out}");
+    let d = json(&work, &cfg, &["diff", &merge, "--format", "json"]);
+    let paths: Vec<&str> = d["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, ["two.md"]);
+}

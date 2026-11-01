@@ -1741,6 +1741,12 @@ fn collect_tree_files(
     }
     let mut content = levcs_core::repo::ContentBudget::default();
     repo.walk_tree(tree_id, prefix, |path, e| {
+        // The root's `.levcs` entry is synthetic history (an authority, a
+        // merge record), never a file, as for `tree_files`: a caller that
+        // looked for it in the working tree was refused there.
+        if path == ".levcs" {
+            return Ok(false);
+        }
         if e.entry_type == levcs_core::EntryType::Blob {
             let blob = repo.read_blob(e.hash, &mut content)?;
             out.insert(path.to_string(), blob.body);
@@ -2039,19 +2045,14 @@ fn merge_run(args: MergeArgs) -> Result<()> {
         theirs: format!("blake3:{}", theirs_id),
         files: Vec::new(),
     };
-    let mut paths: BTreeSet<String> = BTreeSet::new();
-    for k in base_files
+    // `collect_tree_files` leaves out the synthetic `.levcs` entries
+    // (authority, merge-record), which live in commits but never on disk.
+    let paths: BTreeSet<String> = base_files
         .keys()
         .chain(ours_files.keys())
         .chain(theirs_files.keys())
-    {
-        // .levcs/* synthetic tree entries (authority, merge-record) live in
-        // commits but never on disk; skip them when reconciling files.
-        if k.starts_with(".levcs/") || k == ".levcs" {
-            continue;
-        }
-        paths.insert(k.clone());
-    }
+        .cloned()
+        .collect();
 
     let json_mode = is_json(&args.format)?;
     let mut auto_resolved = 0usize;

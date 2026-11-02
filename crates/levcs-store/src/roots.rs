@@ -383,6 +383,19 @@ impl RetainedGeneration {
 /// shard and upper sequence so installing a sealed run can discard exactly
 /// the layers that run covers instead of allowing lookup fan-out to grow once
 /// per committed group forever.
+///
+/// # A layer is coverage, not content
+///
+/// `through_shard_sequence` says "every frame from this shard through here is
+/// accounted for in the index". It is not a claim that this layer holds an
+/// entry for any of them, and a layer with an empty delta is a well-formed
+/// statement rather than a degenerate one: a group whose transactions
+/// introduced no objects — an adopting transaction, whose objects live in
+/// staging's artifacts, or a ref-only transaction — has genuinely nothing to
+/// index and still has a sequence that must be represented. Checkpointing
+/// reads these stamps to decide whether pruning would strand objects, so a
+/// committed sequence that no layer reaches reads as a gap in the index rather
+/// than as an absence of work.
 #[derive(Clone, Debug)]
 pub struct IndexDeltaLayer {
     pub shard_index: u16,
@@ -483,7 +496,29 @@ impl LayeredObjectIndex {
         self.lookup(key).location
     }
 
-    fn with_subtree(&self, subtree: &ShardSubtree) -> Self {
+    /// Compose one publication onto this index.
+    ///
+    /// `advances_committed_sequence` is what decides whether a layer with no
+    /// entries is still installed. A layer records **publication coverage**,
+    /// not the presence of entries: it is the statement "every frame from this
+    /// shard through `through_shard_sequence` is accounted for in the index",
+    /// and a group that introduced no objects makes that statement truthfully
+    /// with nothing in it.
+    ///
+    /// Skipping empty deltas — the earlier behaviour — left the committed
+    /// sequence advancing while coverage did not, so the next checkpoint
+    /// refused: it read the highest layer stamp as the reach of the index and
+    /// concluded that pruning would drop objects that never existed. Any
+    /// transaction introducing no objects reached it, and an adopting
+    /// transaction reaches it as the ordinary case, because its frame carries a
+    /// descriptor rather than object bytes and its membership may resolve
+    /// entirely into sealed runs.
+    ///
+    /// The empty layer counts toward layer fan-out and may later seal into a
+    /// zero-entry run. That is the bounded-run model working as designed, and
+    /// it is the failure-safe direction: a stamped empty layer costs a run
+    /// slot, while an unstamped one costs the ability to checkpoint at all.
+    fn with_subtree(&self, subtree: &ShardSubtree, advances_committed_sequence: bool) -> Self {
         let mut next = self.clone();
         if let Some(sealed_through) = subtree.sealed_through_shard_sequence {
             next.delta_layers_newest_first.retain(|layer| {
@@ -494,13 +529,26 @@ impl LayeredObjectIndex {
         let delta_is_sealed = subtree
             .sealed_through_shard_sequence
             .is_some_and(|sealed_through| sealed_through >= subtree.shard_committed_sequence);
-        if !delta_is_sealed && !subtree.index_delta.is_empty() {
+        if !delta_is_sealed && (!subtree.index_delta.is_empty() || advances_committed_sequence) {
             next.delta_layers_newest_first
                 .push_front(IndexDeltaLayer::new(
                     subtree.shard_index,
                     subtree.shard_committed_sequence,
                     Arc::clone(&subtree.index_delta),
                 ));
+        }
+        // Retirements before installations: the two never name the same run,
+        // but applying them in this order means a publication that retires
+        // sources and installs their merge can never drop the merge it is
+        // installing. `retain` keeps a re-merge idempotent — an already-retired
+        // run stays retired.
+        if !subtree.sealed_run_retirements.is_empty() {
+            next.sealed_runs_newest_first.retain(|run| {
+                !subtree
+                    .sealed_run_retirements
+                    .iter()
+                    .any(|retired| Arc::ptr_eq(retired, run))
+            });
         }
         // `subtree` is already newest-first. Pushing from its back preserves
         // that order at the front of the composed stack.
@@ -732,9 +780,19 @@ impl CommittedRoot {
             retained_generations.insert(*id, Arc::clone(generation));
         }
 
+        // Whether this publication moves the shard's committed frame sequence
+        // forward, which is what obliges it to record coverage. A maintenance
+        // publication appends no frame and republishes the sequence it found,
+        // so it owes nothing.
+        let advances_committed_sequence = self
+            .shard_committed_sequence(subtree.shard_index)
+            .is_none_or(|published| subtree.shard_committed_sequence > published);
+
         Self {
             repositories,
-            index: self.index.with_subtree(subtree),
+            index: self
+                .index
+                .with_subtree(subtree, advances_committed_sequence),
             terminal_statuses,
             shard_committed_sequences,
             retained_generations,
@@ -754,6 +812,15 @@ pub struct ShardSubtree {
     pub sealed_through_shard_sequence: Option<u64>,
     /// Any newly installed runs, newest-first. Most groups leave this empty.
     pub sealed_runs_newest_first: Vector<Arc<IndexRun>>,
+    /// Sealed runs this publication retires, identified by the exact `Arc`s
+    /// the publisher read from the root it built against. Pointer identity is
+    /// sound here for the same reason the CAS retry loop is: only one shard
+    /// writer retires its shard's runs, `merge` is pure, and a re-merge against
+    /// a newer root still finds the same `Arc`s because nothing else removes
+    /// them. Retirement composes with installation — compaction publishes the
+    /// merged run in `sealed_runs_newest_first` and its sources here, in one
+    /// root swap, so no root ever answers from neither.
+    pub sealed_run_retirements: Vector<Arc<IndexRun>>,
     pub repositories: RepoMap,
     /// Terminal rows whose tombstone horizon has ended. Removals are applied
     /// before replacements, which keeps retrying the same subtree idempotent.
@@ -783,6 +850,7 @@ impl ShardSubtree {
             index_delta,
             sealed_through_shard_sequence,
             sealed_runs_newest_first,
+            sealed_run_retirements: Vector::new(),
             repositories,
             terminal_status_removals: Vector::new(),
             terminal_statuses,
@@ -802,6 +870,7 @@ impl ShardSubtree {
     pub fn publishes_index_maintenance(&self) -> bool {
         self.sealed_through_shard_sequence.is_some()
             || !self.sealed_runs_newest_first.is_empty()
+            || !self.sealed_run_retirements.is_empty()
             || !self.retained_generations.is_empty()
             || !self.retained_generation_removals.is_empty()
     }

@@ -44,7 +44,7 @@ use levcs_core::{ObjectId, ObjectType};
 use levcs_protocol::oracle::{self, AppendDeadlinePhase, DeadlineDecision};
 use levcs_protocol::v2::{
     self as protocol, AppliedRefV1, CommittedTransactionV1, DurabilityResultV1, RefMutation,
-    RefStateV1, SignedCommittedTransactionV1,
+    RefStateV1, SignedCommittedTransactionV1, StagedProjectionInstallV1,
 };
 
 use crate::checkpoint::{ReceiptRecord, RefRecord};
@@ -53,6 +53,7 @@ use crate::failpoints::{self, Failpoint, FailpointAction};
 use crate::format::{
     frame_total_len, object_type_code, Frame, FrameHeader, FrameObjectV1, FrameObjectsV1,
     FrameReceiptFieldsV1, Manifest, RepositoryCreateV1, TailRange, TransactionFramePayloadV1,
+    JOURNAL_HEADER_LEN,
 };
 use crate::index::{
     delta_pressure, DeltaPressure, IndexDelta, IndexKey, IndexLocation, IndexRun, IndexRunBuilder,
@@ -72,8 +73,11 @@ use crate::roots::{
 };
 use crate::segment::{self, RootLayout, SegmentReader};
 use crate::snapshot::RepoSnapshot;
-use crate::staging::ProjectionStaging;
-use crate::transaction::ValidatedTransaction;
+use crate::staging::{
+    ProjectionAdoptionOutcome, ProjectionRecoveryResolver, ProjectionStaging,
+    RecoveredProjectionArtifacts,
+};
+use crate::transaction::{AdoptionSlot, ValidatedTransaction};
 use crate::types::{
     CommitEvidenceSigner, CommitReceipt, DurabilityCounterSnapshot, DurabilityCounters,
     NamespaceId, OperationId, PendingPhase, StoreError, TransactionStatus,
@@ -140,8 +144,10 @@ struct EngineShared {
     /// — two handles, or two processes, each admitting up to the full global
     /// limit. Ownership here is what makes "root-global" true rather than
     /// asserted.
-    _staging: Arc<ProjectionStaging>,
-    _session: RecoverySession,
+    staging: Arc<ProjectionStaging>,
+    /// Shared with [`EngineShared::staging`], which retains its own clone.
+    /// Whichever is dropped last releases `LOCK`.
+    _session: Arc<RecoverySession>,
     /// What startup state 1 actually cost, or `None` when this open did not
     /// initialize.
     ///
@@ -165,6 +171,15 @@ struct EngineShared {
     /// seam — `DriveRecovery` retains its report precisely so the two can be
     /// compared, and the engine side had no counterpart. `#[cfg(test)]` for
     /// the same reason as [`EngineShared::initialization`].
+    /// Names of index runs this session's recovery reclaimed, per shard.
+    ///
+    /// The `.idx` a reclamation leaves on the device is forensic evidence the
+    /// recovery report points at (contract review 2026-07-30-G), and
+    /// compaction's sweep spares these names for the lifetime of the session
+    /// that reported them. Kept as names rather than the whole reports — the
+    /// engine consumes reports and keeps only their effects, and this is the
+    /// one effect production needs.
+    reclaimed_run_names: Vec<(u16, String)>,
     #[cfg(test)]
     recovery_reports: Vec<crate::recovery::ShardRecoveryReport>,
     /// Observed committed-root CAS contention.
@@ -256,28 +271,25 @@ impl StoreEngine {
 
         let layout = RootLayout::new(&options.root);
         #[cfg_attr(not(test), allow(unused_variables))]
-        let initialization =
-            match classify_root(&layout)? {
-                // Both reach the same code because they are the same state: a root
-                // that has never finished initializing. The second one only carries
-                // residue this code path wrote, and `initialize_root_state_1`
-                // re-decides which it is under the lock before it writes anything.
-                RootStartupState::AbsentOrEmpty | RootStartupState::InterruptedInitialization => {
-                    Some(initialize_root_state_1(&layout, &options)?)
-                }
-                RootStartupState::Formatted => None,
-                // States 3 and 4 share one refusal because telling them apart is
-                // the legacy recognizer, and returning `UnrecognizedLayout` for a
-                // root that is in fact a legacy instance would tell an operator
-                // holding real data "refusing to modify" instead of the migration
-                // command. Nothing here has written, probed, or inferred.
-                RootStartupState::NonEmptyWithoutFormat => return Err(StoreError::NotImplemented(
-                    "StoreEngine::open startup states 3 and 4 (LegacyLayout carrying the exact \
-                     migrate-store command, UnrecognizedLayout) — B1 NamespaceTxn, scope 6-B1 \
-                     deliverable 1. The root is non-empty and carries no FORMAT; it has not been \
-                     modified",
-                )),
-            };
+        let initialization = match classify_root(&layout)? {
+            // Both reach the same code because they are the same state: a root
+            // that has never finished initializing. The second one only carries
+            // residue this code path wrote, and `initialize_root_state_1`
+            // re-decides which it is under the lock before it writes anything.
+            RootStartupState::AbsentOrEmpty | RootStartupState::InterruptedInitialization => {
+                Some(initialize_root_state_1(&layout, &options)?)
+            }
+            RootStartupState::Formatted => None,
+            // States 3 and 4 share one refusal because telling them apart is
+            // the legacy recognizer, and returning `UnrecognizedLayout` for a
+            // root that is in fact a legacy instance would tell an operator
+            // holding real data "refusing to modify" instead of the migration
+            // command. Nothing here has written, probed, or inferred.
+            RootStartupState::LegacyInstance => return Err(legacy_layout_refusal(&options.root)),
+            RootStartupState::UnrecognizedLayout => {
+                return Err(unrecognized_layout_refusal(&options.root))
+            }
+        };
 
         let session = RecoverySession::open(&options.root)?;
         if session.shard_count() != options.shard_count {
@@ -299,9 +311,19 @@ impl StoreEngine {
         // without it, and a resolver constructed after recovery would be a
         // resolver recovery never had. It then lives in `EngineShared` for
         // exactly as long as the session does.
+        //
+        // The session is wrapped first because staging *keeps* the lease
+        // rather than being shown it: a caller may hold staging, a stage
+        // session, or an adoption pin after this engine is gone, and each can
+        // still write under the root. Sharing the lease is what makes the lock
+        // outlive every writer rather than every *shard* writer.
+        let session = Arc::new(session);
         let staging_durability = Arc::new(DurabilityCounters::default());
-        let staging =
-            ProjectionStaging::open(&session, options.clone(), Arc::clone(&staging_durability))?;
+        let staging = ProjectionStaging::open(
+            Arc::clone(&session),
+            options.clone(),
+            Arc::clone(&staging_durability),
+        )?;
 
         let config = RecoveryConfig::from_store_options(&options)
             .with_projection_recovery_resolver(staging.as_ref());
@@ -331,8 +353,23 @@ impl StoreEngine {
             ))),
             status_metrics: OperationStatusMetrics::default(),
             options,
-            _staging: staging,
+            staging,
             _session: session,
+            reclaimed_run_names: recovered
+                .iter()
+                .flat_map(|shard| {
+                    let shard_index = shard.report.shard_index;
+                    shard
+                        .report
+                        .reclaimed_index_runs
+                        .iter()
+                        .filter_map(move |path| {
+                            path.file_name()
+                                .and_then(|name| name.to_str())
+                                .map(|name| (shard_index, name.to_string()))
+                        })
+                })
+                .collect(),
             #[cfg(test)]
             initialization,
             #[cfg(test)]
@@ -349,13 +386,49 @@ impl StoreEngine {
         Ok(Self { shared, shards })
     }
 
+    /// The one [`ProjectionStaging`] for this root.
+    ///
+    /// Staging is reached *through* the engine rather than constructed beside
+    /// it because its ceilings are root-global and its constructor demands
+    /// proof of the root lock, which this engine holds. A caller that opened
+    /// its own would be a second accountant for one root — see the note on
+    /// [`EngineShared::staging`].
+    ///
+    /// **Borrowing here guarantees nothing about lifetimes**, and an earlier
+    /// version of this comment claimed it did. The returned reference cannot
+    /// escape, but an `Arc::clone` of it can, and so can a
+    /// `ProjectionStageSession` or an adoption pin — both of which own a clone.
+    /// Any of them can still write under the root after this engine is gone.
+    /// What actually holds is ownership: [`ProjectionStaging`] retains a clone
+    /// of the `RecoverySession` lease, so `LOCK` is released when the last of
+    /// them is dropped rather than when the engine is.
+    ///
+    /// This is the production path, not a test hook. Staging a projection and
+    /// adopting it are two halves of one flow — `begin`/`put_chunk`/`seal`
+    /// here, then [`ValidatedTransactionBuilder::adopt_projection`] and
+    /// [`Self::submit`] — and the descriptor and pin that join them are only
+    /// issued by this object.
+    pub fn staging(&self) -> &Arc<ProjectionStaging> {
+        &self.shared.staging
+    }
+
     /// Acquire exactly one committed root and derive a repository view from
     /// it. Readers never observe an index entry newer than their captured
     /// root (plan §5.3).
-    pub fn snapshot(&self, _repo: NamespaceId) -> Result<RepoSnapshot, StoreError> {
-        Err(StoreError::NotImplemented(
-            "StoreEngine::snapshot — B1 NamespaceTxn, scope 6-B1 deliverable 8",
-        ))
+    pub fn snapshot(&self, repo: NamespaceId) -> Result<RepoSnapshot, StoreError> {
+        // `load_full` and not `load`: the snapshot outlives this call, so it
+        // must own the generation it read rather than borrow the slot. That
+        // ownership is the whole retention guarantee -- see the note on
+        // `RepoSnapshot`.
+        //
+        // One load, so the snapshot is a single point in the publication
+        // order. Resolving the repository from a second load could pair one
+        // generation's `RepoState` with another's index.
+        RepoSnapshot::capture(
+            self.shared.committed.load_full(),
+            repo,
+            StoreOptions::shard_of(&repo, self.shared.shard_count),
+        )
     }
 
     /// Submit a validated transaction for sequencing, group append, fence, and
@@ -551,6 +624,191 @@ pub struct IndexMaintenanceSnapshot {
     pub unsealed_delta_layers: u64,
 }
 
+// ===========================================================================
+// Index-run compaction: merge sealed runs so the open-run count stays under
+// the ceilings recovery enforces
+// ===========================================================================
+
+/// How many merged runs one compaction pass may install.
+///
+/// Between installing a merged run and installing the manifest that retires
+/// its sources, the durable manifest names both — and a crash there reopens
+/// through recovery's own `max_open_index_runs` check. The trigger in
+/// `seal_index` fires while at least this many rows of headroom remain, and
+/// the per-pass budget never exceeds the headroom actually left, so no
+/// intermediate manifest this pass writes can exceed what recovery accepts.
+const COMPACTION_INSTALL_RESERVE: u64 = 2;
+
+/// One manifest row a compaction pass may retire: the row as the retirement
+/// manifest must name it, and the pinned run the root answers from.
+struct CompactionSource {
+    row_generation: u64,
+    filename: String,
+    run: Arc<IndexRun>,
+}
+
+/// A set of adjacent sources whose merge the encoder accepted.
+struct CandidateGroup {
+    /// Newest-first, the order `sealed_runs_newest_first` answers in.
+    sources: Vec<CompactionSource>,
+    merged: IndexDelta,
+}
+
+/// What one compaction pass will do, fully decided before anything durable.
+struct PlannedCompaction {
+    /// Oldest-first with ascending generations, the order they install in —
+    /// which makes manifest order agree with precedence order.
+    installs: Vec<PlannedRunInstall>,
+    /// Every source row the retirement manifest drops.
+    retired: Vec<CompactionSource>,
+    /// The generation of the manifest that retires the sources.
+    retire_generation: u64,
+}
+
+struct PlannedRunInstall {
+    generation: u64,
+    bytes: Vec<u8>,
+}
+
+/// Merge sealed runs, newest first, into one delta that answers exactly what
+/// the source stack answered.
+///
+/// First-hit-wins mirrors `LayeredObjectIndex::lookup`: for a key several
+/// sources carry, the newest source's location survives, which is the answer
+/// the stack gave. The delta's ceilings are relaxed for the reason
+/// `seal_index` gives — every entry here was admitted against the configured
+/// ceilings when its run was.
+///
+/// A merge that crosses the projection generation band is refused, not
+/// resolved. Journal runs are manifest rows this writer owns; band runs are
+/// staging-owned artifacts recovery re-derives from committed adoption
+/// frames, so a run answering for both would put staging's entries under a
+/// manifest row whose lifecycle cannot retire them. The check is per entry
+/// rather than per run so a run that somehow mixes domains is refused too.
+fn merge_index_runs_newest_wins(sources: &[Arc<IndexRun>]) -> Result<IndexDelta, StoreError> {
+    let mut merged = IndexDelta::new(u64::MAX, u64::MAX);
+    let mut in_band: Option<bool> = None;
+    for run in sources {
+        for (key, location) in run.entries() {
+            let band =
+                location.segment_generation & crate::staging::PROJECTION_GENERATION_BAND != 0;
+            if *in_band.get_or_insert(band) != band {
+                return Err(StoreError::Corruption(format!(
+                    "merging index run {} would cross the projection generation band; runs \
+                     merge only within their own domain",
+                    run.generation()
+                )));
+            }
+            if merged.get(&key).is_none() {
+                merged.insert(key, location)?;
+            }
+        }
+    }
+    Ok(merged)
+}
+
+/// Split a newest-first candidate list into groups the encoder can seal.
+///
+/// The run format packs each entry's segment generation and shard sequence as
+/// deltas from per-section bases, so a merge spanning too much history fails
+/// `IndexRunBuilder::build` with a span limit. Rather than duplicating those
+/// width rules here, the encoder itself is the authority: each group is the
+/// **largest newest-prefix** a probe encode accepts, then the remainder is
+/// partitioned the same way. Prefixes, not midpoints — splitting an
+/// over-span list down the middle stranded a mergeable newest pair behind an
+/// arbitrary cut. A run left alone is returned as a group of one — it
+/// installs nothing, but the selection needs to see it, because an
+/// unmergeable run standing between groups is a precedence boundary installs
+/// may not cross. The probe generation never reaches a device, so any
+/// in-range value validates the same bytes the install will re-encode.
+fn span_partitioned_groups(
+    root_uuid: [u8; 16],
+    probe_generation: u64,
+    candidates: &[CompactionSource],
+) -> Result<Vec<CandidateGroup>, StoreError> {
+    let merged_prefix = |prefix: &[CompactionSource]| -> Result<IndexDelta, StoreError> {
+        let runs: Vec<Arc<IndexRun>> = prefix
+            .iter()
+            .map(|source| Arc::clone(&source.run))
+            .collect();
+        merge_index_runs_newest_wins(&runs)
+    };
+    let fits = |merged: &IndexDelta| -> Result<bool, StoreError> {
+        if merged.is_empty() {
+            return Ok(true);
+        }
+        match IndexRunBuilder::new(root_uuid, probe_generation, probe_generation).build(merged) {
+            Ok(_) => Ok(true),
+            Err(StoreError::LimitExceeded {
+                limit: "index_run_segment_generation_span" | "index_run_shard_sequence_span",
+                ..
+            }) => Ok(false),
+            Err(error) => Err(error),
+        }
+    };
+
+    let mut groups = Vec::new();
+    let mut rest = candidates;
+    while !rest.is_empty() {
+        // Binary search over the prefix length. Extending a prefix only adds
+        // entries, and added entries only widen a section's spans, so "fits"
+        // is monotone in the length; a prefix of one always fits, because
+        // that run encoded once already.
+        let mut fits_len = 1;
+        let mut too_long = rest.len() + 1;
+        while fits_len + 1 < too_long {
+            let probe = fits_len + (too_long - fits_len) / 2;
+            if fits(&merged_prefix(&rest[..probe])?)? {
+                fits_len = probe;
+            } else {
+                too_long = probe;
+            }
+        }
+        groups.push(CandidateGroup {
+            sources: rest[..fits_len]
+                .iter()
+                .map(|source| CompactionSource {
+                    row_generation: source.row_generation,
+                    filename: source.filename.clone(),
+                    run: Arc::clone(&source.run),
+                })
+                .collect(),
+            merged: merged_prefix(&rest[..fits_len])?,
+        });
+        rest = &rest[fits_len..];
+    }
+    Ok(groups)
+}
+
+/// Choose which groups a pass takes, newest first, never promoting a merge
+/// above rows it did not merge.
+///
+/// A merged run installs at the highest manifest generation, so it answers
+/// above every remaining row. That is sound exactly when everything newer
+/// than its sources merged too — so the first group that stays behind,
+/// whether a lone unmergeable run or a merge past the install budget, closes
+/// installation for everything older this pass. Groups that merge to empty
+/// are exempt on both sides of that line: they install nothing and retire
+/// rows with no entries, which no precedence order can observe.
+fn select_compaction_groups(groups: Vec<CandidateGroup>, budget: u64) -> Vec<CandidateGroup> {
+    let mut installable = budget;
+    let mut blocked = false;
+    let mut selected = Vec::new();
+    for group in groups {
+        if group.merged.is_empty() {
+            selected.push(group);
+            continue;
+        }
+        if group.sources.len() < 2 || blocked || installable == 0 {
+            blocked = true;
+            continue;
+        }
+        installable -= 1;
+        selected.push(group);
+    }
+    selected
+}
+
 /// Plan §5.1's two-root read, written once so both the engine and its test can
 /// only ever agree with `oracle::two_root_status_read`.
 fn two_root_status_read(
@@ -594,12 +852,6 @@ impl Drop for StoreEngine {
 /// Which of plan §5.2's startup states a root is in, decided by reading and
 /// nothing else.
 ///
-/// States 3 and 4 share a variant because this pass does not implement the
-/// legacy recognizer that separates them. That is a deliberate under-
-/// classification, not a catch-all: the variant is named for exactly the
-/// condition it holds — non-empty, no `FORMAT` — and `open` refuses it by
-/// naming both unbuilt states. Charter item 6 forbids a `_ =>` arm; it does
-/// not require inventing a distinction whose recognizer has not been written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RootStartupState {
     /// §5.2 state 1. The path does not exist, or it is a directory holding
@@ -620,8 +872,104 @@ enum RootStartupState {
     /// code path — and because charter item 6 requires the condition that
     /// authorizes a write to be named rather than folded into a neighbour.
     InterruptedInitialization,
-    /// §5.2 states 3 and 4, undivided this pass.
-    NonEmptyWithoutFormat,
+    /// §5.2 state 3. Non-empty, no `FORMAT`, and carrying the legacy instance
+    /// signature: at least one `<64-hex>/.levcs/` entry.
+    ///
+    /// Recognized rather than inferred. A missing `FORMAT` is not evidence of a
+    /// legacy instance — it is evidence of nothing at all, and most roots that
+    /// lack one are state 4. The signature is what distinguishes an operator
+    /// holding real data that a migration can read from an operator holding a
+    /// directory this store must not touch, and the two get different answers
+    /// because they need different actions.
+    LegacyInstance,
+    /// §5.2 state 4. Non-empty, no `FORMAT`, and no legacy signature.
+    UnrecognizedLayout,
+}
+
+/// §5.2 state 3: a legacy instance, refused with the command that migrates it.
+///
+/// The command is the whole value of distinguishing this state. An operator
+/// holding real data needs the next step, and `UnrecognizedLayout` — which is
+/// the honest answer for a directory this store cannot read — would tell them
+/// "refusing to modify" and leave them to work out that a migration exists.
+///
+/// `--destination` is left as a placeholder because only the operator knows
+/// where the v2 root should go, and inventing one would produce a command that
+/// runs and writes somewhere nobody chose.
+fn legacy_layout_refusal(root: &Path) -> StoreError {
+    StoreError::LegacyLayout {
+        migrate_command: format!(
+            "levcs-instance migrate-store --source {} --destination <dest>",
+            root.display()
+        ),
+    }
+}
+
+/// §5.2 state 4: non-empty, unreadable, and left exactly as found.
+///
+/// The message says what was observed and not what the operator should do,
+/// because this store does not know: the directory might be another
+/// application's, a partially copied backup, or a root whose `FORMAT` was
+/// deleted. Suggesting a migration for any of those would be a guess that
+/// costs data if taken.
+fn unrecognized_layout_refusal(root: &Path) -> StoreError {
+    StoreError::UnrecognizedLayout(format!(
+        "{} is not empty, carries no FORMAT, and does not match the legacy instance layout; \
+         it has not been modified",
+        root.display()
+    ))
+}
+
+/// The legacy instance signature: `<64-hex>/.levcs/`.
+///
+/// Read-only and deliberately shallow. It reads the root's entries and, for
+/// each one whose name is 64 hexadecimal characters, asks whether it holds a
+/// `.levcs` directory. It opens no file, follows no symlink into a decision,
+/// and creates nothing — a probe that wrote so much as a directory would
+/// destroy the byte-identity guarantee state 4 exists to make, and it would
+/// destroy it *before* the refusal that promises it.
+///
+/// One matching entry is enough. The scope says "≥1 entry of the form
+/// `<64-hex>/.levcs/`", and requiring more would refuse a legacy root holding
+/// exactly one repository — which is both a real shape and the one an operator
+/// is most likely to be migrating first.
+fn has_legacy_instance_signature(root: &Path) -> Result<bool, StoreError> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(StoreError::from(error)),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.len() != 64 || !name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        // `file_type` on the entry, not a `metadata` call that follows links:
+        // a symlink named like a repository is not a repository, and resolving
+        // it would let a link outside the root decide what this root is.
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        // `symlink_metadata` and not `is_dir`, for the same reason as the entry
+        // type above and with a sharper consequence. `Path::is_dir` follows
+        // links, so a `.levcs` symlink pointing at any directory anywhere would
+        // satisfy it — and the signature this function reports is a claim about
+        // what is *in this root*, not about what a link in it can reach. A root
+        // that borrowed the shape from somewhere else would be answered with a
+        // migration command for repositories it does not hold.
+        //
+        // A missing `.levcs` is an ordinary answer here, not an error: the
+        // entry simply is not a repository.
+        match std::fs::symlink_metadata(entry.path().join(".levcs")) {
+            Ok(metadata) if metadata.file_type().is_dir() => return Ok(true),
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(StoreError::from(error)),
+        }
+    }
+    Ok(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -936,10 +1284,17 @@ fn classify_root(layout: &RootLayout) -> Result<RootStartupState, StoreError> {
     if has_marker && !has_foreign && initializing_marker_is_ours(layout)? {
         return Ok(RootStartupState::InterruptedInitialization);
     }
-    Ok(if has_content {
-        RootStartupState::NonEmptyWithoutFormat
+    if !has_content {
+        return Ok(RootStartupState::AbsentOrEmpty);
+    }
+    // Last, and only for a root already known to be non-empty and unformatted.
+    // Running the recognizer earlier would read repository-shaped names in a
+    // root that turns out to be state 1 or 2, which is work no state needs and
+    // an answer no state uses.
+    Ok(if has_legacy_instance_signature(&layout.root)? {
+        RootStartupState::LegacyInstance
     } else {
-        RootStartupState::AbsentOrEmpty
+        RootStartupState::UnrecognizedLayout
     })
 }
 
@@ -1016,13 +1371,12 @@ fn initialize_root_state_1(
         // Non-empty with no `FORMAT` and no marker, discovered only under the
         // lock. The refusal is the same one state 3/4 gets, and this path has
         // written nothing but the directories it was told were absent.
-        RootStartupState::NonEmptyWithoutFormat => {
-            return Err(StoreError::NotImplemented(
-                "StoreEngine::open startup states 3 and 4 (LegacyLayout carrying the exact \
-                 migrate-store command, UnrecognizedLayout) — B1 NamespaceTxn, scope 6-B1 \
-                 deliverable 1. The root became non-empty without a FORMAT between \
-                 classification and the root lock; it has not been modified",
-            ))
+        // Discovered only under the lock: the root became non-empty between
+        // classification and here. The answer is the same as the first pass
+        // gives, because the condition is the same one.
+        RootStartupState::LegacyInstance => return Err(legacy_layout_refusal(&layout.root)),
+        RootStartupState::UnrecognizedLayout => {
+            return Err(unrecognized_layout_refusal(&layout.root))
         }
     }
 
@@ -1490,6 +1844,9 @@ fn spawn_shard_writer(
         in_flight_reservation: None,
         repositories,
         tail_generation: tail.logical_generation,
+        rotation_wanted: false,
+        durable_answer: None,
+        attached_to: None,
         run_entry_baseline,
         checkpoint_namespaces,
         journal,
@@ -1571,6 +1928,19 @@ struct ShardWriter {
     /// Logical index generation of the active journal, so an index location
     /// built here resolves to the same pinned file after a reopen.
     tail_generation: u64,
+    /// Set by `prepare` when this submission's operation ID is already in
+    /// flight under the same stable digest. Names the leader whose waiter the
+    /// follower's completion is moved onto.
+    attached_to: Option<OperationKey>,
+    /// Set by `prepare` when the operation already committed and the caller is
+    /// retrying. Carries the durable receipt out to `accept`, which completes
+    /// the waiter with it -- a retry is answered, not refused.
+    durable_answer: Option<CommitReceipt>,
+    /// Set by `sequence_into_frame` when the forming group no longer fits the
+    /// active journal, and consumed by `accept`. A flag rather than an error
+    /// variant because the condition is not a refusal — nothing is wrong with
+    /// the transaction, and the answer is to seal and continue.
+    rotation_wanted: bool,
     /// Sealed-run entries that some other term of the replay ceiling already
     /// accounts for — a **duplicate-representation baseline**, not a horizon.
     ///
@@ -1628,6 +1998,15 @@ struct Waiter {
     /// The status-root reservation this waiter owns while it is `PreAppend`.
     /// Taken over by step 8 once the group publishes.
     reservation: Option<OperationKey>,
+    /// Callers that submitted the same operation ID with the same stable digest
+    /// while this one was in flight. They appended nothing and hold no
+    /// reservation; they exist only to be told what this waiter is told.
+    ///
+    /// Kept on the waiter rather than in a side table keyed by operation, so
+    /// that a follower cannot outlive the request it is following: every path
+    /// that resolves a waiter drops it, and the followers go with it whether
+    /// they were answered by a receipt, an error, a poison, or an unwind.
+    followers: Vec<SharedCompletion>,
 }
 
 impl Waiter {
@@ -1636,7 +2015,24 @@ impl Waiter {
             completion,
             phase: WaiterPhase::PreAppend,
             reservation: None,
+            followers: Vec::new(),
         }
+    }
+
+    /// Answer this request and everyone coalesced onto it, with one outcome.
+    ///
+    /// The single place a waiter is completed. There are eight sites that
+    /// resolve one -- commit, pre-append refusal, poison drain, deadline drop,
+    /// panic unwind, and the durable-retry answer among them -- and a follower
+    /// that any one of them forgot would hang forever with no error and no
+    /// receipt, which is the failure mode hardest to notice and hardest to
+    /// diagnose. Routing all of them through here makes "a follower is answered
+    /// exactly when its leader is" true by construction.
+    fn resolve(self, outcome: Result<CommitReceipt, StoreError>) {
+        for follower in &self.followers {
+            follower.complete(outcome.clone());
+        }
+        self.completion.complete(outcome);
     }
 }
 
@@ -1651,6 +2047,14 @@ struct Prepared {
     repo_state: Arc<RepoState>,
     objects: Vec<(ObjectId, u8)>,
     receipt: CommitReceipt,
+    /// This member's adoption pin, if it adopts a projection.
+    ///
+    /// Beside the `Arc` and not inside it: see [`AdoptionSlot`]. It is attached
+    /// to whichever `Prepared` actually joins `pending` — the group-full path
+    /// prepares twice, and a pin attached to the discarded first attempt would
+    /// settle when that attempt dropped, while the transaction it belongs to
+    /// went on to append.
+    adoption: Option<AdoptionSlot>,
     /// Retained so the whole group can be re-sequenced, re-chained, and
     /// re-signed when the pre-mark deadline recheck drops a member.
     ///
@@ -1717,14 +2121,15 @@ fn run_shard_writer(mut writer: ShardWriter, submissions: Receiver<Command>) {
                     if let Some(key) = waiter.reservation {
                         writer.release_reservation(&key);
                     }
-                    waiter.completion.complete(Err(pre_append_panic_error()));
+                    waiter.resolve(Err(pre_append_panic_error()));
                 }
                 WaiterPhase::Publishing => {
                     poisoned_any = true;
-                    waiter.completion.complete(Err(poison.clone()));
+                    waiter.resolve(Err(poison.clone()));
                 }
-                WaiterPhase::Committed(receipt) => {
-                    waiter.completion.complete(Ok(receipt));
+                WaiterPhase::Committed(ref receipt) => {
+                    let receipt = receipt.clone();
+                    waiter.resolve(Ok(receipt));
                 }
             }
         }
@@ -1758,7 +2163,7 @@ fn pre_append_panic_error() -> StoreError {
 impl ShardWriter {
     fn accept(&mut self, submission: Submission) {
         let Submission {
-            transaction,
+            mut transaction,
             completion,
         } = submission;
         // Registered before anything that can fail or panic. Until this
@@ -1766,17 +2171,109 @@ impl ShardWriter {
         // `fail_newest_waiter` is what resolves it.
         self.waiters.push(Waiter::new(completion));
 
-        if let Some(poison) = self.poison.clone() {
-            self.fail_newest_waiter(poison);
-            return;
-        }
+        // Out **before** the `Arc`, which is the only moment it can leave: an
+        // `Arc` has no move-out, and this pin has to be settled by hand. From
+        // here it is a local, and every failure below settles it explicitly.
+        let adoption = transaction.take_adoption();
         let transaction = Arc::new(transaction);
 
-        let (prepared, frame) = match self.prepare_caught(&transaction) {
+        // Every pre-append refusal in this function settles the pin *before*
+        // resolving the waiter. Letting the local drop at the end of scope
+        // would settle it too, but only after the caller already had its
+        // answer — so a submit could return while staging still believed the
+        // pin was live, and a caller that immediately asked staging would get
+        // the pre-submit answer. Settling first makes the order a statement
+        // rather than a consequence of where `adoption` happens to be declared.
+        macro_rules! refuse {
+            ($error:expr) => {{
+                drop(adoption);
+                self.fail_newest_waiter($error);
+                return;
+            }};
+        }
+
+        if let Some(poison) = self.poison.clone() {
+            refuse!(poison);
+        }
+
+        // Pre-append revalidation, and the *only* validation that may use the
+        // pin's read-only view. `resolve_committed` is the post-fence
+        // counterpart and its contract requires the frame to already be
+        // durable, so calling it here would be wrong in the dangerous
+        // direction — it would treat an unwritten frame as authority.
+        if let Some(slot) = adoption.as_ref() {
+            if let Err(error) = self.revalidate_adoption(&transaction, slot) {
+                refuse!(error);
+            }
+        }
+
+        let (mut prepared, frame) = match self.prepare_caught(&transaction) {
             Ok(pair) => pair,
             Err(error) => {
-                self.fail_newest_waiter(error);
-                return;
+                // A second copy of a request already in flight. Its own
+                // waiter is removed and its completion moved onto the leader,
+                // so from here it is answered by whatever resolves the leader
+                // and by nothing else.
+                if let Some(key) = self.attached_to.take() {
+                    drop(adoption);
+                    if let Some(follower) = self.waiters.pop() {
+                        match self
+                            .waiters
+                            .iter_mut()
+                            .find(|waiter| waiter.reservation == Some(key))
+                        {
+                            Some(leader) => leader.followers.push(follower.completion),
+                            // The leader vanished between reserving and this
+                            // lookup. It cannot: `reserve` answered `Attached`
+                            // against the status root, this writer owns every
+                            // transition of that entry, and nothing else runs
+                            // between the two points on this thread. Answering
+                            // the follower with a definitive refusal is still
+                            // better than dropping its completion, which would
+                            // hang the caller with no outcome at all.
+                            None => follower.resolve(Err(self.poison_error(format!(
+                                "operation {} attached to a leader this shard is not holding",
+                                key.operation_id.to_hex()
+                            )))),
+                        }
+                    }
+                    return;
+                }
+
+                // A retry of an operation that already committed. The receipt
+                // is the durable one, so nothing is sequenced and no frame is
+                // appended for it.
+                if let Some(receipt) = self.durable_answer.take() {
+                    drop(adoption);
+                    if let Some(waiter) = self.waiters.pop() {
+                        if let Some(key) = waiter.reservation {
+                            self.release_reservation(&key);
+                        }
+                        waiter.resolve(Ok(receipt));
+                    }
+                    return;
+                }
+                if !std::mem::take(&mut self.rotation_wanted) {
+                    refuse!(error);
+                }
+                // `prepare` reserved before sequencing and the fit was tested
+                // after, so the reservation is held and the speculative state
+                // is not yet advanced -- that insertion happens past the test.
+                // Releasing the reservation is therefore the whole rollback.
+                if let Some(key) = self.in_flight_reservation.take() {
+                    self.release_reservation(&key);
+                }
+                self.publish_open_group();
+                if let Some(poison) = self.poison.clone() {
+                    refuse!(poison);
+                }
+                if let Err(error) = self.rotate_journal() {
+                    refuse!(error);
+                }
+                match self.prepare_caught(&transaction) {
+                    Ok(pair) => pair,
+                    Err(error) => refuse!(error),
+                }
             }
         };
 
@@ -1795,29 +2292,98 @@ impl ShardWriter {
             self.roll_back_prepared(&prepared);
             self.publish_open_group();
             if let Some(poison) = self.poison.clone() {
-                self.fail_newest_waiter(poison);
-                return;
+                refuse!(poison);
             }
-            let (reprepared, frame) = match self.prepare_caught(&transaction) {
+            let (mut reprepared, frame) = match self.prepare_caught(&transaction) {
                 Ok(pair) => pair,
-                Err(error) => {
-                    self.fail_newest_waiter(error);
-                    return;
-                }
+                Err(error) => refuse!(error),
             };
             self.builder
                 .push(frame)
                 .expect("an empty group admits any frame");
             self.attach_newest_reservation(reprepared.key);
+            // Onto the second preparation, because the first was rolled back
+            // and dropped. `publish_open_group` above appended the *previous*
+            // group, never this transaction, so the pin is still `BeforeAppend`
+            // and this attachment is not late.
+            reprepared.adoption = adoption;
             self.pending.push(reprepared);
         } else {
             self.attach_newest_reservation(prepared.key);
+            prepared.adoption = adoption;
             self.pending.push(prepared);
         }
 
         if self.builder.is_closed() {
             self.publish_open_group();
         }
+    }
+
+    /// Prove the pin still protects the projection this frame is about to name.
+    ///
+    /// The pairing itself is guaranteed by [`StagedProjectionAdoption`], which
+    /// cannot be assembled from mismatched halves. What that cannot guarantee
+    /// is *time*: the descriptor was derived when the session finalized, and a
+    /// submit happens later. This recomputes it from the pin's current
+    /// read-only resolution and requires the two to be identical.
+    ///
+    /// Rebuilt through staging's own [`install_from_resolution`] rather than
+    /// compared field by field. A second derivation of a canonical value is a
+    /// second opinion about it, and the fields it forgot to compare would be
+    /// exactly the ones that drifted.
+    fn revalidate_adoption(
+        &mut self,
+        transaction: &ValidatedTransaction,
+        slot: &AdoptionSlot,
+    ) -> Result<(), StoreError> {
+        let Some(descriptor) = transaction.projection() else {
+            return Err(self.pre_append_conflict(
+                "a transaction carries an adoption pin but no install descriptor".into(),
+            ));
+        };
+        let Some(resolution) = slot.resolution() else {
+            return Err(self.pre_append_conflict(
+                "a transaction's adoption pin was already settled before it was sequenced".into(),
+            ));
+        };
+        let resolution = resolution?;
+
+        // The projection is bound to one repository at `begin`, and adopting it
+        // into another would install objects under a namespace that never
+        // agreed to them — the membership boundary §4 makes structural
+        // everywhere else.
+        let bound = NamespaceId::from(resolution.session.destination_repo);
+        if bound != transaction.namespace {
+            return Err(self.pre_append_conflict(format!(
+                "staged projection session {} is bound to repository {} and cannot be adopted \
+                 into {}",
+                hex::encode(resolution.session.session_id),
+                bound.to_hex(),
+                transaction.namespace.to_hex()
+            )));
+        }
+
+        self.adoption_fits_run_ceilings(&resolution)?;
+
+        let current = crate::staging::install_from_resolution(&resolution)?;
+        if current != *descriptor {
+            return Err(self.pre_append_conflict(format!(
+                "the install descriptor for staged projection session {} no longer matches what \
+                 its pin resolves to; the session changed between finalize and submit",
+                hex::encode(descriptor.session_id)
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// A refusal that happens before anything is sequenced.
+    ///
+    /// `Conflict` is the taxonomy's definitive-rejection variant, which is what
+    /// every pre-append refusal in this file returns: nothing was appended and
+    /// nothing can be, so the caller may retry.
+    fn pre_append_conflict(&self, message: String) -> StoreError {
+        StoreError::Conflict(message)
     }
 
     /// Scope 6.3 steps 1-3 with their own unwind boundary.
@@ -1894,7 +2460,7 @@ impl ShardWriter {
             if let Some(key) = waiter.reservation {
                 self.release_reservation(&key);
             }
-            waiter.completion.complete(Err(error));
+            waiter.resolve(Err(error));
         }
     }
 
@@ -1943,13 +2509,59 @@ impl ShardWriter {
 
         // Decision 9.8 ordering, first rule: a committed or expired operation
         // is answered from the committed root and never touches the status
-        // root. The answer itself — returning the durable receipt to a
-        // retrying caller — is deliverable 7.
-        if self.shared.committed.load().terminal_status(&key).is_some() {
-            return Err(StoreError::NotImplemented(
-                "submit idempotency against an already committed operation — B1 NamespaceTxn, \
-                 scope 6-B1 deliverable 7",
-            ));
+        // root.
+        //
+        // The rule is `oracle::coalescing_decision`'s durable branch —
+        // `ReturnDurable` on a matching digest, `OperationIdMismatch`
+        // otherwise — applied to a terminal entry rather than restated. What
+        // makes the digest load-bearing is that an operation ID alone cannot
+        // distinguish a retry from a different request reusing an identity, and
+        // answering the second with the first's receipt would tell a caller its
+        // transaction committed when another one did.
+        if let Some(entry) = self.shared.committed.load().terminal_status(&key) {
+            if entry.operation_digest() != transaction.operation_digest {
+                return Err(StoreError::Conflict(format!(
+                    "operation {} already resolved under a different stable digest; one \
+                     operation ID names one request",
+                    key.operation_id.to_hex()
+                )));
+            }
+            return match entry.transaction_status() {
+                // Not an error, so it travels as a flag rather than through the
+                // error channel: `accept` completes this waiter with the
+                // receipt instead of failing it. Smuggling a success through
+                // `StoreError` would make every caller of `prepare` responsible
+                // for noticing that one variant means "it worked".
+                TransactionStatus::Committed(receipt) => {
+                    self.durable_answer = Some(receipt);
+                    Err(StoreError::Overloaded {
+                        limit: "durable_answer",
+                        retry_after_micros: 0,
+                    })
+                }
+                // The receipt aged out and only the tombstone remains, which is
+                // what stops the ID being reused — but it is no longer an
+                // answer about *this* submit's outcome, so it cannot be
+                // returned as one.
+                TransactionStatus::Expired {
+                    tombstone_until_micros,
+                    ..
+                } => Err(StoreError::Conflict(format!(
+                    "operation {} committed and its receipt is no longer retained; the ID stays \
+                     bound until {tombstone_until_micros}",
+                    key.operation_id.to_hex()
+                ))),
+                // A terminal entry is `Committed` or `Expired` by construction.
+                // Naming the rest is the no-catch-all rule: a third terminal
+                // shape must fail this compile rather than fall through to a
+                // default answer about a durable operation.
+                status @ (TransactionStatus::Pending { .. }
+                | TransactionStatus::Resolving { .. }
+                | TransactionStatus::Unknown) => Err(self.poison_error(format!(
+                    "operation {} has a terminal entry reporting {status:?}",
+                    key.operation_id.to_hex()
+                ))),
+            };
         }
 
         // Plan §5.3: at a hard ceiling the shard seals synchronously **before
@@ -2003,19 +2615,51 @@ impl ShardWriter {
         let payload_len = payload.len() as u64;
         let total_len = frame_total_len(payload_len);
 
-        // Rotation and sealing are not in this slice. Refusing a group that no
-        // longer fits the preallocated journal here — with the exact length in
-        // hand, before anything is marked `Resolving` — keeps the missing
-        // deliverable a clean pre-append refusal rather than a `LimitExceeded`
-        // discovered between the `Resolving` mark and the fence.
-        if !self
+        // Two independent rotation triggers, and the second is not implied by
+        // the first. A group that no longer fits the preallocated file must
+        // rotate or be refused; a cursor that has reached `segment_max_bytes`
+        // must rotate so segments stay near their configured size, and with
+        // `segment_max_bytes < journal_preallocate_bytes` that boundary arrives
+        // first and every time. Checking only the fit let a shard run to the
+        // end of its preallocation whatever the segment ceiling said.
+        //
+        // The exact frame length is known here and nowhere earlier, so this is
+        // where both are discovered — before anything is marked `Resolving`,
+        // which keeps it a clean pre-append condition.
+        let group_end = self.builder.bytes().saturating_add(total_len);
+        let over_segment_ceiling = self
             .journal
-            .fits(self.builder.bytes().saturating_add(total_len))
-        {
-            return Err(StoreError::NotImplemented(
-                "active journal rotation and sealing — B1 NamespaceTxn, scope 6-B1 \
-                 deliverable 1 and scope 3.4",
-            ));
+            .should_rotate(self.shared.options.segment_max_bytes);
+        if !self.journal.fits(group_end) || over_segment_ceiling {
+            // A frame no *empty* journal could hold is a ceiling and not a
+            // rotation: sealing would produce a fresh journal that refuses it
+            // again, so the shard would seal once per submit forever and still
+            // never accept it.
+            //
+            // Measured against the space a fresh journal actually offers, which
+            // is the preallocation less its header — a new journal's cursor
+            // starts past that header, so comparing the frame with the whole
+            // preallocation calls a frame rotatable when no rotation can ever
+            // seat it.
+            let preallocated = self.shared.options.journal_preallocate_bytes;
+            let usable = preallocated.saturating_sub(JOURNAL_HEADER_LEN as u64);
+            if total_len > usable {
+                return Err(StoreError::LimitExceeded {
+                    limit: "journal_preallocate_bytes",
+                    observed: total_len,
+                    allowed: usable,
+                });
+            }
+            // Rotation cannot happen from in here. The open group's frames are
+            // built but not appended, and each carries `journal_id` in its
+            // header; sealing now would leave them naming a journal that no
+            // longer takes writes. `accept` publishes the open group first and
+            // then rotates, which is the same shape the group-full path uses.
+            self.rotation_wanted = true;
+            return Err(StoreError::Overloaded {
+                limit: "active_journal",
+                retry_after_micros: 0,
+            });
         }
 
         let frame = Frame {
@@ -2064,6 +2708,9 @@ impl ShardWriter {
                 repo_state: sequenced.repo_state,
                 objects: sequenced.objects,
                 receipt: sequenced.receipt,
+                // Attached by `accept`, which owns the pin until it knows which
+                // preparation is the one that lands.
+                adoption: None,
                 transaction: Arc::clone(transaction),
             },
             frame,
@@ -2328,17 +2975,24 @@ impl ShardWriter {
             receipt,
             payload: TransactionFramePayloadV1 {
                 repository_create: repository_create(transaction)?,
-                objects: FrameObjectsV1::Inline(
-                    transaction
-                        .objects
-                        .iter()
-                        .map(|object| FrameObjectV1 {
-                            object_type: object.object_type,
-                            object_id: object.id,
-                            raw: object.raw.clone(),
-                        })
-                        .collect(),
-                ),
+                // One payload or the other, which the builder already refused
+                // to let a caller ask for both of. An adopting transaction's
+                // objects are in staging's artifacts; the frame carries only
+                // the descriptor that names them.
+                objects: match transaction.projection() {
+                    Some(install) => FrameObjectsV1::StagedProjectionInstall(install.clone()),
+                    None => FrameObjectsV1::Inline(
+                        transaction
+                            .objects
+                            .iter()
+                            .map(|object| FrameObjectV1 {
+                                object_type: object.object_type,
+                                object_id: object.id,
+                                raw: object.raw.clone(),
+                            })
+                            .collect(),
+                    ),
+                },
                 ref_cas: transaction.refs.clone(),
                 expected_authority,
                 new_authority,
@@ -2372,7 +3026,7 @@ impl ShardWriter {
         // sequencing time. Between the two sit the signer handoff and the whole
         // idle delay that closes an unfull group, either of which can be longer
         // than what remains of a caller's signed deadline.
-        let (frames, pending) = self.close_group();
+        let (frames, mut pending) = self.close_group();
         if frames.is_empty() {
             debug_assert!(pending.is_empty());
             return;
@@ -2391,7 +3045,7 @@ impl ShardWriter {
         }
 
         let keys: Vec<OperationKey> = pending.iter().map(|prepared| prepared.key).collect();
-        let outcome = self.publish_window(&frames, &pending, &keys);
+        let outcome = self.publish_window(&frames, &mut pending, &keys);
         match outcome {
             Ok(()) => {
                 // Step 8 removed the status entries, so the reservations are no
@@ -2404,6 +3058,19 @@ impl ShardWriter {
                 self.wake_committed_group(pending.len());
             }
             Err(error) => {
+                // Settle every surviving pin *before* any waiter is told.
+                //
+                // Dropping `pending` at the end of this function would settle
+                // them too — that is what the slot's `Drop` is for — but it
+                // would happen after the caller already had its answer, so a
+                // submit could return while staging still believed the pin was
+                // live. Taking them here makes the order a statement: the
+                // outcome is recorded, from the append phase each slot reached,
+                // and only then does anyone learn the transaction failed.
+                for prepared in pending.iter_mut() {
+                    drop(prepared.adoption.take());
+                }
+
                 // Scope 3.7: steps 4 to 8 are the poison window. The shard is
                 // read-only from here, the group's status entries stay
                 // `Resolving` because step 8 never ran, and nothing is
@@ -2411,7 +3078,7 @@ impl ShardWriter {
                 // reopen through recovery.
                 self.poison = Some(error.clone());
                 for waiter in self.waiters.drain(..pending.len()) {
-                    waiter.completion.complete(Err(error.clone()));
+                    waiter.resolve(Err(error.clone()));
                 }
             }
         }
@@ -2449,9 +3116,10 @@ impl ShardWriter {
         let deliver = !matches!(hung, Ok(true));
         for waiter in self.waiters.drain(..members) {
             match waiter.phase {
-                WaiterPhase::Committed(receipt) => {
+                WaiterPhase::Committed(ref receipt) => {
                     if deliver {
-                        waiter.completion.complete(Ok(receipt));
+                        let receipt = receipt.clone();
+                        waiter.resolve(Ok(receipt));
                     }
                 }
                 WaiterPhase::PreAppend | WaiterPhase::Publishing => unreachable!(
@@ -2508,15 +3176,23 @@ impl ShardWriter {
         // stay aligned with `new_pending`.
         let mut cursor = 0usize;
 
-        for prepared in pending {
+        for mut prepared in pending {
             let key = prepared.key;
             let transaction = Arc::clone(&prepared.transaction);
+            // Moved out before `prepared` is dropped by this iteration.
+            // `sequence_into_frame` builds a fresh `Prepared` from the retained
+            // `Arc`, which cannot carry the pin — an `Arc` has no move-out —
+            // so a survivor's pin would otherwise settle here as a definitive
+            // pre-append failure while its transaction went on to append. This
+            // is the re-sequencing route the slot exists for.
+            let adoption = prepared.adoption.take();
             let next_sequence = base_sequence + new_pending.len() as u64;
             let outcome = deadline_permits_append(now, prepared.retry_until_micros)
                 .map_err(|reason| reason.into_error(key.operation_id))
                 .and_then(|()| self.sequence_into_frame(&transaction, next_sequence, now));
             match outcome {
-                Ok((reprepared, frame)) => {
+                Ok((mut reprepared, frame)) => {
+                    reprepared.adoption = adoption;
                     new_frames.push(frame);
                     new_pending.push(reprepared);
                     cursor += 1;
@@ -2528,7 +3204,7 @@ impl ShardWriter {
                     // be written.
                     self.release_reservation(&key);
                     let waiter = self.waiters.remove(cursor);
-                    waiter.completion.complete(Err(error));
+                    waiter.resolve(Err(error));
                 }
             }
         }
@@ -2543,7 +3219,7 @@ impl ShardWriter {
     fn publish_window(
         &mut self,
         frames: &[Frame],
-        pending: &[Prepared],
+        pending: &mut [Prepared],
         keys: &[OperationKey],
     ) -> Result<(), StoreError> {
         // The journal's sequence counter advances here and nowhere else.
@@ -2568,6 +3244,20 @@ impl ShardWriter {
         fire_in_poison_window(self.shard_index, Failpoint::AfterMarkedResolving)?;
 
         // --- step 5: exact reserved frames, one fence ----------------------
+        //
+        // The phase advances here, before the call and not after the fence
+        // inside it. From this line on, no failure may claim that nothing was
+        // written: `append_group_and_fence` can fail with a torn frame or with
+        // whole frames that were never fenced, and both are states only
+        // recovery can read the device to resolve. Advancing after the fence
+        // would leave exactly those two outcomes settling as
+        // `DefinitivePreAppendFailure` — staging releasing artifacts a durable
+        // frame may already name.
+        for prepared in pending.iter_mut() {
+            if let Some(slot) = prepared.adoption.as_mut() {
+                slot.entered_append();
+            }
+        }
         let sequences = self.journal.append_group_and_fence(frames)?;
         if sequences.len() != pending.len() {
             return Err(self.poison_error(format!(
@@ -2603,6 +3293,37 @@ impl ShardWriter {
         // of the crate that implements them.
         fence(Ordering::Release);
         self.remove_status_entries(keys);
+
+        // --- step 9: settle every adoption pin ----------------------------
+        //
+        // Strictly after publication, because `Adopted` is a claim that a
+        // committed root references these artifacts and it carries the sequence
+        // that makes the claim checkable. Staging answers "does any root still
+        // point into this directory?" against a root a caller supplies, and a
+        // root captured before this publication references none of them for the
+        // trivial reason that it predates them — so recording the position is
+        // what stops absence-measured-too-early from reading as absence.
+        //
+        // A settlement that fails poisons: the frame is durable and the root is
+        // published, so staging believing otherwise is a disagreement about
+        // committed state, not a lost update. Anything left unsettled by an
+        // early return above is still correct — the slots are `Appended` by
+        // now, so dropping them transfers to recovery.
+        for prepared in pending.iter_mut() {
+            let Some(slot) = prepared.adoption.take() else {
+                continue;
+            };
+            slot.finish(ProjectionAdoptionOutcome::Adopted {
+                committed_shard_sequence: prepared.shard_sequence,
+            })
+            .map_err(|error| {
+                self.poison_error(format!(
+                    "recording the adoption of the projection committed at shard sequence {}: \
+                     {error}",
+                    prepared.shard_sequence
+                ))
+            })?;
+        }
         Ok(())
     }
 
@@ -2645,6 +3366,64 @@ impl ShardWriter {
         }
     }
 
+    /// Bind a committed adoption descriptor to the artifacts on disk.
+    ///
+    /// The post-fence counterpart of [`Self::revalidate_adoption`], and a
+    /// different question asked of a different authority. That one asked
+    /// staging's live session state whether the pin still matched, and could
+    /// refuse. This asks staging to resolve a descriptor whose frame is
+    /// **already durable**, which is what `resolve_committed` requires and why
+    /// it cannot be called before the fence. There is no refusing here: the
+    /// frame naming these artifacts is committed, so a failure is corruption
+    /// and poisons the shard — every caller of this is inside the poison
+    /// window.
+    ///
+    /// The shard sequence is the adoption's identity and is passed rather than
+    /// looked up: it is what every artifact's logical generation derives from,
+    /// and staging cannot supply it because a finalizing session has no durable
+    /// position of its own. Same reason recovery passes it at `recovery.rs`.
+    fn resolve_adoption(
+        &self,
+        prepared: &Prepared,
+        install: &StagedProjectionInstallV1,
+        shard_sequence: u64,
+    ) -> Result<RecoveredProjectionArtifacts, StoreError> {
+        // Materialize before resolving, because resolution only opens what this
+        // creates. Both take the same sequence, and this is the first moment it
+        // is real: the frame is fenced, so it can no longer be re-sequenced.
+        self.shared
+            .staging
+            .materialize_committed_index_runs(prepared.key.namespace, install, shard_sequence)
+            .map_err(|error| {
+                self.poison_error(format!(
+                    "materializing index runs for committed staged projection session {}: {error}",
+                    hex::encode(install.session_id)
+                ))
+            })?;
+
+        let artifacts = self
+            .shared
+            .staging
+            .resolve_committed(prepared.key.namespace, install, shard_sequence)
+            .map_err(|error| {
+                self.poison_error(format!(
+                    "resolving committed staged projection session {}: {error}",
+                    hex::encode(install.session_id)
+                ))
+            })?;
+        // The same recheck recovery makes for the same reason: resolution is
+        // the one step where a descriptor is handed to another package and a
+        // different one could come back, and every artifact below is trusted on
+        // the strength of this descriptor.
+        if artifacts.descriptor() != install {
+            return Err(self.poison_error(format!(
+                "staging resolved committed session {} to a different descriptor",
+                hex::encode(install.session_id)
+            )));
+        }
+        Ok(artifacts)
+    }
+
     fn build_subtree(&self, pending: &[Prepared]) -> Result<ShardSubtree, StoreError> {
         let mut delta = IndexDelta::from_options(&self.shared.options);
         // The device offsets the fence just made durable, read back from the
@@ -2652,6 +3431,10 @@ impl ShardWriter {
         // name bytes that are actually there.
         let index = self.journal.frame_index();
         let appended = &index[index.len() - pending.len()..];
+        // `(adoption frame's shard sequence, what staging resolved it to)`.
+        // Empty for every group that adopts nothing, which is almost all of
+        // them.
+        let mut adopted: Vec<(u64, RecoveredProjectionArtifacts)> = Vec::new();
         for (prepared, (sequence, offset, len)) in pending.iter().zip(appended) {
             if *sequence != prepared.shard_sequence {
                 return Err(self.poison_error(format!(
@@ -2675,6 +3458,18 @@ impl ShardWriter {
                         shard_sequence: *sequence,
                     },
                 )?;
+            }
+
+            // An adopted projection's objects are **not** indexed at the loop
+            // above's frame location. That location names the bytes of the
+            // frame, and an adopting frame's bytes are a descriptor; the
+            // objects live in staging's artifacts, at one logical generation
+            // per chunk. `prepared.objects` is empty for these — the builder
+            // refuses to pair inline objects with an adoption — so nothing here
+            // overwrites anything the loop above wrote.
+            if let Some(install) = prepared.transaction.projection() {
+                let resolved = self.resolve_adoption(prepared, install, *sequence)?;
+                adopted.push((*sequence, resolved));
             }
         }
 
@@ -2710,18 +3505,154 @@ impl ShardWriter {
             .map(|prepared| prepared.shard_sequence)
             .ok_or_else(|| self.poison_error("published an empty group".into()))?;
 
+        // A group that adopted nothing publishes no generation: the active
+        // journal these frames landed in is already pinned by the generation
+        // recovery installed.
+        let mut generations = GenerationMap::new();
+        let mut adopted_runs = Vector::new();
+        if !adopted.is_empty() {
+            // A resolved projection's membership arrives as a delta, as sealed
+            // index runs, or as both — B3 decides which by size, and the
+            // recovery-direction merge handles both for the same reason.
+            //
+            // The delta is merged into this group's own rather than layered
+            // beside it, because a `ShardSubtree` carries exactly one. The keys
+            // cannot collide: an adopting transaction has no inline objects, so
+            // the frame loop above wrote nothing for it, and two committed
+            // frames cannot name one session — staging refuses a second
+            // finalize.
+            for (_, artifacts) in &adopted {
+                for (key, location) in artifacts.index_delta().iter() {
+                    delta.insert(key, location)?;
+                }
+                // Into the *root's* run stack, and not only into the generation
+                // below. Pinning a run keeps its file alive; it is this that
+                // makes its entries findable, and an adoption whose membership
+                // came back as a run resolves to nothing without it.
+                for run in artifacts.index_runs_newest_first() {
+                    adopted_runs.push_back(Arc::clone(run));
+                }
+            }
+            let generation = self.generation_with_adoptions(&adopted)?;
+            generations.insert(generation.id, generation);
+        }
+
         Ok(ShardSubtree::new(
             self.shard_index,
             last,
             Arc::new(delta),
+            // `None`, though runs are installed: these cover the adopted
+            // projections' own objects, not this shard's delta backlog. Naming
+            // a sealed-through sequence would discard delta layers whose
+            // entries no adopted run contains.
             None,
-            Vector::new(),
+            adopted_runs,
             repositories,
             terminal_statuses,
-            // No new generation: the active journal these frames landed in is
-            // already pinned by the generation recovery installed.
-            GenerationMap::new(),
+            generations,
         ))
+    }
+
+    /// Count an adoption's index runs against the ceilings recovery enforces,
+    /// **before** anything is appended.
+    ///
+    /// An adoption installs staging-owned index runs, and a run count this
+    /// store can publish but not reopen is a root that opens once. `seal_index`
+    /// makes the same check against the same numbers for its own run.
+    ///
+    /// Pre-append and not post-fence, though the runs only materialize after
+    /// the fence: the count is a function of the descriptor's chunk count and
+    /// the encoder's fixed partition rule, so it is knowable now, and knowing
+    /// it now is the difference between a clean refusal the caller can act on
+    /// and a poisoned shard holding a frame it already committed.
+    fn adoption_fits_run_ceilings(
+        &mut self,
+        resolution: &crate::staging::ProjectionAdoptionResolution,
+    ) -> Result<(), StoreError> {
+        let planned = crate::staging::planned_index_run_count(resolution.session.chunk_count);
+        // Compact before admitting, under the same trigger the seal uses with
+        // `planned` standing where the seal's one run stands. An adoption is
+        // allowed to land exactly on the ceiling, but landing there while
+        // mergeable manifest rows still hold slots hands every later seal a
+        // zero install budget: the seal's trigger fires, nothing may install,
+        // and every admission that reaches the seal repeats the refusal.
+        // Returning that headroom first is the difference between an adoption
+        // the shard absorbs and one that wedges it.
+        let root = self.shared.committed.load();
+        let root = if self.compact_index_runs_if_crowded(&root, planned)? {
+            self.shared.committed.load()
+        } else {
+            root
+        };
+        let projected = self.owned_run_count(&root).saturating_add(planned);
+        for (limit, allowed) in [
+            ("max_index_runs", self.shared.options.max_index_runs),
+            (
+                "max_open_index_runs",
+                self.shared.options.max_open_index_runs,
+            ),
+        ] {
+            if projected > u64::from(allowed) {
+                return Err(StoreError::LimitExceeded {
+                    limit,
+                    observed: projected,
+                    allowed: u64::from(allowed),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// The current generation, republished with this group's adopted artifacts
+    /// added to its pin set.
+    ///
+    /// Under the **same** `GenerationId`, not a successor. A new manifest
+    /// generation is a durable artifact — `checkpoint` writes one — and this is
+    /// inside the poison window after the fence, where a write that failed
+    /// would poison a shard whose frames are already committed. It does not
+    /// need to be durable: `checkpoint.rs` has no projection-artifact section
+    /// at all, and an adoption's durability comes from the committed frame plus
+    /// staging's marker, with recovery rebuilding these exact pins by replaying
+    /// the frame through `resolve_committed`. What has to survive here is the
+    /// in-memory pin, so that compaction cannot delete an artifact a live root
+    /// resolves through.
+    ///
+    /// Re-publishing the same id is what `CommittedRoot::merge` already does
+    /// for repositories and statuses, and `object_source`'s rule is satisfied
+    /// because the pins carried forward are the identical values — same paths,
+    /// same source kinds — plus new ones for generations no predecessor named.
+    fn generation_with_adoptions(
+        &self,
+        adopted: &[(u64, RecoveredProjectionArtifacts)],
+    ) -> Result<Arc<RetainedGeneration>, StoreError> {
+        let root = self.shared.committed.load();
+        // The *manifest* generation, which is not `tail_generation`: that one
+        // numbers journal segments and is what an index location names, while
+        // retention is keyed by the manifest the checkpointer publishes. The
+        // two are independent counters and only coincide by accident.
+        let id = GenerationId::new(self.shard_index, self.current_manifest_generation(&root)?);
+        let previous = root.retained_generations().get(&id).ok_or_else(|| {
+            self.poison_error(format!(
+                "manifest generation {} vanished from the root while adopting",
+                id.manifest_generation
+            ))
+        })?;
+
+        let mut index_runs = previous.index_runs.to_vec();
+        let mut artifacts = previous.projection_artifacts.to_vec();
+        for (_, resolved) in adopted {
+            index_runs.extend_from_slice(resolved.retained_index_runs());
+            artifacts.extend_from_slice(resolved.retained_artifacts());
+        }
+
+        Ok(Arc::new(RetainedGeneration::new(
+            id,
+            Arc::clone(&previous.segments),
+            index_runs.into(),
+            Arc::clone(&previous.checkpoints),
+            Arc::clone(&previous.active_tails),
+            artifacts.into(),
+        )))
     }
 
     /// This shard's unsealed index backlog, as one captured root reports it.
@@ -2857,12 +3788,25 @@ impl ShardWriter {
             if layer.shard_index != self.shard_index {
                 continue;
             }
+            // What "stable" asks is whether these entries still resolve after
+            // the frames behind them are pruned. A sealed segment and an active
+            // tail do; so does an adopted projection artifact, which is not in
+            // the journal at all and which every successor generation carries
+            // forward by construction. Leaving `ProjectionArtifact` out of this
+            // list stopped coverage at the first adopting group and made the
+            // shard permanently uncheckpointable — the entries were the most
+            // durable kind in the index, and were read as the least.
+            //
+            // Enumerated and not a catch-all: a source kind added later must
+            // fail this compile and be decided, because the wrong answer here
+            // prunes frames whose objects nothing else can find.
             let stable = layer.delta.iter().all(|(_, location)| {
                 matches!(
                     root.object_source(self.shard_index, location.segment_generation),
                     Ok(Some(
                         crate::roots::RetainedObjectSource::Segment(_)
                             | crate::roots::RetainedObjectSource::ActiveTail(_)
+                            | crate::roots::RetainedObjectSource::ProjectionArtifact(_)
                     ))
                 )
             });
@@ -3251,6 +4195,219 @@ impl ShardWriter {
     }
 
     /// Derived shard state through `committed`, read from the published root.
+    /// Seal the active journal into a segment and continue in a fresh one.
+    ///
+    /// Scope 3.4, driven by the journal filling rather than by a checkpoint.
+    /// The two share a sealing sequence and differ in what they *additionally*
+    /// claim: a checkpoint installs a checkpoint row and moves the replay
+    /// horizon, while this installs only the segment. Both advance
+    /// `committed_shard_sequence`, because both make a prefix durable under a
+    /// manifest-referenced name — and `validate_manifest_sequence_coverage`
+    /// requires the final retained tail range to end exactly there. The
+    /// checkpoint list is carried forward untouched; the horizon is the
+    /// checkpoint's sequence and the active journal's position, not this field.
+    ///
+    /// Called from `accept` with the open group already published, so the
+    /// builder is empty. It cannot be called with one forming: those frames
+    /// carry `journal_id` in their headers and would name a journal that no
+    /// longer accepts writes.
+    ///
+    /// Every failure past the seal poisons. The segment is linked into
+    /// `segments/` before the manifest names it and the active name is unlinked
+    /// only after — §3.4's ordering, which leaves every crash point with either
+    /// a scannable journal or a manifest that references the segment, and never
+    /// neither. A failure in the middle is not something this process can
+    /// resolve by retrying.
+    fn rotate_journal(&mut self) -> Result<(), StoreError> {
+        // Nothing appended means nothing to seal. A1 refuses to seal an empty
+        // journal, and a shard that reached here with one is asking for a
+        // rotation that would produce a segment naming no frames.
+        let Some(last) = self.journal.last_appended_shard_sequence() else {
+            return Ok(());
+        };
+
+        let root = self.shared.committed.load_full();
+        let paths = RootLayout::new(&self.shared.options.root).shard(self.shard_index);
+        let root_uuid = self.shared.root_uuid;
+        let counters = Arc::clone(self.journal.counters_handle());
+        let current_generation = self.current_manifest_generation(&root)?;
+        let manifest = read_manifest_or_empty(&paths, current_generation, &root_uuid)?;
+        let next_generation = current_generation + 1;
+
+        // The segment inherits the tail's logical generation, so every
+        // `IndexLocation` already written against it keeps naming the same
+        // bytes (contract review 2026-07-30-A).
+        let sealed_generation = self.tail_generation;
+        let first = self.journal.header().first_shard_sequence;
+        let active_path = self.journal.path().to_path_buf();
+        let segment_path =
+            match segment::seal_journal(&mut self.journal, &paths, sealed_generation, &counters) {
+                Ok(path) => path,
+                Err(error) => {
+                    return Err(self.poison_now(format!("sealing a full journal: {error}")))
+                }
+            };
+        let filename = match segment_path.file_name().and_then(|name| name.to_str()) {
+            Some(name) => name.to_string(),
+            None => return Err(self.poison_now("sealed segment name is not UTF-8".into())),
+        };
+
+        let mut retained_tail_ranges = manifest.retained_tail_ranges.clone();
+        retained_tail_ranges.push(TailRange {
+            generation: sealed_generation,
+            first_shard_sequence: first,
+            last_shard_sequence: last,
+            filename,
+        });
+        let published = Manifest {
+            root_uuid,
+            generation: next_generation,
+            base_generation: manifest.base_generation,
+            retained_tail_ranges,
+            index_runs: manifest.index_runs.clone(),
+            checkpoints: manifest.checkpoints.clone(),
+            // Advanced to the sealed segment's last sequence, and this is the
+            // one field where rotation differs from installing an index run.
+            //
+            // `install_index_run` carries this forward untouched because a run
+            // makes no journal frame more durable than it already was — the
+            // frames it indexes are still only in `active/`, and advancing
+            // would tell recovery to stop replaying them. Sealing does the
+            // opposite: this prefix is now durable under a second name that the
+            // manifest references, which is exactly what the field records.
+            //
+            // `validate_manifest_sequence_coverage` requires the final retained
+            // tail range to end precisely here, so leaving it behind produced a
+            // manifest whose coverage stopped short of its own last range and a
+            // reopen that refused. Advancing skips nothing: with no checkpoint
+            // installed, recovery replays every manifest-referenced retained
+            // tail range, and the replay horizon is the checkpoint's sequence
+            // and the active journal's position rather than this field alone.
+            committed_shard_sequence: last,
+        };
+        if let Err(error) = segment::install_manifest(
+            &paths,
+            &published,
+            self.shared.options.manifest_retain,
+            &counters,
+        ) {
+            return Err(self.poison_now(format!("publishing a rotation manifest: {error}")));
+        }
+
+        if let Err(error) = segment::unlink_sealed_journal(&active_path, &paths, &counters) {
+            return Err(self.poison_now(format!("unlinking the sealed journal: {error}")));
+        }
+        let journal = match Journal::create(
+            &paths.active(),
+            fresh_checkpoint_journal_id(root_uuid, self.shard_index, last),
+            last.saturating_add(1),
+            self.shard_index,
+            root_uuid,
+            self.shared.options.journal_preallocate_bytes,
+            now_micros(),
+            Arc::clone(&counters),
+        ) {
+            Ok(journal) => journal,
+            Err(error) => {
+                return Err(self.poison_now(format!("opening the post-rotation journal: {error}")))
+            }
+        };
+        self.journal = journal;
+        self.tail_generation = sealed_generation + 1;
+
+        let successor = match self.retain_rotated_generation(
+            &root,
+            current_generation,
+            next_generation,
+            sealed_generation,
+            first,
+            last,
+            &segment_path,
+        ) {
+            Ok(successor) => successor,
+            Err(error) => return Err(self.poison_now(format!("pinning a rotation: {error}"))),
+        };
+
+        let mut generations = GenerationMap::new();
+        generations.insert(successor.id, successor);
+        let mut subtree = ShardSubtree::new(
+            self.shard_index,
+            // Unchanged: no frame was appended by this publication.
+            root.shard_committed_sequence(self.shard_index)
+                .unwrap_or(last),
+            Arc::new(IndexDelta::from_options(&self.shared.options)),
+            // `None`, though a segment was installed. Sealing the *journal* is
+            // not sealing the *index*: naming a sealed-through sequence here
+            // would discard delta layers whose entries no run contains.
+            None,
+            Vector::new(),
+            RepoMap::new(),
+            TerminalStatusMap::new(),
+            generations,
+        );
+        subtree
+            .retained_generation_removals
+            .push_back(GenerationId::new(self.shard_index, current_generation));
+        if let Err(error) = self.publish_subtree(&subtree) {
+            return Err(self.poison_now(format!("publishing a rotation: {error}")));
+        }
+        Ok(())
+    }
+
+    /// The successor generation pinning the newly sealed segment and the fresh
+    /// journal, plus everything the predecessor pinned.
+    ///
+    /// The predecessor's active tail is deliberately **not** carried forward:
+    /// that file is now the segment, reachable at its new name, and retaining
+    /// the old pin as a tail would leave one logical generation naming two
+    /// sources -- exactly the collision `object_source` refuses.
+    #[allow(clippy::too_many_arguments)]
+    fn retain_rotated_generation(
+        &self,
+        root: &CommittedRoot,
+        current_generation: u64,
+        next_generation: u64,
+        sealed_generation: u64,
+        first: u64,
+        last: u64,
+        segment_path: &Path,
+    ) -> Result<Arc<RetainedGeneration>, StoreError> {
+        let previous = root
+            .retained_generations()
+            .get(&GenerationId::new(self.shard_index, current_generation))
+            .map(Arc::clone)
+            .ok_or_else(|| {
+                StoreError::Corruption(format!(
+                    "generation {current_generation} vanished from the root while rotating"
+                ))
+            })?;
+
+        let mut segments = previous.segments.to_vec();
+        segments.push(RootRetainedSegment::new(
+            sealed_generation,
+            self.journal_id_of_sealed_prefix(segment_path)?,
+            first,
+            last,
+            PinnedFile::open(segment_path)?,
+        ));
+        let active_tails = vec![RetainedTail::new(
+            self.tail_generation,
+            PinnedFile::from_shared(
+                self.journal.path().to_path_buf(),
+                Arc::new(self.journal.file().try_clone()?),
+            ),
+        )];
+
+        Ok(Arc::new(RetainedGeneration::new(
+            GenerationId::new(self.shard_index, next_generation),
+            segments.into(),
+            Arc::clone(&previous.index_runs),
+            Arc::clone(&previous.checkpoints),
+            active_tails.into(),
+            Arc::clone(&previous.projection_artifacts),
+        )))
+    }
+
     fn checkpoint_body(
         &self,
         root: &CommittedRoot,
@@ -3529,7 +4686,391 @@ impl ShardWriter {
         Ok(reader.footer().journal_id)
     }
 
+    /// Merge this shard's manifest-named runs when the next seal is close
+    /// enough to the run ceilings that refusing is the alternative.
+    ///
+    /// Nothing else in the store removes a sealed run, so without this the
+    /// ceilings are a countdown, not a bound: every campaign long enough to
+    /// seal `max_open_index_runs` runs ends in a refusal regardless of load.
+    /// Runs merge newest-wins within their generation domain; staging-owned
+    /// (projection band) runs are never candidates, because they are not
+    /// manifest rows — they are re-derived by recovery from committed adoption
+    /// frames, and retiring what a recovery re-creates removes nothing.
+    ///
+    /// Every run this shard's generation pins hold — manifest rows and
+    /// adoption-resolved runs alike, because recovery's post-resolve count
+    /// enforces the open ceiling over exactly this total.
+    fn owned_run_count(&self, root: &CommittedRoot) -> u64 {
+        root.retained_generations()
+            .values()
+            .filter(|generation| generation.id.shard_index == self.shard_index)
+            .map(|generation| generation.index_runs.len() as u64)
+            .sum()
+    }
+
+    /// Returns whether a compaction was published, in which case the caller's
+    /// root is stale and must be reloaded. `incoming_runs` is what the caller
+    /// is about to add — one for a seal, the planned count for an adoption —
+    /// so both admissions share one trigger arithmetic.
+    fn compact_index_runs_if_crowded(
+        &mut self,
+        root: &CommittedRoot,
+        incoming_runs: u64,
+    ) -> Result<bool, StoreError> {
+        let allowed = u64::from(self.shared.options.max_open_index_runs);
+        let owned = self.owned_run_count(root);
+        // `max_open_index_runs <= max_index_runs` is a `StoreOptions` invariant,
+        // so headroom against the open ceiling is headroom against both.
+        if owned.saturating_add(incoming_runs) + COMPACTION_INSTALL_RESERVE <= allowed {
+            return Ok(false);
+        }
+        // A shard with no committed sequence has sealed nothing this writer may
+        // merge, and a maintenance publication would mint sequence 0 — a real
+        // frame — for a shard that has none.
+        let Some(committed_sequence) = root.shard_committed_sequence(self.shard_index) else {
+            return Ok(false);
+        };
+        let current_generation = self.current_manifest_generation(root)?;
+        let paths = RootLayout::new(&self.shared.options.root).shard(self.shard_index);
+        let manifest = read_manifest_or_empty(&paths, current_generation, &self.shared.root_uuid)?;
+        if manifest.index_runs.len() < 2 {
+            return Ok(false);
+        }
+        let pin = root
+            .retained_generations()
+            .get(&GenerationId::new(self.shard_index, current_generation))
+            .ok_or_else(|| {
+                StoreError::Corruption(format!(
+                    "generation {current_generation} vanished from the root while compacting"
+                ))
+            })?;
+        // Newest-first, mirroring both the answer order and the manifest read
+        // back in reverse — the same orientation recovery rebuilds.
+        let mut candidates = Vec::new();
+        for (row_generation, filename) in manifest.index_runs.iter().rev() {
+            let retained = pin
+                .index_runs
+                .iter()
+                .find(|retained| retained.run().generation() == *row_generation)
+                .ok_or_else(|| {
+                    StoreError::Corruption(format!(
+                        "manifest row {row_generation} ({filename}) is not pinned by \
+                         generation {current_generation}"
+                    ))
+                })?;
+            candidates.push(CompactionSource {
+                row_generation: *row_generation,
+                filename: filename.clone(),
+                run: Arc::clone(retained.run()),
+            });
+        }
+        let budget = allowed
+            .saturating_sub(owned)
+            .min(COMPACTION_INSTALL_RESERVE);
+        let Some(plan) = self.plan_index_run_compaction(&candidates, current_generation, budget)?
+        else {
+            return Ok(false);
+        };
+        self.compact_index_runs(root, committed_sequence, current_generation, plan)?;
+        Ok(true)
+    }
+
+    /// Decide a full pass — groups, install generations, encoded bytes and the
+    /// retirement row set — before anything durable, so every planning failure
+    /// is an ordinary error on an unchanged store.
+    fn plan_index_run_compaction(
+        &self,
+        candidates: &[CompactionSource],
+        current_generation: u64,
+        budget: u64,
+    ) -> Result<Option<PlannedCompaction>, StoreError> {
+        let root_uuid = self.shared.root_uuid;
+        let groups = span_partitioned_groups(root_uuid, current_generation + 1, candidates)?;
+        let selected = select_compaction_groups(groups, budget);
+        if selected.is_empty() {
+            return Ok(None);
+        }
+        // Oldest first, so ascending install generations reproduce precedence
+        // order in the manifest. The bytes are encoded again here rather than
+        // kept from the probe because only now is each group's real generation
+        // known; the delta is unchanged, so a span the probe accepted cannot
+        // fail.
+        let mut next_generation = current_generation;
+        let mut installs = Vec::new();
+        for group in selected.iter().rev() {
+            if group.merged.is_empty() {
+                continue;
+            }
+            next_generation += 1;
+            let bytes = IndexRunBuilder::new(root_uuid, next_generation, next_generation)
+                .build(&group.merged)
+                .map_err(|error| {
+                    StoreError::Corruption(format!(
+                        "encoding merged index run {next_generation}: {error}"
+                    ))
+                })?;
+            installs.push(PlannedRunInstall {
+                generation: next_generation,
+                bytes,
+            });
+        }
+        let retired: Vec<CompactionSource> = selected
+            .into_iter()
+            .flat_map(|group| group.sources)
+            .collect();
+        Ok(Some(PlannedCompaction {
+            installs,
+            retired,
+            retire_generation: next_generation + 1,
+        }))
+    }
+
+    /// Execute a planned pass: install every merged run, then one manifest
+    /// generation that stops naming the sources, then a single root swap that
+    /// answers from the merge.
+    ///
+    /// The durable order is what makes a crash anywhere here recoverable: each
+    /// intermediate manifest names a superset of the index (sources and merge
+    /// both), never less, and the trigger's headroom keeps every superset
+    /// within the row count recovery accepts. The poison boundary is the same
+    /// as `seal_index`'s — everything before the first install is pre-durable
+    /// and fails ordinary; from it onward, failure poisons.
+    fn compact_index_runs(
+        &mut self,
+        root: &CommittedRoot,
+        committed_sequence: u64,
+        current_generation: u64,
+        plan: PlannedCompaction,
+    ) -> Result<(), StoreError> {
+        let paths = RootLayout::new(&self.shared.options.root).shard(self.shard_index);
+        let root_uuid = self.shared.root_uuid;
+        let manifest_retain = self.shared.options.manifest_retain;
+        let counters = Arc::clone(self.journal.counters_handle());
+
+        let previous = root
+            .retained_generations()
+            .get(&GenerationId::new(self.shard_index, current_generation))
+            .map(Arc::clone)
+            .ok_or_else(|| {
+                StoreError::Corruption(format!(
+                    "generation {current_generation} vanished from the root while compacting"
+                ))
+            })?;
+        let mut index_runs: Vec<RetainedIndexRun> = previous
+            .index_runs
+            .iter()
+            .filter(|retained| {
+                !plan
+                    .retired
+                    .iter()
+                    .any(|source| Arc::ptr_eq(&source.run, retained.run()))
+            })
+            .cloned()
+            .collect();
+
+        // --- durable from here: every failure below poisons ----------------
+        let mut previous_generation = current_generation;
+        let mut installed: Vec<Arc<IndexRun>> = Vec::new();
+        for install in &plan.installs {
+            let sealed = match segment::install_index_run(
+                &paths,
+                &root_uuid,
+                previous_generation,
+                install.generation,
+                &install.bytes,
+                manifest_retain,
+                &counters,
+            ) {
+                Ok(sealed) => sealed,
+                Err(error) => {
+                    return Err(self.poison_now(format!("installing a merged index run: {error}")))
+                }
+            };
+            // Reopened from the device for the reason `seal_index` gives: a
+            // merged run that cannot be reopened is found while the shard can
+            // still poison, not at the next open.
+            let run = match IndexRun::open(&sealed.path, &root_uuid) {
+                Ok(run) => Arc::new(run),
+                Err(error) => {
+                    return Err(self.poison_now(format!("reopening a merged run: {error}")))
+                }
+            };
+            index_runs.push(RetainedIndexRun::new(sealed.path.clone(), Arc::clone(&run)));
+            installed.push(run);
+            previous_generation = install.generation;
+        }
+
+        // The retirement manifest: everything carried forward untouched except
+        // the run rows this pass replaced. When nothing was installed — a pass
+        // retiring only empty coverage stamps — the read is still pre-durable
+        // and fails ordinary.
+        let manifest = if plan.installs.is_empty() {
+            segment::read_manifest(&paths, previous_generation, &root_uuid)?
+        } else {
+            match segment::read_manifest(&paths, previous_generation, &root_uuid) {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    return Err(self.poison_now(format!(
+                        "rereading the manifest after a merged-run install: {error}"
+                    )))
+                }
+            }
+        };
+        let mut manifest = manifest;
+        manifest.generation = plan.retire_generation;
+        manifest.index_runs.retain(|(generation, filename)| {
+            !plan
+                .retired
+                .iter()
+                .any(|source| source.row_generation == *generation && &source.filename == filename)
+        });
+        if let Err(error) = segment::install_manifest(&paths, &manifest, manifest_retain, &counters)
+        {
+            return Err(self.poison_now(format!("installing the retirement manifest: {error}")));
+        }
+
+        // Reclaim every run file no manifest still on the device names.
+        // Sources survive exactly as long as a fallback could select them:
+        // `install_manifest` just trimmed the manifest set to
+        // `manifest_retain`, so the union of rows across the manifests that
+        // remain is the complete set of names any recovery can reach. What is
+        // left over is an orphan recovery ignores — but not one it skips:
+        // the generation-artifact scan inspects and budgets every `.idx`, so
+        // a store that compacted forever and unlinked nothing would stop
+        // reopening while its current manifest stayed small, and repeated
+        // full merges would hold roughly quadratic bytes. A retained manifest
+        // that no longer decodes contributes no names on purpose — it can
+        // never be selected, so files only it named are already unreachable.
+        // Open pins are unaffected: an unlinked inode lives for as long as
+        // any root or reader still maps it.
+        let sweep = || -> Result<(), StoreError> {
+            let mut named: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            for generation in segment::list_manifest_generations(&paths)? {
+                let Ok(kept) = segment::read_manifest(&paths, generation, &root_uuid) else {
+                    continue;
+                };
+                named.extend(kept.index_runs.into_iter().map(|(_, filename)| filename));
+            }
+            // Runs this session's recovery reported as reclaimed are forensic
+            // evidence, not residue (contract review 2026-07-30-G): the
+            // reclamation is invisible in the opened store, so the report and
+            // the `.idx` it points at are the only pair that explains it. The
+            // sweep spares them for as long as the report exists — this
+            // session — and a later session, whose recovery reported nothing
+            // about them, may reclaim their bytes like any other unmanifested
+            // run (2026-08-11-A, amendment 2).
+            named.extend(
+                self.shared
+                    .reclaimed_run_names
+                    .iter()
+                    .filter(|(shard, _)| *shard == self.shard_index)
+                    .map(|(_, name)| name.clone()),
+            );
+            let entries = match std::fs::read_dir(paths.indexes()) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(error.into()),
+            };
+            let mut removed = false;
+            for entry in entries {
+                let path = entry?.path();
+                if path.extension().and_then(|value| value.to_str()) != Some("idx") {
+                    continue;
+                }
+                let orphaned = path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|name| !named.contains(name));
+                if orphaned {
+                    crate::sys::unlink(&path)?;
+                    removed = true;
+                }
+            }
+            if removed {
+                crate::sys::fsync_dir(&paths.indexes(), &counters)?;
+            }
+            Ok(())
+        };
+        if let Err(error) = sweep() {
+            return Err(self.poison_now(format!("reclaiming retired index runs: {error}")));
+        }
+
+        // One root swap: merged runs in, sources out, the successor generation
+        // pinning exactly what the retirement manifest names plus what it
+        // carried forward. Retired run files stay on the device — older
+        // manifest generations recovery may fall back to still name them.
+        let successor = Arc::new(RetainedGeneration::new(
+            GenerationId::new(self.shard_index, plan.retire_generation),
+            Arc::clone(&previous.segments),
+            index_runs.into(),
+            Arc::clone(&previous.checkpoints),
+            Arc::clone(&previous.active_tails),
+            Arc::clone(&previous.projection_artifacts),
+        ));
+        let mut generations = GenerationMap::new();
+        generations.insert(successor.id, successor);
+        let mut sealed_runs = Vector::new();
+        for run in installed.iter().rev() {
+            sealed_runs.push_back(Arc::clone(run));
+        }
+        let mut subtree = ShardSubtree::new(
+            self.shard_index,
+            committed_sequence,
+            Arc::new(IndexDelta::from_options(&self.shared.options)),
+            None,
+            sealed_runs,
+            RepoMap::new(),
+            TerminalStatusMap::new(),
+            generations,
+        );
+        for source in &plan.retired {
+            subtree
+                .sealed_run_retirements
+                .push_back(Arc::clone(&source.run));
+        }
+        subtree
+            .retained_generation_removals
+            .push_back(GenerationId::new(self.shard_index, current_generation));
+        if let Err(error) = self.publish_subtree(&subtree) {
+            return Err(self.poison_now(format!("publishing an index compaction: {error}")));
+        }
+
+        // `replayable_index` estimates what a reopen must rebuild as
+        // `sealed_total - run_entry_baseline` plus the unsealed terms, and the
+        // newest-wins merge just shrank `sealed_total` by every duplicate it
+        // dropped — while what a reopen replays did not move at all. Left
+        // alone, that difference under-counts: a baseline-covered entry
+        // rewritten above the horizon loses its old copy here, admission
+        // stops counting the rewrite, and enough of them admit a store whose
+        // reopen exceeds `max_active_index_entries`. Shrinking the baseline by
+        // the same amount preserves the difference; `saturating_sub` can only
+        // leave the estimate higher than exact, which is the refuse-early
+        // direction every term of that estimator already leans.
+        let retired_entries: u64 = plan
+            .retired
+            .iter()
+            .map(|source| source.run.entry_count())
+            .sum();
+        let installed_entries: u64 = installed.iter().map(|run| run.entry_count()).sum();
+        self.run_entry_baseline = self
+            .run_entry_baseline
+            .saturating_sub(retired_entries.saturating_sub(installed_entries));
+        Ok(())
+    }
+
     fn seal_index(&mut self, root: &CommittedRoot, covered_through: u64) -> Result<(), StoreError> {
+        // A seal is the only place this shard's manifest run count grows, so
+        // approaching the ceilings is relieved here, before this seal's own
+        // admission below. When a pass ran, the caller's root is one
+        // publication behind and everything below must build on the compacted
+        // one.
+        let compacted;
+        let root: &CommittedRoot = if self.compact_index_runs_if_crowded(root, 1)? {
+            compacted = self.shared.committed.load();
+            &compacted
+        } else {
+            root
+        };
         // Both ceilings, before anything is durable, and against the *same*
         // numbers recovery enforces when it reopens the manifest (scope 3.8). A
         // seal that passed here can always be reopened; one that bypassed them
@@ -3538,13 +5079,7 @@ impl ShardWriter {
         // against one shard's manifest, so counting every shard here refused a
         // shard its first run because another shard already had one — a refusal
         // recovery would never have made.
-        let owned_runs: u64 = root
-            .retained_generations()
-            .values()
-            .filter(|generation| generation.id.shard_index == self.shard_index)
-            .map(|generation| generation.index_runs.len() as u64)
-            .sum();
-        let projected = owned_runs + 1;
+        let projected = self.owned_run_count(root) + 1;
         for (limit, allowed) in [
             ("max_index_runs", self.shared.options.max_index_runs),
             (
@@ -3752,11 +5287,17 @@ impl ShardWriter {
             // bound is enforced atomically with the insert by retrying this
             // whole reconsideration on CAS failure.
             match current.reserve(key, entry) {
+                // Same ID, same stable digest, already in flight: one
+                // request that arrived twice. It reserves nothing and
+                // sequences nothing -- `accept` moves its completion onto the
+                // leader's waiter and it is answered with whatever the leader
+                // is answered with.
                 StatusReservation::Attached(_) => {
-                    return Err(StoreError::NotImplemented(
-                        "same-ID/same-digest coalescing onto an in-flight leader — B1 \
-                         NamespaceTxn, scope 6-B1 deliverable 7",
-                    ))
+                    self.attached_to = Some(key);
+                    return Err(StoreError::Overloaded {
+                        limit: "coalesced_follower",
+                        retry_after_micros: 0,
+                    });
                 }
                 StatusReservation::OperationIdMismatch { .. } => {
                     return Err(StoreError::Conflict(format!(
@@ -4366,8 +5907,24 @@ mod tests {
     /// that created a directory, truncated a file, or appended a byte, and it
     /// catches all three including the empty-directory case, which a
     /// contents-only digest would miss.
-    fn tree_image(root: &Path) -> Vec<(PathBuf, bool, Vec<u8>)> {
-        fn walk(base: &Path, dir: &Path, out: &mut Vec<(PathBuf, bool, Vec<u8>)>) {
+    /// What one entry of a tree image is.
+    ///
+    /// A symlink is its own kind and carries its target rather than its
+    /// target's contents. An image that resolved links would not be an image of
+    /// *this* root -- it would describe files somewhere else, miss a link whose
+    /// target changed under it, and fail outright on a link to a directory --
+    /// and it would call a symlink replaced by a real directory of the same
+    /// name "unchanged", which is exactly the substitution these refusals
+    /// promise not to make.
+    #[derive(Debug, PartialEq, Eq)]
+    enum ImageNode {
+        Dir,
+        File(Vec<u8>),
+        Symlink(PathBuf),
+    }
+
+    fn tree_image(root: &Path) -> Vec<(PathBuf, ImageNode)> {
+        fn walk(base: &Path, dir: &Path, out: &mut Vec<(PathBuf, ImageNode)>) {
             let mut entries: Vec<_> = std::fs::read_dir(dir)
                 .expect("read a directory of the image")
                 .map(|entry| entry.expect("a directory entry").path())
@@ -4378,16 +5935,31 @@ mod tests {
                     .strip_prefix(base)
                     .expect("every walked path is under the base")
                     .to_path_buf();
-                if path.is_dir() {
-                    out.push((relative, true, Vec::new()));
+                let kind = std::fs::symlink_metadata(&path)
+                    .expect("stat an entry of the image")
+                    .file_type();
+                if kind.is_symlink() {
+                    out.push((
+                        relative,
+                        ImageNode::Symlink(
+                            std::fs::read_link(&path).expect("read a symlink target"),
+                        ),
+                    ));
+                } else if kind.is_dir() {
+                    out.push((relative, ImageNode::Dir));
                     walk(base, &path, out);
                 } else {
-                    out.push((relative, false, std::fs::read(&path).expect("read a file")));
+                    out.push((
+                        relative,
+                        ImageNode::File(std::fs::read(&path).expect("read a file")),
+                    ));
                 }
             }
         }
         let mut image = Vec::new();
-        if root.exists() {
+        // `symlink_metadata`, so a root that is itself a dangling symlink is
+        // an empty image rather than a panic.
+        if std::fs::symlink_metadata(root).is_ok() {
             walk(root, root, &mut image);
         }
         image
@@ -4648,9 +6220,9 @@ mod tests {
         let refuse = |label: &str, root: &Path| {
             let before = tree_image(root);
             match StoreEngine::open(options(&serial, root, 1)) {
-                Err(StoreError::NotImplemented(reason)) => {
+                Err(StoreError::UnrecognizedLayout(reason)) => {
                     assert!(
-                        reason.contains("startup states 3 and 4"),
+                        reason.contains("has not been modified"),
                         "{label}: {reason}"
                     );
                 }
@@ -4735,10 +6307,12 @@ mod tests {
         let refuse = |label: &str, root: &Path| {
             let before = tree_image(root);
             match StoreEngine::open(options(&serial, root, 1)) {
-                Err(StoreError::NotImplemented(reason)) => assert!(
-                    reason.contains("startup states 3 and 4"),
-                    "{label}: {reason}"
-                ),
+                Err(StoreError::UnrecognizedLayout(reason)) => {
+                    assert!(
+                        reason.contains("has not been modified"),
+                        "{label}: {reason}"
+                    )
+                }
                 other => panic!("{label}: expected a refusal, got {other:?}"),
             }
             assert_eq!(
@@ -4803,8 +6377,8 @@ mod tests {
         )
         .expect("mkfifo");
         match StoreEngine::open(options(&serial, fifo.path(), 1)) {
-            Err(StoreError::NotImplemented(reason)) => {
-                assert!(reason.contains("startup states 3 and 4"), "{reason}")
+            Err(StoreError::UnrecognizedLayout(reason)) => {
+                assert!(reason.contains("has not been modified"), "{reason}")
             }
             other => panic!("a fifo at the staging name: expected a refusal, got {other:?}"),
         }
@@ -4845,8 +6419,8 @@ mod tests {
         std::os::unix::fs::symlink(&victim, &link).expect("symlink");
 
         match StoreEngine::open(options(&serial, root.path(), 1)) {
-            Err(StoreError::NotImplemented(reason)) => {
-                assert!(reason.contains("startup states 3 and 4"), "{reason}")
+            Err(StoreError::UnrecognizedLayout(reason)) => {
+                assert!(reason.contains("has not been modified"), "{reason}")
             }
             other => panic!("expected a refusal, got {other:?}"),
         }
@@ -4961,8 +6535,8 @@ mod tests {
         let locked = tempfile::tempdir().expect("tempdir");
         std::os::unix::fs::symlink(&absent, locked.path().join("LOCK")).expect("symlink");
         match StoreEngine::open(options(&serial, locked.path(), 1)) {
-            Err(StoreError::NotImplemented(reason)) => {
-                assert!(reason.contains("startup states 3 and 4"), "{reason}")
+            Err(StoreError::UnrecognizedLayout(reason)) => {
+                assert!(reason.contains("has not been modified"), "{reason}")
             }
             other => panic!("expected a refusal for a symlinked LOCK, got {other:?}"),
         }
@@ -4984,8 +6558,8 @@ mod tests {
         .expect("marker");
         std::os::unix::fs::symlink(&victim, resumable.path().join("FORMAT.tmp")).expect("symlink");
         match StoreEngine::open(options(&serial, resumable.path(), 1)) {
-            Err(StoreError::NotImplemented(reason)) => {
-                assert!(reason.contains("startup states 3 and 4"), "{reason}")
+            Err(StoreError::UnrecognizedLayout(reason)) => {
+                assert!(reason.contains("has not been modified"), "{reason}")
             }
             other => panic!("expected a refusal for a symlinked FORMAT.tmp, got {other:?}"),
         }
@@ -5098,21 +6672,110 @@ mod tests {
         std::fs::create_dir_all(unrecognized.path().join("empty")).expect("stray directory");
         std::fs::write(unrecognized.path().join("empty-file"), b"").expect("stray empty file");
 
-        for root in [legacy.path(), unrecognized.path()] {
-            let before = tree_image(root);
-            match StoreEngine::open(options(&serial, root, 1)) {
-                Err(StoreError::NotImplemented(reason)) => {
-                    assert!(reason.contains("startup states 3 and 4"), "{reason}");
-                    assert!(reason.contains("LegacyLayout"), "{reason}");
-                    assert!(reason.contains("UnrecognizedLayout"), "{reason}");
-                    assert!(reason.contains("has not been modified"), "{reason}");
-                }
-                other => panic!("expected an explicit refusal for {root:?}, got {other:?}"),
+        // The two are asserted separately and not through one shared shape,
+        // because the whole point of the recognizer is that they get different
+        // answers. A test that accepted either error for either root would
+        // pass with the recognizer deleted.
+        let before = tree_image(legacy.path());
+        match StoreEngine::open(options(&serial, legacy.path(), 1)) {
+            Err(StoreError::LegacyLayout { migrate_command }) => {
+                assert_eq!(
+                    migrate_command,
+                    format!(
+                        "levcs-instance migrate-store --source {} --destination <dest>",
+                        legacy.path().display()
+                    ),
+                    "state 3 must carry the exact migrate-store command, source included: an \
+                     operator holding real data needs the next step and not a diagnosis"
+                );
+            }
+            other => panic!("expected a legacy-layout refusal, got {other:?}"),
+        }
+        assert_eq!(
+            tree_image(legacy.path()),
+            before,
+            "a refused legacy layout must be byte-identical afterwards"
+        );
+
+        let before = tree_image(unrecognized.path());
+        match StoreEngine::open(options(&serial, unrecognized.path(), 1)) {
+            Err(StoreError::UnrecognizedLayout(reason)) => {
+                assert!(reason.contains("carries no FORMAT"), "{reason}");
+                assert!(reason.contains("has not been modified"), "{reason}");
+                assert!(
+                    !reason.contains("migrate-store"),
+                    "state 4 must not suggest a migration: this store does not know what the \
+                     directory is, and a migration command taken on faith costs data: {reason}"
+                );
+            }
+            other => panic!("expected an unrecognized-layout refusal, got {other:?}"),
+        }
+        assert_eq!(
+            tree_image(unrecognized.path()),
+            before,
+            "a refused unrecognized layout must be byte-identical afterwards"
+        );
+    }
+
+    /// The signature is a *shape*, not a name that looks repository-ish.
+    ///
+    /// Each root here is one edit away from state 3 and must be state 4: the
+    /// hazard is a recognizer loose enough to call an operator's ordinary
+    /// directory a legacy instance, which answers them with a migration command
+    /// for data that is not there.
+    #[test]
+    fn near_misses_of_the_legacy_signature_are_unrecognized_rather_than_legacy() {
+        let serial = writer_serial();
+        let cases: [(&str, &dyn Fn(&Path)); 6] = [
+            ("63 hex characters", &|root: &Path| {
+                std::fs::create_dir_all(root.join("a".repeat(63)).join(".levcs")).expect("tree");
+            }),
+            ("64 characters that are not all hex", &|root: &Path| {
+                std::fs::create_dir_all(root.join(format!("{}z", "a".repeat(63))).join(".levcs"))
+                    .expect("tree");
+            }),
+            ("a repository name with no .levcs", &|root: &Path| {
+                std::fs::create_dir_all(root.join("a".repeat(64)).join("objects")).expect("tree");
+            }),
+            ("a .levcs that is a file", &|root: &Path| {
+                let repo = root.join("a".repeat(64));
+                std::fs::create_dir_all(&repo).expect("tree");
+                std::fs::write(repo.join(".levcs"), b"not a directory").expect("file");
+            }),
+            // The signature is about what this root holds, not what it can
+            // reach. A `.levcs` link to a directory elsewhere satisfies any
+            // check that follows links, and answering it as state 3 hands an
+            // operator a migration command for repositories that are not here.
+            (
+                "a .levcs symlinked to an external directory",
+                &|root: &Path| {
+                    let external = root.join("elsewhere");
+                    std::fs::create_dir_all(external.join("objects")).expect("external tree");
+                    let repo = root.join("a".repeat(64));
+                    std::fs::create_dir_all(&repo).expect("tree");
+                    std::os::unix::fs::symlink(&external, repo.join(".levcs")).expect("symlink");
+                },
+            ),
+            // And the repository directory itself, for the same reason.
+            ("a repository entry that is a symlink", &|root: &Path| {
+                let external = root.join("elsewhere");
+                std::fs::create_dir_all(external.join(".levcs")).expect("external tree");
+                std::os::unix::fs::symlink(&external, root.join("a".repeat(64))).expect("symlink");
+            }),
+        ];
+
+        for (what, build) in cases {
+            let root = tempfile::tempdir().expect("tempdir");
+            build(root.path());
+            let before = tree_image(root.path());
+            match StoreEngine::open(options(&serial, root.path(), 1)) {
+                Err(StoreError::UnrecognizedLayout(_)) => {}
+                other => panic!("{what} must be state 4, got {other:?}"),
             }
             assert_eq!(
-                tree_image(root),
+                tree_image(root.path()),
                 before,
-                "a refused non-empty layout must be byte-identical afterwards: {root:?}"
+                "{what}: a refused root must be byte-identical afterwards"
             );
         }
     }
@@ -7171,6 +8834,586 @@ mod index_maintenance_tests {
                     .get(&IndexKey::new(namespace, *object))
                     .is_some(),
                 "{} did not survive the reopen",
+                object.to_hex()
+            );
+        }
+    }
+
+    /// Nothing in the store removes a sealed run except compaction, so a
+    /// workload that seals more runs than `max_open_index_runs` is only
+    /// admissible if approaching the ceiling merges sealed runs instead of
+    /// refusing. Every bound asserted here is the recovery-enforced one — a
+    /// final manifest with more rows than the ceiling is a store that opens
+    /// once — which is why the reopen at the end is part of the assertion.
+    #[test]
+    fn crossing_the_open_run_ceiling_compacts_instead_of_refusing() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let namespace = NamespaceId([0x51; 32]);
+        let configure = || {
+            let mut options = sealing_options(&serial, temporary.path(), 4_000_000);
+            options.max_index_runs = 3;
+            options.max_open_index_runs = 3;
+            options
+        };
+        let mut covered = vec![genesis_object().id];
+        {
+            let engine = StoreEngine::open(configure()).expect("open a fresh root");
+            block_on(engine.submit(create_transaction(namespace, 2))).expect("create");
+            // Every third push crosses the fan-out ceiling and seals one more
+            // run. Fifteen pushes are five seals' worth against a ceiling of
+            // three: without compaction the fourth seal refuses with
+            // `max_open_index_runs` and the push that triggered it fails.
+            for round in 0u8..5 {
+                covered.extend(push_groups(&engine, namespace, 0x60 + round * 3, 3));
+            }
+
+            // Manifest generations advance once per installed run and once per
+            // retirement and never regress, so the pointer is the count the
+            // reclamation sweep cannot erase: five fan-out seals alone reach
+            // five, and anything past seven proves compaction both installed
+            // and retired. Counting files stopped being vitality the moment
+            // retired files began to be reclaimed.
+            let pointer = read_current(
+                &shard_paths(temporary.path(), 0),
+                &root_uuid_of(temporary.path()),
+            )
+            .expect("read CURRENT")
+            .expect("a sealed store has a CURRENT");
+            assert!(
+                pointer.generation >= 7,
+                "manifest generation {} says the ceiling was never approached and this \
+                 test asserts nothing",
+                pointer.generation
+            );
+            assert!(
+                engine.index_maintenance().sealed_runs <= 3,
+                "compaction must keep the open-run count within the ceiling, found {}",
+                engine.index_maintenance().sealed_runs
+            );
+            let rows = manifest_runs(temporary.path(), 0, root_uuid_of(temporary.path()));
+            assert!(
+                rows.len() <= 3,
+                "the manifest names {} rows, more than recovery would accept",
+                rows.len()
+            );
+            // Advance the replay horizon past every frame above, so the reopen
+            // below cannot answer from replayed delta layers and the merged
+            // run is the only index most of these objects have.
+            drop(engine.checkpoint().expect("checkpoint"));
+        }
+
+        let engine = StoreEngine::open(configure()).expect("reopen through production recovery");
+        let root = engine.committed_root();
+        for object in &covered {
+            let key = IndexKey::new(namespace, *object);
+            assert!(
+                root.index()
+                    .delta_layers()
+                    .iter()
+                    .all(|layer| layer.delta.get(&key).is_none()),
+                "{} is answered by a replayed delta layer, so this asserts nothing about \
+                 the merged run",
+                object.to_hex()
+            );
+            let location = root
+                .index()
+                .get(&key)
+                .unwrap_or_else(|| panic!("{} is not answered by any sealed run", object.to_hex()));
+            assert!(
+                root.object_source(0, location.segment_generation)
+                    .expect("resolve")
+                    .is_some(),
+                "{} must resolve to a file the recovered root still pins",
+                object.to_hex()
+            );
+        }
+    }
+
+    /// One sealed run built in memory, for merge tests that need exact
+    /// locations rather than whatever a live engine assigned.
+    fn run_of(
+        uuid: [u8; 16],
+        generation: u64,
+        entries: &[(NamespaceId, ObjectId, IndexLocation)],
+    ) -> Arc<IndexRun> {
+        let mut delta = IndexDelta::new(u64::MAX, u64::MAX);
+        for (namespace, object, location) in entries {
+            delta
+                .insert(IndexKey::new(*namespace, *object), *location)
+                .expect("insert");
+        }
+        Arc::new(
+            IndexRun::from_vec(
+                IndexRunBuilder::new(uuid, generation, generation)
+                    .build(&delta)
+                    .expect("encode"),
+                &uuid,
+            )
+            .expect("reopen from bytes"),
+        )
+    }
+
+    fn location_at(generation: u64, offset: u64, sequence: u64) -> IndexLocation {
+        IndexLocation {
+            segment_generation: generation,
+            frame_offset: offset,
+            frame_len: 8,
+            object_type: ObjectType::Blob as u8,
+            shard_sequence: sequence,
+        }
+    }
+
+    /// The merge is only correct if it answers exactly what the source stack
+    /// answered: every key present, and a key several sources carry answered
+    /// by the newest — `LayeredObjectIndex::lookup`'s first-hit-wins rule.
+    #[test]
+    fn merging_sealed_runs_preserves_entries_and_newest_wins() {
+        let uuid = [0x21; 16];
+        let namespace = NamespaceId([0x52; 32]);
+        let rewritten = ObjectId([0xA0; 32]);
+        let only_new = ObjectId([0xA1; 32]);
+        let only_old = ObjectId([0xA2; 32]);
+        let newest_location = location_at(2, 4096, 9);
+        let stale_location = location_at(1, 512, 3);
+        let newer = run_of(
+            uuid,
+            2,
+            &[
+                (namespace, rewritten, newest_location),
+                (namespace, only_new, location_at(2, 8192, 8)),
+            ],
+        );
+        let older = run_of(
+            uuid,
+            1,
+            &[
+                (namespace, rewritten, stale_location),
+                (namespace, only_old, location_at(1, 1024, 2)),
+            ],
+        );
+
+        let merged = merge_index_runs_newest_wins(&[newer, older]).expect("merge");
+        assert_eq!(merged.len(), 3, "every distinct key must survive the merge");
+        assert_eq!(
+            merged.get(&IndexKey::new(namespace, rewritten)),
+            Some(newest_location),
+            "a rewritten object must answer from the newest source, as the stack did"
+        );
+        assert_eq!(
+            merged.get(&IndexKey::new(namespace, only_new)),
+            Some(location_at(2, 8192, 8))
+        );
+        assert_eq!(
+            merged.get(&IndexKey::new(namespace, only_old)),
+            Some(location_at(1, 1024, 2))
+        );
+    }
+
+    /// Journal runs are manifest rows this writer owns; band runs are
+    /// staging-owned artifacts recovery re-derives. A merge across that line
+    /// must refuse, never resolve.
+    #[test]
+    fn a_merge_crossing_the_projection_band_is_refused() {
+        let uuid = [0x22; 16];
+        let namespace = NamespaceId([0x53; 32]);
+        let journal = run_of(
+            uuid,
+            1,
+            &[(namespace, ObjectId([0xB0; 32]), location_at(1, 512, 1))],
+        );
+        let band = run_of(
+            uuid,
+            2,
+            &[(
+                namespace,
+                ObjectId([0xB1; 32]),
+                location_at(crate::staging::PROJECTION_GENERATION_BAND | (7 << 24), 0, 2),
+            )],
+        );
+
+        let error = merge_index_runs_newest_wins(&[band, journal])
+            .expect_err("a cross-domain merge must be refused");
+        let StoreError::Corruption(message) = error else {
+            panic!("expected a Corruption refusal, got {error:?}")
+        };
+        assert!(
+            message.contains("projection generation band"),
+            "the refusal must name the band it would have crossed: {message}"
+        );
+    }
+
+    /// One candidate row as the planner would build it, from an in-memory run.
+    fn candidate_of(
+        uuid: [u8; 16],
+        namespace: NamespaceId,
+        generation: u64,
+        location: IndexLocation,
+    ) -> CompactionSource {
+        CompactionSource {
+            row_generation: generation,
+            filename: index_run_filename(generation),
+            run: run_of(
+                uuid,
+                generation,
+                &[(namespace, ObjectId([generation as u8; 32]), location)],
+            ),
+        }
+    }
+
+    /// Two groups the encoder cannot bridge and one install of budget: the
+    /// newest pair must be the one taken. A merged run answers above every
+    /// remaining row, so promoting the older pair would put its stale answers
+    /// above rows it never merged.
+    #[test]
+    fn selection_prefers_the_newest_group_under_budget() {
+        let uuid = [0x23; 16];
+        let namespace = NamespaceId([0x55; 32]);
+        // A segment-generation gap the 16-bit section span cannot bridge sits
+        // between the two pairs, so partitioning must split there.
+        let far = 70_000;
+        let candidates = [
+            candidate_of(uuid, namespace, 4, location_at(far + 1, 512, 8)),
+            candidate_of(uuid, namespace, 3, location_at(far, 512, 7)),
+            candidate_of(uuid, namespace, 2, location_at(2, 512, 2)),
+            candidate_of(uuid, namespace, 1, location_at(1, 512, 1)),
+        ];
+
+        let groups = span_partitioned_groups(uuid, 5, &candidates).expect("partition");
+        assert_eq!(groups.len(), 2, "the span gap must split the candidates");
+        let selected = select_compaction_groups(groups, 1);
+        assert_eq!(selected.len(), 1, "one install of budget takes one group");
+        assert_eq!(
+            selected[0]
+                .sources
+                .iter()
+                .map(|source| source.row_generation)
+                .collect::<Vec<_>>(),
+            vec![4, 3],
+            "the newest pair merges; promoting the older pair above it would invert precedence"
+        );
+    }
+
+    /// The partition takes the largest newest-prefix the encoder accepts. A
+    /// midpoint split of this list produced three singletons and no install at
+    /// all — even though the newest pair fits — and at the run ceiling that
+    /// meant the next seal refused.
+    #[test]
+    fn a_mergeable_newest_prefix_is_not_stranded_by_an_over_span_tail() {
+        let uuid = [0x25; 16];
+        let namespace = NamespaceId([0x57; 32]);
+        let candidates = [
+            candidate_of(uuid, namespace, 3, location_at(70_000, 512, 5)),
+            candidate_of(uuid, namespace, 2, location_at(69_999, 512, 4)),
+            candidate_of(uuid, namespace, 1, location_at(1, 512, 1)),
+        ];
+
+        let groups = span_partitioned_groups(uuid, 4, &candidates).expect("partition");
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| group.sources.len())
+                .collect::<Vec<_>>(),
+            vec![2, 1],
+            "the newest pair fits and must form a group; only the far tail stays alone"
+        );
+        let selected = select_compaction_groups(groups, 1);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(
+            selected[0]
+                .sources
+                .iter()
+                .map(|source| source.row_generation)
+                .collect::<Vec<_>>(),
+            vec![3, 2],
+            "the newest pair installs; the lone old run stays behind it"
+        );
+    }
+
+    /// A lone run the encoder cannot merge with anything newer is a boundary:
+    /// installing an older merge above it would let stale locations answer
+    /// ahead of rows the pass never touched, so the pass installs nothing.
+    #[test]
+    fn an_unmergeable_newest_run_blocks_installs_behind_it() {
+        let uuid = [0x24; 16];
+        let namespace = NamespaceId([0x56; 32]);
+        let candidates = [
+            candidate_of(uuid, namespace, 3, location_at(70_000, 512, 5)),
+            candidate_of(uuid, namespace, 2, location_at(2, 512, 2)),
+            candidate_of(uuid, namespace, 1, location_at(1, 512, 1)),
+        ];
+
+        let groups = span_partitioned_groups(uuid, 4, &candidates).expect("partition");
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| group.sources.len())
+                .collect::<Vec<_>>(),
+            vec![1, 2],
+            "the unmergeable newest run must survive as a visible singleton"
+        );
+        assert!(
+            select_compaction_groups(groups, 2).is_empty(),
+            "no install may answer above the unmerged newest run"
+        );
+    }
+
+    /// Retired run files are orphans recovery ignores — but not ones it
+    /// skips: the generation-artifact scan inspects and budgets every `.idx`
+    /// on the device. A store that compacts forever and reclaims nothing
+    /// stops reopening while its current manifest stays small, so the sweep
+    /// is load-bearing for reopen, not tidiness.
+    #[test]
+    fn retired_run_files_are_reclaimed_before_the_artifact_scan_budget() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let namespace = NamespaceId([0x59; 32]);
+        let configure = || {
+            let mut options = sealing_options(&serial, temporary.path(), 4_000_000);
+            options.max_index_runs = 3;
+            options.max_open_index_runs = 3;
+            // The artifact budget is max_manifest_candidates (equal to
+            // manifest_retain) times (max_index_runs + checkpoint_retain + 16),
+            // floored at 64. These minimums land exactly on the floor, so the
+            // rounds below install more runs than a reopen may inspect.
+            options.manifest_retain = 2;
+            options
+        };
+        {
+            let engine = StoreEngine::open(configure()).expect("open a fresh root");
+            block_on(engine.submit(create_transaction(namespace, 2))).expect("create");
+            // Forty-eight fan-out seals plus the compaction passes between
+            // them install over seventy runs against a budget of sixty-four
+            // inspected artifacts.
+            for round in 0u8..48 {
+                push_groups(&engine, namespace, 0x10 + round * 3, 3);
+            }
+            let files = std::fs::read_dir(shard_paths(temporary.path(), 0).indexes())
+                .expect("list run files")
+                .filter_map(|entry| entry.expect("dir entry").file_name().into_string().ok())
+                .filter(|name| name.ends_with(".idx"))
+                .count();
+            assert!(
+                files <= 8,
+                "the sweep left {files} run files behind; unreclaimed sources cross the \
+                 reopen budget long before the manifest does"
+            );
+        }
+        StoreEngine::open(configure())
+            .expect("a long-compacting store must stay inside the artifact-scan budget");
+    }
+
+    /// Compaction may not reclaim what a recovery reported. A reclaimed run's
+    /// `.idx` is the only explanation-bearing artifact the report points at
+    /// (contract review 2026-07-30-G), so the sweep excludes every file this
+    /// session's reports name — while still taking retired sources, which is
+    /// what the file-count bound at the end establishes.
+    #[test]
+    fn compaction_leaves_a_reported_reclaimed_run_inspectable() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let namespace = NamespaceId([0x5A; 32]);
+        let configure = || {
+            let mut options = sealing_options(&serial, temporary.path(), 4_000_000);
+            options.max_index_runs = 3;
+            options.max_open_index_runs = 3;
+            options
+        };
+        // The displacement fixture of 2026-07-30-G: a published run whose only
+        // identity an orphan `.seg` occupies, so the reopen reclaims it and
+        // reports the file it left behind.
+        {
+            let engine = StoreEngine::open(configure()).expect("open a fresh root");
+            block_on(engine.submit(create_transaction(namespace, 2))).expect("create");
+            push_groups(&engine, namespace, 0x60, 2);
+            block_on(engine.submit(push_transaction(namespace, 0x68, 0x68, None)))
+                .expect("the group after the seal commits");
+            assert_eq!(engine.index_maintenance().sealed_runs, 1, "the seal ran");
+            orphan_segment_at(temporary.path(), 0, 1);
+        }
+
+        let engine = StoreEngine::open(configure()).expect("the reopen reclaims the run");
+        let reported = engine.shared.recovery_reports[0]
+            .reclaimed_index_runs
+            .clone();
+        assert_eq!(
+            reported.len(),
+            1,
+            "the fixture must produce exactly one reclaimed run"
+        );
+        assert!(
+            reported[0].exists(),
+            "the reported file precedes compaction"
+        );
+
+        // Enough sealing to cross the trigger repeatedly, so the sweep runs.
+        for round in 0u8..4 {
+            push_groups(&engine, namespace, 0x70 + round * 3, 3);
+        }
+
+        assert!(
+            reported[0].exists(),
+            "the reclaimed run this session reported must stay inspectable through \
+             compaction; the sweep takes retired sources, never forensic evidence"
+        );
+        // And the sweep genuinely ran: a dozen installs happened above, and
+        // only the retained window plus the forensic file may remain.
+        let files = std::fs::read_dir(shard_paths(temporary.path(), 0).indexes())
+            .expect("list run files")
+            .filter_map(|entry| entry.expect("dir entry").file_name().into_string().ok())
+            .filter(|name| name.ends_with(".idx"))
+            .count();
+        assert!(
+            files <= 6,
+            "{files} run files remain, so the sweep never ran and the forensic assertion \
+             above is vacuous"
+        );
+    }
+
+    /// Compaction's newest-wins merge drops duplicate entries, which shrinks
+    /// the `sealed - baseline` difference `replayable_index` admits against —
+    /// while what a reopen actually replays does not shrink at all. The
+    /// baseline must move with the merge, or enough rewrites let admission
+    /// outrun recovery's own ceiling and the store commits work it cannot
+    /// reopen. The property asserted at the end is the whole point: every
+    /// store the writer admits must be a store that opens.
+    #[test]
+    fn compaction_keeps_admission_honest_about_replayable_entries() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let namespace = NamespaceId([0x58; 32]);
+        let configure = || {
+            let mut options = sealing_options(&serial, temporary.path(), 12);
+            options.max_index_runs = 3;
+            options.max_open_index_runs = 3;
+            options
+        };
+        {
+            let engine = StoreEngine::open(configure()).expect("open a fresh root");
+            block_on(engine.submit(create_transaction(namespace, 2))).expect("create");
+            // Four keys below the horizon, then a checkpoint that sets the
+            // baseline over the runs holding them.
+            push_groups(&engine, namespace, 0x30, 4);
+            drop(engine.checkpoint().expect("checkpoint"));
+            // The same four objects rewritten above the horizon: fresh
+            // operations, identical object ids. Their old locations sit in
+            // baseline-covered runs, so compaction drops exactly these
+            // duplicates — the case that used to shrink the estimate while
+            // the replayed frames stayed.
+            for step in 0u8..4 {
+                block_on(engine.submit(push_transaction(
+                    namespace,
+                    0x40 + step,
+                    0x30 + step,
+                    None,
+                )))
+                .unwrap_or_else(|error| panic!("rewrite {step} commits: {error:?}"));
+            }
+            // New keys until the replay guard refuses. The bound is vitality:
+            // a guard that never refuses would otherwise let this loop admit
+            // arbitrarily far past what a reopen can rebuild.
+            let mut refused = None;
+            for step in 0u8..20 {
+                match block_on(engine.submit(push_transaction(
+                    namespace,
+                    0x50 + step,
+                    0x70 + step,
+                    None,
+                ))) {
+                    Ok(_) => {}
+                    Err(error) => {
+                        refused = Some(error);
+                        break;
+                    }
+                }
+            }
+            let refused = refused.expect("the replay guard must refuse within twenty pushes");
+            assert!(
+                matches!(
+                    &refused,
+                    StoreError::LimitExceeded {
+                        limit: "max_active_index_entries",
+                        ..
+                    }
+                ),
+                "the refusal must be the replay guard, got {refused:?}"
+            );
+        }
+
+        StoreEngine::open(configure())
+            .expect("every admitted transaction must leave a store that reopens");
+    }
+
+    /// The one durable window compaction introduces: merged run installed and
+    /// named, sources not yet retired. The manifest names a superset of the
+    /// index, so a crash there must reopen and answer — never refuse, never
+    /// lose a key.
+    #[test]
+    fn an_interrupted_compaction_leaves_a_superset_the_store_reopens() {
+        let serial = writer_serial();
+        let temporary = tempfile::tempdir().expect("tempdir");
+        let namespace = NamespaceId([0x54; 32]);
+        let configure = || {
+            let mut options = sealing_options(&serial, temporary.path(), 4_000_000);
+            options.max_index_runs = 3;
+            options.max_open_index_runs = 3;
+            options
+        };
+        let mut covered = vec![genesis_object().id];
+        {
+            let engine = StoreEngine::open(configure()).expect("open a fresh root");
+            block_on(engine.submit(create_transaction(namespace, 2))).expect("create");
+            // Two seals' worth: every third push crosses the fan-out ceiling.
+            covered.extend(push_groups(&engine, namespace, 0x70, 6));
+        }
+
+        // Exactly the crash window, constructed with the same installer the
+        // pass uses: the merged run is manifest-named, and so are its sources.
+        let uuid = root_uuid_of(temporary.path());
+        let paths = shard_paths(temporary.path(), 0);
+        let pointer = read_current(&paths, &uuid)
+            .expect("read CURRENT")
+            .expect("a sealed store has a CURRENT");
+        let rows = read_manifest(&paths, pointer.generation, &uuid)
+            .expect("read the current manifest")
+            .index_runs;
+        assert_eq!(rows.len(), 2, "two sealed runs precede the interruption");
+        let sources: Vec<Arc<IndexRun>> = rows
+            .iter()
+            .rev()
+            .map(|(_, filename)| {
+                Arc::new(IndexRun::open(&paths.indexes().join(filename), &uuid).expect("open"))
+            })
+            .collect();
+        let merged = merge_index_runs_newest_wins(&sources).expect("merge");
+        let next = pointer.generation + 1;
+        let bytes = IndexRunBuilder::new(uuid, next, next)
+            .build(&merged)
+            .expect("encode");
+        crate::segment::install_index_run(
+            &paths,
+            &uuid,
+            pointer.generation,
+            next,
+            &bytes,
+            configure().manifest_retain,
+            &DurabilityCounters::default(),
+        )
+        .expect("install the merged run without retiring its sources");
+
+        let engine = StoreEngine::open(configure()).expect("a superset manifest must reopen");
+        assert_eq!(
+            engine.index_maintenance().sealed_runs,
+            3,
+            "recovery answers from sources and merge alike"
+        );
+        let root = engine.committed_root();
+        for object in &covered {
+            assert!(
+                root.index()
+                    .get(&IndexKey::new(namespace, *object))
+                    .is_some(),
+                "{} must survive the interrupted compaction",
                 object.to_hex()
             );
         }

@@ -430,7 +430,15 @@
           "minLength": 1
         },
         "temperature_celsius": {
-          "type": "number"
+          "oneOf": [
+            {
+              "type": "number"
+            },
+            {
+              "const": "recorded by the deployed-node harness"
+            }
+          ],
+          "description": "The NVMe composite temperature read for this run, or the deployed-node placeholder when the host exposed no sensor. The placeholder is a hardware-field marker, so a bundle carrying it cannot name a frozen profile and cannot pass; a number here is a measurement, never a default."
         },
         "nic": {
           "type": "string",
@@ -560,9 +568,10 @@
         "index_run_ceiling": {
           "enum": [
             "store_default",
+            "raised_above_store_default",
             "raised_because_index_sealing_unimplemented"
           ],
-          "description": "Whether StoreOptions::max_index_runs was left at the store default (64) or raised so the run could reach its measured seconds despite unimplemented index-delta sealing. Cross-checked against resources.configured_ceilings.max_index_runs by the two \"index run ceiling\" rules in allOf: \"store_default\" bounds the recorded value at 64 and the raised value floors it at 65, so a bundle that declares one and records the other is invalid. The recorded value must be the value the run configured, never a constant restated here."
+          "description": "Whether StoreOptions::max_index_runs was left at the store default (64) or raised above it. Cross-checked against resources.configured_ceilings.max_index_runs by the two \"index run ceiling\" rules in allOf: \"store_default\" bounds the recorded value at 64 and either raised value floors it at 65, so a bundle that declares one and records the other is invalid. The recorded value must be the value the run configured, never a constant restated here. DEPRECATED: \"raised_because_index_sealing_unimplemented\" is accepted only so archived v1 bundles stay valid; index-delta sealing is implemented and the emitter no longer produces it. It states a cause the emitter never verified — the declaration is derived by comparing the configured ceiling with the store default, so it named a reason for a fact it only observed. Emit \"raised_above_store_default\", which is that fact and nothing more. Contract review 2026-08-09-B."
         },
         "receipt_reconciliation": {
           "enum": [
@@ -782,7 +791,7 @@
             "max_index_runs": {
               "type": "integer",
               "minimum": 1,
-              "description": "The StoreOptions::max_index_runs the run actually configured, read back from the options the store opened with — never the store default restated here, and never omitted. Bounded against run_conditions.index_run_ceiling by the two \"index run ceiling\" rules in allOf, so a defaulted or contradicted value is invalid rather than merely unverified. It is a ceiling this workload genuinely reaches: index-delta sealing being unimplemented makes it the limit submit refuses at."
+              "description": "The StoreOptions::max_index_runs the run actually configured, read back from the options the store opened with — never the store default restated here, and never omitted. Bounded against run_conditions.index_run_ceiling by the two \"index run ceiling\" rules in allOf, so a defaulted or contradicted value is invalid rather than merely unverified. It is a ceiling this workload genuinely reaches: the run seals against it, and its fan-out trigger is what imposes the steady state a P2 number has to be measured in."
             }
           },
           "additionalProperties": {
@@ -1574,7 +1583,10 @@
           "run_conditions": {
             "properties": {
               "index_run_ceiling": {
-                "const": "raised_because_index_sealing_unimplemented"
+                "enum": [
+                  "raised_above_store_default",
+                  "raised_because_index_sealing_unimplemented"
+                ]
               }
             },
             "required": [
@@ -1648,6 +1660,9 @@
                   "minimum-30k",
                   "release-60k"
                 ]
+              },
+              "temperature_celsius": {
+                "type": "number"
               }
             }
           }

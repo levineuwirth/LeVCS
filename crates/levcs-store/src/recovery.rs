@@ -2320,6 +2320,17 @@ fn recover_shard_under_lock(
         // The frame's own sequence is the adoption's identity, and the only
         // authority that creates one: staging has no durable position for a pin
         // that transferred across a process boundary.
+        // The same materialization the live adopter performs, replayed. A
+        // process that stopped between the fence and materialization left some
+        // prefix of this frame's runs on disk, and possibly none; recomputing
+        // them from the same committed inputs either finds identical bytes or
+        // writes what is missing. That is what makes that window recoverable
+        // rather than a state recovery can only report.
+        resolver.materialize_committed_index_runs(
+            frame.facts.namespace,
+            descriptor,
+            frame.facts.shard_sequence,
+        )?;
         let artifacts = resolver.resolve_committed(
             frame.facts.namespace,
             descriptor,
@@ -3202,6 +3213,18 @@ mod production_session_tests {
     impl ProjectionRecoveryResolver for StagedResolver {
         fn transferred_sessions(&self, _shard_index: u16) -> Result<Arc<[[u8; 16]]>, StoreError> {
             Ok(Arc::from([self.descriptor.session_id, self.absent_session]))
+        }
+
+        /// The double's runs are whatever its fixture already holds, so
+        /// materialization has nothing to create. Recording that it *ran* is
+        /// what the callers under test care about; producing bytes is not.
+        fn materialize_committed_index_runs(
+            &self,
+            _namespace: NamespaceId,
+            _descriptor: &StagedProjectionInstallV1,
+            _adoption_shard_sequence: u64,
+        ) -> Result<(), StoreError> {
+            Ok(())
         }
 
         fn resolve_committed(

@@ -648,10 +648,11 @@ This is a young project. The most useful contributions right now are:
 3. **Plugin handlers.** The wasm plugin protocol exists; concrete
    handlers (e.g. protobuf, SQL migrations) are needed to validate it.
 4. **Tightening CI.** CI builds and tests the workspace, runs the
-   deployment gate, and checks formatting, clippy, a build on the declared
-   `rust-version`, and the lockfile against the RustSec advisory
-   database. Clippy leaves out `levcs-store`, whose storage engine is
-   being replaced; its warnings go with it.
+   deployment gate and the Phase 1 storage gate
+   (`scripts/check-phase1.sh`), and checks formatting, clippy, a build on
+   the declared `rust-version`, and the lockfile against the RustSec
+   advisory database. Clippy leaves out `levcs-store`, whose warnings are
+   not yet fixed.
 
 Please open an issue or reach out before starting non-trivial work so
 we can coordinate.

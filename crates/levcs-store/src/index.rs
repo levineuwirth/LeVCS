@@ -1126,6 +1126,36 @@ impl IndexRun {
     /// at all — but a section covering the range does not mean an entry in it
     /// does, and answering `true` on the range alone would turn recoverable
     /// roots into outages for a generation no entry mentions.
+    /// Every entry this run holds, in stored order.
+    ///
+    /// Granted to B1 by contract review 2026-08-09-C, for index-run compaction.
+    /// Merging sealed runs is the only way the open-run count stays under
+    /// `max_open_index_runs` across a measured campaign -- nothing else in the
+    /// store ever removes a run -- and a merge cannot be written against an API
+    /// that answers only point lookups.
+    ///
+    /// Read-only and additive: no byte of the format moves, and the order is
+    /// the one already on the device (sections ascending by namespace, entries
+    /// ascending within a section), so a caller that re-encodes what it reads
+    /// produces the same layout it consumed.
+    ///
+    /// Deliberately not `Iterator`-returning-`Result`: every value here is
+    /// decoded from bytes this run already validated at `open`, so there is no
+    /// per-entry failure to report. A run that could not be trusted entry by
+    /// entry is one that should not have opened.
+    pub fn entries(&self) -> impl Iterator<Item = (IndexKey, IndexLocation)> + '_ {
+        (0..self.section_count).flat_map(move |i| {
+            let section = self.section(i);
+            (0..section.entry_count).map(move |j| {
+                let at = section.first_entry + j;
+                (
+                    IndexKey::new(section.namespace, self.entry_object(at)),
+                    self.entry_location(at, &section),
+                )
+            })
+        })
+    }
+
     pub fn references_segment_generation(&self, generation: u64) -> bool {
         for i in 0..self.section_count {
             let section = self.section(i);
@@ -1322,6 +1352,60 @@ impl ObjectIndex {
 
 #[cfg(test)]
 mod tests {
+    /// Everything `entries` yields is what `get` answers for the same key, and
+    /// it yields every entry the run counts.
+    ///
+    /// Asserted against the run's own point lookup rather than against the
+    /// delta it was built from: the delta is what the encoder was given, and
+    /// the question is whether the decoder reads back what was written. A merge
+    /// built on an iterator that disagreed with `get` would produce a run whose
+    /// entries moved.
+    #[test]
+    fn entries_yields_every_entry_and_agrees_with_get() {
+        let mut delta = IndexDelta::new(1_000, 1 << 20);
+        let mut expected = Vec::new();
+        // Several namespaces, so the walk crosses section boundaries, and
+        // several generations within each, so the packed deltas vary.
+        for ns in 0..4u8 {
+            for object in 0..7u8 {
+                let key = IndexKey::new(NamespaceId([ns; 32]), ObjectId([ns * 16 + object; 32]));
+                let location = IndexLocation {
+                    segment_generation: 40 + u64::from(object),
+                    frame_offset: 512 * u64::from(object),
+                    frame_len: 128 + u32::from(object),
+                    object_type: 1,
+                    shard_sequence: 900 + u64::from(object),
+                };
+                delta.insert(key, location).expect("insert");
+                expected.push((key, location));
+            }
+        }
+
+        let bytes = IndexRunBuilder::new(ROOT, 9, 9)
+            .build(&delta)
+            .expect("build");
+        let run = IndexRun::from_bytes(RunBytes::Owned(bytes), &ROOT).expect("open");
+
+        let seen: Vec<_> = run.entries().collect();
+        assert_eq!(
+            seen.len() as u64,
+            run.entry_count(),
+            "the iterator must yield exactly the entries the run counts"
+        );
+        for (key, location) in &seen {
+            assert_eq!(
+                run.get(key),
+                Some(*location),
+                "entries and get disagree for {key:?}"
+            );
+        }
+
+        expected.sort_by_key(|(key, _)| *key);
+        let mut sorted = seen.clone();
+        sorted.sort_by_key(|(key, _)| *key);
+        assert_eq!(sorted, expected, "every inserted entry must be read back");
+    }
+
     use super::*;
 
     const ROOT: [u8; 16] = [7u8; 16];

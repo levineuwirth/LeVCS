@@ -7073,13 +7073,17 @@ sys.exit(1 if errors else 0)
         let directory = tempfile::tempdir().expect("tempdir");
         let root = directory.path().join("root");
         let ack = directory.path().join("ack-journal");
+        // A warmup longer than the window, so that an elapsed which included
+        // it would be at least five seconds, and one that did not has three
+        // seconds to spare for a slow last fence. With two of each the margin
+        // was two seconds, and a gate run under load used it all.
         let run = run_engine(
             &root,
             &ack,
             AckJournalFault::None,
             4,
-            Duration::from_secs(2),
-            2,
+            Duration::from_secs(4),
+            1,
             75_000,
             1,
             1,
@@ -7105,7 +7109,8 @@ sys.exit(1 if errors else 0)
         );
         assert!(
             run.elapsed.as_secs() < 4,
-            "elapsed must be the measured window alone, not warmup plus window; got {:?}",
+            "elapsed must be the one-second window alone, not the four-second warmup plus \
+             the window; got {:?}",
             run.elapsed
         );
         assert!(

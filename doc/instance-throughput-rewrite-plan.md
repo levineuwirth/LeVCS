@@ -1839,6 +1839,65 @@ The integration suite's `cleanup_is_deferred_and_names_its_deliverable` is repla
 deleted — the distinction it stood for, that "nothing to do" and "cannot answer yet" are
 different results, is now asserted the other way round at the public surface.
 
+##### Contract review 2026-11-02-C
+
+`sys.rs`, the lead-owned durability funnel (scope 2.3), and the crash driver. Requested by
+finding S2 of the 2026-10-03 audit: the crash suite could not detect a missing durability fence.
+With `fdatasync`, `fsync_dir` and `fsync_dir_fd` turned into counted no-ops, the crash matrix,
+the frame golden tests, the recovery suites and `verify-store-recovery.sh --cycles 12` all still
+passed, because `_exit` and `SIGKILL` both leave the page cache intact: an unfenced write is
+still there for the next process to read.
+
+**A model of the page cache a power loss discards.** `sys::power_loss`, compiled only with
+`failpoints` and re-exported as `drive::power_loss`, is armed by a writer with a log path. Every
+write through the funnel first logs the bytes it is about to overwrite within the file's durable
+length; a truncation or allocation logs that length; a successful `fdatasync` logs that the file
+is durable as it stands. `apply` puts back, in the files under a root, everything no fence
+covered, the worst case a power loss allows, and removes the log. The log lives beside the root
+and outlives a writer, as a machine's page cache does, so the group a crash-matrix row commits in
+one process and the crash it suffers in the next are one machine's history. Records are written
+ahead of the write they describe and a torn last record ends the log, so a writer killed at any
+instant leaves a usable log. The model reads and writes with plain file calls, never through the
+funnel's fault seam, so an armed fault cannot fire inside it.
+
+**The crash driver models a power loss by default.** `append` and `soak` arm the model
+(`--power-loss on`, logging to `<root>.power-loss`; `off` and `ignore-fences` are the
+alternatives), and `reconcile` applies it before recovery reads the root and reports what it put
+back. Every run through the crash driver is therefore a power loss, not only a killed process:
+the Wave A rows of the crash matrix and the scenario tests beside them, and every SIGKILL cycle
+of `verify-store-recovery.sh`. With the fences in place they pass unchanged; two runs of 12
+cycles acknowledged 207 and 643 operations, with `acknowledged_loss=0` in both.
+
+**What the model does not cover**, as the review of this change established:
+
+- **Directory entries.** A rename, link or unlink that no directory fsync covered survives the
+  modelled power loss, so a missing directory fsync is still invisible: with `fsync_dir` and
+  `fsync_dir_fd` turned into counted no-ops the crash matrix still passes.
+- **The Wave B rows.** They drive the engine in-process through
+  `engine_matrix::drive_submit_row`, not through the crash driver, and neither arm nor apply the
+  model.
+- **The in-process suites** (`frame_golden`, the recovery suites) never crash and are unaffected
+  either way.
+
+**Evidence.** The audit's experiment, repeated with `fdatasync` a counted no-op: 7 of the 33
+crash-matrix tests fail, the Wave A rows losing the earlier group's acknowledged frames and stores
+whose creation was never fenced no longer opening, and `verify-store-recovery.sh --cycles 12`
+fails at its first cycle, whose store no longer opens. A permanent self-test pins the same thing
+without a source change: a second writer acknowledges four frames, the power is lost, and the
+reconciliation reports `acknowledged_loss=0` with fences honoured and 4 with the model ignoring
+them. Eight unit tests pin the model: a fenced write survives and an unfenced overwrite is put
+back; a shrink and an allocation are undone; ignored fences are undone too; a second writer
+cannot move what was durable, and a later writer's fence covers an earlier writer's write; a torn
+last record ends the log; no log is no loss; an unarmed funnel logs nothing. Two regressions
+come from the review: a writer arming after a torn record cuts it off before appending, since
+appending behind it put every later record out of step and lost a later writer's fence; and the
+crash driver models a power loss with no `--power-loss` flag, which a crash-matrix test pins by
+letting a writer die between writing a group and fencing it, then requiring the reconciliation
+to report the rollback and adopt none of the group. Mutation-checked, each killed: fences that
+never reach the model, writes that are never logged, the newest pre-image of a byte winning over
+the oldest, a later writer's length taken for the durable one, the durable length never
+restored, a torn record left in place on arming, and the driver's default turned off.
+
 ##### Contract review 2026-11-02-B
 
 Scope 3.8 step 5, `recovery.rs`'s handling of an active journal, and one field of the frozen

@@ -97,17 +97,18 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all --check
 
-  # Informational: clippy lints with default severity. Same deal as
-  # fmt — when the codebase is lint-clean, drop continue-on-error and
-  # add `-- -D warnings` to make this a real gate.
+  # Gate: no clippy warning at default severity, in every crate but
+  # levcs-store, whose engine Phase 1 replaces. The toolchain is pinned so
+  # that the lints a new release adds arrive in a commit that moves the pin,
+  # not in an unrelated pull request.
   clippy:
-    name: clippy (informational)
+    name: clippy
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.99.0
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --all-targets
+      - run: cargo clippy --workspace --exclude levcs-store --all-targets --locked -- -D warnings

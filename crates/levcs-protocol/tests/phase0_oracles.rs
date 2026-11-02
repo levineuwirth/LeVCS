@@ -311,6 +311,75 @@ fn external_ack_journal_rejects_corrupt_complete_records() {
     ));
 }
 
+fn ack_record(n: u8) -> AckRecord {
+    AckRecord {
+        repo_id: id(1),
+        operation_id: [n; 16],
+        operation_digest: id(n.wrapping_add(100)),
+        receipt_digest: id(n.wrapping_add(150)),
+        repo_sequence: u64::from(n),
+        blob_ids: vec![id(n), id(n.wrapping_add(50))],
+        tree_ids: vec![id(n.wrapping_add(1)), id(n.wrapping_add(51))],
+        commit_ids: vec![id(n.wrapping_add(2)), id(n.wrapping_add(52))],
+    }
+}
+
+/// Group commit is a change of fence count, not of format: a batch is the
+/// same bytes the records appended one at a time are, so a journal written
+/// either way recovers identically and digests identically.
+#[test]
+fn external_ack_journal_batch_is_its_records_appended_in_order() {
+    let directory = tempfile::tempdir().unwrap();
+    let records: Vec<AckRecord> = (1..=5).map(ack_record).collect();
+
+    let one_at_a_time = directory.path().join("single.lv");
+    {
+        let mut journal = ExternalAckJournal::open(&one_at_a_time).unwrap();
+        for record in &records {
+            journal.append_durable(record).unwrap();
+        }
+    }
+    let batched = directory.path().join("batched.lv");
+    {
+        let mut journal = ExternalAckJournal::open(&batched).unwrap();
+        journal.append_batch_durable(&records[..2]).unwrap();
+        journal.append_batch_durable(&[]).unwrap();
+        journal.append_batch_durable(&records[2..]).unwrap();
+    }
+
+    assert_eq!(
+        std::fs::read(&batched).unwrap(),
+        std::fs::read(&one_at_a_time).unwrap()
+    );
+    assert_eq!(ExternalAckJournal::recover(&batched).unwrap(), records);
+}
+
+/// Every record is encoded before any byte is written: a batch the journal
+/// would refuse part of appends none of it, so no acknowledgment a caller was
+/// told failed can be recovered as if it had been fenced.
+#[test]
+fn external_ack_journal_batch_with_an_invalid_record_appends_nothing() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("acks.lv");
+    let mut journal = ExternalAckJournal::open(&path).unwrap();
+    journal.append_durable(&ack_record(1)).unwrap();
+    let before = std::fs::read(&path).unwrap();
+
+    let mut invalid = ack_record(3);
+    invalid.tree_ids.pop();
+    assert!(matches!(
+        journal.append_batch_durable(&[ack_record(2), invalid]),
+        Err(AckJournalError::InvalidRecord(_))
+    ));
+    drop(journal);
+
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert_eq!(
+        ExternalAckJournal::recover(&path).unwrap(),
+        vec![ack_record(1)]
+    );
+}
+
 #[test]
 fn exact_restore_is_byte_exact_event_neutral_and_absent_destination_only() {
     let exported = ExactRestoreFixture {

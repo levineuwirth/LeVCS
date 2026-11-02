@@ -1839,6 +1839,67 @@ The integration suite's `cleanup_is_deferred_and_names_its_deliverable` is repla
 deleted — the distinction it stood for, that "nothing to do" and "cannot answer yet" are
 different results, is now asserted the other way round at the public surface.
 
+##### Contract review 2026-11-02-A
+
+`levcs-protocol::oracle::ExternalAckJournal::append_batch_durable`. Requested by finding S3 of the
+2026-10-03 audit: the P2 harness measured its own acknowledgment journal. Every `store-bench`
+submitter took one process-wide mutex and `sync_data`ed its own record before issuing its next
+arrival, so acknowledgments were serialized behind one fence each: the audit measured 57 commits/s
+as built against 2,629/s with that sync removed, and the archived rehearsals agree at 102-104/s
+with a p99 of 74 s. A reference-host campaign would have measured the journal's flush latency, not
+the store.
+
+**One method is added; nothing is removed or changes meaning.** `append_batch_durable(&mut self,
+records)` encodes every record, appends them in order with one write and fences them with one
+`sync_data`. An invalid record fails the batch before any byte is written; an empty batch writes and
+fences nothing. `append_durable` is now a batch of one. The on-disk format, `recover` and
+`encoded_record_len` are unchanged: a batch is byte for byte its records appended one at a time.
+
+**The rule it serves is unchanged; who waits for the fence is what changed.** `store-bench`'s
+`AckSink` owns a writer thread. A submitter queues its acknowledgment and issues its next arrival;
+the writer takes everything queued, writes it, fences it with one `sync_data`, and takes the next
+group. A commit is still counted only once a fence covering its acknowledgment has returned, which
+its submitter learns as it goes and waits for when its window ends, so
+`ack_journal_fenced_before_count` stays true; counting asserts it in debug builds. A failed write or
+fence fails every record not yet fenced and refuses every later one, since a later fence that
+succeeded would not vouch for what the failed one wrote. Closing the sink fences what is still
+queued before the journal closes. `--fail-ack-append-after N` now fails the fence of the group
+holding append N, against `/dev/full` as before, so its regressions run through the asynchronous
+failure path the run actually takes. Latency is still measured from the scheduled arrival to the
+store's response. A commit's one-minute window is now the minute the store responded in, where it
+was the minute its acknowledgment was fenced: the windows describe the store.
+
+Grouping the fences while each submitter still waited for its own group's fence was built and
+measured first, and was not enough: a submitter held at the acknowledgment journal is a submitter
+the store does not see.
+
+**Evidence.** On the development host (diagnostic, not the reference profile), 60-second `run`s at
+the default four shards of 16 submitters and 75,000/s offered. The host's own fence latency swings
+the absolute rate by a factor of two between runs, so the comparison is commits per store fence,
+which is how much concurrency the store saw:
+
+| Harness | Runs | Commits/s | Commits per store fence |
+|---|---|---|---|
+| As built | 1 | 28.5 | 0.9 |
+| Grouped, submitters waiting | 2 | 539-564 | 7.2-7.3 |
+| Pipelined (this change) | 2 | 926-1,240 | 13.3-13.9 |
+| No acknowledgment sync | 4 | 1,066-2,162 | 12.9-13.5 |
+
+The pipelined harness gives the store what it gets with no acknowledgment sync at all; the journal
+fenced about 48 acknowledgments per group. Both pipelined runs reconciled with
+`acknowledged_loss=0` and no torn transaction. The oracle's tests pin a batch as its records in order
+and an invalid record as appending nothing. `store-bench`'s tests pin that nothing is reported fenced
+while its fence is open, leader or follower; that queueing never waits and what queues behind an
+open fence is one group; that a failed fence fails every record not yet fenced and every later one;
+that closing fences what is queued; that concurrent acknowledgments on the real journal are all
+recovered; and that a submitter counts only the fenced prefix of its queue. Mutation-checked, each
+killed: a group reported fenced before its fence returns, one record per fence, success after a
+failed fence, a failure forgotten, queueing that waits, closing that drops the queue, a countable
+prefix that takes everything, counting before the fence at the run loop (by the debug assertion,
+in the engine's own tests), an armed fault that never fires, a batch written before every record is
+encoded, and a batch that drops records. A missing `sync_data` in the batch is not detectable here:
+that is finding S2's class, a crash model that keeps the page cache.
+
 ##### Contract review 2026-08-11-B
 
 `bench/result-schema.json` — `hardware.temperature_celsius`. Requested during the closure-path

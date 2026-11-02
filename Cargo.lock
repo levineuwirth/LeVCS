@@ -1734,7 +1734,7 @@ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
 name = "levcs-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -1757,7 +1757,7 @@ dependencies = [
 
 [[package]]
 name = "levcs-client"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64 0.22.1",
  "hex",
@@ -1772,7 +1772,7 @@ dependencies = [
 
 [[package]]
 name = "levcs-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "blake3",
  "byteorder",
@@ -1787,7 +1787,7 @@ dependencies = [
 
 [[package]]
 name = "levcs-gate"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "levcs-client",
@@ -1799,7 +1799,7 @@ dependencies = [
 
 [[package]]
 name = "levcs-identity"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -1821,7 +1821,7 @@ dependencies = [
 
 [[package]]
 name = "levcs-instance"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "axum",
  "hex",
@@ -1844,7 +1844,7 @@ dependencies = [
 
 [[package]]
 name = "levcs-merge"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "blake3",
  "criterion",
@@ -1877,7 +1877,7 @@ dependencies = [
 
 [[package]]
 name = "levcs-protocol"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -1899,7 +1899,7 @@ dependencies = [
 
 [[package]]
 name = "levcs-store"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arc-swap",
  "blake3",
@@ -1923,7 +1923,7 @@ dependencies = [
 
 [[package]]
 name = "levcs-tui"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "crossterm",

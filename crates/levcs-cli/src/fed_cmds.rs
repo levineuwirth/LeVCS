@@ -791,7 +791,7 @@ pub fn inspect(args: InspectArgs) -> Result<()> {
         let entry = tree
             .entries
             .iter()
-            .find(|e| &e.name == *comp)
+            .find(|e| e.name == *comp)
             .ok_or_else(|| anyhow!("path not found: {comp}"))?;
         match entry.entry_type {
             EntryType::Tree => {
@@ -947,6 +947,7 @@ fn build_deploy_archive(
 ///   2. push every branch and release in a single signed manifest,
 ///      with a pack containing the closure of all refs and the current
 ///      authority chain.
+///
 /// Idempotent at the wire level: if the destination already has the
 /// repo_id (e.g. a previous attempt got partway), init returns 409 and
 /// we skip straight to push.
@@ -1184,12 +1185,12 @@ pub fn dial(args: DialArgs) -> Result<()> {
     // Verify each tip end-to-end. verify_commit / verify_release walk the
     // authority chain and the embedded signatures — refuse to record any
     // ref whose tip can't be verified, even if the bytes hash-match.
-    for (_name, hex) in &manifest.branches {
+    for hex in manifest.branches.values() {
         let id = ObjectId::from_hex(hex)?;
         levcs_identity::verify::verify_commit(&repo.objects, id, None)
             .map_err(|e| anyhow!("verify branch tip {hex}: {e}"))?;
     }
-    for (_name, hex) in &manifest.releases {
+    for hex in manifest.releases.values() {
         let id = ObjectId::from_hex(hex)?;
         levcs_identity::verify::verify_release(&repo.objects, id)
             .map_err(|e| anyhow!("verify release {hex}: {e}"))?;

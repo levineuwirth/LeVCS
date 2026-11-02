@@ -28,9 +28,11 @@
 //!
 //! Compression and delta selection are encoder-side optimizations; the wire
 //! format is exact in either direction. The current encoder uses
+//!
 //!   * zstd level 3 (libzstd's default — balanced ratio/throughput),
 //!   * a 256-byte threshold below which framing overhead beats savings,
 //!   * "previous entry of same object_type" as the delta-base candidate,
+//!
 //! and only emits the compressed/delta form when the result is strictly
 //! smaller than the alternative. This keeps encode O(N total bytes) and
 //! decode at zstd-with-dictionary speed (essentially the same as plain

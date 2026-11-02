@@ -7,7 +7,7 @@
 //!   * `full`     — accepts every push.
 //!   * `release`  — only `refs/releases/*` updates are accepted.
 //!   * `metadata` — every push is rejected (mode is intended to be
-//!                  populated via mirroring, not direct push).
+//!     populated via mirroring, not direct push).
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

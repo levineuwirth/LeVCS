@@ -53,6 +53,19 @@ fn setup(tag: &str) -> (PathBuf, PathBuf) {
 /// Some(bytes)) writes or (path, None) deletions.
 type Side<'a> = &'a [(&'a str, Option<&'a [u8]>)];
 
+/// A merge case: its tag, then the file's base, ours and theirs.
+type Case = (&'static str, &'static [u8], &'static [u8], &'static [u8]);
+
+/// A merge case where a side may delete the file (`None`), with the bytes
+/// the working tree should keep.
+type DeleteCase = (
+    &'static str,
+    &'static [u8],
+    Option<&'static [u8]>,
+    Option<&'static [u8]>,
+    &'static [u8],
+);
+
 fn diverge(work: &Path, cfg: &Path, base: Side, ours: Side, theirs: Side) -> Output {
     let apply = |side: Side| {
         for (p, content) in side {
@@ -389,7 +402,7 @@ fn a_branch_switch_cannot_discard_a_merge_in_progress() {
 fn a_deleted_file_is_not_an_empty_file() {
     // Comparing bytes alone made absence equal to emptiness, and each of
     // these merged "cleanly" and committed.
-    let cases: [(&str, &[u8], Option<&[u8]>, Option<&[u8]>, &[u8]); 4] = [
+    let cases: [DeleteCase; 4] = [
         (
             "empty-delete-edit",
             b"",
@@ -432,7 +445,7 @@ fn files_containing_nul_are_never_line_merged() {
     // NUL is valid UTF-8, so binary formats used to reach the line merge:
     // overlapping edits got conflict markers inserted into the binary, and
     // disjoint edits were spliced together and reported AUTO.
-    let cases: [(&str, &[u8], &[u8], &[u8]); 2] = [
+    let cases: [Case; 2] = [
         ("nul-overlap", b"\0base\n", b"\0ours\n", b"\0theirs\n"),
         (
             "nul-disjoint",
@@ -466,7 +479,7 @@ fn files_containing_nul_are_never_line_merged() {
 #[test]
 fn forced_conflicts_leave_binary_files_untouched() {
     // `--no-auto` skipped the engine and wrapped binary content in markers.
-    let cases: [(&str, &[u8], &[u8], &[u8]); 2] = [
+    let cases: [Case; 2] = [
         ("noauto-nul", b"\0base\n", b"\0ours\n", b"\0theirs\n"),
         ("noauto-utf8", b"\xffbase", b"\xffours", b"\xfftheirs"),
     ];

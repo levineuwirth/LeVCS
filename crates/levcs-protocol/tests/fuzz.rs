@@ -80,7 +80,7 @@ fn pack_decode_does_not_panic_on_random_bytes() {
 /// gracefully without trying to allocate `count * struct_size` bytes.
 #[test]
 fn pack_decode_handles_extreme_object_counts() {
-    let mut seed = 0xc0ffee_aaaa_5555u64;
+    let mut seed = 0xc0_ffee_aaaa_5555u64;
     for _ in 0..512 {
         let mut bytes = b"LVPK".to_vec();
         bytes.extend_from_slice(&1u32.to_le_bytes()); // version

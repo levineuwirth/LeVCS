@@ -243,7 +243,7 @@ async fn main() -> std::io::Result<()> {
             interval_secs = interval.as_secs(),
             "starting mirror poller"
         );
-        let _ = spawn_poller(cfg_arc.clone(), mirror.clone(), interval);
+        drop(spawn_poller(cfg_arc.clone(), mirror.clone(), interval));
     }
 
     serve(state, bind).await

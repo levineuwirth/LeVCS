@@ -461,7 +461,6 @@ async fn dogfood_three_instance_scenario() {
         let b = b_base.clone();
         let c = c_base.clone();
         let rid = setup.repo_id.clone();
-        let head = head;
         move || {
             (
                 Client::new(a).get_object(&rid, head).unwrap(),

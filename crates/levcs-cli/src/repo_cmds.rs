@@ -66,7 +66,7 @@ pub fn init(args: InitArgs) -> Result<()> {
             }
         },
     };
-    let sk: SecretKey = if let Some(_) = kc.entry(&label) {
+    let sk: SecretKey = if kc.entry(&label).is_some() {
         let (_, sk) = load_secret(Some(&label))?;
         sk
     } else {

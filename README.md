@@ -60,6 +60,13 @@ Three binaries land in `target/release/`:
   `levcs-instance` together before an instance is relied on (see
   [`deploy/README.md`](deploy/README.md)).
 
+`levcs --version` and `levcs-instance --version` name the git commit a
+binary was built from, followed by `modified` if a file it is compiled
+from differed from that commit (a change to a test or a document does
+not count). A build outside a git checkout of this repository says
+`unknown commit`, unless `LEVCS_BUILD_COMMIT` was set at build time to the
+text to report instead.
+
 For local use, install the first two somewhere on `PATH`:
 
 ```sh

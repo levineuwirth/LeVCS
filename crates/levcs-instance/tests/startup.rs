@@ -13,6 +13,7 @@ const INSTANCE: &str = env!("CARGO_BIN_EXE_levcs-instance");
 struct Started {
     child: Child,
     root: PathBuf,
+    port: u16,
     /// What it logged up to and including the line that says it is starting.
     log: Vec<String>,
 }
@@ -37,6 +38,7 @@ impl Started {
         let mut started = Started {
             child,
             root,
+            port,
             log: Vec::new(),
         };
         let (send, lines) = mpsc::channel();
@@ -61,6 +63,10 @@ impl Started {
             }
         }
     }
+
+    fn starting(&self) -> &str {
+        self.log.last().unwrap()
+    }
 }
 
 impl Drop for Started {
@@ -79,4 +85,42 @@ fn a_log_that_is_not_a_terminal_has_no_colour() {
     for line in &started.log {
         assert!(!line.contains('\x1b'), "an escape code in {line:?}");
     }
+}
+
+#[test]
+fn version_names_the_commit() {
+    for flag in ["--version", "-V"] {
+        let out = Command::new(INSTANCE).arg(flag).output().unwrap();
+        assert!(out.status.success(), "{flag}: {out:?}");
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap(),
+            format!("levcs-instance {}\n", env!("LEVCS_VERSION")),
+            "{flag}"
+        );
+    }
+}
+
+/// A running instance says which build it is: in the line it logs as it
+/// starts, and in its info.
+#[test]
+fn the_running_instance_names_its_commit() {
+    let started = Started::new("startup-commit");
+    let commit = env!("LEVCS_BUILD_COMMIT");
+    let line = started.starting();
+    assert!(line.contains(commit), "{line:?} does not name {commit}");
+    assert!(
+        line.contains(env!("CARGO_PKG_VERSION")),
+        "{line:?} does not name the version"
+    );
+
+    let client = levcs_client::Client::new(format!("http://127.0.0.1:{}/levcs/v1", started.port));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let info = loop {
+        match client.instance_info() {
+            Ok(info) => break info,
+            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            Err(e) => panic!("the instance never answered: {e}"),
+        }
+    };
+    assert_eq!(info.commit.as_deref(), Some(commit));
 }

@@ -407,6 +407,11 @@ This replaces the server only. Install the new `levcs` into
 backups with it; and the new `levcs-gate`, so that the next update is
 checked by this version's gate.
 
+`levcs-instance --version` says which commit a binary was built from. The
+running instance says it too: in the line it logs as it starts (`levcs
+instance starting`, with `commit=`), and as `commit` in what `levcs
+instance --info` prints.
+
 ### Storage growth
 
 There is no garbage collection on the instance yet. A repository's

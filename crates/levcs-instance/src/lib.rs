@@ -671,6 +671,7 @@ async fn handle_instance_info(State(s): State<AppState>) -> impl IntoResponse {
     let info = InstanceInfo {
         software: "levcs-instance".into(),
         version: env!("CARGO_PKG_VERSION").into(),
+        commit: Some(env!("LEVCS_BUILD_COMMIT").into()),
         storage_mode: if s.config.storage_mode.is_empty() {
             "full".into()
         } else {

@@ -67,6 +67,7 @@ OPTIONS:
     --config <PATH>    Read TOML config from this path. CLI flags override it.
     --root   <DIR>     Repository root directory.        Default: ./levcs-data
     --bind   <ADDR>    Listen address.                   Default: 127.0.0.1:7117
+    -V, --version      Show the version and the commit it was built from.
     -h, --help         Show this message.
 
 ENVIRONMENT:
@@ -150,6 +151,10 @@ async fn main() -> std::io::Result<()> {
                 print!("{HELP}");
                 return Ok(());
             }
+            "--version" | "-V" => {
+                println!("levcs-instance {}", env!("LEVCS_VERSION"));
+                return Ok(());
+            }
             other => die(format!("unknown argument {other:?} (try --help)")),
         }
     }
@@ -195,6 +200,8 @@ async fn main() -> std::io::Result<()> {
     }
 
     tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        commit = env!("LEVCS_BUILD_COMMIT"),
         addr = %bind,
         root = %config.root.display(),
         storage_mode = %config.storage_mode,

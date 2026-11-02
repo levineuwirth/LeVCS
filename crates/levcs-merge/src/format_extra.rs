@@ -1,7 +1,7 @@
 //! Format handlers that round out §6.3.1: YAML, Markdown, prose, XML.
 //!
 //! YAML reuses the same recursive value merge as the JSON handler, parsing
-//! each side via `serde_yaml::Value` and bridging through `serde_json::Value`.
+//! each side via `serde_norway::Value` and bridging through `serde_json::Value`.
 //!
 //! Markdown is split into top-level sections by ATX heading; sections with a
 //! shared heading are reconciled with the textual handler's diff3 merge,
@@ -40,8 +40,8 @@ pub struct XmlHandler;
 // YAML
 // ---------------------------------------------------------------------------
 
-fn yaml_to_json(v: serde_yaml::Value) -> Value {
-    use serde_yaml::Value as Y;
+fn yaml_to_json(v: serde_norway::Value) -> Value {
+    use serde_norway::Value as Y;
     match v {
         Y::Null => Value::Null,
         Y::Bool(b) => Value::Bool(b),
@@ -63,7 +63,7 @@ fn yaml_to_json(v: serde_yaml::Value) -> Value {
             for (k, v) in map {
                 let key = match k {
                     Y::String(s) => s,
-                    other => serde_yaml::to_string(&other).unwrap_or_default(),
+                    other => serde_norway::to_string(&other).unwrap_or_default(),
                 };
                 obj.insert(key, yaml_to_json(v));
             }
@@ -73,8 +73,8 @@ fn yaml_to_json(v: serde_yaml::Value) -> Value {
     }
 }
 
-fn json_to_yaml(v: &Value) -> serde_yaml::Value {
-    use serde_yaml::Value as Y;
+fn json_to_yaml(v: &Value) -> serde_norway::Value {
+    use serde_norway::Value as Y;
     match v {
         Value::Null => Y::Null,
         Value::Bool(b) => Y::Bool(*b),
@@ -90,7 +90,7 @@ fn json_to_yaml(v: &Value) -> serde_yaml::Value {
         Value::String(s) => Y::String(s.clone()),
         Value::Array(a) => Y::Sequence(a.iter().map(json_to_yaml).collect()),
         Value::Object(o) => {
-            let mut m = serde_yaml::Mapping::new();
+            let mut m = serde_norway::Mapping::new();
             for (k, v) in o {
                 m.insert(Y::String(k.clone()), json_to_yaml(v));
             }
@@ -113,7 +113,7 @@ impl MergeHandler for YamlHandler {
 
     fn merge(&self, _path: &Path, base: &[u8], ours: &[u8], theirs: &[u8]) -> MergeResult {
         let parse = |b: &[u8]| -> Option<Value> {
-            let v: serde_yaml::Value = serde_yaml::from_slice(b).ok()?;
+            let v: serde_norway::Value = serde_norway::from_slice(b).ok()?;
             Some(yaml_to_json(v))
         };
         let (b, o, t) = match (parse(base), parse(ours), parse(theirs)) {
@@ -126,7 +126,7 @@ impl MergeHandler for YamlHandler {
             }
         };
         let (merged, conflicts) = merge_value(&b, &o, &t, "");
-        let bytes = serde_yaml::to_string(&json_to_yaml(&merged))
+        let bytes = serde_norway::to_string(&json_to_yaml(&merged))
             .unwrap_or_default()
             .into_bytes();
         let status = if conflicts.is_empty() {

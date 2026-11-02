@@ -144,7 +144,7 @@ fn json_to_toml(v: &Value) -> toml::Value {
 }
 
 /// Recursive structural merge over `serde_json::Value`. Reused by the YAML
-/// handler (which converts via `serde_yaml::Value`).
+/// handler (which converts via `serde_norway::Value`).
 pub fn merge_value(
     base: &Value,
     ours: &Value,

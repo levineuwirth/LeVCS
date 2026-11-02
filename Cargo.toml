@@ -54,7 +54,7 @@ tree-sitter-cpp = "0.23"
 tree-sitter-java = "0.23"
 tree-sitter-ruby = "0.23"
 tree-sitter-bash = "0.25"
-serde_yaml = "0.9"
+serde_norway = "0.9"
 quick-xml = { version = "0.42", features = ["serialize"] }
 pulldown-cmark = "0.13"
 wasmtime = { version = "36", default-features = false, features = ["cranelift", "runtime"] }

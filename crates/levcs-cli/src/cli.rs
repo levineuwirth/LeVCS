@@ -5,7 +5,11 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Parser, Debug)]
-#[command(name = "levcs", version, about = "LeVCS: federated, memory-safe VCS")]
+#[command(
+    name = "levcs",
+    version = env!("LEVCS_VERSION"),
+    about = "LeVCS: federated, memory-safe VCS"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Cmd,

@@ -21,6 +21,7 @@
 //!
 //! `[[mirrors]]` blocks are refused: see `InstanceConfig::validate`.
 
+use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -66,6 +67,7 @@ OPTIONS:
     --config <PATH>    Read TOML config from this path. CLI flags override it.
     --root   <DIR>     Repository root directory.        Default: ./levcs-data
     --bind   <ADDR>    Listen address.                   Default: 127.0.0.1:7117
+    -V, --version      Show the version and the commit it was built from.
     -h, --help         Show this message.
 
 ENVIRONMENT:
@@ -116,10 +118,13 @@ fn load_file(path: &Path) -> FileConfig {
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
+    // Colour only on a terminal: under systemd the log goes to the journal,
+    // where escape codes are noise in every line.
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
+        .with_ansi(std::io::stdout().is_terminal())
         .compact()
         .init();
 
@@ -144,6 +149,10 @@ async fn main() -> std::io::Result<()> {
             }
             "--help" | "-h" => {
                 print!("{HELP}");
+                return Ok(());
+            }
+            "--version" | "-V" => {
+                println!("levcs-instance {}", env!("LEVCS_VERSION"));
                 return Ok(());
             }
             other => die(format!("unknown argument {other:?} (try --help)")),
@@ -191,6 +200,8 @@ async fn main() -> std::io::Result<()> {
     }
 
     tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        commit = env!("LEVCS_BUILD_COMMIT"),
         addr = %bind,
         root = %config.root.display(),
         storage_mode = %config.storage_mode,

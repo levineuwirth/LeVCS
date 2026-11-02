@@ -33,6 +33,11 @@ pub struct InfoResponse {
 pub struct InstanceInfo {
     pub software: String,
     pub version: String,
+    /// What the instance was built from: `git <id>`, `git <id> modified`,
+    /// `unknown`, or the text its build was given instead. Absent from an
+    /// instance that does not say it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
     pub storage_mode: String,
     #[serde(default)]
     pub allowed_handlers: Vec<String>,

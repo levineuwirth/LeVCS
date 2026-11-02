@@ -315,19 +315,9 @@ pub const BUILTIN_HANDLERS: &[&str] = &[
 pub const FLOW_HANDLERS: &[&str] = &["ours-only", "theirs-only", "delete", "no-auto", "none"];
 
 pub fn is_builtin_handler(name: &str) -> bool {
-    BUILTIN_HANDLERS.iter().any(|b| *b == name) || FLOW_HANDLERS.iter().any(|b| *b == name)
+    BUILTIN_HANDLERS.contains(&name) || FLOW_HANDLERS.contains(&name)
 }
 
-/// Decide whether a `(handler, handler_hash)` tuple is permitted by the
-/// supplied allow list. Semantics:
-///
-/// - Empty list → permissive (no enforcement).
-/// - List containing `"builtin"` → all built-in handlers pass; explicit
-///   `"name:blake3:<hex>"` entries also pass for plugins that pin to that
-///   exact hash.
-/// - List without `"builtin"` → only entries that match the explicit form
-///   pass; built-ins are blocked (useful for an instance that wants to
-///   forbid anything other than a vetted plugin set).
 /// Validate every file entry of a merge-record against an allow list. Returns
 /// the names of any handlers that violate the policy, in original order.
 pub fn validate_record_against_policy(
@@ -343,6 +333,16 @@ pub fn validate_record_against_policy(
     bad
 }
 
+/// Decide whether a `(handler, handler_hash)` tuple is permitted by the
+/// supplied allow list. Semantics:
+///
+/// - Empty list → permissive (no enforcement).
+/// - List containing `"builtin"` → all built-in handlers pass; explicit
+///   `"name:blake3:<hex>"` entries also pass for plugins that pin to that
+///   exact hash.
+/// - List without `"builtin"` → only entries that match the explicit form
+///   pass; built-ins are blocked (useful for an instance that wants to
+///   forbid anything other than a vetted plugin set).
 pub fn check_handler_allowed(handler: &str, handler_hash: &str, allowed: &[String]) -> bool {
     if allowed.is_empty() {
         return true;

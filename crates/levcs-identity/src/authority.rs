@@ -139,7 +139,7 @@ impl AuthorityBody {
                 )));
             }
         }
-        self.members.sort_by(|a, b| a.key.0.cmp(&b.key.0));
+        self.members.sort_by_key(|m| m.key.0);
         for w in self.members.windows(2) {
             if w[0].key == w[1].key {
                 return Err(IdentityError::MalformedAuthority(format!(
@@ -484,7 +484,7 @@ fn parse_blake3(s: &str) -> Result<ObjectId> {
     let rest = s.strip_prefix("blake3:").ok_or_else(|| {
         IdentityError::MalformedAuthority(format!("missing blake3: prefix in {s}"))
     })?;
-    Ok(ObjectId::from_hex(rest).map_err(|e| IdentityError::MalformedAuthority(e.to_string()))?)
+    ObjectId::from_hex(rest).map_err(|e| IdentityError::MalformedAuthority(e.to_string()))
 }
 
 fn parse_rfc3339_micros(s: &str) -> Result<i64> {
@@ -562,7 +562,7 @@ fn ymd_to_days(mut y: i64, mut m: u32, d: u32) -> i64 {
         m += 12;
     }
     let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = (y - era * 400) as i64;
+    let yoe = y - era * 400;
     let doy = (153 * (m as i64 - 3) + 2) / 5 + d as i64 - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146097 + doe - 719468
@@ -573,7 +573,7 @@ fn days_to_ymd(mut days: i64) -> (i32, u32, u32) {
     let era = days.div_euclid(146097);
     let doe = days.rem_euclid(146097);
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i64 + era * 400;
+    let y = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
     let d = (doy - (153 * mp + 2) / 5 + 1) as u32;

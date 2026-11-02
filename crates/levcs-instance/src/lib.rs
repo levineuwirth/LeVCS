@@ -464,11 +464,6 @@ impl NonceCache {
         self.seen.insert(nonce, request_ts_micros);
         Nonce::New
     }
-
-    #[cfg(test)]
-    pub fn len(&self) -> usize {
-        self.seen.len()
-    }
 }
 
 pub fn router(state: AppState) -> Router {

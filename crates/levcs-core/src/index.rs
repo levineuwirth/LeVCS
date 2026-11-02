@@ -15,7 +15,7 @@
 //!   size      8 bytes  u64 LE
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use byteorder::{ByteOrder, LittleEndian};
 
@@ -192,7 +192,7 @@ impl Index {
         }
     }
 
-    pub fn write_to(&self, path: &PathBuf) -> Result<()> {
+    pub fn write_to(&self, path: &Path) -> Result<()> {
         crate::fsutil::replace_file(path, &self.serialize())
     }
 }

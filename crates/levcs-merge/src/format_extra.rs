@@ -445,13 +445,7 @@ impl MergeHandler for ProseHandler {
             if !emitted.insert(k.clone()) {
                 continue;
             }
-            let in_base = b.iter().any(|x| key(x) == k);
-            let in_theirs = t.iter().any(|x| key(x) == k);
-            if in_base || in_theirs {
-                out.push(p.clone());
-            } else {
-                out.push(p.clone());
-            }
+            out.push(p.clone());
         }
         for p in &t {
             let k = key(p);

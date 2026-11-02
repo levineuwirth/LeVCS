@@ -109,7 +109,7 @@ fn authority_body_round_trip_when_parse_succeeds() {
 
 #[test]
 fn parse_toml_authority_does_not_panic() {
-    let mut seed = 0xfacefade_1357_2468u64;
+    let mut seed = 0xface_fade_1357_2468u64;
     for _ in 0..ITERS {
         let n = rand_size(&mut seed);
         let bytes = rand_bytes(&mut seed, n);

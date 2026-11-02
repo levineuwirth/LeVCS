@@ -70,12 +70,10 @@ impl ObjectSource for MemorySource {
 
 pub(crate) fn read_signed<S: ObjectSource>(src: &S, id: ObjectId) -> Verification<SignedObject> {
     let bytes = src.read_raw(id)?;
-    Ok(
-        SignedObject::parse(&bytes).map_err(|e| VerifyError::Object {
-            hash: id.to_hex(),
-            kind: e.to_string(),
-        })?,
-    )
+    SignedObject::parse(&bytes).map_err(|e| VerifyError::Object {
+        hash: id.to_hex(),
+        kind: e.to_string(),
+    })
 }
 
 /// Verify the signature(s) on a SignedObject. Each signature in the trailer
@@ -86,8 +84,7 @@ pub fn verify_signed_object(signed: &SignedObject) -> Verification<()> {
     let h = signed.signing_hash();
     for s in &signed.signatures {
         let pk = PublicKey(s.public_key);
-        pk.verify(h.as_bytes(), &s.signature)
-            .map_err(IdentityError::from)?;
+        pk.verify(h.as_bytes(), &s.signature)?;
     }
     Ok(())
 }

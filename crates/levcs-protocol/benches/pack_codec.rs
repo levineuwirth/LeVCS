@@ -62,13 +62,12 @@ fn bench_encode(c: &mut Criterion) {
             b.iter(|| black_box(pk.encode()))
         });
     }
-    for &(label, count, size) in &[("100x1KiB-similar", 100usize, 1024usize)] {
-        let pk = delta_friendly_pack(0x5a5a_5a5a, count, size);
-        g.throughput(Throughput::Bytes((count * size) as u64));
-        g.bench_with_input(BenchmarkId::new("delta_friendly", label), &pk, |b, pk| {
-            b.iter(|| black_box(pk.encode()))
-        });
-    }
+    let (label, count, size) = ("100x1KiB-similar", 100usize, 1024usize);
+    let pk = delta_friendly_pack(0x5a5a_5a5a, count, size);
+    g.throughput(Throughput::Bytes((count * size) as u64));
+    g.bench_with_input(BenchmarkId::new("delta_friendly", label), &pk, |b, pk| {
+        b.iter(|| black_box(pk.encode()))
+    });
     g.finish();
 }
 

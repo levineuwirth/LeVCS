@@ -113,7 +113,7 @@ pub fn evict_to(repo: &Repository, cap: u64) -> Result<EvictReport> {
         });
     }
     // Oldest first.
-    entries.sort_by(|a, b| a.2.cmp(&b.2));
+    entries.sort_by_key(|e| e.2);
 
     let mut evicted_files = 0usize;
     let mut evicted_bytes: u64 = 0;

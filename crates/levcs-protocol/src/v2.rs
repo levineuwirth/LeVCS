@@ -850,6 +850,9 @@ pub fn decode_init_request_body(bytes: &[u8]) -> CodecResult<(SignedInitOperatio
     Ok((envelope, genesis_bytes))
 }
 
+/// One per request, decoded and dropped, never held in bulk, so the size
+/// of the larger variant costs nothing worth a box.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SignedClientOperationV2 {
     Init(SignedInitOperationV2),

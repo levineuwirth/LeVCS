@@ -189,6 +189,8 @@ pub(crate) fn write_vectored_all(
 ) -> io::Result<u64> {
     let total: usize = bufs.iter().map(|b| b.len()).sum();
     let start = file.stream_position()?;
+    #[cfg(feature = "failpoints")]
+    power_loss::before_write(file, start, total as u64)?;
 
     // Flatten once. `write_vectored` may consume a partial slice, and
     // re-slicing `IoSlice`s across a partial consume is where short-write
@@ -278,7 +280,10 @@ pub(crate) fn fdatasync(file: &File, counters: &DurabilityCounters) -> io::Resul
         return Err(eio("fdatasync"));
     }
     counters.fdatasync.fetch_add(1, Relaxed);
-    file.sync_data()
+    file.sync_data()?;
+    #[cfg(feature = "failpoints")]
+    power_loss::after_fence(file)?;
+    Ok(())
 }
 
 /// Make a directory entry durable. Required after every create, rename, and
@@ -684,6 +689,8 @@ pub(crate) fn truncate(file: &File, len: u64, counters: &DurabilityCounters) -> 
             "injected ENOSPC during truncate",
         ));
     }
+    #[cfg(feature = "failpoints")]
+    power_loss::before_resize(file, len)?;
     counters.write_vectored.fetch_add(1, Relaxed);
     file.set_len(len)
 }
@@ -733,6 +740,8 @@ pub(crate) fn pread(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<usiz
 /// with unwritten extents and appends become overwrites within an already
 /// sized file (scope 3.2).
 pub(crate) fn preallocate(file: &File, len: u64) -> io::Result<()> {
+    #[cfg(feature = "failpoints")]
+    power_loss::before_resize(file, len)?;
     rustix::fs::fallocate(file, rustix::fs::FallocateFlags::empty(), 0, len)
         .map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))
 }
@@ -771,6 +780,372 @@ pub(crate) fn cursor(file: &mut File) -> io::Result<u64> {
 
 pub(crate) fn seek_to(file: &mut File, offset: u64) -> io::Result<()> {
     file.seek(SeekFrom::Start(offset)).map(|_| ())
+}
+
+// ---------------------------------------------------------------------------
+// Power loss (failpoints only)
+// ---------------------------------------------------------------------------
+
+/// A userspace model of the page cache a power loss discards: audit finding
+/// S2, contract review 2026-11-02-C.
+///
+/// `_exit` and `SIGKILL` both leave the page cache intact, so a crash suite that
+/// only kills the writer cannot see a missing fence: an unfenced write is still
+/// there when the next process reads it, and every suite passed with
+/// `fdatasync` turned into a counted no-op. With the model armed, every write
+/// through this funnel first logs the bytes it is about to overwrite, a resize
+/// logs the length that was durable, and a successful [`fdatasync`] logs that
+/// the file is durable as it stands. [`apply`](power_loss::apply), run once the
+/// writer is gone and before recovery, puts back everything no fence covered —
+/// the worst case a power loss allows — so a missing fence loses exactly the
+/// data it should have made durable.
+///
+/// The log lives outside the store root and outlives a writer, as a machine's
+/// page cache does: a writer that exits normally leaves its unfenced writes
+/// logged for the next writer to add to, and `apply` is the power loss and the
+/// reboot together, consuming the log.
+///
+/// Each record is appended before the write it describes, so a writer killed at
+/// any instant leaves a log `apply` can use, and a torn last record is ignored.
+/// A fence is logged after it returns: a writer killed between the two is
+/// treated as unfenced, which is pessimistic only about work it had not yet
+/// acknowledged.
+///
+/// Directory entries are not modelled: a missing directory fsync is still
+/// invisible to the crash suites.
+#[cfg(feature = "failpoints")]
+pub mod power_loss {
+    use std::collections::hash_map::Entry;
+    use std::collections::HashMap;
+    use std::fs::{File, OpenOptions};
+    use std::io::{self, Write};
+    use std::os::unix::fs::{FileExt, MetadataExt};
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, MutexGuard};
+
+    use super::FaultSerial;
+
+    const MAGIC: &[u8; 8] = b"LVPWRLS1";
+    const SEEN: u8 = 1;
+    const PRE_IMAGE: u8 = 2;
+    const FENCED: u8 = 3;
+    const RECORD_HEAD: usize = 1 + 8 + 8;
+
+    /// A file by device and inode, which outlives its names.
+    type Inode = (u64, u64);
+
+    struct Model {
+        log: File,
+        honour_fences: bool,
+        /// Files this process changed since their last fence.
+        dirty: HashMap<Inode, Dirty>,
+    }
+
+    struct Dirty {
+        /// The length that was durable when this process first changed it.
+        durable_len: u64,
+        /// Ranges, half-open, whose pre-image this process has logged.
+        logged: Vec<(u64, u64)>,
+    }
+
+    static MODEL: Mutex<Option<Model>> = Mutex::new(None);
+
+    fn model() -> MutexGuard<'static, Option<Model>> {
+        MODEL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Start modelling, appending to `log`. With `honour_fences` false the model
+    /// ignores every fence: the self-test that a crash suite catches a missing
+    /// one.
+    pub fn arm(_serial: &FaultSerial, log: &Path, honour_fences: bool) -> io::Result<()> {
+        let mut file = OpenOptions::new().create(true).append(true).open(log)?;
+        let existing = std::fs::read(log)?;
+        if MAGIC.starts_with(&existing) {
+            // Empty, or a writer died writing the magic.
+            file.set_len(0)?;
+            file.write_all(MAGIC)?;
+        } else {
+            // A writer killed mid-record left a torn last record. Appending
+            // after it would put every later record out of step, and `apply`
+            // would misread them, missing among others a later writer's fence.
+            let (_, whole) = parse(log, &existing)?;
+            if whole < existing.len() {
+                file.set_len(whole as u64)?;
+            }
+        }
+        *model() = Some(Model {
+            log: file,
+            honour_fences,
+            dirty: HashMap::new(),
+        });
+        Ok(())
+    }
+
+    pub fn disarm(_serial: &FaultSerial) {
+        *model() = None;
+    }
+
+    fn identify(file: &File) -> io::Result<(Inode, u64)> {
+        let metadata = file.metadata()?;
+        Ok(((metadata.dev(), metadata.ino()), metadata.len()))
+    }
+
+    /// One record, in one write.
+    fn record(log: &mut File, tag: u8, inode: Inode, body: &[u8]) -> io::Result<()> {
+        let mut bytes = Vec::with_capacity(RECORD_HEAD + body.len());
+        bytes.push(tag);
+        bytes.extend_from_slice(&inode.0.to_le_bytes());
+        bytes.extend_from_slice(&inode.1.to_le_bytes());
+        bytes.extend_from_slice(body);
+        log.write_all(&bytes)
+    }
+
+    /// Log the pre-image of whatever part of `[from, to)` lies within the
+    /// durable length and has not been logged since the file's last fence. The
+    /// first change since a fence also logs that durable length.
+    fn log_pre_image(model: &mut Model, file: &File, from: u64, to: u64) -> io::Result<()> {
+        let (inode, len) = identify(file)?;
+        let Model { log, dirty, .. } = model;
+        let entry = match dirty.entry(inode) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                record(log, SEEN, inode, &len.to_le_bytes())?;
+                entry.insert(Dirty {
+                    durable_len: len,
+                    logged: Vec::new(),
+                })
+            }
+        };
+        let to = to.min(entry.durable_len);
+        let mut at = from;
+        while at < to {
+            if let Some(&(_, end)) = entry.logged.iter().find(|&&(s, e)| s <= at && at < e) {
+                at = end;
+                continue;
+            }
+            let next = entry
+                .logged
+                .iter()
+                .map(|&(start, _)| start)
+                .filter(|&start| start > at)
+                .min()
+                .unwrap_or(to)
+                .min(to);
+            let mut bytes = vec![0u8; (next - at) as usize];
+            let read = file.read_at(&mut bytes, at)?;
+            bytes.truncate(read);
+            let mut body = Vec::with_capacity(16 + bytes.len());
+            body.extend_from_slice(&at.to_le_bytes());
+            body.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            body.extend_from_slice(&bytes);
+            record(log, PRE_IMAGE, inode, &body)?;
+            entry.logged.push((at, next));
+            at = next;
+        }
+        Ok(())
+    }
+
+    /// Before a write of `len` bytes at `offset`.
+    pub(crate) fn before_write(file: &File, offset: u64, len: u64) -> io::Result<()> {
+        match model().as_mut() {
+            Some(model) => log_pre_image(model, file, offset, offset.saturating_add(len)),
+            None => Ok(()),
+        }
+    }
+
+    /// Before a truncation or an allocation to `new_len`. Growth needs no
+    /// pre-image, since putting the durable length back drops it; a shrink logs
+    /// what it is about to cut.
+    pub(crate) fn before_resize(file: &File, new_len: u64) -> io::Result<()> {
+        match model().as_mut() {
+            Some(model) => log_pre_image(model, file, new_len, u64::MAX),
+            None => Ok(()),
+        }
+    }
+
+    /// After a successful `fdatasync`: the file is durable as it stands.
+    pub(crate) fn after_fence(file: &File) -> io::Result<()> {
+        let mut guard = model();
+        let Some(model) = guard.as_mut() else {
+            return Ok(());
+        };
+        if !model.honour_fences {
+            return Ok(());
+        }
+        let (inode, _) = identify(file)?;
+        model.dirty.remove(&inode);
+        record(&mut model.log, FENCED, inode, &[])
+    }
+
+    enum Record {
+        Seen {
+            inode: Inode,
+            durable_len: u64,
+        },
+        PreImage {
+            inode: Inode,
+            offset: u64,
+            data: Vec<u8>,
+        },
+        Fenced {
+            inode: Inode,
+        },
+    }
+
+    /// A log's whole records, and the length they end at. A torn last record
+    /// is where a writer died, so it ends the log: `apply` ignores it and `arm`
+    /// cuts it off before appending.
+    fn parse(log: &Path, bytes: &[u8]) -> io::Result<(Vec<Record>, usize)> {
+        if bytes.get(..MAGIC.len()) != Some(&MAGIC[..]) {
+            return Err(io::Error::other(format!(
+                "{} is not a power-loss log",
+                log.display()
+            )));
+        }
+        let u64_at = |at: usize| -> Option<u64> {
+            bytes
+                .get(at..at.checked_add(8)?)
+                .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+        };
+        let mut records = Vec::new();
+        let mut at = MAGIC.len();
+        while at + RECORD_HEAD <= bytes.len() {
+            let inode = (u64_at(at + 1).unwrap(), u64_at(at + 9).unwrap());
+            let body = at + RECORD_HEAD;
+            let (record, next) = match bytes[at] {
+                SEEN => {
+                    let Some(durable_len) = u64_at(body) else {
+                        break;
+                    };
+                    (Record::Seen { inode, durable_len }, body + 8)
+                }
+                PRE_IMAGE => {
+                    let (Some(offset), Some(len)) = (u64_at(body), u64_at(body + 8)) else {
+                        break;
+                    };
+                    let data_at = body + 16;
+                    let Some(data) = usize::try_from(len)
+                        .ok()
+                        .and_then(|len| bytes.get(data_at..data_at.checked_add(len)?))
+                    else {
+                        break;
+                    };
+                    let next = data_at + data.len();
+                    (
+                        Record::PreImage {
+                            inode,
+                            offset,
+                            data: data.to_vec(),
+                        },
+                        next,
+                    )
+                }
+                FENCED => (Record::Fenced { inode }, body),
+                other => {
+                    return Err(io::Error::other(format!(
+                        "{}: unknown power-loss record {other} at byte {at}",
+                        log.display()
+                    )))
+                }
+            };
+            records.push(record);
+            at = next;
+        }
+        Ok((records, at))
+    }
+
+    /// What [`apply`] put back.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct Applied {
+        /// Files returned to their durable length and content.
+        pub files: u64,
+        /// Bytes of pre-image written back.
+        pub bytes: u64,
+        /// Changed files no name under the root reaches any more, so nothing a
+        /// recovery could read; counted, not restored.
+        pub unreachable: u64,
+    }
+
+    /// The power loss: put back, in the files under `root`, everything the log
+    /// says no fence covered, then remove the log. No log is no loss.
+    pub fn apply(root: &Path, log: &Path) -> io::Result<Applied> {
+        let bytes = match std::fs::read(log) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Applied::default()),
+            Err(error) => return Err(error),
+        };
+        struct Unfenced {
+            durable_len: u64,
+            pre_images: Vec<(u64, Vec<u8>)>,
+        }
+        let mut unfenced: HashMap<Inode, Unfenced> = HashMap::new();
+        for record in parse(log, &bytes)?.0 {
+            match record {
+                // The first since the last fence wins: a later writer saw this
+                // writer's unfenced length, not the durable one.
+                Record::Seen { inode, durable_len } => {
+                    unfenced.entry(inode).or_insert(Unfenced {
+                        durable_len,
+                        pre_images: Vec::new(),
+                    });
+                }
+                Record::PreImage {
+                    inode,
+                    offset,
+                    data,
+                } => {
+                    if let Some(entry) = unfenced.get_mut(&inode) {
+                        entry.pre_images.push((offset, data));
+                    }
+                }
+                Record::Fenced { inode } => {
+                    unfenced.remove(&inode);
+                }
+            }
+        }
+
+        let mut paths = HashMap::new();
+        walk(root, &mut paths)?;
+        let mut applied = Applied::default();
+        for (inode, entry) in unfenced {
+            let Some(path) = paths.get(&inode) else {
+                applied.unreachable += 1;
+                continue;
+            };
+            let file = OpenOptions::new().write(true).open(path)?;
+            file.set_len(entry.durable_len)?;
+            // Newest first, so the oldest pre-image of each byte is the one left.
+            for (offset, data) in entry.pre_images.iter().rev() {
+                if *offset >= entry.durable_len {
+                    continue;
+                }
+                let len = data.len().min((entry.durable_len - offset) as usize);
+                file.write_all_at(&data[..len], *offset)?;
+                applied.bytes += len as u64;
+            }
+            applied.files += 1;
+        }
+        std::fs::remove_file(log)?;
+        Ok(applied)
+    }
+
+    /// Every regular file under `dir`, by inode, at the first name found.
+    fn walk(dir: &Path, paths: &mut HashMap<Inode, PathBuf>) -> io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if metadata.is_dir() {
+                walk(&path, paths)?;
+            } else if metadata.is_file() {
+                paths
+                    .entry((metadata.dev(), metadata.ino()))
+                    .or_insert(path);
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -900,5 +1275,194 @@ mod tests {
 
     fn libc_eexist() -> i32 {
         17
+    }
+}
+
+#[cfg(all(test, feature = "failpoints"))]
+mod power_loss_tests {
+    use super::*;
+    use std::io::Seek;
+
+    struct Machine {
+        _dir: tempfile::TempDir,
+        root: std::path::PathBuf,
+        log: std::path::PathBuf,
+        counters: DurabilityCounters,
+    }
+
+    /// A root holding one durable file, `f`, of eight `A`s, and a log beside it.
+    fn machine() -> (Machine, File) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).expect("root");
+        let path = root.join("f");
+        std::fs::write(&path, b"AAAAAAAA").expect("durable content");
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open");
+        let log = dir.path().join("root.power-loss");
+        let machine = Machine {
+            _dir: dir,
+            root,
+            log,
+            counters: DurabilityCounters::default(),
+        };
+        (machine, file)
+    }
+
+    fn write_at(file: &mut File, offset: u64, bytes: &[u8], counters: &DurabilityCounters) {
+        file.seek(SeekFrom::Start(offset)).expect("seek");
+        write_vectored_all(file, &[IoSlice::new(bytes)], counters).expect("write");
+    }
+
+    fn content(machine: &Machine) -> Vec<u8> {
+        std::fs::read(machine.root.join("f")).expect("read")
+    }
+
+    #[test]
+    fn a_fenced_write_survives_and_an_unfenced_one_is_put_back() {
+        let serial = serial();
+        let (machine, mut file) = machine();
+        power_loss::arm(&serial, &machine.log, true).expect("arm");
+        write_at(&mut file, 0, b"BBBB", &machine.counters);
+        fdatasync(&file, &machine.counters).expect("fence");
+        write_at(&mut file, 4, b"CCCCCCCC", &machine.counters);
+        power_loss::disarm(&serial);
+        assert_eq!(content(&machine), b"BBBBCCCCCCCC");
+
+        let applied = power_loss::apply(&machine.root, &machine.log).expect("apply");
+        assert_eq!(content(&machine), b"BBBBAAAA");
+        assert_eq!(applied.files, 1);
+        assert_eq!(applied.bytes, 4);
+        assert!(!machine.log.exists(), "the log is consumed");
+    }
+
+    #[test]
+    fn a_shrink_and_an_allocation_are_put_back() {
+        let serial = serial();
+        let (machine, file) = machine();
+        power_loss::arm(&serial, &machine.log, true).expect("arm");
+        truncate(&file, 2, &machine.counters).expect("shrink");
+        preallocate(&file, 16).expect("allocate");
+        power_loss::disarm(&serial);
+        assert_eq!(content(&machine).len(), 16);
+
+        power_loss::apply(&machine.root, &machine.log).expect("apply");
+        assert_eq!(content(&machine), b"AAAAAAAA");
+    }
+
+    #[test]
+    fn ignoring_fences_puts_back_fenced_writes_too() {
+        let serial = serial();
+        let (machine, mut file) = machine();
+        power_loss::arm(&serial, &machine.log, false).expect("arm");
+        write_at(&mut file, 0, b"BBBB", &machine.counters);
+        fdatasync(&file, &machine.counters).expect("fence");
+        power_loss::disarm(&serial);
+
+        power_loss::apply(&machine.root, &machine.log).expect("apply");
+        assert_eq!(content(&machine), b"AAAAAAAA");
+    }
+
+    /// The page cache outlives a writer that exits normally: a second writer
+    /// sees the first one's unfenced bytes and length, and must not have them
+    /// taken for durable.
+    #[test]
+    fn a_second_writer_does_not_move_what_was_durable() {
+        let serial = serial();
+        let (machine, mut file) = machine();
+        power_loss::arm(&serial, &machine.log, true).expect("arm the first writer");
+        write_at(&mut file, 0, b"BBBBBBBBBBBB", &machine.counters);
+        power_loss::disarm(&serial);
+
+        power_loss::arm(&serial, &machine.log, true).expect("arm the second writer");
+        write_at(&mut file, 0, b"CCCC", &machine.counters);
+        power_loss::disarm(&serial);
+
+        power_loss::apply(&machine.root, &machine.log).expect("apply");
+        assert_eq!(content(&machine), b"AAAAAAAA");
+    }
+
+    #[test]
+    fn a_fence_by_a_later_writer_covers_an_earlier_one() {
+        let serial = serial();
+        let (machine, mut file) = machine();
+        power_loss::arm(&serial, &machine.log, true).expect("arm the first writer");
+        write_at(&mut file, 0, b"BBBB", &machine.counters);
+        power_loss::disarm(&serial);
+
+        power_loss::arm(&serial, &machine.log, true).expect("arm the second writer");
+        fdatasync(&file, &machine.counters).expect("fence");
+        power_loss::disarm(&serial);
+
+        power_loss::apply(&machine.root, &machine.log).expect("apply");
+        assert_eq!(content(&machine), b"BBBBAAAA");
+    }
+
+    /// A writer killed mid-record leaves a torn last record, which is where the
+    /// log ends; everything before it still applies.
+    #[test]
+    fn a_torn_last_record_is_where_the_log_ends() {
+        let serial = serial();
+        let (machine, mut file) = machine();
+        power_loss::arm(&serial, &machine.log, true).expect("arm");
+        write_at(&mut file, 0, b"BBBB", &machine.counters);
+        power_loss::disarm(&serial);
+        let mut log = File::options()
+            .append(true)
+            .open(&machine.log)
+            .expect("the log");
+        std::io::Write::write_all(&mut log, &[2, 0, 0, 0]).expect("a torn record");
+        drop(log);
+
+        power_loss::apply(&machine.root, &machine.log).expect("apply");
+        assert_eq!(content(&machine), b"AAAAAAAA");
+    }
+
+    /// Found in review: a writer that arms after a torn record must not append
+    /// behind it, or every later record is misread and a later fence is
+    /// missed, putting back data that fence made durable.
+    #[test]
+    fn a_writer_after_a_torn_record_keeps_its_own_fence() {
+        let serial = serial();
+        let (machine, mut file) = machine();
+        power_loss::arm(&serial, &machine.log, true).expect("arm the first writer");
+        write_at(&mut file, 0, b"BBBB", &machine.counters);
+        power_loss::disarm(&serial);
+        let mut log = File::options()
+            .append(true)
+            .open(&machine.log)
+            .expect("the log");
+        std::io::Write::write_all(&mut log, &[2, 0, 0, 0]).expect("a torn record");
+        drop(log);
+
+        power_loss::arm(&serial, &machine.log, true).expect("arm the second writer");
+        write_at(&mut file, 4, b"CCCC", &machine.counters);
+        fdatasync(&file, &machine.counters).expect("fence");
+        power_loss::disarm(&serial);
+
+        power_loss::apply(&machine.root, &machine.log).expect("apply");
+        assert_eq!(content(&machine), b"BBBBCCCC");
+    }
+
+    #[test]
+    fn no_log_is_no_loss() {
+        let (machine, _file) = machine();
+        assert_eq!(
+            power_loss::apply(&machine.root, &machine.log).expect("apply"),
+            power_loss::Applied::default()
+        );
+        assert_eq!(content(&machine), b"AAAAAAAA");
+    }
+
+    #[test]
+    fn an_unarmed_funnel_logs_nothing() {
+        let serial = serial();
+        power_loss::disarm(&serial);
+        let (machine, mut file) = machine();
+        write_at(&mut file, 0, b"BBBB", &machine.counters);
+        assert!(!machine.log.exists());
     }
 }

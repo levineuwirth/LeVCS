@@ -199,6 +199,13 @@ pub mod faults {
     pub use crate::sys::{arm, disarm, serial, Fault, FaultSerial};
 }
 
+/// The power-loss model of the page cache, likewise (contract review
+/// 2026-11-02-C).
+#[cfg(feature = "failpoints")]
+pub mod power_loss {
+    pub use crate::sys::power_loss::{apply, arm, disarm, Applied};
+}
+
 /// Failpoint arming, likewise.
 #[cfg(feature = "failpoints")]
 pub mod points {

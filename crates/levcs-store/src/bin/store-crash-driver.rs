@@ -314,6 +314,51 @@ fn parse_fault(value: &str, victim: usize) -> Result<Option<Fault>, String> {
 // Subcommand: append
 // ---------------------------------------------------------------------------
 
+/// Whether a writer logs what a power loss would discard (audit S2, contract
+/// review 2026-11-02-C).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PowerLoss {
+    /// Log every write's pre-image and every fence, so `reconcile` can put back
+    /// what no fence covered. The default: every run through this driver models
+    /// a power loss, not only a killed process.
+    On,
+    /// Log, but ignore every fence: the self-test that the crash suites catch a
+    /// missing one.
+    IgnoreFences,
+    Off,
+}
+
+impl PowerLoss {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "on" => Some(Self::On),
+            "ignore-fences" => Some(Self::IgnoreFences),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+}
+
+/// The power-loss log for `root`: beside it, not in it, like the ACK journal.
+fn power_loss_log(root: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.power-loss", root.display()))
+}
+
+/// Arm the model for this writer, if asked to.
+fn arm_power_loss(
+    serial: &levcs_store::drive::faults::FaultSerial,
+    root: &Path,
+    mode: PowerLoss,
+) -> Result<(), String> {
+    let honour_fences = match mode {
+        PowerLoss::Off => return Ok(()),
+        PowerLoss::On => true,
+        PowerLoss::IgnoreFences => false,
+    };
+    levcs_store::drive::power_loss::arm(serial, &power_loss_log(root), honour_fences)
+        .map_err(|error| format!("arming the power-loss model: {error}"))
+}
+
 struct AppendArgs {
     root: PathBuf,
     shard: u16,
@@ -335,6 +380,7 @@ struct AppendArgs {
     /// A fault armed immediately before that seal, so the seal/rotate/`CURRENT`
     /// ordering points of scope 3.4 and 3.5 can be attacked one at a time.
     seal_fault: Option<Fault>,
+    power_loss: PowerLoss,
 }
 
 fn run_append(args: AppendArgs) -> ExitCode {
@@ -342,6 +388,20 @@ fn run_append(args: AppendArgs) -> ExitCode {
     let group: Vec<ScriptedTransaction> = (0..args.group_len as u64)
         .map(|ordinal| ScriptedTransaction::new(args.seed, ordinal))
         .collect();
+
+    // Exclusive use of both registries, held for the rest of the run. This
+    // process drives one shard on one thread, so the token is never contended
+    // here — but `arm` requires it, and that is the point: the requirement is
+    // what makes every arming site in the crate provably guarded rather than
+    // guarded by whoever remembered.
+    let serial = levcs_store::drive::faults::serial();
+
+    // Before the drive exists, so the writes that create or open it are
+    // modelled too.
+    if let Err(error) = arm_power_loss(&serial, &args.root, args.power_loss) {
+        eprintln!("store-crash-driver: {error}");
+        return ExitCode::from(EX_SOFTWARE);
+    }
 
     let mut drive = if args.create {
         match ShardDrive::create(&args.root, args.shard, args.shard_count) {
@@ -360,13 +420,6 @@ fn run_append(args: AppendArgs) -> ExitCode {
             }
         }
     };
-
-    // Exclusive use of both registries, held for the rest of the run. This
-    // process drives one shard on one thread, so the token is never contended
-    // here — but `arm` requires it, and that is the point: the requirement is
-    // what makes every arming site in the crate provably guarded rather than
-    // guarded by whoever remembered.
-    let serial = levcs_store::drive::faults::serial();
 
     // Arm last, immediately before the call under test, so nothing in setup
     // consumes the one-shot arming.
@@ -647,6 +700,7 @@ struct SoakArgs {
     ack_journal: PathBuf,
     max_groups: u64,
     path: DrivePath,
+    power_loss: PowerLoss,
 }
 
 /// Append groups until something kills the process.
@@ -657,6 +711,13 @@ struct SoakArgs {
 /// already in the external journal survives.
 fn run_soak(args: SoakArgs) -> ExitCode {
     let namespace = namespace_for(args.seed);
+
+    // Held for the whole soak, which only a signal ends.
+    let serial = levcs_store::drive::faults::serial();
+    if let Err(error) = arm_power_loss(&serial, &args.root, args.power_loss) {
+        eprintln!("store-crash-driver: {error}");
+        return ExitCode::from(EX_SOFTWARE);
+    }
 
     let mut drive = match ShardDrive::create(&args.root, args.shard, args.shard_count) {
         Ok(drive) => drive,
@@ -764,6 +825,22 @@ fn run_reconcile(args: ReconcileArgs) -> ExitCode {
     // that is the call under test here, and nothing in this function reads the
     // funnel ahead of it that could consume the one-shot arming.
     let serial = levcs_store::drive::faults::serial();
+
+    // The power loss, before anything reads the root: whatever the writers
+    // logged and no fence covered is put back to what was durable, as a power
+    // cut would leave it, and the log is consumed — the machine has rebooted.
+    match levcs_store::drive::power_loss::apply(&args.root, &power_loss_log(&args.root)) {
+        Ok(applied) => {
+            println!("power_loss_files={}", applied.files);
+            println!("power_loss_bytes={}", applied.bytes);
+            println!("power_loss_unreachable={}", applied.unreachable);
+        }
+        Err(error) => {
+            eprintln!("store-crash-driver: applying the power-loss log: {error}");
+            return ExitCode::from(EX_SOFTWARE);
+        }
+    }
+
     if let Some(fault) = args.fault {
         levcs_store::drive::faults::arm(&serial, fault);
     }
@@ -931,17 +1008,25 @@ store-crash-driver <append|damage|soak|reconcile> [flags]
   append     --root P --shard N [--shard-count N] [--create] --seed U64
              --group-len N [--victim N] [--point NAME] [--action ACTION]
              [--fault FAULT] [--ack-journal P] [--path drive|submit]
-             [--seal] [--seal-fault FAULT]
+             [--seal] [--seal-fault FAULT] [--power-loss MODE]
   damage     --root P --kind sealed-frame-corruption [--shard N]
   damage     --root P --kind cross-shard-journal-movement
              [--source-shard N] [--destination-shard N]
   soak       --root P --shard N [--shard-count N] --seed U64 --group-len N
              --ack-journal P [--max-groups N] [--path drive|submit]
+             [--power-loss MODE]
   reconcile  --root P --shard N [--ack-journal P] [--fault FAULT]
 
   ACTION  continue | fail | panic | hard-exit
   FAULT   none | short-write-tears-victim | short-write:BYTES | no-space
           | fence-eio | read-eio | dir-sync-eio
+  MODE    on (default) | off | ignore-fences
+
+append and soak log, beside the root as <root>.power-loss, what a power loss
+would discard: each write's pre-image and each fence. reconcile applies that
+log before recovery, putting back whatever no fence covered, so a crash is a
+power loss and not only a killed process. ignore-fences logs no fence, the
+self-test that a missing fence is caught.
 ";
 
 fn main() -> ExitCode {
@@ -960,6 +1045,12 @@ fn main() -> ExitCode {
             ExitCode::from(EX_USAGE)
         }
     }
+}
+
+fn power_loss_flag(args: &Args) -> Result<PowerLoss, String> {
+    let value = args.get("power-loss").unwrap_or("on");
+    PowerLoss::parse(value)
+        .ok_or_else(|| format!("--power-loss must be on, off or ignore-fences, not {value:?}"))
 }
 
 fn dispatch(args: &Args) -> Result<ExitCode, String> {
@@ -995,6 +1086,7 @@ fn dispatch(args: &Args) -> Result<ExitCode, String> {
             path,
             seal: args.get("seal").is_some(),
             seal_fault: parse_fault(args.get("seal-fault").unwrap_or("none"), victim)?,
+            power_loss: power_loss_flag(args)?,
         }));
     }
 
@@ -1010,6 +1102,7 @@ fn dispatch(args: &Args) -> Result<ExitCode, String> {
             ack_journal: PathBuf::from(args.required("ack-journal")?),
             max_groups: args.parsed::<u64>("max-groups", u64::MAX)?,
             path,
+            power_loss: power_loss_flag(args)?,
         }));
     }
 

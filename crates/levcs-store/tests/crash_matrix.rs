@@ -1179,6 +1179,152 @@ fn enospc_during_append_is_refused_and_leaves_an_openable_store() {
     }
 }
 
+/// A crash is a power loss (audit S2, contract review 2026-11-02-C): the
+/// writer logs every write's pre-image and every fence, and `reconcile` puts
+/// back whatever no fence covered before recovery reads the root.
+///
+/// The control: a second writer acknowledges a group, the power is lost, and
+/// every acknowledgment is recovered. The self-test: the same writer with the
+/// model ignoring its fences, as if they were missing, and the reconciliation
+/// reports those acknowledgments lost. Every crash suite missed that while a
+/// crash only killed the process, because the page cache kept the unfenced
+/// frames.
+#[test]
+fn a_missing_fence_is_acknowledged_loss_once_a_crash_is_a_power_loss() {
+    fn acknowledged_then_power_lost(second_writer: &str) -> harness::ChildRun {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = directory.path().join("root");
+        let ack = directory.path().join("ack.journal");
+        let first = harness::run_append(&harness::AppendRun {
+            root: &root,
+            shard: 0,
+            shard_count: 1,
+            seed: 0x5332,
+            group_len: 2,
+            victim: 0,
+            point: Failpoint::BeforeAppend,
+            action: "continue",
+            fault: "none",
+            ack_journal: &ack,
+            create: true,
+        });
+        assert_eq!(first.exit_code, Some(0), "{}", first.stderr);
+
+        let second = std::process::Command::new(harness::DRIVER)
+            .arg("append")
+            .arg("--root")
+            .arg(&root)
+            .args(["--shard", "0", "--shard-count", "1", "--seed", "21299"])
+            .args([
+                "--group-len",
+                "4",
+                "--point",
+                Failpoint::BeforeAppend.name(),
+            ])
+            .args(["--action", "continue", "--fault", "none", "--path", "drive"])
+            .arg("--ack-journal")
+            .arg(&ack)
+            .args(["--power-loss", second_writer])
+            .output()
+            .expect("spawning the second writer");
+        let stdout = String::from_utf8_lossy(&second.stdout);
+        assert_eq!(second.status.code(), Some(0), "{stdout}");
+        assert!(stdout.contains("acknowledged_count=4"), "{stdout}");
+
+        harness::run_reconcile(&root, 0, &ack)
+    }
+
+    let honoured = acknowledged_then_power_lost("on");
+    assert_eq!(
+        honoured.get("recovery_ok"),
+        Some("true"),
+        "{}",
+        honoured.stderr
+    );
+    assert_eq!(honoured.get("acknowledged_loss"), Some("0"));
+
+    let missing = acknowledged_then_power_lost("ignore-fences");
+    assert_eq!(
+        missing.get("recovery_ok"),
+        Some("true"),
+        "{}",
+        missing.stderr
+    );
+    assert_ne!(
+        missing.get("power_loss_files"),
+        Some("0"),
+        "the power loss put nothing back, so the model saw no unfenced write"
+    );
+    assert_eq!(
+        missing.get("acknowledged_loss"),
+        Some("4"),
+        "the four acknowledgments whose fences the model ignored must be lost"
+    );
+}
+
+/// The crash driver models a power loss without being asked: no
+/// `--power-loss` flag below. Found in review: the self-test above passes the
+/// flag in every run, so turning the default off broke nothing.
+///
+/// A writer dies after writing its group's frames and before fencing them;
+/// the reconciliation must report putting them back, and recover none of them.
+#[test]
+fn the_crash_driver_models_a_power_loss_by_default() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let root = directory.path().join("root");
+    let ack = directory.path().join("ack.journal");
+    let committed = harness::run_append(&harness::AppendRun {
+        root: &root,
+        shard: 0,
+        shard_count: 1,
+        seed: 0x5333,
+        group_len: 2,
+        victim: 0,
+        point: Failpoint::BeforeAppend,
+        action: "continue",
+        fault: "none",
+        ack_journal: &ack,
+        create: true,
+    });
+    assert_eq!(committed.exit_code, Some(0), "{}", committed.stderr);
+    let committed = committed.sequences("appended_sequences");
+
+    let unfenced = harness::run_append(&harness::AppendRun {
+        root: &root,
+        shard: 0,
+        shard_count: 1,
+        seed: 0x5334,
+        group_len: 4,
+        victim: 3,
+        point: Failpoint::AfterFrameWrite,
+        action: "hard-exit",
+        fault: "none",
+        ack_journal: &ack,
+        create: false,
+    });
+    assert_eq!(unfenced.exit_code, Some(3), "{}", unfenced.stderr);
+
+    let reconcile = harness::run_reconcile(&root, 0, &ack);
+    assert_eq!(
+        reconcile.get("recovery_ok"),
+        Some("true"),
+        "{}",
+        reconcile.stderr
+    );
+    assert_ne!(
+        reconcile.get("power_loss_files"),
+        Some("0"),
+        "without the flag the driver must still have logged the unfenced group"
+    );
+    assert_ne!(reconcile.get("power_loss_bytes"), Some("0"));
+    assert_eq!(
+        reconcile.sequences("adopted_sequences"),
+        committed,
+        "the unfenced group must be put back, and only it"
+    );
+    assert_eq!(reconcile.get("acknowledged_loss"), Some("0"));
+}
+
 /// A read `EIO` anywhere in the reopen path is a clean refusal, never a panic
 /// and never a partial adoption.
 ///

@@ -986,7 +986,12 @@ Deliverables:
 4. **Fault injection through `sys.rs`** — short write, `ENOSPC`, `EIO` on `fdatasync`,
    `EIO` on `pread`, unexpected cursor. dm-flakey and power-cut belong to the reviewed
    root-only scripts of §10 and are Phase 4/5; Phase 1 gets the userspace layer so the
-   matrix runs unprivileged in CI.
+   matrix runs unprivileged in CI. **Amended by contract review 2026-11-02-C:** that
+   layer now includes a model of the page cache a power loss discards. The crash
+   driver's writers log every write's pre-image and every fence, and `reconcile` puts
+   back what no fence covered before recovery, so the runs through the crash driver (the
+   Wave A rows and the SIGKILL cycles) see a missing `fdatasync`. Directory entries, and
+   the Wave B rows, which drive the engine in-process, are not modelled.
 5. **External ACK reconciliation** — reuse `oracle::ExternalAckJournal`. Every
    acknowledged operation is durably journaled before it is counted; after each crash the
    harness proves zero acknowledged loss and zero torn transactions against the recovered

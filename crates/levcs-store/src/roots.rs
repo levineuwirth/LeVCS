@@ -1286,6 +1286,74 @@ mod tests {
         assert_eq!(survivor.shard_index, 1);
     }
 
+    /// A seal thinning a layer stack longer than one chunk of the persistent
+    /// vector, which holds 64 elements. Layers are pushed at the front and the
+    /// seal removes them with `retain`, which moves the survivors into place
+    /// through the vector's mutable focus. imbl 6.1.0 to 7.0.2 did that through
+    /// a slice that ignored where a front-filled chunk's elements start
+    /// (jneem/imbl-sized-chunks#22): it read and wrote uninitialized slots, and
+    /// the store crashed. The gate's engine tests reached this length only
+    /// when their temporary files were on tmpfs. This builds it directly, so
+    /// any map crate behind `Vector` is held to it on every host.
+    #[test]
+    fn a_seal_thins_a_layer_stack_longer_than_one_chunk() {
+        fn object(shard: u16, sequence: u64) -> ObjectId {
+            let mut bytes = [0; 32];
+            bytes[..2].copy_from_slice(&shard.to_le_bytes());
+            bytes[2..10].copy_from_slice(&sequence.to_le_bytes());
+            ObjectId(bytes)
+        }
+        fn location(sequence: u64) -> IndexLocation {
+            IndexLocation {
+                segment_generation: 1,
+                frame_offset: sequence,
+                frame_len: 1,
+                object_type: 1,
+                shard_sequence: sequence,
+            }
+        }
+
+        // Two shards' layers interleaved, newest first, so the seal of one
+        // shard removes every other layer across all four chunks.
+        let mut root = CommittedRoot::default();
+        for sequence in 1..=100 {
+            for shard in [0u16, 1] {
+                let ns = namespace(shard as u8 + 1);
+                let layer = delta(ns, object(shard, sequence), location(sequence));
+                root = root.merge(&subtree(shard, sequence, ns, sequence, layer));
+            }
+        }
+        assert_eq!(root.index().delta_layer_count(), 200);
+
+        let mut seal = subtree(
+            0,
+            101,
+            namespace(1),
+            101,
+            Arc::new(IndexDelta::new(10, 1024)),
+        );
+        seal.sealed_through_shard_sequence = Some(101);
+        let sealed = root.merge(&seal);
+
+        let survivors: Vec<(u16, u64)> = sealed
+            .index()
+            .delta_layers()
+            .iter()
+            .map(|layer| (layer.shard_index, layer.through_shard_sequence))
+            .collect();
+        let expected: Vec<(u16, u64)> = (1..=100).rev().map(|sequence| (1, sequence)).collect();
+        assert_eq!(survivors, expected);
+        for sequence in 1..=100 {
+            let key = IndexKey::new(namespace(2), object(1, sequence));
+            assert_eq!(sealed.index().get(&key), Some(location(sequence)));
+        }
+
+        // The unsealed root is untouched, and both drop cleanly.
+        assert_eq!(root.index().delta_layer_count(), 200);
+        drop(root);
+        drop(sealed);
+    }
+
     #[test]
     fn untouched_repository_arc_is_shared_across_merge() {
         let untouched_namespace = namespace(1);

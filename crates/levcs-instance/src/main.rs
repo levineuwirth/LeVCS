@@ -21,6 +21,7 @@
 //!
 //! `[[mirrors]]` blocks are refused: see `InstanceConfig::validate`.
 
+use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -116,10 +117,13 @@ fn load_file(path: &Path) -> FileConfig {
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
+    // Colour only on a terminal: under systemd the log goes to the journal,
+    // where escape codes are noise in every line.
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
+        .with_ansi(std::io::stdout().is_terminal())
         .compact()
         .init();
 

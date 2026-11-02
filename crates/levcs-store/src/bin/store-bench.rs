@@ -3135,30 +3135,190 @@ const FULL_DEVICE: &str = "/dev/full";
 enum AckJournalFault {
     #[default]
     None,
-    /// The append with this zero-based index is issued against `/dev/full`
-    /// instead of the journal, and its error is propagated as the journal's.
+    /// The group holding the append with this zero-based index is written to
+    /// `/dev/full` instead of the journal, by the writer as it fences that
+    /// group, and the error is propagated as the journal's.
     EnospcOnAppend(u64),
 }
 
-/// The acknowledgment journal as the run loop uses it, plus the armed fault.
+/// What the acknowledgment sink fences records with: the external journal in a
+/// run, and in the tests that pin the grouping a double that can hold a fence
+/// open.
+trait AckFence: Send + 'static {
+    fn append_batch_durable(
+        &mut self,
+        records: &[AckRecord],
+    ) -> Result<(), levcs_protocol::oracle::AckJournalError>;
+}
+
+impl AckFence for ExternalAckJournal {
+    fn append_batch_durable(
+        &mut self,
+        records: &[AckRecord],
+    ) -> Result<(), levcs_protocol::oracle::AckJournalError> {
+        ExternalAckJournal::append_batch_durable(self, records)
+    }
+}
+
+/// The acknowledgment journal as the run loop uses it: queued from every
+/// submitter, fenced in groups by a writer thread of its own, plus the armed
+/// fault.
+///
+/// **Audit S3.** Every submitter used to take one mutex and `sync_data` its own
+/// record before issuing its next arrival, so the P2 run measured the
+/// journal's flush latency rather than the store: 57 commits/s against 2,629/s
+/// with that sync removed, on the audit's host. Grouping the fences alone was
+/// not enough while each submitter still waited for one: on this harness's
+/// development host it reached 539-564/s against 1,094-2,162/s without the
+/// sync, because a submitter held at the acknowledgment fence is a submitter
+/// the store does not see.
+///
+/// So the fence is off the submitter's path. A submitter queues its
+/// acknowledgment with [`AckSink::enqueue`] and issues its next arrival; the
+/// writer takes everything queued, writes it, fences it with one `sync_data`,
+/// and takes the next group. The rule is unchanged: a commit is counted only
+/// once a fence covering its acknowledgment has returned, which the submitter
+/// learns from [`AckSink::poll`] as it goes and from [`AckSink::wait_fenced`]
+/// when its window ends.
 ///
 /// A wrapper rather than a branch at the call site: the fault has to fire
-/// inside the same call the run loop already makes, or the regression would be
+/// inside the path the run loop already takes, or the regression would be
 /// exercising a path the emitter does not take.
-struct AckSink {
-    journal: ExternalAckJournal,
+struct AckSink<F: AckFence = ExternalAckJournal> {
+    shared: std::sync::Arc<AckShared>,
+    /// Joined on drop, which fences whatever is still queued and then closes
+    /// the journal.
+    writer: Option<std::thread::JoinHandle<F>>,
     fault: AckJournalFault,
-    appended: u64,
-    /// Whether the armed fault actually fired. See [`AckSink::unfired_arming`].
-    fired: bool,
+}
+
+struct AckShared {
+    state: Mutex<AckState>,
+    /// The writer waits here for records, or for the sink to close.
+    work: Condvar,
+    /// Whoever waits for a fence waits here; signalled when one finishes, well
+    /// or badly.
+    fenced: Condvar,
     /// Opened when the fault is armed, not when it fires, so a host where the
     /// fault cannot be induced says so before the run rather than after it.
     full_device: Option<std::fs::File>,
 }
 
+#[derive(Default)]
+struct AckState {
+    /// Records waiting for the next fence, in the order they were queued.
+    pending: Vec<AckRecord>,
+    /// Records queued so far. A record's ticket is its position, from 1.
+    queued: u64,
+    /// Every ticket up to this one has been fenced.
+    fenced_through: u64,
+    /// The ticket the armed fault fails: the group holding it is written to
+    /// `/dev/full` instead of the journal.
+    poisoned: Option<u64>,
+    /// Why a group's write or fence failed. No record after the last good
+    /// fence can be fenced any more: after a failed fence the kernel may have
+    /// dropped the dirty pages, so a later fence that succeeded would not
+    /// vouch for what was written before it.
+    failed: Option<(std::io::ErrorKind, String)>,
+    /// The sink is closing: the writer fences what is queued, then stops.
+    closing: bool,
+    /// Appends issued, which is what the armed fault counts.
+    appended: u64,
+    /// Whether the armed fault actually fired. See [`AckSink::unfired_arming`].
+    fired: bool,
+    /// Fences that succeeded: what group commit is measured by, against
+    /// `fenced_through` records.
+    fences: u64,
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+fn ack_failure(failure: &(std::io::ErrorKind, String)) -> levcs_protocol::oracle::AckJournalError {
+    levcs_protocol::oracle::AckJournalError::Io(std::io::Error::new(failure.0, failure.1.clone()))
+}
+
+/// The writer: one group at a time, everything queued while the last fence
+/// was in progress.
+fn write_ack_groups<F: AckFence>(shared: &AckShared, fence: &mut F) {
+    use std::io::Write as _;
+
+    loop {
+        let mut state = lock(&shared.state);
+        while state.pending.is_empty() && !state.closing {
+            state = shared.work.wait(state).unwrap_or_else(|p| p.into_inner());
+        }
+        if state.pending.is_empty() {
+            return;
+        }
+        let batch = std::mem::take(&mut state.pending);
+        let through = state.queued;
+        let poisoned = state
+            .poisoned
+            .is_some_and(|ticket| ticket > state.fenced_through && ticket <= through);
+        if poisoned {
+            state.fired = true;
+        }
+        drop(state);
+
+        let outcome = if poisoned {
+            let mut device = shared
+                .full_device
+                .as_ref()
+                .expect("an armed fault opened /dev/full before the run");
+            Err(match device.write_all(&[0u8]) {
+                Err(error) => error.into(),
+                // Named rather than folded into the fault: a device that
+                // accepted the write did not produce the failure this run
+                // claims to be injecting, and reporting it as one would make
+                // the regression pass on evidence it never had.
+                Ok(()) => std::io::Error::other(format!(
+                    "{FULL_DEVICE} accepted a write, so the armed acknowledgment-journal \
+                     fault produced no kernel error to propagate"
+                ))
+                .into(),
+            })
+        } else {
+            fence.append_batch_durable(&batch)
+        };
+
+        let mut state = lock(&shared.state);
+        match outcome {
+            Ok(()) => {
+                state.fenced_through = through;
+                state.fences += 1;
+                shared.fenced.notify_all();
+            }
+            Err(error) => {
+                state.failed = Some((
+                    match &error {
+                        levcs_protocol::oracle::AckJournalError::Io(io) => io.kind(),
+                        _ => std::io::ErrorKind::Other,
+                    },
+                    format!(
+                        "writing and fencing a group of {} acknowledgment(s) failed: \
+                         {error} ({error:?})",
+                        batch.len()
+                    ),
+                ));
+                state.pending.clear();
+                shared.fenced.notify_all();
+                return;
+            }
+        }
+    }
+}
+
 impl AckSink {
     fn open(path: &Path, fault: AckJournalFault) -> Result<Self, String> {
         let journal = ExternalAckJournal::open(path).map_err(|e| format!("ack journal: {e}"))?;
+        AckSink::with_fence(journal, fault)
+    }
+}
+
+impl<F: AckFence> AckSink<F> {
+    fn with_fence(fence: F, fault: AckJournalFault) -> Result<Self, String> {
         let full_device = match fault {
             AckJournalFault::None => None,
             AckJournalFault::EnospcOnAppend(_) => Some(
@@ -3176,12 +3336,27 @@ impl AckSink {
                     })?,
             ),
         };
-        Ok(Self {
-            journal,
-            fault,
-            appended: 0,
-            fired: false,
+        let shared = std::sync::Arc::new(AckShared {
+            state: Mutex::new(AckState::default()),
+            work: Condvar::new(),
+            fenced: Condvar::new(),
             full_device,
+        });
+        let writer = std::thread::Builder::new()
+            .name("ack-journal".into())
+            .spawn({
+                let shared = shared.clone();
+                move || {
+                    let mut fence = fence;
+                    write_ack_groups(&shared, &mut fence);
+                    fence
+                }
+            })
+            .map_err(|error| format!("starting the acknowledgment-journal writer: {error}"))?;
+        Ok(Self {
+            shared,
+            writer: Some(writer),
+            fault,
         })
     }
 
@@ -3198,49 +3373,127 @@ impl AckSink {
     /// So it is charter item 7 again: the arming is a claim, `fired` is the
     /// counter, and the two are compared instead of the flag being trusted.
     fn unfired_arming(&self) -> Option<String> {
+        let state = lock(&self.shared.state);
         match self.fault {
             AckJournalFault::None => None,
-            AckJournalFault::EnospcOnAppend(target) if !self.fired => Some(format!(
+            AckJournalFault::EnospcOnAppend(target) if !state.fired => Some(format!(
                 "--fail-ack-append-after {target} armed an acknowledgment-journal failure that \
                  never fired: the run issued only {} append(s), so no injected failure was \
                  observed and this run is not evidence of the behaviour the flag claims to \
                  exercise. Refusing rather than emitting a bundle that would read as a normal \
                  run.",
-                self.appended
+                state.appended
             )),
             AckJournalFault::EnospcOnAppend(_) => None,
         }
     }
 
+    /// The records fenced and the fences that did it.
+    fn fenced(&self) -> (u64, u64) {
+        let state = lock(&self.shared.state);
+        (state.fenced_through, state.fences)
+    }
+
+    /// Queues `record` for the next fence and returns its ticket, without
+    /// waiting for any fence. Fails once a fence has failed: nothing queued
+    /// after that could be fenced behind it.
+    fn enqueue(&self, record: &AckRecord) -> Result<u64, levcs_protocol::oracle::AckJournalError> {
+        let mut state = lock(&self.shared.state);
+        if let Some(failure) = &state.failed {
+            return Err(ack_failure(&(
+                failure.0,
+                format!(
+                    "an earlier group of acknowledgments failed to reach the journal, so this \
+                     one cannot be fenced after it: {}",
+                    failure.1
+                ),
+            )));
+        }
+        let ordinal = state.appended;
+        state.appended += 1;
+        state.pending.push(record.clone());
+        state.queued += 1;
+        let ticket = state.queued;
+        if self.fault == AckJournalFault::EnospcOnAppend(ordinal) {
+            state.poisoned = Some(ticket);
+        }
+        self.shared.work.notify_one();
+        Ok(ticket)
+    }
+
+    /// Every ticket fenced so far, and the failure that stops the rest, if
+    /// one has. Does not wait.
+    fn poll(&self) -> (u64, Option<levcs_protocol::oracle::AckJournalError>) {
+        let state = lock(&self.shared.state);
+        (state.fenced_through, state.failed.as_ref().map(ack_failure))
+    }
+
+    /// Returns once `ticket` is fenced, or fails if it never will be.
+    fn wait_fenced(&self, ticket: u64) -> Result<(), levcs_protocol::oracle::AckJournalError> {
+        let mut state = lock(&self.shared.state);
+        loop {
+            if state.fenced_through >= ticket {
+                return Ok(());
+            }
+            if let Some(failure) = &state.failed {
+                return Err(ack_failure(failure));
+            }
+            state = self
+                .shared
+                .fenced
+                .wait(state)
+                .unwrap_or_else(|p| p.into_inner());
+        }
+    }
+
+    /// Queues `record` and returns once it is fenced: for a caller with
+    /// nothing else to do meanwhile.
     fn append_durable(
-        &mut self,
+        &self,
         record: &AckRecord,
     ) -> Result<(), levcs_protocol::oracle::AckJournalError> {
-        use std::io::Write as _;
-
-        if self.fault == AckJournalFault::EnospcOnAppend(self.appended) {
-            self.fired = true;
-            let device = self
-                .full_device
-                .as_mut()
-                .expect("an armed fault opened /dev/full before the run");
-            return Err(match device.write_all(&[0u8]) {
-                Err(error) => error.into(),
-                // Named rather than folded into the fault: a device that
-                // accepted the write did not produce the failure this run
-                // claims to be injecting, and reporting it as one would make
-                // the regression pass on evidence it never had.
-                Ok(()) => std::io::Error::other(format!(
-                    "{FULL_DEVICE} accepted a write, so the armed acknowledgment-journal \
-                     fault produced no kernel error to propagate"
-                ))
-                .into(),
-            });
-        }
-        self.journal.append_durable(record)?;
-        self.appended += 1;
-        Ok(())
+        let ticket = self.enqueue(record)?;
+        self.wait_fenced(ticket)
     }
+}
+
+impl<F: AckFence> Drop for AckSink<F> {
+    fn drop(&mut self) {
+        lock(&self.shared.state).closing = true;
+        self.shared.work.notify_all();
+        if let Some(writer) = self.writer.take() {
+            // The writer returns the journal, which closes as it drops here.
+            let _ = writer.join();
+        }
+    }
+}
+
+/// A commit the store acknowledged whose acknowledgment is queued on the
+/// journal: counted once a fence covering `ticket` has returned.
+struct Unacked {
+    ticket: u64,
+    /// Classified into the measured window by the boundary gate.
+    measured: bool,
+    /// From the scheduled arrival to the store's response.
+    micros: u64,
+    /// The measured window's minute the store responded in.
+    minute: u64,
+    objects_new: u64,
+    bytes: u64,
+    operation: levcs_store::types::OperationId,
+    operation_id: [u8; 16],
+    repo_sequence: u64,
+    ordinal: u64,
+}
+
+/// The front of `unacked` that `through` covers. Tickets are queued in order,
+/// so a submitter's own are ascending and the fenced ones are a prefix.
+fn take_fenced(unacked: &mut std::collections::VecDeque<Unacked>, through: u64) -> Vec<Unacked> {
+    let mut fenced = Vec::new();
+    while unacked.front().is_some_and(|entry| entry.ticket <= through) {
+        fenced.extend(unacked.pop_front());
+    }
+    fenced
 }
 
 fn run_skeleton(
@@ -3250,7 +3503,7 @@ fn run_skeleton(
     group_len: usize,
     seconds: u64,
 ) -> Result<SkeletonRun, String> {
-    let mut ack = AckSink::open(ack_path, ack_fault)?;
+    let ack = AckSink::open(ack_path, ack_fault)?;
     let mut acknowledged = 0u64;
     let mut drive = ShardDrive::create(root, 0, 1).map_err(|e| format!("create: {e}"))?;
     let mut namespace_bytes = [0u8; 32];
@@ -3928,7 +4181,7 @@ fn run_engine(
         .map(|shard| engine_namespace(shard, shard_count))
         .collect();
 
-    let ack = Mutex::new(AckSink::open(ack_path, ack_fault)?);
+    let ack = AckSink::open(ack_path, ack_fault)?;
     let acknowledged = AtomicU64::new(0);
 
     // One repository per shard, created before the measured window.
@@ -4217,6 +4470,85 @@ fn run_engine(
                     let mut ordinal = 0u64;
                     let branch = format!("refs/heads/s{shard}-w{submitter}");
                     let mut expected: Option<ObjectId> = None;
+                    // This submitter's commits the store acknowledged whose
+                    // acknowledgments are queued on the journal but not yet
+                    // fenced, oldest first.
+                    let mut unacked: std::collections::VecDeque<Unacked> =
+                        std::collections::VecDeque::new();
+                    // A commit is counted once its acknowledgment is fenced,
+                    // which is what the rate is a rate of — and only when the
+                    // gate classified it into the measured phase. A warmup
+                    // commit is real store work the acknowledgment journal and
+                    // the reconciliation cover like any other; it is simply not
+                    // measured.
+                    let count = |entry: Unacked| {
+                        debug_assert!(
+                            entry.ticket <= ack.poll().0,
+                            "a commit was counted before its acknowledgment was fenced"
+                        );
+                        acknowledged.fetch_add(1, Ordering::Relaxed);
+                        if entry.measured {
+                            measured_commits.fetch_add(1, Ordering::Relaxed);
+                            // The store's own count of the objects this
+                            // transaction introduced, not `3` restated by the
+                            // harness. `objects_new` derived from the commit
+                            // count is what makes
+                            // `verification.objects_new_equals_three_per_commit`
+                            // a tautology instead of a check.
+                            objects_new.fetch_add(entry.objects_new, Ordering::Relaxed);
+                            raw_bytes.fetch_add(entry.bytes, Ordering::Relaxed);
+                            latency_histogram
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .saturating_record(entry.micros.max(1));
+                            let mut windows =
+                                window_commits.lock().unwrap_or_else(|p| p.into_inner());
+                            if windows.len() <= entry.minute as usize {
+                                windows.resize(entry.minute as usize + 1, 0);
+                            }
+                            windows[entry.minute as usize] += 1;
+                        }
+                        results.lock().unwrap_or_else(|p| p.into_inner()).push((
+                            namespace,
+                            entry.operation,
+                            entry.repo_sequence,
+                            entry.ordinal,
+                        ));
+                    };
+                    // Not a counter and not a `false`. The store committed
+                    // this transaction and fenced and signed for it, so those
+                    // costs are already inside the totals; the harness cannot
+                    // record the acknowledgment, so the transaction can never
+                    // be inside them. Ending the run here without saying so —
+                    // which is what this did — omitted a committed transaction
+                    // from the bundle while still counting its fence and its
+                    // signature, and silently shortened the measured interval.
+                    // `EDQUOT` on a full tmpfs is the ordinary way to get here.
+                    let unaccountable =
+                        |operation_id: [u8; 16],
+                         repo_sequence: u64,
+                         error: &levcs_protocol::oracle::AckJournalError| {
+                            let mut slot = unaccounted.lock().unwrap_or_else(|p| p.into_inner());
+                            if slot.is_none() {
+                                *slot = Some(format!(
+                                    "refusing to emit a bundle: incomplete accounting. \
+                                     StoreEngine::submit committed operation {} in namespace \
+                                     {} at repo_sequence {} and returned its receipt, but \
+                                     appending that acknowledgment to the external journal \
+                                     failed: {error} ({error:?}). The commit's durability \
+                                     fence and its signature are already inside the counters \
+                                     this run reports and the transaction itself can never \
+                                     be, so every total this run could emit describes a \
+                                     workload that did not happen. This is not a refused \
+                                     submit and not a shortened run: the harness cannot \
+                                     account for what it measured, so it emits nothing.",
+                                    hex::encode(operation_id),
+                                    hex::encode(namespace.as_bytes()),
+                                    repo_sequence,
+                                ));
+                            }
+                            stop.store(true, Ordering::Relaxed);
+                        };
                     let (authority, _) = engine_object(
                         "levcs-store/store-bench/genesis/v1",
                         &(shard as u64).to_le_bytes(),
@@ -4312,10 +4644,11 @@ fn run_engine(
                         scheduled += arrival_interval;
                         match outcome {
                             Some(Ok(receipt)) => {
-                                // The fence returned. Acknowledgment is only
-                                // permitted once the acknowledgment is itself
-                                // durable on an independent journal, so this
-                                // happens before anything counts the commit.
+                                // The store's fence returned. The commit may be
+                                // counted only once its acknowledgment is itself
+                                // durable on an independent journal, so it is
+                                // queued here and counted below once a fence
+                                // covering it has returned, never before.
                                 let record = AckRecord {
                                     repo_id: ObjectId(*namespace.as_bytes()),
                                     operation_id,
@@ -4328,88 +4661,31 @@ fn run_engine(
                                     tree_ids: vec![tree],
                                     commit_ids: vec![commit],
                                 };
-                                {
-                                    let mut journal = ack.lock().unwrap_or_else(|p| p.into_inner());
-                                    // Not a counter and not a `false`. The
-                                    // store committed this transaction and
-                                    // fenced and signed for it, so those costs
-                                    // are already inside the totals; the
-                                    // harness cannot record the acknowledgment,
-                                    // so the transaction can never be inside
-                                    // them. Ending the run here without saying
-                                    // so — which is what this did — omitted a
-                                    // committed transaction from the bundle
-                                    // while still counting its fence and its
-                                    // signature, and silently shortened the
-                                    // measured interval. `EDQUOT` on a full
-                                    // tmpfs is the ordinary way to get here.
-                                    if let Err(error) = journal.append_durable(&record) {
-                                        let mut slot =
-                                            unaccounted.lock().unwrap_or_else(|p| p.into_inner());
-                                        if slot.is_none() {
-                                            *slot = Some(format!(
-                                                "refusing to emit a bundle: incomplete \
-                                                 accounting. StoreEngine::submit committed \
-                                                 operation {} in namespace {} at \
-                                                 repo_sequence {} and returned its receipt, \
-                                                 but appending that acknowledgment to the \
-                                                 external journal failed: {error} \
-                                                 ({error:?}). The commit's durability fence \
-                                                 and its signature are already inside the \
-                                                 counters this run reports and the \
-                                                 transaction itself can never be, so every \
-                                                 total this run could emit describes a \
-                                                 workload that did not happen. This is not \
-                                                 a refused submit and not a shortened run: \
-                                                 the harness cannot account for what it \
-                                                 measured, so it emits nothing.",
-                                                hex::encode(operation_id),
-                                                hex::encode(namespace.as_bytes()),
-                                                receipt.repo_sequence,
-                                            ));
-                                        }
-                                        stop.store(true, Ordering::Relaxed);
+                                // The minute the store responded in, taken now
+                                // rather than when the acknowledgment's fence
+                                // returns: the windows describe the store.
+                                let minute = Instant::now()
+                                    .saturating_duration_since(measure_start)
+                                    .as_secs()
+                                    / 60;
+                                match ack.enqueue(&record) {
+                                    Ok(ticket) => unacked.push_back(Unacked {
+                                        ticket,
+                                        measured,
+                                        micros,
+                                        minute,
+                                        objects_new: receipt.objects_new,
+                                        bytes,
+                                        operation,
+                                        operation_id,
+                                        repo_sequence: receipt.repo_sequence,
+                                        ordinal,
+                                    }),
+                                    Err(error) => {
+                                        unaccountable(operation_id, receipt.repo_sequence, &error);
                                         return;
                                     }
                                 }
-                                acknowledged.fetch_add(1, Ordering::Relaxed);
-                                // A commit is counted when it is acknowledged,
-                                // which is what the rate is a rate of — and
-                                // only when the gate above classified it into
-                                // the measured phase. A warmup commit is real
-                                // store work the acknowledgment journal and
-                                // the reconciliation cover like any other;
-                                // it is simply not measured.
-                                let now = Instant::now();
-                                if measured {
-                                    measured_commits.fetch_add(1, Ordering::Relaxed);
-                                    // The store's own count of the objects this
-                                    // transaction introduced, not `3` restated
-                                    // by the harness. `objects_new` derived
-                                    // from the commit count is what makes
-                                    // `verification.objects_new_equals_three_per_commit`
-                                    // a tautology instead of a check.
-                                    objects_new.fetch_add(receipt.objects_new, Ordering::Relaxed);
-                                    raw_bytes.fetch_add(bytes, Ordering::Relaxed);
-                                    latency_histogram
-                                        .lock()
-                                        .unwrap_or_else(|p| p.into_inner())
-                                        .saturating_record(micros.max(1));
-                                    let minute =
-                                        now.saturating_duration_since(measure_start).as_secs() / 60;
-                                    let mut windows =
-                                        window_commits.lock().unwrap_or_else(|p| p.into_inner());
-                                    if windows.len() <= minute as usize {
-                                        windows.resize(minute as usize + 1, 0);
-                                    }
-                                    windows[minute as usize] += 1;
-                                }
-                                results.lock().unwrap_or_else(|p| p.into_inner()).push((
-                                    namespace,
-                                    operation,
-                                    receipt.repo_sequence,
-                                    ordinal,
-                                ));
                                 expected = Some(commit);
                             }
                             Some(Err(error)) => {
@@ -4433,6 +4709,33 @@ fn run_engine(
                                 return;
                             }
                         }
+                        // Count what the journal has fenced since, without
+                        // waiting for it.
+                        let (through, failure) = ack.poll();
+                        for entry in take_fenced(&mut unacked, through) {
+                            count(entry);
+                        }
+                        if let (Some(error), Some(front)) = (failure, unacked.front()) {
+                            unaccountable(front.operation_id, front.repo_sequence, &error);
+                            return;
+                        }
+                    }
+                    // The window is over. Every commit the store acknowledged
+                    // to this submitter is counted once its acknowledgment is
+                    // fenced, so wait for the last one.
+                    if let Some(last) = unacked.back().map(|entry| entry.ticket) {
+                        if let Err(error) = ack.wait_fenced(last) {
+                            let (through, _) = ack.poll();
+                            for entry in take_fenced(&mut unacked, through) {
+                                count(entry);
+                            }
+                            let front = unacked.front().expect("the unfenced ticket is queued");
+                            unaccountable(front.operation_id, front.repo_sequence, &error);
+                            return;
+                        }
+                    }
+                    for entry in unacked.drain(..) {
+                        count(entry);
                     }
                 });
             }
@@ -4457,13 +4760,14 @@ fn run_engine(
     // For the same reason, and in the same place: before any total is read.
     // Borrowed rather than consumed — the sink is dropped later, deliberately,
     // to close the journal before it is digested.
-    if let Some(failure) = ack
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .unfired_arming()
-    {
+    if let Some(failure) = ack.unfired_arming() {
         return Err(failure);
     }
+    let (acknowledgments, fences) = ack.fenced();
+    eprintln!(
+        "store-bench: the acknowledgment journal fenced {acknowledgments} \
+         acknowledgment(s) in {fences} group(s)"
+    );
 
     let total_fences = sum_fences(&engine, shard_count)?;
 
@@ -5123,9 +5427,9 @@ workload file rather than from whatever the caller typed. --repetition and
 repetitions and waits out the settle interval between them.
 
 --fail-ack-append-after N is fault injection, and a run that uses it emits no
-bundle by construction: the Nth acknowledgment-journal append is issued against
-/dev/full so the kernel's ENOSPC drives the emitter's incomplete-accounting
-refusal. It exists so that refusal is exercised deterministically rather than
+bundle by construction: the acknowledgment-journal group holding append N is
+written to /dev/full when it is fenced, so the kernel's ENOSPC drives the
+emitter's incomplete-accounting refusal. It exists so that refusal is exercised deterministically rather than
 by racing a full device. \"Emits no bundle\" is unconditional: a run that ended
 before reaching append N is refused too, because the flag claims a failure was
 observed and that run observed none.
@@ -7483,6 +7787,314 @@ sys.exit(1 if errors else 0)
             "a fault that did fire must report the injected failure, not the arming check: \
              {injected}"
         );
+    }
+
+    /// A fence the test holds open: each group it is asked to write is
+    /// announced with its size, and finishes only when the test says how.
+    struct HeldFence {
+        entered: std::sync::mpsc::Sender<usize>,
+        release: std::sync::mpsc::Receiver<Result<(), std::io::ErrorKind>>,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl AckFence for HeldFence {
+        fn append_batch_durable(
+            &mut self,
+            records: &[AckRecord],
+        ) -> Result<(), levcs_protocol::oracle::AckJournalError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = self.entered.send(records.len());
+            // Bounded, so a test that fails while a fence is held ends rather
+            // than waiting on the writer for a release that never comes.
+            match self.release.recv_timeout(Duration::from_secs(10)) {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(kind)) => Err(std::io::Error::new(kind, "the held fence failed").into()),
+                Err(_) => Err(std::io::Error::other("the test never finished this fence").into()),
+            }
+        }
+    }
+
+    struct Held {
+        sink: AckSink<HeldFence>,
+        entered: std::sync::mpsc::Receiver<usize>,
+        release: std::sync::mpsc::Sender<Result<(), std::io::ErrorKind>>,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    fn held_sink() -> Held {
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fence = HeldFence {
+            entered: entered_tx,
+            release: release_rx,
+            calls: calls.clone(),
+        };
+        Held {
+            sink: AckSink::with_fence(fence, AckJournalFault::None).expect("unarmed"),
+            entered,
+            release,
+            calls,
+        }
+    }
+
+    impl Held {
+        fn next_group(&self) -> usize {
+            self.entered
+                .recv_timeout(Duration::from_secs(30))
+                .expect("a fence was entered")
+        }
+
+        fn enqueue(&self, sequence: u64) -> u64 {
+            self.sink
+                .enqueue(&skeleton_ack_record(sequence))
+                .expect("queued")
+        }
+    }
+
+    /// The rule the pipeline must keep: nothing is reported fenced while the
+    /// fence that covers it is still open, whether its record led the group or
+    /// followed in it.
+    #[test]
+    fn an_acknowledgment_is_fenced_only_once_its_fence_returns() {
+        let held = held_sink();
+        let returned = std::sync::atomic::AtomicBool::new(false);
+        let first = held.enqueue(0);
+        assert_eq!(held.next_group(), 1);
+        assert_eq!(
+            held.sink.poll().0,
+            0,
+            "nothing is fenced while the fence is open"
+        );
+        held.enqueue(1);
+        let third = held.enqueue(2);
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| {
+                let outcome = held.sink.wait_fenced(third);
+                returned.store(true, std::sync::atomic::Ordering::SeqCst);
+                outcome
+            });
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(!returned.load(std::sync::atomic::Ordering::SeqCst));
+            held.release.send(Ok(())).unwrap();
+            assert_eq!(held.next_group(), 2);
+            assert_eq!(
+                held.sink.poll().0,
+                first,
+                "the first fence covers the first record and nothing queued after it"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(
+                !returned.load(std::sync::atomic::Ordering::SeqCst),
+                "a record was reported fenced while its group's fence was open"
+            );
+            held.release.send(Ok(())).unwrap();
+            waiter.join().unwrap().expect("the second fence succeeded");
+        });
+        assert_eq!(held.sink.fenced(), (3, 2));
+    }
+
+    /// What S3 is about. Queueing does not wait for the fence in progress, so
+    /// a submitter is never held at the acknowledgment journal; and what
+    /// queues meanwhile is fenced together, not one fence each.
+    #[test]
+    fn queueing_never_waits_and_what_queues_behind_an_open_fence_shares_the_next() {
+        let held = held_sink();
+        held.enqueue(0);
+        assert_eq!(held.next_group(), 1);
+        let started = Instant::now();
+        let tickets: Vec<u64> = (1..=7).map(|sequence| held.enqueue(sequence)).collect();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "queueing waited for the open fence: {:?}",
+            started.elapsed()
+        );
+        held.release.send(Ok(())).unwrap();
+        assert_eq!(
+            held.next_group(),
+            7,
+            "the seven queued records are one group"
+        );
+        held.release.send(Ok(())).unwrap();
+        held.sink
+            .wait_fenced(*tickets.last().unwrap())
+            .expect("the second fence succeeded");
+        assert_eq!(held.sink.fenced(), (8, 2));
+        assert_eq!(held.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// A failed fence fails every record not yet fenced, and nothing queues
+    /// after it: a later fence that succeeded would not vouch for what the
+    /// failed one wrote. None of those commits may be counted; the records
+    /// fenced before the failure stay fenced.
+    #[test]
+    fn a_failed_fence_fails_every_record_not_yet_fenced_and_every_later_one() {
+        let held = held_sink();
+        let first = held.enqueue(0);
+        assert_eq!(held.next_group(), 1);
+        let queued: Vec<u64> = (1..=3).map(|sequence| held.enqueue(sequence)).collect();
+        held.release.send(Ok(())).unwrap();
+        assert_eq!(held.next_group(), 3);
+        held.release
+            .send(Err(std::io::ErrorKind::StorageFull))
+            .unwrap();
+        // Bounded, before anything waits on a ticket: a sink that forgot the
+        // failure would leave those waits hanging rather than failing.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while held.sink.poll().1.is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "the failed fence was never reported"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        for ticket in &queued {
+            let error = held
+                .sink
+                .wait_fenced(*ticket)
+                .expect_err("a record in the failed group must not be reported fenced");
+            assert!(format!("{error}").contains("group of 3"), "{error}");
+        }
+        held.sink
+            .wait_fenced(first)
+            .expect("the first group was fenced before the failure");
+        let (through, failure) = held.sink.poll();
+        assert_eq!(through, first);
+        assert!(failure.is_some());
+        let later = held
+            .sink
+            .enqueue(&skeleton_ack_record(9))
+            .expect_err("nothing queues after a failed fence");
+        assert!(format!("{later}").contains("earlier group"), "{later}");
+        assert_eq!(
+            held.calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "nothing after the failure may reach the journal"
+        );
+        assert_eq!(held.sink.fenced(), (1, 1));
+    }
+
+    /// The real journal under concurrent submitters: every acknowledgment is
+    /// recovered, exactly once.
+    #[test]
+    fn concurrent_acknowledgments_are_all_recovered_from_the_journal() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("ack-journal");
+        let sink = AckSink::open(&path, AckJournalFault::None).expect("open");
+        std::thread::scope(|scope| {
+            for thread in 0..16u64 {
+                let sink = &sink;
+                scope.spawn(move || {
+                    for n in 0..20u64 {
+                        sink.append_durable(&skeleton_ack_record(thread * 1_000 + n))
+                            .expect("append");
+                    }
+                });
+            }
+        });
+        let (records, fences) = sink.fenced();
+        assert_eq!(records, 320);
+        assert!((1..=320).contains(&fences), "{fences}");
+        drop(sink);
+
+        let mut recovered: Vec<u64> = ExternalAckJournal::recover(&path)
+            .expect("recover")
+            .into_iter()
+            .map(|record| record.repo_sequence)
+            .collect();
+        recovered.sort_unstable();
+        let mut expected: Vec<u64> = (0..16u64)
+            .flat_map(|thread| (0..20u64).map(move |n| thread * 1_000 + n))
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(recovered, expected);
+    }
+
+    /// Closing the sink fences what is still queued before the journal closes,
+    /// so the journal the run digests holds every acknowledgment it queued.
+    #[test]
+    fn closing_the_sink_fences_what_is_still_queued() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("ack-journal");
+        let sink = AckSink::open(&path, AckJournalFault::None).expect("open");
+        for sequence in 0..5 {
+            sink.enqueue(&skeleton_ack_record(sequence))
+                .expect("queued");
+        }
+        drop(sink);
+        let recovered: Vec<u64> = ExternalAckJournal::recover(&path)
+            .expect("recover")
+            .into_iter()
+            .map(|record| record.repo_sequence)
+            .collect();
+        assert_eq!(recovered, vec![0, 1, 2, 3, 4]);
+    }
+
+    /// Closing does not cut the queue short: records queued behind an open
+    /// fence are still fenced, as a group of their own, before the writer
+    /// stops. Released only once the sink is closing, so a writer that stopped
+    /// at the close would be seen to.
+    #[test]
+    fn closing_waits_for_what_is_queued_to_be_fenced() {
+        let held = held_sink();
+        held.enqueue(0);
+        assert_eq!(held.next_group(), 1);
+        for sequence in 1..=4 {
+            held.enqueue(sequence);
+        }
+        let Held {
+            sink,
+            entered,
+            release,
+            calls,
+        } = held;
+        let shared = sink.shared.clone();
+        std::thread::scope(|scope| {
+            let closer = scope.spawn(move || drop(sink));
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !lock(&shared.state).closing {
+                assert!(Instant::now() < deadline, "the sink never began closing");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            release.send(Ok(())).unwrap();
+            assert_eq!(
+                entered
+                    .recv_timeout(Duration::from_secs(30))
+                    .expect("what was queued is fenced as the sink closes"),
+                4
+            );
+            release.send(Ok(())).unwrap();
+            closer.join().unwrap();
+        });
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(lock(&shared.state).fenced_through, 5);
+    }
+
+    /// A submitter counts the fenced prefix of its queue and nothing past it.
+    #[test]
+    fn only_the_fenced_prefix_of_a_submitters_queue_is_countable() {
+        let entry = |ticket| Unacked {
+            ticket,
+            measured: true,
+            micros: 1,
+            minute: 0,
+            objects_new: 3,
+            bytes: 1,
+            operation: levcs_store::types::OperationId([0; 16]),
+            operation_id: [0; 16],
+            repo_sequence: ticket,
+            ordinal: ticket,
+        };
+        let mut unacked: std::collections::VecDeque<Unacked> =
+            [3, 5, 9].into_iter().map(entry).collect();
+        let tickets = |taken: Vec<Unacked>| taken.iter().map(|e| e.ticket).collect::<Vec<_>>();
+        assert_eq!(tickets(take_fenced(&mut unacked, 2)), Vec::<u64>::new());
+        assert_eq!(tickets(take_fenced(&mut unacked, 5)), vec![3, 5]);
+        assert_eq!(unacked.len(), 1);
+        assert_eq!(tickets(take_fenced(&mut unacked, 8)), Vec::<u64>::new());
+        assert_eq!(tickets(take_fenced(&mut unacked, 9)), vec![9]);
+        assert!(unacked.is_empty());
     }
 
     #[test]

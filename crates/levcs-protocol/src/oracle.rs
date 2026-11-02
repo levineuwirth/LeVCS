@@ -620,11 +620,28 @@ impl ExternalAckJournal {
     /// Append and fence the record before the caller may count the
     /// corresponding server response.
     pub fn append_durable(&mut self, record: &AckRecord) -> Result<(), AckJournalError> {
-        let payload = record.payload()?;
-        let checksum = blake3::hash(&payload);
-        self.file.write_all(&(payload.len() as u32).to_le_bytes())?;
-        self.file.write_all(&payload)?;
-        self.file.write_all(checksum.as_bytes())?;
+        self.append_batch_durable(std::slice::from_ref(record))
+    }
+
+    /// Append the records in order and fence them with one `sync_data`: group
+    /// commit, for a caller acknowledging many responses at once. None of them
+    /// may be counted before this returns `Ok`. The bytes are exactly those
+    /// `append_durable` writes for each record in turn, so `recover` reads a
+    /// batch back as its records. Every record is encoded before anything is
+    /// written, so an invalid one fails the batch with nothing appended. An
+    /// empty batch writes and fences nothing.
+    pub fn append_batch_durable(&mut self, records: &[AckRecord]) -> Result<(), AckJournalError> {
+        let mut bytes = Vec::new();
+        for record in records {
+            let payload = record.payload()?;
+            bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&payload);
+            bytes.extend_from_slice(blake3::hash(&payload).as_bytes());
+        }
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        self.file.write_all(&bytes)?;
         self.file.sync_data()?;
         Ok(())
     }

@@ -46,7 +46,8 @@ use levcs_store::StoreEngine;
 use support::group_model::{
     canonical_group_expectation, group_failpoint_expectation, oracle_recovery_outcome,
     outcome_admits, physical_state_class, verify_adopted_prefix, victim_placement,
-    AdoptedPrefixExpectation, PhysicalStateClass, PrefixViolation, VictimPlacement,
+    AdoptedPrefixExpectation, AdoptionOutcomeExpectation, PayloadKind, PhysicalStateClass,
+    PrefixViolation, VictimPlacement,
 };
 use support::harness;
 
@@ -117,6 +118,102 @@ fn the_two_independent_derivations_agree_for_every_row() {
         assert_eq!(
             resolved.required_outcome, from_class,
             "row {}: the recorded required_outcome must equal the class-derived one",
+            row.failpoint
+        );
+    }
+}
+
+/// The adoption expectation gets the same two-derivation treatment as the
+/// recovery outcome: the fixture states it, the physical state class derives
+/// it, and they must agree.
+///
+/// This runs on every Wave B row now, before any row lists
+/// `staged_projection`, and that is the point. Turning the kind on becomes a
+/// matter of listing it, not of also getting the expectation right in the same
+/// commit — and if the two ever disagree, the failure names the row rather
+/// than surfacing as a mis-driven adoption much later.
+#[test]
+fn the_adoption_expectation_agrees_with_the_physical_state_class() {
+    let fixture = harness::load_fixture();
+    let mut checked = 0;
+    for row in &fixture.rows {
+        let Some(plan) = &row.submit else { continue };
+        let resolved = harness::resolve(row);
+
+        let stated =
+            AdoptionOutcomeExpectation::from_name(&plan.adoption_outcome).unwrap_or_else(|| {
+                panic!(
+                    "row {}: submit.adoption_outcome {:?} names no AdoptionOutcomeExpectation",
+                    row.failpoint, plan.adoption_outcome
+                )
+            });
+        let derived = resolved.class.adoption_outcome();
+
+        assert_eq!(
+            stated,
+            derived,
+            "row {}: the fixture states the adoption pin ends as {}, but the \
+             physical state class {} derives {}. The class is the authority on \
+             whether a frame binding the artifacts exists, and a pin settled \
+             against the wrong answer either strands a session or licenses \
+             staging to reclaim content a committed root points into.",
+            row.failpoint,
+            stated.name(),
+            resolved.class.name(),
+            derived.name()
+        );
+        checked += 1;
+    }
+
+    assert_eq!(
+        checked,
+        fixture.rows.iter().filter(|r| r.submit.is_some()).count(),
+        "every submit row must carry an adoption expectation"
+    );
+    assert!(checked > 0, "the fixture carries no submit rows to check");
+}
+
+/// Every payload kind a row lists must name a real [`PayloadKind`], and the
+/// inline kind must be present on every submit row.
+///
+/// Inline is required rather than merely allowed because it is the payload the
+/// eight locations were characterized with. A row that dropped it while adding
+/// `staged_projection` would move coverage sideways and read as having added
+/// some.
+#[test]
+fn every_submit_row_lists_known_payload_kinds_including_inline() {
+    let fixture = harness::load_fixture();
+    for row in &fixture.rows {
+        let Some(plan) = &row.submit else { continue };
+
+        let kinds: Vec<PayloadKind> = plan
+            .payload_kinds
+            .iter()
+            .map(|name| {
+                PayloadKind::from_name(name).unwrap_or_else(|| {
+                    panic!(
+                        "row {}: submit.payload_kinds names {name:?}, which is no PayloadKind",
+                        row.failpoint
+                    )
+                })
+            })
+            .collect();
+
+        assert!(
+            kinds.contains(&PayloadKind::Inline),
+            "row {}: every submit row must keep driving the inline payload the \
+             location was characterized with",
+            row.failpoint
+        );
+
+        let mut seen = kinds.clone();
+        seen.sort_by_key(|kind| kind.name());
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            kinds.len(),
+            "row {}: submit.payload_kinds repeats a kind, which would drive the \
+             same case twice and report it as two",
             row.failpoint
         );
     }
@@ -1453,11 +1550,37 @@ fn wave_b_rows_drive_through_submit_to_their_full_failpoint_expectation() {
             continue;
         }
 
+        let expected_adoption = AdoptionOutcomeExpectation::from_name(&plan.adoption_outcome)
+            .unwrap_or_else(|| {
+                panic!(
+                    "row {}: submit.adoption_outcome {:?} names no AdoptionOutcomeExpectation",
+                    row.failpoint, plan.adoption_outcome
+                )
+            });
+
         for action in &plan.actions {
             let action = engine_matrix::action_from_name(action)
                 .unwrap_or_else(|| panic!("row {}: unknown action {action:?}", row.failpoint));
-            let observation = engine_matrix::drive_submit_row(&serial, resolved.point, action);
-            assert_full_expectation(resolved.point, resolved.class, &observation);
+            // The payload is a matrix axis, so every row runs once per kind it
+            // declares. The staged-projection pass is what makes the adoption
+            // outcome an observation rather than a fixture field: without it the
+            // column would agree with the class table and describe nothing that
+            // ran.
+            for kind in &plan.payload_kinds {
+                let kind = PayloadKind::from_name(kind).unwrap_or_else(|| {
+                    panic!("row {}: unknown payload kind {kind:?}", row.failpoint)
+                });
+                let observation = engine_matrix::drive_submit_row(
+                    &serial,
+                    resolved.point,
+                    action,
+                    kind.carries_adoption(),
+                );
+                assert_full_expectation(resolved.point, resolved.class, &observation);
+                if kind.carries_adoption() {
+                    assert_adoption_outcome(&observation, expected_adoption);
+                }
+            }
         }
         driven.push(row.failpoint.clone());
     }
@@ -1470,6 +1593,44 @@ fn wave_b_rows_drive_through_submit_to_their_full_failpoint_expectation() {
     assert_eq!(
         driven, expected,
         "every Wave B row must actually have been driven, by name"
+    );
+}
+
+/// The pin's terminal outcome, observed rather than derived.
+///
+/// The expectation comes from the fixture, which `the_adoption_expectation_
+/// agrees_with_the_physical_state_class` independently checks against the class
+/// table. This compares that expectation with what staging actually counted, so
+/// the two derivations the charter requires stay two: a rule about physical
+/// state, and a number a run produced.
+///
+/// Every driven row must settle exactly one pin. Settling none is the leak §6.5
+/// declares a bug, and settling two means one adoption reached two terminal
+/// states — both are failures here rather than shrugs.
+fn assert_adoption_outcome(
+    observation: &engine_matrix::RowObservation,
+    expected: AdoptionOutcomeExpectation,
+) {
+    let counters = observation
+        .adoption
+        .expect("a staged-projection row records staging's pin counters");
+    let observed = counters
+        .sole_outcome()
+        .unwrap_or_else(|why| panic!("row {}: {why}", observation.row));
+    let observed = observed.unwrap_or_else(|| {
+        panic!(
+            "row {}: the adoption pin was never settled; a pin dropped without an outcome is \
+             the lifecycle bug the handle exists to expose ({counters:?})",
+            observation.row
+        )
+    });
+    assert_eq!(
+        observed,
+        expected.name(),
+        "row {}: the adoption pin settled {observed}, but this row's physical state class \
+         requires {} ({counters:?})",
+        observation.row,
+        expected.name()
     );
 }
 

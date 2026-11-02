@@ -108,9 +108,26 @@ trap cleanup EXIT
 
 features="failpoints,store-internals,store-privileged"
 
+# Where cargo puts binaries is not necessarily `$repo_root/target`:
+# `CARGO_TARGET_DIR`, a `build.target-dir` in a config.toml, and a shared
+# workspace target directory all move it. Assuming the default turns a host
+# that sets one into a build that succeeds followed by a "was not built"
+# refusal, which reads as a compilation failure and is not one. Ask cargo.
+#
+# This resolves the *build output* directory only. The working directory above
+# deliberately stays under `$repo_root/target`: it holds crash roots whose
+# filesystem is part of what the campaign measures, and a shared target
+# directory may be on a different one.
+target_dir="$(cargo metadata --no-deps --format-version 1 \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
+if [ -z "$target_dir" ]; then
+  echo "could not resolve cargo's target directory from cargo metadata" >&2
+  exit 70
+fi
+
 echo "== building the crash driver ==" >&2
 cargo build -q -p levcs-store --features "$features" --bin store-crash-driver
-driver="$repo_root/target/debug/store-crash-driver"
+driver="$target_dir/debug/store-crash-driver"
 if [ ! -x "$driver" ]; then
   echo "store-crash-driver was not built at $driver" >&2
   exit 70
@@ -270,7 +287,7 @@ if [ "$run_bundle" = "1" ]; then
     bundle_out="$work/storage-primitive-skeleton-$bundle_variant.json"
     rm -rf "$bundle_root" "$bundle_out"
 
-    if "$repo_root/target/debug/store-bench" emit-skeleton \
+    if "$target_dir/debug/store-bench" emit-skeleton \
         --root "$bundle_root" --out "$bundle_out" --path "$bundle_variant" \
         --allow-unsigned --seconds 2 --group-len 16 >&2; then
       if python3 - "$repo_root/bench/result-schema.json" "$bundle_out" >&2 <<'PY'
@@ -319,7 +336,7 @@ PY
     zero_work_root="$bundle_parent/zero-work-root"
     zero_work_out="$work/storage-primitive-zero-work.json"
     rm -rf "$zero_work_root" "$zero_work_out"
-    if "$repo_root/target/debug/store-bench" emit-skeleton \
+    if "$target_dir/debug/store-bench" emit-skeleton \
         --root "$zero_work_root" --out "$zero_work_out" --path submit \
         --allow-unsigned --seconds 2 --group-len 16 \
         --submitters-per-shard 0 >&2; then
@@ -348,7 +365,7 @@ PY
     unaccounted_root="$bundle_parent/unaccounted-root"
     unaccounted_out="$work/storage-primitive-unaccounted.json"
     rm -rf "$unaccounted_root" "$unaccounted_out"
-    if "$repo_root/target/debug/store-bench" emit-skeleton \
+    if "$target_dir/debug/store-bench" emit-skeleton \
         --root "$unaccounted_root" --out "$unaccounted_out" --path submit \
         --allow-unsigned --seconds 2 --group-len 4 \
         --shards 1 --submitters-per-shard 1 \

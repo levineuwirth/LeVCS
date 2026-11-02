@@ -54,6 +54,20 @@ pub struct SubmitPlan {
     /// True for exactly one row, and the matrix asserts that rather than
     /// letting a second row quietly acquire it.
     pub requires_root_cas_contention: bool,
+    /// Which payloads this location is driven with — the third independent
+    /// axis, for the reason given on [`PayloadKind`]. Required: a row that
+    /// omitted it would acquire a default, and a default here is a silent
+    /// claim about coverage.
+    pub payload_kinds: Vec<String>,
+    /// The terminal outcome an adoption pin must carry at this location, as
+    /// the fixture states it.
+    ///
+    /// Stated even on rows that do not yet list `staged_projection`, and
+    /// checked against `PhysicalStateClass::adoption_outcome` on every row.
+    /// That agreement check is what makes turning the kind on a matter of
+    /// listing it rather than of also getting the expectation right at the
+    /// same moment.
+    pub adoption_outcome: String,
 }
 
 #[derive(Clone, Debug)]
@@ -196,6 +210,10 @@ pub fn load_fixture() -> Fixture {
                         .get("requires_root_cas_contention")
                         .and_then(|v| v.as_bool())
                         .expect("submit.requires_root_cas_contention"),
+                    payload_kinds: string_list(
+                        plan.get("payload_kinds").expect("submit.payload_kinds"),
+                    ),
+                    adoption_outcome: string_field(plan, "adoption_outcome"),
                 })
             }),
             rationale: string_field(row, "rationale"),

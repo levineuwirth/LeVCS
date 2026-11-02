@@ -37,23 +37,22 @@
 //! run against a differently garbage-collected drive than repetition 1
 //! (scope 8.2).
 //!
-//! # What is blocked
+//! # What was blocked, and is not any more
 //!
-//! `emit-skeleton --path submit` now drives the production `StoreEngine::submit`
+//! `emit-skeleton --path submit` drives the production `StoreEngine::submit`
 //! (scope 6.6 deliverable 3) over a root the production `StoreEngine::open`
-//! built. It is still not a P2 run, and two of B1's unimplemented deliverables
-//! are why — both of them a bound on the bundle, not merely on this file:
+//! built. The two bounds that kept a `run` from being a P2 measurement are
+//! both closed by name rather than re-worded:
 //!
-//!   * `submit` refuses after `max_index_runs` group publications, because
-//!     sealing the in-memory index delta into an `IndexRun` is unimplemented.
-//!     The ceiling is raised for the run, which means every delta layer ever
-//!     published is still resident and lookup fan-out grows for the whole run.
-//!     P2 measures a steady state; this is not one.
-//!   * `StoreEngine::checkpoint` is unimplemented, so no checkpoint is taken.
-//!     Section 7 requires that a P2 run not have been achieved with
-//!     checkpointing disabled. This one was.
+//!   * Index sealing landed, and with it index-run compaction (contract
+//!     reviews 2026-08-09-C and 2026-08-11-A), so a measured run seals at the
+//!     store-default ceiling and its open-run count stays bounded across the
+//!     whole window — the steady state P2 measures.
+//!   * `StoreEngine::checkpoint` landed, and `run` drives it on a cadence
+//!     *inside* the measured window, so `checkpointing: "exercised"` reports
+//!     what the measurement contained rather than what a probe predicted.
 //!
-//! The third bound is gone rather than re-worded: `StoreEngine::open` refused
+//! An earlier bound closed the same way: `StoreEngine::open` refused
 //! startup state 1, so the root was created by `segment::initialize_root` and
 //! the run measured the production path over a store production had not built.
 //! B1 landed state 1, `run_engine` builds through `open`, and the bundle now
@@ -68,24 +67,13 @@
 //! `initialization_path` from what the `FORMAT` marker did across the open,
 //! `index_run_ceiling` by comparing the configured `max_index_runs` to the
 //! store default, `index_maintenance` from the `IndexRun` files on the device
-//! *read back and validated*, `checkpointing` from what
-//! `StoreEngine::checkpoint` answered when this run called it, `build_profile`
-//! from `cfg!`, and `environment_fidelity` from all four conditions the
-//! reference profile re-pins. A hardcoded block would be the same caveat in a
-//! different syntax.
+//! *read back and validated* beside the engine's own backlog reading,
+//! `checkpointing` from whether the measured window contained one,
+//! `build_profile` from `cfg!`, and `environment_fidelity` from all four
+//! conditions the reference profile re-pins. A hardcoded block would be the
+//! same caveat in a different syntax.
 //!
 //! # What still has to land, recorded as a refusal rather than as a plan
-//!
-//! **Index steady state.** `index_maintenance: runs_sealed` says the index
-//! reached a steady state. That is a statement about *bounded maintenance* —
-//! deltas published and not yet sealed — and not about how many files are in a
-//! directory, so the derivation requires validated index-run files **and** a
-//! reading of the outstanding backlog. Nothing seals today and `StoreEngine`
-//! exposes no such reading, so the honest value is unchanged
-//! (`deltas_retained_in_memory`) and the declaration is unearnable rather than
-//! inferable. **Interface request to B1:** a counter of sealed index runs and
-//! outstanding index deltas, in the shape of `DurabilityCounters`. Until it
-//! exists, a run that finds sealed runs on the device refuses by name.
 //!
 //! **Hardware profile.** `hardware.profile` is derived by comparing what this
 //! process can read off the host against the complete `[[profile]]` tables of
@@ -105,17 +93,24 @@
 //! truthful value while the reconciliation accepts any `Committed(_)` and the
 //! journalled `receipt_digest` is `blake3(operation_id)`.
 //!
-//! The `run` subcommand — warmup, three repetitions, per-repetition fresh
-//! roots, trim settle — stays blocked on the same two.
+//! The `run` subcommand measures the frozen campaign: the workload file's
+//! warmup ahead of the window (recorded, excluded from every measured figure
+//! at a drained counter baseline), one-minute §3 windows, open-loop
+//! coordinated-omission-corrected latency recorded into an HdrHistogram, and
+//! per-repetition provenance — `--repetition`, `--trim-settle-seconds` —
+//! recorded by the driver that loops the repetitions over fresh roots
+//! (`scripts/close-phase1.sh`).
 //!
-//! Real Ed25519 attestation signing is also blocked: `levcs-store` has no
-//! signing dependency and scope §1 forbids any `levcs_identity::` path in this
-//! crate. `emit-skeleton` therefore requires an explicit `--allow-unsigned`,
-//! and the `run` path refuses to emit an unsigned bundle at all.
+//! Real Ed25519 attestation signing is still blocked: `levcs-store` has no
+//! signing dependency and scope §1 forbids any `levcs_identity::` path in
+//! this crate. `emit-skeleton` and `run` therefore both require an explicit
+//! `--allow-unsigned` and emit a placeholder attestation for schema
+//! validation, with `promotable: false` and the outcome rules keeping that
+//! honest.
 
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use levcs_core::ObjectId;
@@ -933,11 +928,19 @@ pub enum CheckpointProbe {
     /// `StoreEngine::checkpoint` refused `NotImplemented`, so no checkpoint was
     /// taken and none could have been.
     RefusedNotImplemented,
-    /// `StoreEngine::checkpoint` returned a lease. The measured window still
-    /// contains no checkpoint — the harness takes none inside it — so the
-    /// truthful value is `enabled_not_reached`, and reaching one is the
-    /// emitter's next change rather than a relabelling of this one.
+    /// `StoreEngine::checkpoint` returned a lease, but no checkpoint was taken
+    /// inside the measured window. The value is honest and cannot pass: a run
+    /// whose lookup fan-out grows for its whole duration and which never
+    /// checkpoints is not measuring the steady state a P2 number is supposed to
+    /// characterize.
     EnabledNotReached,
+    /// At least one checkpoint completed **inside the measured interval**.
+    ///
+    /// Counted from checkpoints the run actually took, never from the ability
+    /// to take one -- that is what `EnabledNotReached` already records, and the
+    /// distinction between "the store can checkpoint" and "this measurement
+    /// contains one" is the whole reason scope §7 requires this field.
+    Exercised,
 }
 
 /// Whether the index reached a steady state, from what is on the device.
@@ -1048,6 +1051,14 @@ pub struct RunObservations {
     /// The filesystem carrying the store root, read from `/proc/mounts`.
     pub store_root_filesystem: String,
     pub store_root_is_tmpfs: bool,
+    /// `"debug"` or `"release"`, observed at construction from
+    /// `cfg!(debug_assertions)`. An observation like the mount facts are, so
+    /// the derivation stays a pure function of what was observed — and the
+    /// safe direction holds: a debug build can only disqualify a run from
+    /// `reference_profile`, never admit one, which is why
+    /// `release_with_debug_assertions` is a value this emitter never
+    /// produces.
+    pub build_profile: &'static str,
 }
 
 impl RunObservations {
@@ -1066,6 +1077,11 @@ impl RunObservations {
             uniqueness: facts.uniqueness,
             store_root_filesystem: mount.filesystem,
             store_root_is_tmpfs: mount.tmpfs,
+            build_profile: if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            },
         }
     }
 }
@@ -1176,7 +1192,14 @@ impl RunConditions {
             if observations.configured_max_index_runs == observations.default_max_index_runs {
                 "store_default"
             } else if observations.configured_max_index_runs > observations.default_max_index_runs {
-                "raised_because_index_sealing_unimplemented"
+                // The fact, and only the fact. This branch is reached by
+                // comparing two numbers and knows nothing about *why* the
+                // ceiling was raised, so it may not name a reason.
+                // `raised_because_index_sealing_unimplemented` did, and the
+                // reason it named is no longer true; the schema keeps accepting
+                // it for archived bundles and this emitter never writes it
+                // again. Contract review 2026-08-09-B.
+                "raised_above_store_default"
             } else {
                 return Err(format!(
                     "refusing to emit a bundle: the run configured max_index_runs = {} below \
@@ -1191,16 +1214,10 @@ impl RunConditions {
         // `cfg!(debug_assertions)` is the whole of what a compiled binary can
         // see of its own profile: `opt-level` is not exposed to `cfg`, so a
         // release build with `debug-assertions = true` is indistinguishable
-        // from a debug build from in here and is reported as `debug`. That is
-        // the safe direction — it can only disqualify a run from
-        // `reference_profile`, never admit one — and it is why
-        // `release_with_debug_assertions` is a value this emitter never
-        // produces.
-        let build_profile = if cfg!(debug_assertions) {
-            "debug"
-        } else {
-            "release"
-        };
+        // from a debug build and is reported as `debug`. Observed at
+        // `RunObservations::new` rather than here, so the derivation is a
+        // pure function of its observations.
+        let build_profile = observations.build_profile;
 
         // `reference_profile` re-pins persistent_data_mount, tmpfs,
         // build_profile, and a named hardware profile, so it is asserted only
@@ -1228,6 +1245,7 @@ impl RunConditions {
             checkpointing: match observations.checkpoint {
                 CheckpointProbe::RefusedNotImplemented => "unimplemented",
                 CheckpointProbe::EnabledNotReached => "enabled_not_reached",
+                CheckpointProbe::Exercised => "exercised",
             },
             index_maintenance,
             index_run_ceiling,
@@ -1675,6 +1693,390 @@ pub fn observe_host_facts(store_root_filesystem: &str) -> Vec<HostFact> {
     ]
 }
 
+/// One fact the deployed-node harness measured, spelled exactly as
+/// `bench/reference-hardware.toml` spells it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeployedFact {
+    pub table: String,
+    pub key: String,
+    pub value: String,
+}
+
+/// Parse a deployed-facts file: one `table.key = value` per line, with `#`
+/// comments and blank lines ignored. A value may be quoted in the frozen
+/// file's spelling; the quotes are stripped when they enclose the whole
+/// value. Malformed lines refuse by line number rather than being skipped —
+/// a fact file with a typo is not a smaller fact file.
+pub fn parse_deployed_facts(text: &str) -> Result<Vec<DeployedFact>, String> {
+    let mut facts = Vec::new();
+    for (index, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (name, value) = line.split_once('=').ok_or_else(|| {
+            format!(
+                "deployed-facts line {}: expected `table.key = value`, got {line:?}",
+                index + 1
+            )
+        })?;
+        let name = name.trim();
+        let (table, key) = name.split_once('.').ok_or_else(|| {
+            format!(
+                "deployed-facts line {}: the fact name {name:?} is not `table.key` as the                  frozen file spells it",
+                index + 1
+            )
+        })?;
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|inner| inner.strip_suffix('"'))
+            .unwrap_or(value);
+        if table.is_empty() || key.is_empty() || value.is_empty() {
+            return Err(format!(
+                "deployed-facts line {}: {line:?} has an empty table, key, or value",
+                index + 1
+            ));
+        }
+        facts.push(DeployedFact {
+            table: table.to_string(),
+            key: key.to_string(),
+            value: value.to_string(),
+        });
+    }
+    Ok(facts)
+}
+
+/// Fill what this process could not read with what the deployed-node harness
+/// did, and refuse what contradicts what it could.
+///
+/// The merge is one-directional by design: a supplied fact may fill an
+/// unobserved reading or corroborate an observed one, and one that disagrees
+/// with a host observation refuses the run — the file is **evidence to
+/// compare, never an override**, for the same reason the derivation refuses a
+/// profile *name*. Returns the names actually ingested, so the bundle's
+/// reader can see which half of the comparison came from the file.
+pub fn apply_deployed_facts(
+    host: &mut Vec<HostFact>,
+    deployed: &[DeployedFact],
+) -> Result<Vec<String>, String> {
+    let mut ingested = Vec::new();
+    for fact in deployed {
+        let name = format!("{}.{}", fact.table, fact.key);
+        match host
+            .iter_mut()
+            .find(|entry| entry.table == fact.table && entry.key == fact.key)
+        {
+            Some(entry) => match entry.observed.as_deref() {
+                Some(observed) if observed == fact.value => {}
+                Some(observed) => {
+                    return Err(format!(
+                        "refusing to ingest deployed facts: {name} is observable from this                          process and reads {observed:?}, but the file supplies {supplied:?}.                          A deployed fact may fill what the host cannot see, never overwrite                          what it can.",
+                        supplied = fact.value
+                    ))
+                }
+                None => {
+                    entry.observed = Some(fact.value.clone());
+                    ingested.push(name);
+                }
+            },
+            None => {
+                // A fact this emitter does not model at all — pinned by a
+                // profile, readable only by the deployed harness. Leaked, not
+                // interned: `HostFact` names are `'static` because the
+                // modelled set is, and the leak is bounded by the fact file
+                // the operator wrote.
+                host.push(HostFact {
+                    table: Box::leak(fact.table.clone().into_boxed_str()),
+                    key: Box::leak(fact.key.clone().into_boxed_str()),
+                    observed: Some(fact.value.clone()),
+                });
+                ingested.push(name);
+            }
+        }
+    }
+    Ok(ingested)
+}
+
+/// Replace the deployed-half placeholders in the emitted hardware fields with
+/// the facts that actually arrived, so the fields and the profile comparison
+/// describe the same host. Numeric fields refuse an unparseable fact by name
+/// rather than emitting a string where the schema holds an integer.
+fn fill_hardware_fields_from_facts(
+    fields: &mut [(String, J)],
+    facts: &[HostFact],
+) -> Result<(), String> {
+    let fact = |table: &str, key: &str| {
+        facts
+            .iter()
+            .find(|entry| entry.table == table && entry.key == key)
+            .and_then(|entry| entry.observed.clone())
+    };
+    let text_fields: [(&str, &str, &str); 7] = [
+        ("nvme", "nvme", "model"),
+        ("firmware", "nvme", "firmware"),
+        ("write_cache", "nvme", "write_cache"),
+        ("scheduler", "nvme", "scheduler"),
+        ("barriers", "filesystem", "barriers"),
+        ("nic", "network", "nic"),
+        ("driver", "network", "driver"),
+    ];
+    for (field, table, key) in text_fields {
+        if let Some(value) = fact(table, key) {
+            if let Some(slot) = fields.iter_mut().find(|(name, _)| name == field) {
+                slot.1 = jstr(value);
+            }
+        }
+    }
+    // The mount-option list arrives in the frozen file's array spelling and
+    // is emitted as the array it is.
+    if let Some(value) = fact("filesystem", "mount_options") {
+        if let Some(slot) = fields.iter_mut().find(|(name, _)| name == "mount_options") {
+            slot.1 = J::Array(parse_string_array(&value).into_iter().map(jstr).collect());
+        }
+    }
+    // `numa` is a rendered reading rather than a copied one, so it is mapped
+    // by hand: the field spells the layout, the fact carries the count.
+    if let Some(value) = fact("cpu", "numa_nodes") {
+        if let Some(slot) = fields.iter_mut().find(|(name, _)| name == "numa") {
+            slot.1 = jstr(format!("nodes={value}"));
+        }
+    }
+    let numeric_fields: [(&str, &str, &str); 2] = [
+        ("link_mbps", "network", "link_mbps"),
+        ("mtu", "network", "mtu"),
+    ];
+    for (field, table, key) in numeric_fields {
+        if let Some(value) = fact(table, key) {
+            let parsed = value.parse::<i128>().map_err(|_| {
+                format!(
+                    "refusing to emit a bundle: the deployed fact {table}.{key} reads                      {value:?}, and the {field} field it fills is an integer"
+                )
+            })?;
+            if let Some(slot) = fields.iter_mut().find(|(name, _)| name == field) {
+                slot.1 = jint(parsed);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Decrements the producer count when its thread finishes, whatever path it
+/// takes out.
+///
+/// The temperature sampler drains on this count rather than on gate
+/// idleness: once it reaches zero, no thread exists that could enroll device
+/// work. That closes the late-enrollment window an idleness check left open
+/// — a worker that had passed its deadline check but not yet enrolled was
+/// invisible to `in_flight`, and a momentarily idle gate let the sampler
+/// leave while that worker's device load was still coming.
+struct ProducerTicket<'a>(&'a std::sync::atomic::AtomicU64);
+
+impl Drop for ProducerTicket<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// The maximum of NVMe temperature samples taken on `cadence` for as long as
+/// any producer thread lives — submitters and the checkpointer alike, from
+/// the run's start until the last of them has finished, which by
+/// construction outlives every enrollment they could make.
+///
+/// **Coverage is the contract, so a failed scheduled reading fails the whole
+/// measurement closed**: one stale pre-load sample followed by silence would
+/// otherwise stand in for a window nobody measured. And the value is a
+/// **sampled maximum, not a continuous peak**: a spike between samples is
+/// invisible, and the bundle's claim is exactly the samples' maximum. The
+/// five-second production cadence sits well inside the sustained-load
+/// thermal time constants the recording exists to witness; what it cannot
+/// witness is a sub-cadence transient, and this contract says so rather than
+/// claiming otherwise.
+fn sample_peak_until_drained(
+    read: impl Fn() -> Option<f64>,
+    producers: &std::sync::atomic::AtomicU64,
+    stop: &std::sync::atomic::AtomicBool,
+    cadence: Duration,
+) -> Option<f64> {
+    use std::sync::atomic::Ordering;
+    let mut peak: Option<f64> = None;
+    let mut next = Instant::now();
+    while !stop.load(Ordering::Relaxed) && producers.load(Ordering::Acquire) > 0 {
+        if Instant::now() < next {
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+        let sample = read()?;
+        peak = Some(peak.map_or(sample, |best| best.max(sample)));
+        next = Instant::now() + cadence;
+    }
+    peak
+}
+
+/// The hottest NVMe composite temperature the host exposes right now, in
+/// Celsius. One instantaneous sample — the thermal claim about a *run* is
+/// made by the sampler in `run_engine`, which tracks the peak of these
+/// readings while the run is live.
+fn read_nvme_temperature_celsius() -> Option<f64> {
+    read_nvme_temperature_below(Path::new("/sys/class/hwmon"))
+}
+
+/// The reader over an explicit hwmon root, so the millidegree conversion,
+/// the multiple-drive maximum, the ignore rule, and the fail-closed rule are
+/// testable off the host. NVMe sensors are the hwmon entries whose `name`
+/// starts with `nvme`; `temp1_input` is the composite temperature in
+/// **integer millidegrees** — parsed as the integer the ABI defines, because
+/// parsing as `f64` admitted `nan`, which the JSON writer would then emit as
+/// a fabricated `0`.
+///
+/// The reading **fails closed across the NVMe set**: an unprivileged hwmon
+/// scan cannot tell which drive backs the store, so one NVMe sensor that is
+/// missing its input or carries something unparsable makes the whole host
+/// unmeasured, rather than letting an unrelated drive supply the
+/// pass-enabling number while the benchmark device goes unread.
+fn read_nvme_temperature_below(hwmon_root: &Path) -> Option<f64> {
+    let hwmons = std::fs::read_dir(hwmon_root).ok()?;
+    let mut hottest: Option<f64> = None;
+    for entry in hwmons {
+        // Enumeration fails closed too: an entry this scan cannot read, or a
+        // sensor whose name it cannot read, could be the benchmark NVMe — a
+        // host that cannot be enumerated cannot be measured.
+        let path = entry.ok()?.path();
+        let name = std::fs::read_to_string(path.join("name")).ok()?;
+        if !name.trim().starts_with("nvme") {
+            continue;
+        }
+        let raw = std::fs::read_to_string(path.join("temp1_input")).ok()?;
+        let millidegrees = raw.trim().parse::<i64>().ok()?;
+        let celsius = millidegrees as f64 / 1000.0;
+        hottest = Some(hottest.map_or(celsius, |best| best.max(celsius)));
+    }
+    hottest
+}
+
+/// The emitted `hardware` fields before the profile derivation fills and
+/// names them.
+///
+/// Factored so `precheck-facts` evaluates exactly the fields the bundle
+/// would carry — one construction, two callers, no drift. Everything here is
+/// either read off the host at call time or a placeholder the deployed facts
+/// must fill before a profile may be named.
+fn base_hardware_fields(
+    store_root_filesystem: &str,
+    nvme_temperature_celsius: Option<f64>,
+) -> Result<Vec<(String, J)>, String> {
+    Ok(vec![
+        (
+            "cpu".into(),
+            jstr(or_unknown(
+                command_output(
+                    "sh",
+                    &["-c", "grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-"],
+                ),
+                "cpu model",
+            )),
+        ),
+        // Filled from the observed cpu.numa_nodes fact below; this default
+        // is a placeholder on purpose, so a host that could not read its NUMA
+        // layout cannot be named a reference host while claiming one.
+        ("numa".into(), jstr("unverified on this host")),
+        (
+            "governor".into(),
+            jstr(or_unknown(
+                read_first_line("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"),
+                "cpufreq governor",
+            )),
+        ),
+        (
+            "microcode".into(),
+            jstr(or_unknown(
+                command_output(
+                    "sh",
+                    &["-c", "grep -m1 microcode /proc/cpuinfo | cut -d: -f2-"],
+                ),
+                "microcode revision",
+            )),
+        ),
+        ("ram_bytes".into(), jint(read_total_ram_bytes()? as i128)),
+        ("swap_events".into(), jint(0i128)),
+        // Read back from `/proc/mounts` for the store root this run used, not
+        // the frozen profile's `btrfs` restated. A bundle that names the
+        // filesystem it was supposed to run on tells a reader nothing about the
+        // one it ran on.
+        ("filesystem".into(), jstr(store_root_filesystem.to_string())),
+        // The mount's option list, filled from the deployed
+        // `filesystem.mount_options` fact. The store-directory attributes are
+        // a different reading with a field of their own under `deployment`;
+        // emitting them here dressed a per-directory attribute up as the
+        // mount's options.
+        (
+            "mount_options".into(),
+            J::Array(vec![jstr("recorded by the deployed-node harness")]),
+        ),
+        ("nvme".into(), jstr("recorded by the deployed-node harness")),
+        (
+            "firmware".into(),
+            jstr("recorded by the deployed-node harness"),
+        ),
+        ("write_cache".into(), jstr("enabled")),
+        ("barriers".into(), jstr("enabled")),
+        ("scheduler".into(), jstr("none")),
+        // A measured reading or the placeholder the derivation refuses past —
+        // never a fabricated number. The schema admits exactly this marker
+        // beside a measurement, so a sensor-less diagnostic host can still
+        // emit while a named reference host cannot skip the reading.
+        (
+            "temperature_celsius".into(),
+            match nvme_temperature_celsius {
+                Some(celsius) => J::Float(celsius),
+                None => jstr("recorded by the deployed-node harness"),
+            },
+        ),
+        ("nic".into(), jstr("none (in-process P2)")),
+        ("driver".into(), jstr("none (in-process P2)")),
+        ("link_mbps".into(), jint(1i128)),
+        ("mtu".into(), jint(1500i128)),
+        (
+            "kernel".into(),
+            jstr(or_unknown(command_output("uname", &["-sr"]), "kernel")),
+        ),
+    ])
+}
+
+/// The whole fact-file evaluation the bundle will make, run before the
+/// campaign spends anything: parse, the fill-only merge (a contradiction with
+/// a host observation refuses), the frozen-profile completeness comparison,
+/// and the emitted-field consistency check — through the same functions the
+/// emitter calls, so preflight and assembly cannot drift. Refuses unless the
+/// facts name a frozen profile outright: the closure campaign exists to
+/// produce a pass, and a diagnostic derivation cannot.
+fn validate_deployed_facts(
+    repo_root: &Path,
+    store_root_filesystem: &str,
+    facts_text: &str,
+    nvme_temperature_celsius: Option<f64>,
+) -> Result<HardwareProfileDerivation, String> {
+    let frozen = load_frozen_profile(&repo_root.join("bench/reference-hardware.toml"))?;
+    let deployed = parse_deployed_facts(facts_text)?;
+    let mut host_facts = observe_host_facts(store_root_filesystem);
+    let ingested = apply_deployed_facts(&mut host_facts, &deployed)?;
+    let mut fields = base_hardware_fields(store_root_filesystem, nvme_temperature_celsius)?;
+    fill_hardware_fields_from_facts(&mut fields, &host_facts)?;
+    let mut derivation = hardware_profile_of(&frozen.profiles, &host_facts, &fields)?;
+    derivation.ingested = ingested;
+    if derivation.name == "diagnostic" {
+        return Err(format!(
+            "the fact file does not complete any frozen profile: unobserved [{}], \
+             mismatched [{}]. A campaign run with it cannot name a profile and cannot \
+             pass; measure the missing facts (bench/deployed-facts.template) rather \
+             than running three repetitions to learn this.",
+            derivation.unobserved.join(", "),
+            derivation.mismatched.join(", ")
+        ));
+    }
+    Ok(derivation)
+}
+
 /// Why `hardware.profile` came out the way it did, reported alongside the value
 /// so a reader can see what was compared rather than only what was concluded.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1687,6 +2089,10 @@ pub struct HardwareProfileDerivation {
     pub unobserved: Vec<String>,
     /// Facts read whose value disagrees with every frozen profile.
     pub mismatched: Vec<String>,
+    /// Facts the deployed-node harness supplied and this run ingested, so a
+    /// reader can see which half of a named profile's comparison came from
+    /// the fact file rather than from this process.
+    pub ingested: Vec<String>,
 }
 
 /// `hardware.profile`, derived by comparing observed host facts against the
@@ -1801,6 +2207,7 @@ fn hardware_profile_of(
             name: "diagnostic",
             unobserved,
             mismatched,
+            ingested: Vec::new(),
         });
     };
 
@@ -1831,7 +2238,17 @@ fn hardware_profile_of(
                 .iter()
                 .any(|marker| text.contains(marker))
                 .then_some(field.as_str()),
-            J::Bool(_) | J::Int(_) | J::Float(_) | J::Array(_) | J::Object(_) => None,
+            // `mount_options` is an array of strings; a placeholder hiding
+            // inside one is the same disagreement as one at the top level.
+            J::Array(items) => items
+                .iter()
+                .any(|item| {
+                    matches!(item, J::Str(text) if HARDWARE_PLACEHOLDER_MARKERS
+                        .iter()
+                        .any(|marker| text.contains(marker)))
+                })
+                .then_some(field.as_str()),
+            J::Bool(_) | J::Int(_) | J::Float(_) | J::Object(_) => None,
         })
         .collect();
     if !placeholders.is_empty() {
@@ -1848,6 +2265,7 @@ fn hardware_profile_of(
         name,
         unobserved,
         mismatched,
+        ingested: Vec::new(),
     })
 }
 
@@ -1873,6 +2291,18 @@ pub struct BundleInputs {
     pub latency_p99: u64,
     pub latency_max: u64,
     pub histogram_digest: String,
+    /// What `histogram_digest` digests, named by the record that produced it.
+    pub histogram_format: &'static str,
+    /// Whether latency was measured from scheduled arrivals (open loop). From
+    /// the same record as the format, so the two cannot disagree.
+    pub coordinated_omission_corrected: bool,
+    /// Facts the deployed-node harness measured, to be merged fill-only into
+    /// what this process observes. Empty when no fact file was supplied.
+    pub deployed_facts: Vec<DeployedFact>,
+    /// The peak NVMe temperature sampled while the run was live, or `None`
+    /// when no sensor was exposed — recorded as the placeholder the
+    /// derivation refuses to name a reference host past, never fabricated.
+    pub nvme_temperature_celsius: Option<f64>,
     pub one_minute_windows: Vec<f64>,
     pub windows_meeting_target_percent: f64,
     pub ack_journal_digest: String,
@@ -1986,6 +2416,7 @@ pub fn storage_primitive_outcome(inputs: &BundleInputs, conditions: &RunConditio
         return Outcome::Fail;
     }
     if inputs.skeleton
+        || !inputs.coordinated_omission_corrected
         || conditions.environment_fidelity != "reference_profile"
         || conditions.initialization_path != "store_engine_open"
         || conditions.mutation_path != "store_engine_submit"
@@ -2192,12 +2623,12 @@ pub fn assemble_bundle(
             jstr(inputs.histogram_digest.clone()),
         ),
         (
-            // Only what actually produced the numbers. The previous
-            // `hdrhistogram: 7.5` entry named a crate this binary never calls:
-            // the latencies are a sorted vector of microsecond samples and the
-            // percentiles are computed here. Naming a telemetry stack the
-            // artifact does not use is the same defect as a substring test —
-            // an assertion about the harness rather than about what it emitted.
+            // Only what actually produced the numbers. The open-loop engine
+            // path records into `hdrhistogram` and says so in
+            // `histogram_format`, where the claim is bound to the digested
+            // artifact itself; restating a dependency version here would be
+            // an assertion about the harness rather than about what it
+            // emitted, which is the defect the previous entry had.
             "telemetry_versions".into(),
             J::Object(vec![(
                 "store-bench".into(),
@@ -2224,67 +2655,10 @@ pub fn assemble_bundle(
         ("generator".into(), jstr(workload.generator.clone())),
     ]);
 
-    let mut hardware_fields: Vec<(String, J)> = vec![
-        (
-            "cpu".into(),
-            jstr(or_unknown(
-                command_output(
-                    "sh",
-                    &["-c", "grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-"],
-                ),
-                "cpu model",
-            )),
-        ),
-        ("numa".into(), jstr("nodes=1 (unverified on this host)")),
-        (
-            "governor".into(),
-            jstr(or_unknown(
-                read_first_line("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"),
-                "cpufreq governor",
-            )),
-        ),
-        (
-            "microcode".into(),
-            jstr(or_unknown(
-                command_output(
-                    "sh",
-                    &["-c", "grep -m1 microcode /proc/cpuinfo | cut -d: -f2-"],
-                ),
-                "microcode revision",
-            )),
-        ),
-        ("ram_bytes".into(), jint(read_total_ram_bytes()? as i128)),
-        ("swap_events".into(), jint(0i128)),
-        // Read back from `/proc/mounts` for the store root this run used, not
-        // the frozen profile's `btrfs` restated. A bundle that names the
-        // filesystem it was supposed to run on tells a reader nothing about the
-        // one it ran on.
-        (
-            "filesystem".into(),
-            jstr(inputs.observations.store_root_filesystem.clone()),
-        ),
-        (
-            "mount_options".into(),
-            J::Array(vec![jstr(inputs.store_directory_attributes.clone())]),
-        ),
-        ("nvme".into(), jstr("recorded by the deployed-node harness")),
-        (
-            "firmware".into(),
-            jstr("recorded by the deployed-node harness"),
-        ),
-        ("write_cache".into(), jstr("enabled")),
-        ("barriers".into(), jstr("enabled")),
-        ("scheduler".into(), jstr("none")),
-        ("temperature_celsius".into(), J::Float(0.0)),
-        ("nic".into(), jstr("none (in-process P2)")),
-        ("driver".into(), jstr("none (in-process P2)")),
-        ("link_mbps".into(), jint(1i128)),
-        ("mtu".into(), jint(1500i128)),
-        (
-            "kernel".into(),
-            jstr(or_unknown(command_output("uname", &["-sr"]), "kernel")),
-        ),
-    ];
+    let mut hardware_fields: Vec<(String, J)> = base_hardware_fields(
+        &inputs.observations.store_root_filesystem,
+        inputs.nvme_temperature_celsius,
+    )?;
 
     // Derived by comparing what this run read off the host against the complete
     // `[[profile]]` tables of the frozen file, and derived before
@@ -2292,8 +2666,17 @@ pub fn assemble_bundle(
     // bundle may only claim the reference environment if it named a frozen
     // hardware profile, and it may only name one if the facts compared equal.
     let frozen = load_frozen_profile(&repo_root.join("bench/reference-hardware.toml"))?;
-    let host_facts = observe_host_facts(&inputs.observations.store_root_filesystem);
-    let hardware_derivation = hardware_profile_of(&frozen.profiles, &host_facts, &hardware_fields)?;
+    let mut host_facts = observe_host_facts(&inputs.observations.store_root_filesystem);
+    // The deployed-node harness's half of the comparison, merged fill-only:
+    // a supplied fact that contradicts a host observation refuses above, and
+    // the emitted hardware fields are filled from the merged facts before the
+    // derivation so the fields and the comparison describe one host — the
+    // placeholder refusal inside `hardware_profile_of` holds them to that.
+    let ingested = apply_deployed_facts(&mut host_facts, &inputs.deployed_facts)?;
+    fill_hardware_fields_from_facts(&mut hardware_fields, &host_facts)?;
+    let mut hardware_derivation =
+        hardware_profile_of(&frozen.profiles, &host_facts, &hardware_fields)?;
+    hardware_derivation.ingested = ingested;
     let hardware_profile = hardware_derivation.name;
     hardware_fields.insert(0, ("profile".into(), jstr(hardware_profile)));
     let hardware = J::Object(hardware_fields);
@@ -2328,6 +2711,16 @@ pub fn assemble_bundle(
         }
     }
 
+    // The deployment object describes the topology of THIS run, not the
+    // installed host. A P2 measurement drives `StoreEngine::submit`
+    // in-process, so there is no proxy, no TLS terminator, and no service
+    // manager in the measured path — and "none (in-process P2)" says exactly
+    // that. The frozen profile's [profile.software] table pins the host's
+    // INSTALLED stack — Caddy, TLS 1.3, systemd — which the deployed-fact
+    // file supplies and the profile comparison consumes. The two answer
+    // different questions and legitimately differ at this gate; the schema
+    // pins the deployment values per gate, so a bundle cannot quietly swap
+    // one contract for the other.
     let deployment = J::Object(vec![
         // Observed, not asserted. A tmpfs run is representable and
         // mechanically disqualified as of contract review 2026-07-28-C; it was
@@ -2374,27 +2767,26 @@ pub fn assemble_bundle(
                     .collect(),
             ),
         ),
-        // What `raw_metrics_digest` actually digests: the measured latencies as
-        // ascending decimal microseconds, comma-separated. A P2 run through
-        // `StoreEngine::submit` will emit a real HdrHistogram — the
-        // `bench-harness` feature already carries the dependency — and must
-        // change this string when it does.
+        // What the histogram digest actually digests, named by the
+        // `LatencyRecord` that produced it: raw ascending micros for the
+        // closed-loop skeleton, recorded value:count lines from the
+        // HdrHistogram for the open-loop engine path.
         (
             "histogram_format".into(),
-            jstr("ascending-micros-csv/blake3"),
+            jstr(inputs.histogram_format.to_string()),
         ),
-        // `false`, and the distinction matters. Coordinated-omission correction
-        // is *applicable* to any latency measurement — unlike the five graph
-        // claims above, which are omitted because they are not applicable here.
-        // The Wave A skeleton is a closed-loop driver: it issues the next group
-        // only after the previous fence returns, so it does not correct for
-        // coordinated omission and cannot. Applicable and not performed is
-        // exactly what `false` says.
-        //
-        // The schema permits either value at this gate, so nothing in
-        // `result-schema.json` would catch a regression to `true` here. The
-        // test asserts on the emitted artifact instead.
-        ("coordinated_omission_corrected".into(), J::Bool(false)),
+        // From the same `LatencyRecord` as the format label. The Wave A
+        // skeleton is a closed-loop driver and reports `false` — applicable
+        // and not performed. The engine path schedules open-loop arrivals and
+        // measures from them, which is the correction, and reports `true`.
+        // The schema permits either value at this gate, so the skeleton's
+        // artifact test and `storage_primitive_outcome`'s refusal are what
+        // stand between a closed-loop run and a bundle claiming a correction
+        // it never performed.
+        (
+            "coordinated_omission_corrected".into(),
+            J::Bool(inputs.coordinated_omission_corrected),
+        ),
         (
             "windows_meeting_target_percent".into(),
             J::Float(inputs.windows_meeting_target_percent),
@@ -2455,7 +2847,9 @@ pub fn assemble_bundle(
                 // The `u32` from the `StoreOptions` the store was opened with,
                 // carried through the run rather than `ENGINE_MAX_INDEX_RUNS`
                 // written out a second time. It is the ceiling this workload
-                // genuinely reaches: `submit` refuses `NotImplemented` at it.
+                // genuinely reaches -- the fan-out trigger fires on it and the
+                // run seals against it, which is the steady state a P2 number
+                // has to be measured in.
                 (
                     "max_index_runs".into(),
                     jint(i128::from(inputs.observations.configured_max_index_runs)),
@@ -3056,20 +3450,30 @@ fn skeleton_ack_record(sequence: u64) -> AckRecord {
 //
 // # What this run can and cannot claim, stated before the code
 //
-// Two of B1's unimplemented deliverables bound it, and both are a bound on the
-// *bundle*, not merely on this file:
+// One condition still bounds it, and it is a bound on the *bundle*, not merely
+// on this file:
 //
-//   * `submit` refuses `NotImplemented` after `max_index_runs` group
-//     publications, because sealing the in-memory index delta into an
-//     `IndexRun` is unimplemented. The ceiling is raised here so the run can
-//     reach its measured seconds at all, which means the run holds every delta
-//     layer it ever published in memory and its lookup fan-out grows for the
-//     whole run. A P2 measurement is of a steady state; this is not one, and
-//     the bundle says so through `outcome` and its verdicts.
-//   * `StoreEngine::checkpoint` is unimplemented, so no checkpoint is taken.
-//     Section 7 requires that a P2 run not have been achieved with
-//     checkpointing disabled. This one was. That alone makes the
-//     `storage_primitive` gate unearnable today, whatever the rate says.
+//   * `StoreEngine::checkpoint` exists but this run never accumulates enough
+//     work to trip it, so the bundle declares `enabled_not_reached`. Section 7
+//     requires that a P2 run not have been achieved with checkpointing
+//     disabled, and `exercised` is the value it wants. Until a run reaches
+//     that, the `storage_primitive` gate stays unearnable whatever the rate
+//     says.
+//
+// One bound that stood here is gone, and the ceiling below is the evidence.
+// `submit` used to refuse `NotImplemented` after `max_index_runs` group
+// publications because sealing the in-memory delta into an `IndexRun` was
+// unimplemented, so this file raised the ceiling to a million to reach its
+// measured seconds at all — which meant the run held every delta layer it ever
+// published and its lookup fan-out grew for the whole run. Sealing landed, so
+// the raise outlived its reason and was dropped: the store opens at its own
+// default and the bundle declares `index_run_ceiling: store_default`.
+//
+// Dropping it is what makes `index_maintenance: runs_sealed` mean what it
+// reads. At a ceiling of a million the fan-out trigger never fired and every
+// seal in a measured run came from entry pressure; at the default the run seals
+// on fan-out as well, which is the steady state the ceiling exists to impose
+// and the one a P2 number has to be of.
 //
 // A third bound stood here until B1 landed startup state 1: `StoreEngine::open`
 // refused to build an absent root, so this run seeded one with
@@ -3087,8 +3491,18 @@ fn skeleton_ack_record(sequence: u64) -> AckRecord {
 // `transaction_status` on a reopened engine rather than comparing sequence
 // sets.
 
-/// Raised because index-delta sealing is unimplemented; see the note above.
-const ENGINE_MAX_INDEX_RUNS: u32 = 1_000_000;
+/// A ceiling above the store default, used **only** by the derivation's unit
+/// tests so the `raised_*` branch stays covered after the measured run stopped
+/// producing it.
+///
+/// No measured run configures this. It is not the value the old
+/// `ENGINE_MAX_INDEX_RUNS` had a right to: that one was applied to the store,
+/// and this one exists so a test can hand `RunConditions::derive` a raised
+/// observation and check it says so. Deleting it would leave the branch
+/// reachable only from a configuration nothing here produces, which is how a
+/// derivation quietly stops being a derivation.
+#[cfg(test)]
+const RAISED_MAX_INDEX_RUNS_FOR_DERIVATION_TESTS: u32 = 1_000_000;
 
 /// One commit's objects, matching the frozen workload: one 1 KiB blob, one
 /// tree, one commit.
@@ -3274,7 +3688,10 @@ pub struct SetupTraffic {
 
 /// What one engine-driven run measured.
 struct EngineRun {
-    latencies_micros: Vec<u64>,
+    latency_histogram: hdrhistogram::Histogram<u64>,
+    /// Peak NVMe temperature sampled while the run was live, `None` when the
+    /// host exposed no sensor.
+    nvme_temperature_peak_celsius: Option<f64>,
     transactions: u64,
     objects_new: u64,
     raw_bytes: u64,
@@ -3289,6 +3706,17 @@ struct EngineRun {
     /// Group publications, counted as fences: `journal::append_group_and_fence`
     /// performs exactly one per group and A1's acceptance pins that.
     groups: u64,
+    /// Checkpoints that completed inside the measured interval. Zero is a
+    /// truthful answer for a run too short to reach the interval, and it is
+    /// what keeps `checkpointing` at `enabled_not_reached` rather than
+    /// promoting a run that never checkpointed.
+    checkpoints_taken: u64,
+    /// Commits in each whole one-minute window of the measured interval.
+    ///
+    /// Whole windows only: a trailing partial minute is not a one-minute window
+    /// and including it would report a rate over less than a minute as though
+    /// it were one, which §3's rule is specifically about.
+    window_commits: Vec<u64>,
     signing_micros_p50: f64,
     /// Signing samples taken inside the measured interval, on the same basis.
     signings: u64,
@@ -3307,21 +3735,108 @@ struct EngineRun {
 }
 
 #[allow(clippy::too_many_lines)]
+/// The warmup boundary as one synchronization primitive.
+///
+/// A flag beside a counter left a check-then-act gap: a worker could pass the
+/// park check, build and sleep, and enroll after the baseline thread had
+/// already observed zero in-flight work — its fence landing mid-snapshot or
+/// on the far side of it from its commit. Here enrollment and the boundary
+/// transition share one mutex. A worker either enrolled before the transition
+/// closed the gate — and the transition waits for its exit before reading any
+/// counter — or it blocks in `enroll` until the baseline is read and comes
+/// back measured. Classification is the value `enroll` returns, decided under
+/// the lock, so no fence or signature can land on the opposite side of the
+/// baseline from the commit it belongs to. The checkpointer enrolls through
+/// the same gate: a checkpoint fences too.
+struct BoundaryGate {
+    state: Mutex<GateState>,
+    changed: Condvar,
+}
+
+struct GateState {
+    in_flight: u64,
+    measuring: bool,
+    closed: bool,
+}
+
+impl BoundaryGate {
+    fn new(measuring: bool) -> Self {
+        Self {
+            state: Mutex::new(GateState {
+                in_flight: 0,
+                measuring,
+                closed: false,
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    /// Begin one unit of counter-relevant work. Blocks while the boundary
+    /// transition holds the gate closed. Returns whether the measured phase
+    /// is open, decided atomically with the enrollment.
+    fn enroll(&self) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        while state.closed {
+            state = self.changed.wait(state).unwrap_or_else(|p| p.into_inner());
+        }
+        state.in_flight += 1;
+        state.measuring
+    }
+
+    fn exit(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.in_flight -= 1;
+        if state.in_flight == 0 {
+            self.changed.notify_all();
+        }
+    }
+
+    /// Whether a transition currently holds the gate closed. Test-only: the
+    /// seam test uses it to place an enrollment deterministically inside the
+    /// transition window instead of racing it there.
+    #[cfg(test)]
+    fn closed(&self) -> bool {
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).closed
+    }
+
+    /// Close the gate, drain enrolled work, take the baseline at the quiescent
+    /// point, and open the measured phase. On a snapshot error the gate
+    /// reopens unmeasured, so blocked workers resume and observe the stop the
+    /// caller is about to set instead of hanging in `enroll`.
+    fn open_measurement<T, E>(&self, snapshot: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.closed = true;
+        while state.in_flight > 0 {
+            state = self.changed.wait(state).unwrap_or_else(|p| p.into_inner());
+        }
+        let baseline = snapshot();
+        if baseline.is_ok() {
+            state.measuring = true;
+        }
+        state.closed = false;
+        self.changed.notify_all();
+        baseline
+    }
+}
+
 fn run_engine(
     root: &Path,
     ack_path: &Path,
     ack_fault: AckJournalFault,
     group_len: usize,
+    warmup: Duration,
     seconds: u64,
+    target_rate: u64,
     shard_count: u16,
     submitters_per_shard: usize,
+    checkpoint_interval: Duration,
 ) -> Result<EngineRun, String> {
     use levcs_store::segment::RootLayout;
     use levcs_store::transaction::StagedObject;
     use levcs_store::types::{OperationId, PrivilegedConstruction, StoreError};
     use levcs_store::{StoreEngine, ValidatedTransaction};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     // A run with no submitter measures nothing, and a bundle from it asserts
     // `setup_traffic_excluded`, `unique_blob_tree_commit_ids`, and
@@ -3358,7 +3873,7 @@ fn run_engine(
         options.max_group_bytes = 8 * 1024 * 1024;
         options.max_group_idle = Duration::from_millis(1);
         options.journal_preallocate_bytes = 64 * 1024 * 1024;
-        options.max_index_runs = ENGINE_MAX_INDEX_RUNS;
+        // Deliberately left at the store default. See the note above.
         options.signer = Some(signer.clone());
         options
     };
@@ -3481,14 +3996,198 @@ fn run_engine(
     // transaction can never be.
     let unaccounted: Mutex<Option<String>> = Mutex::new(None);
     let results: Mutex<Vec<(NamespaceId, OperationId, u64, u64)>> = Mutex::new(Vec::new());
-    let latencies: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+    let latency_histogram: Mutex<hdrhistogram::Histogram<u64>> = Mutex::new(
+        hdrhistogram::Histogram::new_with_bounds(1, 3_600_000_000, 3)
+            .map_err(|error| format!("constructing the latency histogram: {error}"))?,
+    );
     let objects_new = AtomicU64::new(0);
     let raw_bytes = AtomicU64::new(0);
 
     let started = Instant::now();
-    let deadline = started + Duration::from_secs(seconds.max(1));
+    // The measured window opens after the warmup, and everything the bundle
+    // reports as *measured* — rate, latencies, windows, fences, signings — is
+    // taken from that boundary. The warmup's traffic is real store work: its
+    // commits append acknowledgments and reconcile like any other, its
+    // checkpoints keep index maintenance on cadence, and only the measurement
+    // excludes it, exactly as the frozen workload's 300-second warmup intends.
+    let measure_start = started + warmup;
+    let deadline = measure_start + Duration::from_secs(seconds.max(1));
+    let measured_commits = AtomicU64::new(0);
+    // The counter baselines at the instant the window opens, snapshotted by a
+    // thread that waits for it. With no warmup the window opens now, and the
+    // baseline is the setup snapshot above.
+    let window_baseline: Mutex<Option<SetupTraffic>> =
+        Mutex::new(if warmup.is_zero() { Some(setup) } else { None });
+    let baseline_failure: Mutex<Option<String>> = Mutex::new(None);
+    // One primitive owns the boundary: see [`BoundaryGate`]. With no warmup
+    // the phase is open from the start and the gate never closes.
+    let gate = BoundaryGate::new(warmup.is_zero());
+    // The maximum sampled NVMe temperature while any producer thread lives;
+    // see `sample_peak_until_drained` for exactly what the number does and
+    // does not witness. The count is loaded before anything spawns, so the
+    // sampler cannot observe a zero that merely means "not started yet"; each
+    // producer carries a `ProducerTicket` that decrements on any exit path.
+    let producers = AtomicU64::new(u64::from(shard_count) * submitters_per_shard as u64 + 1);
+    let temperature_peak: Mutex<Option<f64>> = Mutex::new(None);
+    // Open-loop arrivals (scope §10): every submitter issues on a fixed
+    // schedule derived from the target rate rather than on the previous
+    // completion, and latency is measured from the *scheduled* arrival — the
+    // wrk2 method, which is what corrects for coordinated omission. A stalled
+    // store keeps accruing scheduled arrivals, and their queueing delay lands
+    // in the histogram instead of vanishing into an idle driver. The offered
+    // rate carries a 1% margin over the target: §3 windows compare completed
+    // commits to the target exactly, so boundary jitter on an exactly-paced
+    // stream would fail windows on a store that sustains the target. The
+    // margin is extra offered load the store must absorb, and schedule-based
+    // latency can only overstate under it, never understate.
+    if target_rate == 0 {
+        return Err(
+            "refusing to measure: --target-rate 0 schedules no arrival at all, so \
+             the open-loop driver would issue nothing and measure an empty interval."
+                .to_string(),
+        );
+    }
+    let workers = u64::from(shard_count) * submitters_per_shard as u64;
+    let paced = target_rate + (target_rate / 100).max(1);
+    let arrival_interval = Duration::from_nanos((workers * 1_000_000_000) / paced);
+
+    // Checkpoints taken inside the measured interval, by a thread that lives
+    // exactly as long as the submitters do.
+    //
+    // Inside the window on purpose. A checkpoint taken before or after it would
+    // leave the measured seconds describing a store that never compacted its
+    // index -- fan-out growing for the whole run -- which is the condition
+    // scope §7's stop clause exists to exclude. Its cost is therefore *in* the
+    // reported rate, which is the honest place for it: a P2 number that
+    // excluded checkpoint cost would not describe a steady state either.
+    // Commits per one-minute window, indexed by whole minutes since the window
+    // opened. Counted here rather than reconstructed from per-transaction
+    // timestamps: the §3 rule needs a rate per minute, and a counter per minute
+    // is bounded by the run's length while a timestamp per commit is bounded by
+    // its throughput -- 22 million of them at the P2 target.
+    let window_commits: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+    let checkpoints_taken = AtomicU64::new(0);
+    let checkpoint_failure: Mutex<Option<String>> = Mutex::new(None);
 
     std::thread::scope(|scope| {
+        {
+            let engine = &engine;
+            let stop = &stop;
+            let checkpoints_taken = &checkpoints_taken;
+            let checkpoint_failure = &checkpoint_failure;
+            let gate = &gate;
+            let producers = &producers;
+            scope.spawn(move || {
+                let _ticket = ProducerTicket(producers);
+                // Polled rather than slept in one block, so the thread leaves
+                // promptly when the window closes instead of holding the scope
+                // open for a whole interval past it.
+                let mut next = Instant::now() + checkpoint_interval;
+                while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+                    if Instant::now() < next {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    // Enrolled like a submitter: a checkpoint fences too, so
+                    // it may not run while the baseline is being read, and
+                    // whether it counts is decided with the enrollment.
+                    let measured = gate.enroll();
+                    let result = engine.checkpoint();
+                    gate.exit();
+                    match result {
+                        Ok(_) => {
+                            // Warmup checkpoints keep maintenance on cadence
+                            // but do not count: `Exercised` claims this
+                            // *measurement* contains a checkpoint, and a
+                            // warmup-only checkpoint would make that claim
+                            // for it.
+                            if measured {
+                                checkpoints_taken.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        // Recorded and fatal to the run rather than retried. A
+                        // checkpoint that fails mid-measurement leaves the
+                        // store in a state the bundle would have to describe,
+                        // and continuing would report a rate for a run whose
+                        // index maintenance stopped working partway.
+                        Err(error) => {
+                            let mut slot =
+                                checkpoint_failure.lock().unwrap_or_else(|e| e.into_inner());
+                            if slot.is_none() {
+                                *slot = Some(format!("{error:?}"));
+                            }
+                            stop.store(true, Ordering::Relaxed);
+                            return;
+                        }
+                    }
+                    next = Instant::now() + checkpoint_interval;
+                }
+            });
+        }
+
+        {
+            let stop = &stop;
+            let temperature_peak = &temperature_peak;
+            let producers = &producers;
+            scope.spawn(move || {
+                let peak = sample_peak_until_drained(
+                    read_nvme_temperature_celsius,
+                    producers,
+                    stop,
+                    Duration::from_secs(5),
+                );
+                *temperature_peak.lock().unwrap_or_else(|p| p.into_inner()) = peak;
+            });
+        }
+
+        // The window baseline, snapshotted by a thread that waits for the
+        // window to open. Setup's snapshot pattern, at the warmup boundary:
+        // reading the counters from the submitters would race the boundary,
+        // and reading them after the scope would read them from the end.
+        if !warmup.is_zero() {
+            let engine = &engine;
+            let stop = &stop;
+            let signer = &signer;
+            let window_baseline = &window_baseline;
+            let baseline_failure = &baseline_failure;
+            let gate = &gate;
+            scope.spawn(move || {
+                while !stop.load(Ordering::Relaxed) && Instant::now() < measure_start {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                // The whole transition happens inside the gate: enrollments
+                // block, enrolled work drains, and the snapshot runs at the
+                // quiescent point — an acknowledgment returns only after its
+                // group's fence and signatures, so zero enrolled work means
+                // every pre-boundary cost is in the counters and no
+                // post-boundary work has begun.
+                let baseline = gate.open_measurement(|| -> Result<SetupTraffic, String> {
+                    let fences = sum_fences(engine, shard_count)?;
+                    let signings = signer
+                        .micros
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .len() as u64;
+                    Ok(SetupTraffic { fences, signings })
+                });
+                match baseline {
+                    Ok(baseline) => {
+                        *window_baseline.lock().unwrap_or_else(|p| p.into_inner()) = Some(baseline);
+                    }
+                    Err(error) => {
+                        let mut slot = baseline_failure.lock().unwrap_or_else(|p| p.into_inner());
+                        if slot.is_none() {
+                            *slot = Some(error);
+                        }
+                        stop.store(true, Ordering::Relaxed);
+                    }
+                }
+            });
+        }
+
         for shard in 0..shard_count {
             for submitter in 0..submitters_per_shard {
                 let namespace = namespaces[shard as usize];
@@ -3500,10 +4199,21 @@ fn run_engine(
                 let first_refusal = &first_refusal;
                 let unaccounted = &unaccounted;
                 let results = &results;
-                let latencies = &latencies;
+                let window_commits = &window_commits;
                 let objects_new = &objects_new;
                 let raw_bytes = &raw_bytes;
+                let measured_commits = &measured_commits;
+                let gate = &gate;
+                let producers = &producers;
+                let latency_histogram = &latency_histogram;
+                // Staggered start phases keep the workers' schedules from
+                // beating in step; the interval itself is the whole fleet's.
+                let worker_index =
+                    u64::from(shard) * submitters_per_shard as u64 + submitter as u64;
                 scope.spawn(move || {
+                    let _ticket = ProducerTicket(producers);
+                    let mut scheduled = started
+                        + arrival_interval.mul_f64(worker_index as f64 / workers.max(1) as f64);
                     let mut ordinal = 0u64;
                     let branch = format!("refs/heads/s{shard}-w{submitter}");
                     let mut expected: Option<ObjectId> = None;
@@ -3583,10 +4293,23 @@ fn run_engine(
                         .build()
                         .expect("a complete push transaction");
 
-                        let call = Instant::now();
+                        // Sleep only when ahead of schedule; behind it, the
+                        // arrival issues immediately and its latency carries
+                        // the backlog — that is the correction.
+                        let now = Instant::now();
+                        if now < scheduled {
+                            std::thread::sleep(scheduled - now);
+                        }
+                        // Enrollment blocks across the boundary transition and
+                        // decides the classification atomically with it: a
+                        // commit and its fence and signature land wholly on
+                        // one side of the baseline, never split.
+                        let measured = gate.enroll();
                         let outcome =
                             block_on_until(engine.submit(transaction), Duration::from_secs(60));
-                        let micros = call.elapsed().as_micros() as u64;
+                        gate.exit();
+                        let micros = scheduled.elapsed().as_micros() as u64;
+                        scheduled += arrival_interval;
                         match outcome {
                             Some(Ok(receipt)) => {
                                 // The fence returned. Acknowledgment is only
@@ -3650,18 +4373,37 @@ fn run_engine(
                                     }
                                 }
                                 acknowledged.fetch_add(1, Ordering::Relaxed);
-                                // The store's own count of the objects this
-                                // transaction introduced, not `3` restated by
-                                // the harness. `objects_new` derived from the
-                                // commit count is what makes
-                                // `verification.objects_new_equals_three_per_commit`
-                                // a tautology instead of a check.
-                                objects_new.fetch_add(receipt.objects_new, Ordering::Relaxed);
-                                raw_bytes.fetch_add(bytes, Ordering::Relaxed);
-                                latencies
-                                    .lock()
-                                    .unwrap_or_else(|p| p.into_inner())
-                                    .push(micros);
+                                // A commit is counted when it is acknowledged,
+                                // which is what the rate is a rate of — and
+                                // only when the gate above classified it into
+                                // the measured phase. A warmup commit is real
+                                // store work the acknowledgment journal and
+                                // the reconciliation cover like any other;
+                                // it is simply not measured.
+                                let now = Instant::now();
+                                if measured {
+                                    measured_commits.fetch_add(1, Ordering::Relaxed);
+                                    // The store's own count of the objects this
+                                    // transaction introduced, not `3` restated
+                                    // by the harness. `objects_new` derived
+                                    // from the commit count is what makes
+                                    // `verification.objects_new_equals_three_per_commit`
+                                    // a tautology instead of a check.
+                                    objects_new.fetch_add(receipt.objects_new, Ordering::Relaxed);
+                                    raw_bytes.fetch_add(bytes, Ordering::Relaxed);
+                                    latency_histogram
+                                        .lock()
+                                        .unwrap_or_else(|p| p.into_inner())
+                                        .saturating_record(micros.max(1));
+                                    let minute =
+                                        now.saturating_duration_since(measure_start).as_secs() / 60;
+                                    let mut windows =
+                                        window_commits.lock().unwrap_or_else(|p| p.into_inner());
+                                    if windows.len() <= minute as usize {
+                                        windows.resize(minute as usize + 1, 0);
+                                    }
+                                    windows[minute as usize] += 1;
+                                }
                                 results.lock().unwrap_or_else(|p| p.into_inner()).push((
                                     namespace,
                                     operation,
@@ -3697,7 +4439,10 @@ fn run_engine(
         }
     });
 
-    let elapsed = started.elapsed();
+    // Elapsed *measured* time: the window's, not the process's. `elapsed`
+    // divides the rate and truncates the one-minute windows, and both are
+    // statements about the measured interval alone.
+    let elapsed = measure_start.elapsed();
 
     // Before anything is read off a counter, let alone reported. A run that
     // could not account for a committed transaction has no totals worth
@@ -3722,7 +4467,9 @@ fn run_engine(
 
     let total_fences = sum_fences(&engine, shard_count)?;
 
-    let latencies = latencies.into_inner().unwrap_or_else(|p| p.into_inner());
+    let latency_histogram = latency_histogram
+        .into_inner()
+        .unwrap_or_else(|p| p.into_inner());
     let results = results.into_inner().unwrap_or_else(|p| p.into_inner());
     let refused = refused.load(Ordering::Relaxed);
     let first_refusal = first_refusal
@@ -3738,30 +4485,76 @@ fn run_engine(
         .clone();
     let total_signings = all_signing.len() as u64;
 
-    // The measured interval is what the totals hold *beyond* the baselines. A
-    // counter that went backwards is a store or a harness finding and not a
-    // number to publish, so the subtraction refuses rather than saturating.
-    let fences = total_fences.checked_sub(setup.fences).ok_or_else(|| {
-        format!(
-            "refusing to measure: the durability fence counter read {total_fences} at the \
+    // The baseline at the instant the measured window opened. Absent means the
+    // run stopped during warmup, and there is no measured interval to report.
+    if let Some(failure) = baseline_failure
+        .into_inner()
+        .unwrap_or_else(|p| p.into_inner())
+    {
+        return Err(format!(
+            "snapshotting the measured-window baseline failed: {failure}"
+        ));
+    }
+    let Some(window_start) = window_baseline
+        .into_inner()
+        .unwrap_or_else(|p| p.into_inner())
+    else {
+        return Err(format!(
+            "the run stopped during its warmup, before the measured window opened; \
+             first refusal: {first_refusal:?}"
+        ));
+    };
+
+    // The measured interval is what the totals hold *beyond* the window
+    // baseline — which is the setup snapshot when there is no warmup, and the
+    // boundary snapshot when there is. A counter that went backwards is a
+    // store or a harness finding and not a number to publish, so the
+    // subtraction refuses rather than saturating.
+    let fences = total_fences
+        .checked_sub(window_start.fences)
+        .ok_or_else(|| {
+            format!(
+                "refusing to measure: the durability fence counter read {total_fences} at the \
              end of the measured interval and {} at its start. A counter that went \
              backwards cannot bound what the interval contained.",
-            setup.fences
-        )
-    })?;
-    let signings = total_signings.checked_sub(setup.signings).ok_or_else(|| {
-        format!(
-            "refusing to measure: {total_signings} signing samples were recorded in total \
-             and {} before the measured interval opened.",
-            setup.signings
-        )
-    })?;
+                window_start.fences
+            )
+        })?;
+    let signings = total_signings
+        .checked_sub(window_start.signings)
+        .ok_or_else(|| {
+            format!(
+                "refusing to measure: {total_signings} signing samples were recorded in total \
+                 and {} before the measured interval opened.",
+                window_start.signings
+            )
+        })?;
     // Samples are appended in signing order, so the measured interval's samples
     // are exactly the tail past the baseline. Sorted *after* the split, because
     // sorting first would make the baseline index meaningless.
-    let mut signing = all_signing[setup.signings as usize..].to_vec();
+    let mut signing = all_signing[window_start.signings as usize..].to_vec();
     signing.sort_unstable();
     let signing_p50 = percentile(&signing, 0.50) as f64;
+
+    // One last checkpoint, **after** the measured window has closed.
+    //
+    // A steady-state run is publishing deltas continuously and sealing them
+    // periodically, so at the instant the window closes there is essentially
+    // always a partial backlog -- it is an artifact of where the clock stopped,
+    // not a statement about whether maintenance kept pace. `index_maintenance`
+    // requires a drained backlog to declare `runs_sealed`, and that check is
+    // worth keeping strict: the alternative is asserting a steady state while
+    // carrying a backlog the bundle has no field to report.
+    //
+    // Draining here reconciles the two without weakening either. It is outside
+    // the measured interval, so it changes no reported rate; the checkpoints
+    // that establish maintenance kept pace are the periodic ones *inside* it,
+    // counted separately and reported as `checkpointing`.
+    if checkpoints_taken.load(Ordering::Relaxed) > 0 {
+        engine
+            .checkpoint()
+            .map_err(|error| format!("the closing checkpoint failed: {error:?}"))?;
+    }
 
     drop(ack);
     drop(engine);
@@ -3818,7 +4611,15 @@ fn run_engine(
     // What the store answers about checkpoints, asked of the store rather than
     // asserted about it. Asked after the reconciliation so a checkpoint the day
     // this stops refusing cannot move what the reconciliation read.
-    let checkpoint = probe_checkpointing(&reopened)?;
+    // `Exercised` comes from the run, never from the probe: the probe can only
+    // establish that a checkpoint is *possible*, and the field is about whether
+    // this measurement contains one. A run that took none falls through to the
+    // probe and reports `enabled_not_reached`, which cannot pass.
+    let checkpoint = if checkpoints_taken.load(Ordering::Relaxed) > 0 {
+        CheckpointProbe::Exercised
+    } else {
+        probe_checkpointing(&reopened)?
+    };
     // Read from the live engine, after the checkpoint probe, so it describes
     // the state the bundle is about — and before the handle is dropped, because
     // the reading only exists while the root is open.
@@ -3854,7 +4655,32 @@ fn run_engine(
     // as index runs rather than counted as directory entries.
     let index_scan = scan_index_runs(root, shard_count);
 
+    // A checkpoint that failed mid-window invalidates the measurement rather
+    // than reducing it: the reported rate would be for a run whose index
+    // maintenance stopped partway, which is not a steady state either.
+    if let Some(error) = checkpoint_failure.into_inner().unwrap_or(None) {
+        return Err(format!(
+            "a checkpoint failed inside the measured interval: {error}. The run is \
+             discarded rather than reported, because its rate would describe a store \
+             that stopped maintaining its index partway through."
+        ));
+    }
+
+    // Whole windows only. The run stops at its deadline, so the last bucket is
+    // almost always a fraction of a minute; keeping it would divide a partial
+    // minute's commits by sixty seconds and report a rate no window achieved.
+    let mut window_commits = window_commits
+        .into_inner()
+        .unwrap_or_else(|p| p.into_inner());
+    let whole_windows = (elapsed.as_secs() / 60) as usize;
+    window_commits.truncate(whole_windows);
+
     Ok(EngineRun {
+        nvme_temperature_peak_celsius: temperature_peak
+            .into_inner()
+            .unwrap_or_else(|p| p.into_inner()),
+        window_commits,
+        checkpoints_taken: checkpoints_taken.load(Ordering::Relaxed),
         facts: RunFacts {
             initialization,
             mutation: MutationPath::StoreEngineSubmit,
@@ -3886,8 +4712,12 @@ fn run_engine(
             uniqueness,
         },
         groups: fences,
-        transactions: acknowledged,
-        latencies_micros: latencies,
+        // Commits acknowledged inside the measured window. `acknowledged`
+        // below stays the whole run's count — warmup included — because the
+        // acknowledgment journal and its reconciliation cover every commit
+        // the store ever promised, not only the measured ones.
+        transactions: measured_commits.load(Ordering::Relaxed),
+        latency_histogram,
         objects_new,
         raw_bytes,
         elapsed,
@@ -3959,9 +4789,102 @@ fn check_global_uniqueness(records: &[AckRecord]) -> Result<UniquenessCheck, Str
 /// bundle emitter identical for both: the thing that must not differ between a
 /// seam measurement and a store measurement is how the measurement is
 /// *reported*.
+/// How a path measured latency, carried whole so the bundle can only describe
+/// the measurement that actually ran.
+///
+/// The Wave A skeleton is a closed-loop driver and keeps its raw ascending
+/// micros; the engine path is an open-loop, coordinated-omission-corrected
+/// driver recording into the HdrHistogram §10 requires. One seam, so the
+/// format label, the correction flag, the percentiles and the digest input
+/// all come from the same value and cannot disagree about which methodology
+/// produced them.
+enum LatencyRecord {
+    ClosedLoopMicros(Vec<u64>),
+    OpenLoopHdr(hdrhistogram::Histogram<u64>),
+}
+
+impl LatencyRecord {
+    fn coordinated_omission_corrected(&self) -> bool {
+        match self {
+            Self::ClosedLoopMicros(_) => false,
+            Self::OpenLoopHdr(_) => true,
+        }
+    }
+
+    fn format_label(&self) -> &'static str {
+        match self {
+            Self::ClosedLoopMicros(_) => "ascending-micros-csv/blake3",
+            Self::OpenLoopHdr(_) => "hdrhistogram-recorded-value-count-csv/blake3",
+        }
+    }
+
+    fn samples(&self) -> u64 {
+        match self {
+            Self::ClosedLoopMicros(values) => values.len() as u64,
+            Self::OpenLoopHdr(histogram) => histogram.len(),
+        }
+    }
+
+    fn quantile(&self, fraction: f64) -> u64 {
+        match self {
+            Self::ClosedLoopMicros(values) => {
+                let mut sorted = values.clone();
+                sorted.sort_unstable();
+                percentile(&sorted, fraction)
+            }
+            Self::OpenLoopHdr(histogram) => histogram.value_at_quantile(fraction),
+        }
+    }
+
+    fn max(&self) -> u64 {
+        match self {
+            Self::ClosedLoopMicros(values) => values.iter().copied().max().unwrap_or(0),
+            Self::OpenLoopHdr(histogram) => histogram.max(),
+        }
+    }
+
+    /// The text the histogram digest is computed over — exactly what
+    /// `format_label` names.
+    fn canonical_text(&self) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        match self {
+            Self::ClosedLoopMicros(values) => {
+                let mut sorted = values.clone();
+                sorted.sort_unstable();
+                for value in &sorted {
+                    let _ = write!(out, "{value},");
+                }
+            }
+            Self::OpenLoopHdr(histogram) => {
+                for entry in histogram.iter_recorded() {
+                    let _ = writeln!(
+                        out,
+                        "{}:{}",
+                        entry.value_iterated_to(),
+                        entry.count_at_value()
+                    );
+                }
+            }
+        }
+        out
+    }
+}
+
 struct MeasuredRun {
-    latencies_micros: Vec<u64>,
+    latency: LatencyRecord,
+    /// Peak NVMe temperature sampled while the run was live. `None` on the
+    /// drive path, which samples nothing and stays diagnostic.
+    nvme_temperature_peak_celsius: Option<f64>,
     groups: u64,
+    /// Checkpoints completed inside the measured interval. The journal seam has
+    /// no engine and therefore no checkpoint, so it is always zero there --
+    /// which is why the drive path declares `unimplemented` rather than this.
+    checkpoints_taken: u64,
+    /// Commits per whole one-minute window, empty for a run shorter than a
+    /// minute. Empty is what makes the §3 rule unevaluable rather than
+    /// vacuously satisfied.
+    window_commits: Vec<u64>,
     transactions: u64,
     /// Counted from the objects the store actually staged on the submit path,
     /// and derived as `transactions * 3` on the drive path, where there are no
@@ -3999,6 +4922,9 @@ struct MeasuredRun {
 impl From<SkeletonRun> for MeasuredRun {
     fn from(run: SkeletonRun) -> Self {
         Self {
+            // The journal seam has no engine to checkpoint.
+            checkpoints_taken: 0,
+            window_commits: Vec::new(),
             groups: run.groups,
             transactions: run.transactions,
             objects_new: run.transactions * OBJECTS_PER_COMMIT,
@@ -4021,7 +4947,8 @@ impl From<SkeletonRun> for MeasuredRun {
             total_signings: 0,
             acknowledged_sequences_reconciled: run.acknowledged_sequences_reconciled,
             ack_journal_digest: run.ack_journal_digest,
-            latencies_micros: run.latencies_micros,
+            latency: LatencyRecord::ClosedLoopMicros(run.latencies_micros),
+            nvme_temperature_peak_celsius: None,
             path: "drive",
             refused: 0,
             first_refusal: None,
@@ -4032,6 +4959,8 @@ impl From<SkeletonRun> for MeasuredRun {
 impl From<EngineRun> for MeasuredRun {
     fn from(run: EngineRun) -> Self {
         Self {
+            checkpoints_taken: run.checkpoints_taken,
+            window_commits: run.window_commits.clone(),
             groups: run.groups,
             transactions: run.transactions,
             objects_new: run.objects_new,
@@ -4050,7 +4979,8 @@ impl From<EngineRun> for MeasuredRun {
             total_signings: run.total_signings,
             acknowledged_sequences_reconciled: run.acknowledged_sequences_reconciled,
             ack_journal_digest: run.ack_journal_digest,
-            latencies_micros: run.latencies_micros,
+            latency: LatencyRecord::OpenLoopHdr(run.latency_histogram),
+            nvme_temperature_peak_celsius: run.nvme_temperature_peak_celsius,
             path: "submit",
             refused: run.refused,
             first_refusal: run.first_refusal,
@@ -4175,11 +5105,22 @@ const USAGE: &str = "\
 store-bench <precheck|emit-skeleton|run> [flags]
 
   precheck        --root P [--repo-root P] [--target-rate N]
+  precheck-facts  --facts P --root P [--repo-root P]
   emit-skeleton   --root P --out P --allow-unsigned [--repo-root P]
                   [--seconds N] [--group-len N] [--skip-attribute-check]
                   [--path submit|drive] [--shards N] [--submitters-per-shard N]
                   [--fail-ack-append-after N]
-  run             --root P --out-dir P   (P2; blocked, see below)
+  run             --root P --out P --allow-unsigned [--repo-root P]
+                  [--seconds N] [--warmup-seconds N] [--repetition N]
+                  [--trim-settle-seconds N] [--group-len N] [--target-rate N]
+                  [--path submit|drive] [--shards N] [--submitters-per-shard N]
+                  [--checkpoint-interval-millis N] [--skip-attribute-check]
+
+A measured run omits --seconds and --warmup-seconds: they default to the frozen
+workload's measured and warmup lengths, so the campaign's shape comes from the
+workload file rather than from whatever the caller typed. --repetition and
+--trim-settle-seconds are recorded into the bundle by the driver that loops the
+repetitions and waits out the settle interval between them.
 
 --fail-ack-append-after N is fault injection, and a run that uses it emits no
 bundle by construction: the Nth acknowledgment-journal append is issued against
@@ -4308,25 +5249,44 @@ fn dispatch(subcommand: &str, flags: &Flags) -> Result<ExitCode, String> {
                 Err(error)
             }
         }
+    } else if subcommand == "precheck-facts" {
+        let facts_path = flags.required("facts")?;
+        let root = PathBuf::from(flags.required("root")?);
+        let mount = detect_mount(&root)?;
+        let facts_text = std::fs::read_to_string(facts_path)
+            .map_err(|error| format!("reading --facts {facts_path}: {error}"))?;
+        let derivation = validate_deployed_facts(
+            &repo_root,
+            &mount.filesystem,
+            &facts_text,
+            read_nvme_temperature_celsius(),
+        )?;
+        println!("precheck_facts=ok");
+        println!("precheck_facts_profile={}", derivation.name);
+        println!("precheck_facts_ingested={}", derivation.ingested.join(","));
+        Ok(ExitCode::SUCCESS)
     } else if subcommand == "emit-skeleton" {
-        emit_skeleton(&repo_root, &workload, &profile, flags)
+        emit_bundle(&repo_root, &workload, &profile, flags, true)
     } else if subcommand == "run" {
-        Err(
-            "the P2 run goes through StoreEngine::submit, which is B1 NamespaceTxn \
-             (scope 6-B1). Wave A can produce a P1-micro number and a skeleton \
-             bundle; it cannot produce a P2 result."
-                .to_string(),
-        )
+        emit_bundle(&repo_root, &workload, &profile, flags, false)
     } else {
         Err(format!("unknown subcommand {subcommand:?}\n\n{USAGE}"))
     }
 }
 
-fn emit_skeleton(
+/// Emit one bundle, either as a skeleton or as a measured P2 run.
+///
+/// One function for both because the two must not drift: a skeleton whose
+/// measurement block is assembled by different code from the run's would let a
+/// field be checked in rehearsal and unchecked in the campaign. What differs is
+/// stated in `skeleton` and nowhere else -- the window arithmetic below, and
+/// the `skeleton` flag the outcome rule reads.
+fn emit_bundle(
     repo_root: &Path,
     workload: &FrozenWorkload,
     profile: &FrozenProfile,
     flags: &Flags,
+    skeleton: bool,
 ) -> Result<ExitCode, String> {
     if flags.get("allow-unsigned").is_none() {
         return Err(
@@ -4341,13 +5301,60 @@ fn emit_skeleton(
 
     let root = PathBuf::from(flags.required("root")?);
     let out = PathBuf::from(flags.required("out")?);
-    let seconds = flags.number::<u64>("seconds", 2)?;
+    // A skeleton is a rehearsal and defaults to seconds; a measured run defaults
+    // to the frozen `p2_p3_measured_seconds`, so the campaign's length comes
+    // from the workload rather than from whatever the caller typed.
+    let seconds = flags.number::<u64>(
+        "seconds",
+        if skeleton {
+            2
+        } else {
+            workload.measured_seconds
+        },
+    )?;
     let group_len = flags.number::<usize>("group-len", 16)?;
+    // How often the measured window takes a checkpoint. The default is short
+    // enough that even a brief run reaches one, because a run that silently
+    // never checkpointed is exactly the state scope §7 forbids a P2 number from
+    // having been obtained in.
+    let checkpoint_interval =
+        Duration::from_millis(flags.number::<u64>("checkpoint-interval-millis", 1_000)?);
+    // The warmup default is the frozen workload's for a measured run and zero
+    // for a skeleton rehearsal; either is overridable for short rehearsals.
+    // It applies to the submit path — the drive skeleton has no measured
+    // window to warm into — so what the bundle records is what ran.
+    let warmup_seconds = flags.number::<u64>(
+        "warmup-seconds",
+        if skeleton { 0 } else { workload.warmup_seconds },
+    )?;
+    // Which of the frozen campaign's repetitions this bundle is. The driver
+    // passes it per repetition; a lone run is repetition 1, and the schema
+    // bounds the value to the frozen count.
+    let repetition = flags.number::<u32>("repetition", 1)?;
+    if repetition < 1 || repetition > workload.repetitions {
+        return Err(format!(
+            "--repetition {repetition} is outside the frozen campaign's 1..={}",
+            workload.repetitions
+        ));
+    }
+    let path = flags.get("path").unwrap_or("submit").to_string();
+    let executed_warmup = if path == "submit" { warmup_seconds } else { 0 };
+    // The deployed-node harness's fact file (scope 6.6): facts to compare,
+    // never a profile name to accept. Parsed before the run so a malformed
+    // file refuses in seconds rather than after a measured campaign.
+    let deployed_facts = match flags.get("deployed-facts") {
+        None => Vec::new(),
+        Some(file) => parse_deployed_facts(
+            &std::fs::read_to_string(file)
+                .map_err(|error| format!("reading --deployed-facts {file}: {error}"))?,
+        )?,
+    };
 
     // Precheck 1 runs against the skeleton's own budget, not P2's: the point
     // is to exercise the code path and the arithmetic, and demanding 280 GB
-    // for a two-second run would only prove that the formula is large.
-    let requirement = required_free_space(0, seconds, 75_000, P2_FRAME_BYTES)?;
+    // for a two-second run would only prove that the formula is large. The
+    // warmup writes too (scope 8.2), so a measured run budgets for it.
+    let requirement = required_free_space(executed_warmup, seconds, 75_000, P2_FRAME_BYTES)?;
     let available = check_free_space(&root, requirement)?;
 
     let started_at = SystemTime::now();
@@ -4368,12 +5375,24 @@ fn emit_skeleton(
         }
     };
 
-    let path = flags.get("path").unwrap_or("submit").to_string();
+    // Read before the run: the open-loop driver schedules its arrivals from
+    // the same target the §3 window rule compares against.
+    let target_rate = flags.number::<u64>("target-rate", 75_000)?;
+
     let run: MeasuredRun = if path == "submit" {
         let shards = flags.number::<u16>("shards", 4)?;
         let submitters = flags.number::<usize>("submitters-per-shard", group_len.max(1))?;
         run_engine(
-            &root, &ack_path, ack_fault, group_len, seconds, shards, submitters,
+            &root,
+            &ack_path,
+            ack_fault,
+            group_len,
+            Duration::from_secs(executed_warmup),
+            seconds,
+            target_rate,
+            shards,
+            submitters,
+            checkpoint_interval,
         )?
         .into()
     } else if path == "drive" {
@@ -4422,13 +5441,12 @@ fn emit_skeleton(
     // persistent without anything noticing.
     let mount = detect_mount(&root)?;
 
-    // The trim-settle interval between repetitions (scope 8.2). A one-shot
-    // skeleton has no second repetition, so the interval is observed as zero
-    // and recorded as such rather than omitted.
-    let trim_settle = Duration::ZERO;
+    // The trim-settle interval between repetitions (scope 8.2), recorded from
+    // what the driver actually waited before starting this repetition rather
+    // than asserted. A lone or first repetition records zero — there was no
+    // preceding deletion to settle from.
+    let trim_settle = Duration::from_secs(flags.number::<u64>("trim-settle-seconds", 0)?);
 
-    let mut sorted = run.latencies_micros.clone();
-    sorted.sort_unstable();
     let ended_at = SystemTime::now();
 
     let rate = if run.elapsed.as_secs_f64() > 0.0 {
@@ -4437,10 +5455,53 @@ fn emit_skeleton(
         0.0
     };
 
-    let mut histogram_input = String::new();
-    for value in &sorted {
-        let _ = write!(histogram_input, "{value},");
-    }
+    // The §3 window rule, computed from whole one-minute windows the run
+    // actually recorded.
+    //
+    // A skeleton has none -- it is shorter than a minute by design -- so it
+    // reports the single whole-run rate and a trivially-satisfied percentage,
+    // and its `skeleton` flag is what stops the outcome rule reading that as a
+    // pass. A measured run with no whole window is refused outright rather than
+    // falling back to the same synthesis: a P2 bundle whose window rule was
+    // evaluated over a synthesized window would state the rule as met without
+    // having tested it.
+    let target_rate = target_rate as f64;
+    let (window_rates, windows_meeting_target) = if run.window_commits.is_empty() {
+        if !skeleton {
+            return Err(format!(
+                "refusing to emit a measured bundle: the run recorded no whole one-minute \
+                 window (it ran for {seconds}s). Section 3's rule is about one-minute \
+                 windows, and a run too short to contain one cannot have met it. Pass \
+                 --seconds 60 or more, or emit-skeleton if a rehearsal was intended."
+            ));
+        }
+        (vec![rate], 100.0)
+    } else {
+        let rates: Vec<f64> = run
+            .window_commits
+            .iter()
+            .map(|commits| *commits as f64 / 60.0)
+            .collect();
+        // Both halves of the rule. The percentage is what the schema records;
+        // the floor is checked here because a single window below 90% of target
+        // fails §3 outright however good the percentage is, and nothing
+        // downstream would notice it.
+        let meeting = rates.iter().filter(|r| **r >= target_rate).count();
+        let percent = (meeting as f64 / rates.len() as f64) * 100.0;
+        let floor = target_rate * 0.90;
+        let percent = if rates.iter().any(|r| *r < floor) {
+            // Reported as a failure of the rule rather than as a separate
+            // field, because the schema has one number for it and a bundle that
+            // passed the percentage while dipping below the floor must not read
+            // as having met the rule.
+            0.0
+        } else {
+            percent
+        };
+        (rates, percent)
+    };
+
+    let histogram_input = run.latency.canonical_text();
 
     // Section 13's two stop conditions, measured against A2's index.
     let index_cost = measure_index_costs()?;
@@ -4454,8 +5515,8 @@ fn emit_skeleton(
 
     let inputs = BundleInputs {
         run_id,
-        repetition: 1,
-        warmup_seconds: 0,
+        repetition,
+        warmup_seconds: executed_warmup,
         measured_seconds: run.elapsed.as_secs().max(1),
         started_at,
         ended_at,
@@ -4474,19 +5535,20 @@ fn emit_skeleton(
         objects_new: run.objects_new,
         raw_bytes: run.bytes,
         application_bytes: run.bytes,
-        latency_p50: percentile(&sorted, 0.50),
-        latency_p95: percentile(&sorted, 0.95),
-        latency_p99: percentile(&sorted, 0.99),
-        latency_max: sorted.last().copied().unwrap_or(0),
+        latency_p50: run.latency.quantile(0.50),
+        latency_p95: run.latency.quantile(0.95),
+        latency_p99: run.latency.quantile(0.99),
+        latency_max: run.latency.max(),
         histogram_digest: digest_hex(histogram_input.as_bytes()),
-        // A run shorter than a minute has no one-minute windows. What is
-        // reported is the single whole-run rate, and the percentage is
-        // therefore trivially 100 — which is why the bundle's `outcome` is
-        // `preliminary` and its own gate verdict `not-applicable`. A P2 run
-        // computes real windows; nothing here should be read as having met the
-        // section 3 window rule.
-        one_minute_windows: vec![rate],
-        windows_meeting_target_percent: 100.0,
+        histogram_format: run.latency.format_label(),
+        coordinated_omission_corrected: run.latency.coordinated_omission_corrected(),
+        deployed_facts,
+        // The peak the sampler tracked while the run was live — never a
+        // post-run snapshot, which could miss a mid-window throttle that
+        // cooled before assembly.
+        nvme_temperature_celsius: run.nvme_temperature_peak_celsius,
+        one_minute_windows: window_rates.clone(),
+        windows_meeting_target_percent: windows_meeting_target,
         ack_journal_digest: run.ack_journal_digest.clone(),
         acknowledged_loss: run.acknowledged_loss,
         torn_transactions: run.torn_transactions,
@@ -4520,7 +5582,12 @@ fn emit_skeleton(
         free_bytes_available: available,
         free_bytes_required: requirement.required_bytes,
         acknowledged_sequences_reconciled: run.acknowledged_sequences_reconciled,
-        skeleton: true,
+        // The parameter, not a constant: this is the one flag that separates a
+        // rehearsal from a measured campaign, and hardcoding `true` here made
+        // `run` structurally unable to emit a `pass` — the outcome rule reads
+        // this field, so the reference machine would have produced a perfect
+        // campaign stamped `preliminary`. Caught by a local rehearsal.
+        skeleton,
         observations: RunObservations::new(run.facts, mount),
     };
 
@@ -4532,7 +5599,7 @@ fn emit_skeleton(
     println!("bundle_path={}", out.display());
     println!("bundle_gate=storage_primitive");
     println!("bundle_promotable=false");
-    println!("bundle_skeleton=true");
+    println!("bundle_skeleton={skeleton}");
     println!("bundle_path_driven={}", run.path);
     println!("objects_new={}", inputs.objects_new);
     println!(
@@ -4578,6 +5645,10 @@ fn emit_skeleton(
     println!(
         "hardware_profile_mismatched={}",
         assembled.hardware.mismatched.join(",")
+    );
+    println!(
+        "deployed_facts_ingested={}",
+        assembled.hardware.ingested.join(",")
     );
     println!("bundle_outcome={}", outcome.name());
     println!("groups={}", run.groups);
@@ -5127,9 +6198,14 @@ sys.exit(1 if errors else 0)
         assert_eq!(submit.initialization_path, "store_engine_open");
         assert_eq!(submit.mutation_path, "store_engine_submit");
         assert_eq!(
-            submit.index_run_ceiling, "raised_because_index_sealing_unimplemented",
-            "the submit run raises max_index_runs above the store default, and the \
-             declaration must follow from that comparison rather than from the path"
+            submit.index_run_ceiling, "raised_above_store_default",
+            "this fixture configures max_index_runs above the store default, and the \
+             declaration must follow from that comparison rather than from the path. \
+             The measured submit run no longer raises it -- see \
+             `a_run_at_the_store_default_declares_store_default` -- so this is the \
+             only remaining cover for the raised branch. It must be the reason-free \
+             value: this branch compares two numbers and cannot know why they differ \
+             (contract review 2026-08-09-B)"
         );
         assert_eq!(submit.index_maintenance, "deltas_retained_in_memory");
         assert_eq!(
@@ -5178,6 +6254,31 @@ sys.exit(1 if errors else 0)
             "diagnostic",
             "a run that skipped the store-directory attribute precheck has not met the \
              reference environment, whatever else it met"
+        );
+    }
+
+    /// The measured submit run stopped raising `max_index_runs` once index
+    /// sealing landed, so the value it now declares is `store_default`. This
+    /// asserts the derivation follows the observation to that value rather
+    /// than to the path it came from.
+    ///
+    /// It is the other half of the pair: the fixture in
+    /// `the_ten_run_conditions_are_derived_from_what_the_run_observed` keeps
+    /// the raised branch covered, and this covers the branch a real run now
+    /// takes. Neither is redundant, because the derivation is a comparison and
+    /// a comparison needs both sides exercised.
+    #[test]
+    fn a_run_at_the_store_default_declares_store_default() {
+        let mut at_default = submit_observations();
+        at_default.configured_max_index_runs = at_default.default_max_index_runs;
+
+        let conditions = RunConditions::derive(&at_default, true, "diagnostic")
+            .expect("a store-default ceiling declares");
+
+        assert_eq!(
+            conditions.index_run_ceiling, "store_default",
+            "a run that configured exactly the store default must declare it, \
+             whatever path it ran"
         );
     }
 
@@ -5356,6 +6457,673 @@ sys.exit(1 if errors else 0)
         assert!(!bundle.contains("objects_new_equals_three_per_commit"));
     }
 
+    /// The merge direction is the contract: a deployed fact may fill an
+    /// unobserved reading or corroborate an observed one, and a contradiction
+    /// refuses by name with both values — the file is evidence to compare,
+    /// never an override.
+    #[test]
+    fn a_deployed_fact_may_fill_but_never_overwrite() {
+        let mut host = vec![
+            HostFact {
+                table: "cpu",
+                key: "architecture",
+                observed: Some("x86_64".into()),
+            },
+            HostFact {
+                table: "nvme",
+                key: "model",
+                observed: None,
+            },
+        ];
+        let facts = parse_deployed_facts(
+            "# deployed half\n\
+             nvme.model = \"TestDisk 100\"\n\
+             cpu.architecture = x86_64\n\
+             network.nic = test-nic\n",
+        )
+        .expect("a well-formed fact file parses");
+
+        let ingested = apply_deployed_facts(&mut host, &facts).expect("fill-only merge");
+        assert_eq!(
+            ingested,
+            vec!["nvme.model".to_string(), "network.nic".to_string()],
+            "filled and appended facts are ingested; a corroboration is not"
+        );
+        assert_eq!(
+            host.iter()
+                .find(|fact| fact.table == "nvme" && fact.key == "model")
+                .and_then(|fact| fact.observed.as_deref()),
+            Some("TestDisk 100")
+        );
+        assert_eq!(
+            host.iter()
+                .find(|fact| fact.table == "network" && fact.key == "nic")
+                .and_then(|fact| fact.observed.as_deref()),
+            Some("test-nic"),
+            "a fact this emitter does not model is appended, not dropped"
+        );
+
+        let contradiction = parse_deployed_facts("cpu.architecture = riscv64\n").expect("parses");
+        let error = apply_deployed_facts(&mut host, &contradiction)
+            .expect_err("a contradiction with a host observation must refuse");
+        assert!(
+            error.contains("x86_64") && error.contains("riscv64"),
+            "the refusal names both values: {error}"
+        );
+
+        let malformed = parse_deployed_facts("nvme model = broken\n")
+            .expect_err("a fact name without table.key must refuse");
+        assert!(malformed.contains("line 1"), "{malformed}");
+    }
+
+    /// The derivation names a profile only when the deployed half arrives:
+    /// the same profile is diagnostic with the privileged fact unobserved and
+    /// named once the fact file fills it.
+    #[test]
+    fn deployed_facts_complete_the_frozen_profile_derivation() {
+        let profile = ReferenceProfile {
+            name: "minimum-30k".into(),
+            purpose: "derivation-completion test".into(),
+            facts: vec![
+                ("cpu".into(), "architecture".into(), "x86_64".into()),
+                ("nvme".into(), "model".into(), "TestDisk 100".into()),
+            ],
+        };
+        let mut host = vec![HostFact {
+            table: "cpu",
+            key: "architecture",
+            observed: Some("x86_64".into()),
+        }];
+
+        let before = hardware_profile_of(std::slice::from_ref(&profile), &host, &[])
+            .expect("derivation runs");
+        assert_eq!(before.name, "diagnostic");
+        assert!(
+            before.unobserved.contains(&"nvme.model".to_string()),
+            "the missing deployed fact is the named work order: {:?}",
+            before.unobserved
+        );
+
+        let facts = parse_deployed_facts("nvme.model = \"TestDisk 100\"\n").expect("parses");
+        apply_deployed_facts(&mut host, &facts).expect("fill");
+        let after = hardware_profile_of(std::slice::from_ref(&profile), &host, &[])
+            .expect("derivation runs");
+        assert_eq!(
+            after.name, "minimum-30k",
+            "the ingested fact completes the comparison"
+        );
+        assert!(after.unobserved.is_empty(), "{:?}", after.unobserved);
+    }
+
+    /// A synthetic frozen profile mirroring this host's observable facts,
+    /// plus the production pins the deployed-node harness supplies — the
+    /// installed software stack and the mount options included, so the
+    /// deployment-contract separation is exercised rather than skirted.
+    /// Writes `bench/reference-hardware.toml`, the lockfile, and the frozen
+    /// workload into `dir` and returns the fact-file text that completes the
+    /// profile.
+    fn synthetic_host_mirror(dir: &Path) -> String {
+        use std::fmt::Write as _;
+        std::fs::create_dir_all(dir.join("bench/workloads")).expect("bench dir");
+        let host = observe_host_facts("btrfs");
+        let mut pins: Vec<(String, String, String)> = host
+            .iter()
+            .filter_map(|fact| {
+                fact.observed
+                    .clone()
+                    .map(|value| (fact.table.to_string(), fact.key.to_string(), value))
+            })
+            .collect();
+        let privileged: [(&str, &str, &str); 12] = [
+            ("nvme", "model", "TestDisk 100"),
+            ("nvme", "firmware", "1.0"),
+            ("network", "nic", "test-nic"),
+            ("network", "driver", "test-driver"),
+            ("network", "link_mbps", "10000"),
+            ("network", "mtu", "1500"),
+            ("filesystem", "store_directory_attributes", "nodatacow"),
+            (
+                "filesystem",
+                "store_directories",
+                "[\"shards/*/active\", \"shards/*/segments\"]",
+            ),
+            ("filesystem", "mount_options", "[\"rw\", \"noatime\"]"),
+            ("software", "proxy", "Caddy 2.10.0"),
+            ("software", "tls", "TLS 1.3"),
+            ("software", "service_manager", "systemd"),
+        ];
+        for (table, key, value) in privileged {
+            pins.push((table.to_string(), key.to_string(), value.to_string()));
+        }
+        let mut tables: Vec<String> = Vec::new();
+        for (table, _, _) in &pins {
+            if !tables.contains(table) {
+                tables.push(table.clone());
+            }
+        }
+        let mut profile = String::from(
+            "schema_version = 1\n\n[[profile]]\nname = \"minimum-30k\"\npurpose = \"host mirror for the end-to-end pass test\"\n",
+        );
+        for table in &tables {
+            let _ = write!(profile, "\n[profile.{table}]\n");
+            for (pin_table, key, value) in &pins {
+                if pin_table != table {
+                    continue;
+                }
+                let bare = value.parse::<i128>().is_ok()
+                    || value == "true"
+                    || value == "false"
+                    || value.starts_with('[');
+                if bare {
+                    let _ = writeln!(profile, "{key} = {value}");
+                } else {
+                    let _ = writeln!(profile, "{key} = \"{value}\"");
+                }
+            }
+        }
+        std::fs::write(dir.join("bench/reference-hardware.toml"), &profile)
+            .expect("write the synthetic profile");
+        std::fs::copy(repo_root().join("Cargo.lock"), dir.join("Cargo.lock"))
+            .expect("copy Cargo.lock");
+        std::fs::copy(
+            repo_root().join("bench/workloads/small-commit.toml"),
+            dir.join("bench/workloads/small-commit.toml"),
+        )
+        .expect("copy the frozen workload");
+
+        let mut facts = String::new();
+        for (table, key, value) in privileged {
+            let _ = writeln!(facts, "{table}.{key} = {value}");
+        }
+        facts
+    }
+
+    /// One synthetic hwmon root per case, so every rule is pinned alone.
+    fn hwmon_root(sensors: &[(&str, &str, Option<&str>)]) -> tempfile::TempDir {
+        let directory = tempfile::tempdir().expect("tempdir");
+        for (dir, name, temp) in sensors {
+            let path = directory.path().join(dir);
+            std::fs::create_dir_all(&path).expect("hwmon dir");
+            std::fs::write(path.join("name"), format!("{name}\n")).expect("name");
+            if let Some(temp) = temp {
+                std::fs::write(path.join("temp1_input"), temp).expect("temp");
+            }
+        }
+        directory
+    }
+
+    /// The hwmon reader's whole contract, one synthetic root per rule:
+    /// integer millidegrees convert, the hotter of several NVMe drives wins,
+    /// non-NVMe sensors are ignored — and any NVMe sensor that is missing or
+    /// unreadable fails the whole reading closed, because an unprivileged
+    /// scan cannot tell which drive backs the store and an unrelated drive
+    /// must not supply the pass-enabling number for an unmeasured one.
+    #[test]
+    fn the_hwmon_reader_converts_selects_ignores_and_fails_closed() {
+        let healthy = hwmon_root(&[
+            ("hwmon0", "nvme", Some("45500\n")),
+            ("hwmon1", "nvme", Some("51250\n")),
+            ("hwmon2", "k10temp", Some("99000\n")),
+        ]);
+        assert_eq!(
+            read_nvme_temperature_below(healthy.path()),
+            Some(51.25),
+            "integer millidegrees convert, the hotter drive wins, the CPU sensor is ignored"
+        );
+
+        let malformed = hwmon_root(&[
+            ("hwmon0", "nvme", Some("45500\n")),
+            ("hwmon1", "nvme", Some("garbage\n")),
+        ]);
+        assert_eq!(
+            read_nvme_temperature_below(malformed.path()),
+            None,
+            "one unreadable NVMe sensor makes the host unmeasured; the healthy drive \
+             must not answer for it"
+        );
+
+        let missing = hwmon_root(&[
+            ("hwmon0", "nvme", Some("45500\n")),
+            ("hwmon1", "nvme", None),
+        ]);
+        assert_eq!(
+            read_nvme_temperature_below(missing.path()),
+            None,
+            "a missing temp1_input fails closed the same way"
+        );
+
+        // The hwmon ABI is integer millidegrees; "nan" parsed as f64 would
+        // survive to the JSON writer and come out as a fabricated 0.
+        let non_finite = hwmon_root(&[("hwmon0", "nvme", Some("nan\n"))]);
+        assert_eq!(
+            read_nvme_temperature_below(non_finite.path()),
+            None,
+            "a non-finite reading is unparsable, never a number"
+        );
+
+        // A sensor directory whose name cannot be read could BE the
+        // benchmark NVMe; enumeration fails closed rather than skipping it.
+        let unnamed = hwmon_root(&[("hwmon0", "nvme", Some("45500\n"))]);
+        std::fs::create_dir_all(unnamed.path().join("hwmon1")).expect("nameless sensor");
+        assert_eq!(
+            read_nvme_temperature_below(unnamed.path()),
+            None,
+            "an entry with no readable name fails the reading closed"
+        );
+
+        let empty = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            read_nvme_temperature_below(empty.path()),
+            None,
+            "no NVMe sensor is None, never a number"
+        );
+        assert_eq!(
+            read_nvme_temperature_below(&empty.path().join("missing")),
+            None,
+            "an absent hwmon root is None"
+        );
+    }
+
+    /// The sampler's temporal contract, at the seam: it samples for as long
+    /// as a producer thread lives — even one that has enrolled nothing, which
+    /// is exactly the late-enrollment window a gate-idleness check missed —
+    /// and returns the **maximum** of the sequence once the last ticket
+    /// drops, not the first sample and not the latest. The waits are on
+    /// observed state, not timing, so the order is deterministic.
+    #[test]
+    fn the_temperature_sampler_outlives_producers_and_keeps_the_maximum() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        let producers = AtomicU64::new(1);
+        let stop = AtomicBool::new(false);
+        let calls = AtomicU64::new(0);
+
+        let peak = std::thread::scope(|scope| {
+            let producers = &producers;
+            let stop = &stop;
+            let calls = &calls;
+            let sampler = scope.spawn(move || {
+                sample_peak_until_drained(
+                    || {
+                        // 40 -> 70 -> 50 -> 50 ...: the answer is the middle
+                        // sample, so neither first-wins nor latest-wins can
+                        // fake it.
+                        let call = calls.fetch_add(1, Ordering::SeqCst);
+                        Some(match call {
+                            0 => 40.0,
+                            1 => 70.0,
+                            _ => 50.0,
+                        })
+                    },
+                    producers,
+                    stop,
+                    Duration::ZERO,
+                )
+            });
+            // One producer is alive and nothing is enrolled. A third sample
+            // is proof the sampler stays for the producer itself, not for any
+            // enrollment it may or may not have made yet — and it puts a
+            // post-peak sample on record so latest-wins would show.
+            while calls.load(Ordering::SeqCst) < 3 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            drop(ProducerTicket(producers));
+            sampler.join().expect("sampler")
+        });
+
+        assert_eq!(
+            peak,
+            Some(70.0),
+            "the recorded value is the maximum of the samples, and sampling spans the \
+             producer's whole life"
+        );
+    }
+
+    /// Coverage is the contract: one failed scheduled reading invalidates
+    /// the measurement, so a stale pre-load sample cannot stand in for a
+    /// window nobody measured.
+    #[test]
+    fn a_failed_scheduled_reading_invalidates_the_temperature() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        let producers = AtomicU64::new(1);
+        let stop = AtomicBool::new(false);
+        let calls = AtomicU64::new(0);
+
+        let peak = std::thread::scope(|scope| {
+            let producers = &producers;
+            let stop = &stop;
+            let calls = &calls;
+            let sampler = scope.spawn(move || {
+                sample_peak_until_drained(
+                    || {
+                        let call = calls.fetch_add(1, Ordering::SeqCst);
+                        if call == 0 {
+                            Some(40.0)
+                        } else {
+                            None
+                        }
+                    },
+                    producers,
+                    stop,
+                    Duration::ZERO,
+                )
+            });
+            // The ticket drops before the join: a regression that ignored the
+            // failed reading would keep looping on the live producer, so
+            // joining first would hang the suite instead of failing it. With
+            // the count at zero such a regression returns `Some(40.0)` and
+            // fails the assertion below deterministically.
+            while calls.load(Ordering::SeqCst) < 2 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            drop(ProducerTicket(producers));
+            sampler.join().expect("sampler")
+        });
+
+        assert_eq!(
+            peak, None,
+            "a good first sample followed by a failed reading is an unmeasured window, \
+             not a 40-degree one"
+        );
+    }
+
+    /// The preflight runs the same evaluation the bundle will make, so an
+    /// empty template, a missing fact, or a fact file that cannot name a
+    /// profile refuses in seconds instead of after three repetitions.
+    #[test]
+    fn the_fact_precheck_refuses_what_the_bundle_would_refuse() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let facts = synthetic_host_mirror(directory.path());
+        let repo = directory.path().to_path_buf();
+
+        let named = validate_deployed_facts(&repo, "btrfs", &facts, Some(35.0))
+            .expect("a complete fact file names the profile");
+        assert_eq!(named.name, "minimum-30k");
+
+        let partial: String = facts
+            .lines()
+            .filter(|line| !line.contains("nvme.firmware"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let error = validate_deployed_facts(&repo, "btrfs", &partial, Some(35.0))
+            .expect_err("a missing fact must refuse");
+        assert!(
+            error.contains("nvme.firmware"),
+            "the refusal names the missing fact: {error}"
+        );
+
+        let error = validate_deployed_facts(&repo, "btrfs", "", Some(35.0))
+            .expect_err("an empty template must refuse");
+
+        // A complete fact file on a host that cannot read its NVMe
+        // temperature refuses too: the reading is a measurement the pass
+        // requires, not a fact a file may assert.
+        let unmeasured = validate_deployed_facts(&repo, "btrfs", &facts, None)
+            .expect_err("a missing temperature measurement must refuse");
+        assert!(
+            unmeasured.contains("temperature_celsius"),
+            "the refusal names the missing measurement: {unmeasured}"
+        );
+        assert!(error.contains("does not complete"), "{error}");
+    }
+
+    /// End to end to `outcome: "pass"`: a synthetic frozen profile mirroring
+    /// this host's observable facts, a deployed-fact file supplying the
+    /// privileged half, and passing measured inputs produce a schema-valid
+    /// bundle that names the profile, claims `reference_profile`, and passes.
+    /// On the reference machine the same chain runs against the real frozen
+    /// table with the release build supplying `build_profile` physically; the
+    /// one observation modelled here is that build profile, because a debug
+    /// test binary can honestly observe nothing else.
+    #[test]
+    fn a_complete_fact_set_reaches_outcome_pass_end_to_end() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let facts_text = synthetic_host_mirror(directory.path());
+        let workload = load_frozen_workload(&repo_root().join("bench/workloads/small-commit.toml"))
+            .expect("workload");
+        let build_inputs = || {
+            let mut inputs = submit_inputs();
+            inputs.skeleton = false;
+            inputs.deployed_facts =
+                parse_deployed_facts(&facts_text).expect("the deployed half parses");
+            inputs.observations.build_profile = "release";
+            inputs.observations.checkpoint = CheckpointProbe::Exercised;
+            inputs.observations.index = IndexObservation::StoreRoot {
+                validated_runs: 2,
+                unvalidatable: Vec::new(),
+                groups: 1,
+                unsealed_delta_backlog: Some(0),
+            };
+            inputs.observations.configured_max_index_runs = default_max_index_runs();
+            inputs.observations.store_root_filesystem = "btrfs".into();
+            inputs
+        };
+        let inputs = build_inputs();
+
+        let bundle = build_bundle(&directory.path().to_path_buf(), &workload, &inputs)
+            .expect("a complete fact set assembles");
+        assert!(
+            bundle.contains("\"profile\": \"minimum-30k\""),
+            "the derivation must name the synthetic profile\n{bundle}"
+        );
+        assert!(
+            bundle.contains("\"environment_fidelity\": \"reference_profile\""),
+            "{bundle}"
+        );
+        assert!(
+            bundle.contains("\"outcome\": \"pass\""),
+            "every condition a pass costs is present, so the outcome must be pass\n{bundle}"
+        );
+        // The mount options the comparison consumed are the mount options the
+        // bundle emits — not the store-directory attribute that used to be
+        // dressed up as them.
+        assert!(
+            bundle.contains("\"noatime\""),
+            "hardware.mount_options must carry the deployed fact's list\n{bundle}"
+        );
+        assert!(
+            !bundle.contains("\"mount_options\": [\"nodatacow\"]"),
+            "the store-directory attribute is not a mount option\n{bundle}"
+        );
+        // The separated contracts, visible in one bundle: the host's installed
+        // stack named the profile through the software facts, while the
+        // deployment object still records this run's in-process topology.
+        assert!(
+            bundle.contains("\"proxy\": \"none (in-process P2)\""),
+            "deployment describes the run, not the installed host\n{bundle}"
+        );
+        // The temperature is the supplied measurement, never a fabricated
+        // default and never the placeholder.
+        let after_field = bundle
+            .find("\"temperature_celsius\": ")
+            .map(|at| &bundle[at + "\"temperature_celsius\": ".len()..])
+            .expect("the field is emitted");
+        assert!(
+            after_field
+                .chars()
+                .next()
+                .is_some_and(|first| first.is_ascii_digit() || first == '-'),
+            "a passing bundle carries a measured temperature\n{bundle}"
+        );
+        let errors = schema_errors(&bundle);
+        assert!(errors.is_empty(), "{}", errors.join("\n"));
+
+        // The schema is its own line of defense: the same passing bundle with
+        // the temperature swapped for the placeholder must fail validation,
+        // whatever the emitter would have done.
+        let mutated = {
+            let at = bundle
+                .find("\"temperature_celsius\": ")
+                .expect("field present");
+            let value_at = at + "\"temperature_celsius\": ".len();
+            let value_end = value_at + bundle[value_at..].find([',', '}']).expect("the value ends");
+            format!(
+                "{}\"recorded by the deployed-node harness\"{}",
+                &bundle[..value_at],
+                &bundle[value_end..]
+            )
+        };
+        assert!(
+            !schema_errors(&mutated).is_empty(),
+            "a reference_profile bundle carrying the temperature placeholder must fail \
+             the schema itself"
+        );
+
+        // And without the measurement the same inputs refuse: the field falls
+        // back to the hardware placeholder, and a bundle naming a frozen
+        // profile may not carry one.
+        let mut unmeasured = build_inputs();
+        unmeasured.nvme_temperature_celsius = None;
+        let error = build_bundle(&directory.path().to_path_buf(), &workload, &unmeasured)
+            .expect_err("a missing temperature measurement must refuse the named profile");
+        assert!(
+            error.contains("temperature_celsius"),
+            "the refusal names the missing measurement: {error}"
+        );
+    }
+
+    /// The boundary gate's whole contract, pinned at the seam rather than
+    /// observed through a run: the snapshot happens only after enrolled work
+    /// exits, an enrollment attempted during the transition blocks until the
+    /// baseline is read and comes back measured, and afterwards exactly the
+    /// post-boundary work sits above the baseline. The event order is
+    /// deterministic — it is enforced by the gate's own lock, not by timing —
+    /// and the sleep below is not the assertion: it only gives a racy gate
+    /// every chance to snapshot early and fail the order checks.
+    #[test]
+    fn the_boundary_gate_classifies_and_drains_atomically() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let gate = BoundaryGate::new(false);
+        let counter = AtomicU64::new(0);
+        let events: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+
+        // A enrolls pre-boundary and stays in flight.
+        assert!(
+            !gate.enroll(),
+            "the phase is closed until the baseline is read"
+        );
+
+        let (baseline, late_enrollment_measured) = std::thread::scope(|scope| {
+            let gate = &gate;
+            let counter = &counter;
+            let events = &events;
+            // B: the boundary transition, which must block on A.
+            let transition = scope.spawn(move || {
+                gate.open_measurement(|| -> Result<u64, String> {
+                    events.lock().expect("events").push("snapshot");
+                    Ok(counter.load(Ordering::SeqCst))
+                })
+            });
+            // D: an enrollment placed deterministically inside the
+            // transition window — it waits until the transition has closed
+            // the gate, then enrolls. It must block until the phase opens and
+            // come back measured, never slip in between.
+            let late = scope.spawn(move || {
+                while !gate.closed() {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let measured = gate.enroll();
+                events.lock().expect("events").push("late_enrolled");
+                counter.fetch_add(1, Ordering::SeqCst);
+                gate.exit();
+                measured
+            });
+
+            // Give a broken gate every chance to snapshot while A is still
+            // enrolled, then do A's counter-relevant work and exit.
+            std::thread::sleep(Duration::from_millis(60));
+            counter.fetch_add(1, Ordering::SeqCst);
+            events.lock().expect("events").push("work_a");
+            gate.exit();
+
+            (
+                transition.join().expect("transition").expect("snapshot"),
+                late.join().expect("late enrollment"),
+            )
+        });
+
+        assert_eq!(
+            baseline, 1,
+            "the baseline must contain the work of everything enrolled before it"
+        );
+        let order = events.lock().expect("events").clone();
+        assert_eq!(
+            order,
+            vec!["work_a", "snapshot", "late_enrolled"],
+            "drain before snapshot, snapshot before any later enrollment"
+        );
+        assert!(
+            late_enrollment_measured,
+            "an enrollment that raced the transition must come back measured, \
+             with its work above the baseline"
+        );
+        assert_eq!(
+            counter.load(Ordering::SeqCst) - baseline,
+            1,
+            "exactly the post-boundary work sits above the baseline"
+        );
+    }
+
+    /// Warmup commits are real store work — acknowledged, journaled, and
+    /// reconciled like any other — and none of them are measured. What the
+    /// bundle reports as measured describes the window alone: its commit
+    /// count, its latency samples, and an elapsed that starts where the
+    /// warmup ends.
+    #[test]
+    fn warmup_commits_are_reconciled_but_never_measured() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = directory.path().join("root");
+        let ack = directory.path().join("ack-journal");
+        let run = run_engine(
+            &root,
+            &ack,
+            AckJournalFault::None,
+            4,
+            Duration::from_secs(2),
+            2,
+            75_000,
+            1,
+            1,
+            Duration::from_millis(500),
+        )
+        .expect("an engine-driven run with a warmup");
+
+        assert!(
+            run.acknowledged > run.transactions,
+            "warmup must commit and acknowledge work ({} acknowledged, {} measured), or \
+             this test cannot tell the boundary from an absence",
+            run.acknowledged,
+            run.transactions
+        );
+        assert!(
+            run.transactions > 0,
+            "the measured window must contain work of its own"
+        );
+        assert_eq!(
+            run.transactions,
+            run.latency_histogram.len(),
+            "every measured commit has a latency sample and no warmup commit does"
+        );
+        assert!(
+            run.elapsed.as_secs() < 4,
+            "elapsed must be the measured window alone, not warmup plus window; got {:?}",
+            run.elapsed
+        );
+        assert!(
+            run.acknowledged_sequences_reconciled,
+            "warmup acknowledgments must reconcile like any others"
+        );
+        // The boundary alignment pin: the signer signs exactly once per
+        // commit, so measured signings equal measured commits only when the
+        // gate classifies every commit and its signature onto the same side
+        // of the baseline. A clock-raced boundary counts a commit as measured
+        // while its signature sits below the baseline, and this identity is
+        // what breaks.
+        assert_eq!(
+            run.signings, run.transactions,
+            "measured signings must equal measured commits exactly"
+        );
+    }
+
     #[test]
     fn repository_creation_is_outside_the_fences_and_signatures_the_bundle_reports() {
         // The P1 defect: repositories are created *before* the measured
@@ -5372,8 +7140,21 @@ sys.exit(1 if errors else 0)
         let directory = tempfile::tempdir().expect("tempdir");
         let root = directory.path().join("root");
         let ack = directory.path().join("ack-journal");
-        let run = run_engine(&root, &ack, AckJournalFault::None, 4, 1, 2, 1)
-            .expect("an engine-driven run");
+        // A one-second run with a half-second interval, so the measured window
+        // contains a checkpoint rather than depending on the default cadence.
+        let run = run_engine(
+            &root,
+            &ack,
+            AckJournalFault::None,
+            4,
+            Duration::ZERO,
+            1,
+            75_000,
+            2,
+            1,
+            Duration::from_millis(500),
+        )
+        .expect("an engine-driven run");
 
         // The exclusion is not vacuous: creating the repositories really did
         // fence and really did sign, so there is something to exclude. Without
@@ -5451,9 +7232,12 @@ sys.exit(1 if errors else 0)
             &directory.path().join("ack-journal"),
             AckJournalFault::None,
             4,
+            Duration::ZERO,
             1,
+            75_000,
             2,
             0,
+            Duration::from_secs(3_600),
         )
         .err()
         .expect("a run with no submitter measures nothing");
@@ -5465,9 +7249,12 @@ sys.exit(1 if errors else 0)
             &directory.path().join("ack-journal-b"),
             AckJournalFault::None,
             4,
+            Duration::ZERO,
             1,
+            75_000,
             0,
             1,
+            Duration::from_secs(3_600),
         )
         .err()
         .expect("no shard is no repository and no transaction");
@@ -5821,6 +7608,10 @@ sys.exit(1 if errors else 0)
             index_maintenance: "runs_sealed",
             ..conditions.clone()
         };
+        // A pass also costs the frozen latency methodology now: the fixture
+        // models a closed-loop record, and the pass requires the corrected
+        // one.
+        inputs.coordinated_omission_corrected = true;
         assert_eq!(
             storage_primitive_outcome(&inputs, &reference),
             Outcome::Pass,
@@ -5839,6 +7630,7 @@ sys.exit(1 if errors else 0)
         // from its own validator has already published the claim.
         let mut inputs = skeleton_inputs();
         inputs.skeleton = false;
+        inputs.coordinated_omission_corrected = true;
 
         // Everything a pass costs, held true at once.
         let passing = RunConditions {
@@ -5854,6 +7646,18 @@ sys.exit(1 if errors else 0)
             environment_fidelity: "reference_profile",
         };
         assert_eq!(storage_primitive_outcome(&inputs, &passing), Outcome::Pass);
+
+        // The latency methodology is a member of the price too, checked the
+        // same way the four conditions below are: alone, against otherwise
+        // passing inputs. A closed-loop measurement did not measure the
+        // frozen workload, however good its numbers.
+        let mut uncorrected = skeleton_inputs();
+        uncorrected.skeleton = false;
+        assert_eq!(
+            storage_primitive_outcome(&uncorrected, &passing),
+            Outcome::Preliminary,
+            "an uncorrected latency measurement may not pass"
+        );
 
         // Each condition alone, moved to the value today's run genuinely has.
         // Every one of them must cost the pass, and the reason each one is
@@ -6013,7 +7817,7 @@ sys.exit(1 if errors else 0)
         refuses(
             &submit,
             submit.replace(
-                "\"index_run_ceiling\": \"raised_because_index_sealing_unimplemented\"",
+                "\"index_run_ceiling\": \"raised_above_store_default\"",
                 "\"index_run_ceiling\": \"store_default\"",
             ),
             "declaring the store default while recording a raised ceiling must be \
@@ -6024,7 +7828,7 @@ sys.exit(1 if errors else 0)
             &bundle,
             bundle.replace(
                 "\"index_run_ceiling\": \"store_default\"",
-                "\"index_run_ceiling\": \"raised_because_index_sealing_unimplemented\"",
+                "\"index_run_ceiling\": \"raised_above_store_default\"",
             ),
             "declaring a raise while recording the default must be rejected in the \
              other direction",
@@ -6235,7 +8039,7 @@ sys.exit(1 if errors else 0)
                     groups: 1,
                     unsealed_delta_backlog: None,
                 },
-                configured_max_index_runs: ENGINE_MAX_INDEX_RUNS,
+                configured_max_index_runs: RAISED_MAX_INDEX_RUNS_FOR_DERIVATION_TESTS,
                 default_max_index_runs: default_max_index_runs(),
                 receipts: ReceiptComparison::AnyCommittedStatusAccepted,
                 objects_new_counted: true,
@@ -6260,6 +8064,8 @@ sys.exit(1 if errors else 0)
         BundleInputs {
             run_id: "engine-wave-b-test".into(),
             observations: submit_observations(),
+            histogram_format: "hdrhistogram-recorded-value-count-csv/blake3",
+            coordinated_omission_corrected: true,
             ..skeleton_inputs()
         }
     }
@@ -6283,6 +8089,10 @@ sys.exit(1 if errors else 0)
             latency_p99: 300,
             latency_max: 400,
             histogram_digest: digest_hex(b"test"),
+            histogram_format: "ascending-micros-csv/blake3",
+            coordinated_omission_corrected: false,
+            deployed_facts: Vec::new(),
+            nvme_temperature_celsius: Some(35.0),
             one_minute_windows: vec![3.0],
             windows_meeting_target_percent: 100.0,
             ack_journal_digest: digest_hex(b"test"),

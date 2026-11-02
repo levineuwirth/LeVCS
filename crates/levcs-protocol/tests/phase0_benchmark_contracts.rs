@@ -944,6 +944,11 @@ fn submit_path_bundle() -> serde_json::Value {
             "mutation_path": "store_engine_submit",
             "checkpointing": "unimplemented",
             "index_maintenance": "deltas_retained_in_memory",
+            // Deliberately the deprecated spelling: this fixture is the standing
+            // proof that an archived v1 bundle still validates. The emitter
+            // writes `raised_above_store_default` now, and
+            // `both_raised_spellings_are_accepted_and_bound_the_same_way`
+            // covers the pair. Contract review 2026-08-09-B.
             "index_run_ceiling": "raised_because_index_sealing_unimplemented",
             "receipt_reconciliation": "acceptance_of_any_committed_status",
             "objects_new_source": "summed_from_receipts",
@@ -1510,6 +1515,46 @@ fn the_instance_gates_are_not_loosened_by_the_storage_path_split() {
             rule["else"]["properties"]["verification"]["properties"][claim]["const"].as_bool(),
             Some(true),
             "{claim} must stay pinned true at every non-storage gate"
+        );
+    }
+}
+
+/// Both spellings of a raised ceiling are accepted, and both are bound the same
+/// way.
+///
+/// The deprecated one is kept only so an archived v1 bundle stays valid --
+/// `schema_version` is `const: 1`, so there is no later version to move it to,
+/// and this repository has never held a bundle to check against. What must not
+/// happen is the deprecation becoming a second, weaker rule: a bundle that
+/// declares the old string still has to record a ceiling above the default, or
+/// "deprecated" would have quietly turned into "unchecked".
+///
+/// The new spelling states only what the emitter observes. It compares the
+/// configured ceiling with the store default and cannot know why they differ,
+/// so it may not name a cause -- which is exactly what the old string did, for
+/// a cause that is no longer true. Contract review 2026-08-09-B.
+#[test]
+fn both_raised_spellings_are_accepted_and_bound_the_same_way() {
+    for spelling in [
+        "raised_above_store_default",
+        "raised_because_index_sealing_unimplemented",
+    ] {
+        let mut bundle = submit_path_bundle();
+        bundle["run_conditions"]["index_run_ceiling"] = serde_json::json!(spelling);
+        assert_valid(
+            &bundle,
+            &format!("{spelling} must be an accepted declaration of a raised ceiling"),
+        );
+
+        // The floor still applies. Recording the store default under either
+        // spelling is a bundle whose declaration and measurement disagree.
+        bundle["resources"]["configured_ceilings"]["max_index_runs"] = serde_json::json!(64);
+        assert_invalid(
+            &bundle,
+            &format!(
+                "{spelling} recording the store default must be refused; a deprecated \
+                 spelling is still cross-checked"
+            ),
         );
     }
 }

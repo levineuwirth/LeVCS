@@ -196,6 +196,25 @@ pub enum StoreError {
     #[error("mutable-state conflict: {0}")]
     Conflict(String),
 
+    /// No repository is bound for this namespace in the captured committed
+    /// root. Contract review 2026-08-07-A, requested by B1 for scope 6-B1
+    /// deliverable 8.
+    ///
+    /// This is an inability to answer and not a lifecycle state, which is the
+    /// distinction the taxonomy above turns on. A namespace that was never
+    /// bound has no `RepoState`, so there is no `genesis_authority` to report
+    /// and no sequence to report it at; `StoreEngine::snapshot` cannot
+    /// manufacture either without fabricating a trust root. A namespace that
+    /// *is* bound and has been retired is the opposite case — `Deleted` is a
+    /// lifecycle, it has a `RepoState`, and it is reported through
+    /// `RepoSnapshot::lifecycle` rather than through this error.
+    ///
+    /// It carries the typed `NamespaceId` rather than a rendered string so a
+    /// caller can match on the identity it asked for instead of parsing it
+    /// back out of a message.
+    #[error("no repository bound for namespace {}", namespace.to_hex())]
+    NoSuchRepository { namespace: NamespaceId },
+
     #[error("store is not ready")]
     NotReady,
 

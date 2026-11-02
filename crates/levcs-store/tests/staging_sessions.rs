@@ -42,7 +42,7 @@ const HOUR_MICROS: i64 = 3_600_000_000;
 /// a constructor production cannot reach.
 struct Root {
     directory: TempDir,
-    lock: RecoverySession,
+    lock: Arc<RecoverySession>,
     options: StoreOptions,
 }
 
@@ -64,7 +64,7 @@ impl Root {
             &DurabilityCounters::default(),
         )
         .expect("v2 root layout");
-        let lock = RecoverySession::open(directory.path()).expect("root lock");
+        let lock = Arc::new(RecoverySession::open(directory.path()).expect("root lock"));
         Self {
             directory,
             lock,
@@ -83,7 +83,7 @@ impl Root {
     }
 
     fn open_with(&self, durability: Arc<DurabilityCounters>) -> Arc<ProjectionStaging> {
-        ProjectionStaging::open(&self.lock, self.options.clone(), durability)
+        ProjectionStaging::open(Arc::clone(&self.lock), self.options.clone(), durability)
             .expect("staging root opens")
     }
 
@@ -1091,7 +1091,7 @@ fn one_root_admits_exactly_one_staging_accountant() {
     let (_first, _durability) = root.open();
 
     let result = ProjectionStaging::open(
-        &root.lock,
+        Arc::clone(&root.lock),
         root.options.clone(),
         Arc::new(DurabilityCounters::default()),
     );
@@ -1108,7 +1108,7 @@ fn a_root_lock_held_on_another_root_is_not_proof() {
     let other = Root::new();
 
     let result = ProjectionStaging::open(
-        &other.lock,
+        Arc::clone(&other.lock),
         owner.options.clone(),
         Arc::new(DurabilityCounters::default()),
     );
@@ -1189,20 +1189,21 @@ fn session_of(
 /// that the staged objects are invisible, and that they become visible only
 /// after a `submit` adopts the descriptor.
 ///
-/// Still blocked on B1 NamespaceTxn, and blocked in one more place than before.
-/// `RepoSnapshot::locate`, `StoreEngine::snapshot`, and the submit path are all
-/// `NotImplemented`/`unimplemented!` today. On top of that, the P1-4 fix moved
-/// staging inside the locked engine lifetime: this test can no longer open its
-/// own `ProjectionStaging` beside a `StoreEngine`, because holding two root
-/// locks is exactly what was made unrepresentable. It needs an accessor on the
-/// engine — recorded as an interface request to B1 — to reach the staging the
-/// engine owns.
+/// Still blocked on B1 NamespaceTxn, but in one place now rather than three.
+/// `RepoSnapshot::locate` and `StoreEngine::snapshot` are implemented (scope
+/// 6-B1 deliverable 8), and the interface request this comment used to record —
+/// an engine accessor for the staging the engine owns, needed because the P1-4
+/// fix made holding two root locks unrepresentable — was granted as
+/// `StoreEngine::staging()` under contract review 2026-08-09-A. What remains is
+/// the submit path: it refuses an adopting transaction, settling the pin before
+/// anything is queued, until deliverable 3 wires the descriptor payload, the
+/// pre-append revalidation, and the post-fence artifact merge.
 ///
 /// Asserting the property against staging's own state instead would be charter
 /// item 8 exactly — a property proved against the helper rather than the path
 /// that runs — so it is marked blocked rather than satisfied the wrong way.
 #[test]
-#[ignore = "blocked on B1 NamespaceTxn: needs RepoSnapshot::locate, StoreEngine::snapshot/submit (scope 6.4 deliverables 1, 3-8), and a StoreEngine accessor for the engine-owned ProjectionStaging"]
+#[ignore = "blocked on B1 NamespaceTxn: StoreEngine::submit refuses an adopting transaction until scope 6-B1 deliverable 3 wires it (the descriptor payload, the pre-append revalidation, and the post-fence artifact merge)"]
 fn sealed_objects_stay_invisible_until_a_submit_adopts_them() {
     let root = Root::new();
     let fixture = projection([25; 16], [21; 32], 1, 2, HOUR_MICROS);
@@ -1228,8 +1229,8 @@ fn sealed_objects_stay_invisible_until_a_submit_adopts_them() {
     }
 
     unimplemented!(
-        "B1: expose the engine-owned ProjectionStaging, begin/put/seal a session through it, \
-         re-assert locate() is None for every staged object, then build a ValidatedTransaction \
-         with adopt_projection(install, handle), submit it, and assert locate() returns Some"
+        "B1: begin/put/seal a session through engine.staging(), re-assert locate() is None for \
+         every staged object, then finalize() it and build a ValidatedTransaction with \
+         adopt_projection(adoption), submit it, and assert locate() returns Some"
     );
 }

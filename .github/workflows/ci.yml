@@ -86,6 +86,22 @@ jobs:
 
       - run: cargo audit
 
+  # Gate: the Phase 1 storage spine's own gate. The workspace tests above
+  # build levcs-store with its default features only; this runs it under the
+  # feature configurations the crash matrix, the harness and store-bench need,
+  # and checks the golden frame corpus and the crash matrix's rows.
+  phase1:
+    name: phase 1 gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: bash scripts/check-phase1.sh
+
   # Gate: the codebase is fmt-clean; keep it that way.
   fmt:
     name: fmt
@@ -98,7 +114,8 @@ jobs:
       - run: cargo fmt --all --check
 
   # Gate: no clippy warning at default severity, in every crate but
-  # levcs-store, whose engine Phase 1 replaces. The toolchain is pinned so
+  # levcs-store, the Phase 1 storage spine, whose warnings are not yet
+  # fixed. The toolchain is pinned so
   # that the lints a new release adds arrive in a commit that moves the pin,
   # not in an unrelated pull request.
   clippy:

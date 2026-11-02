@@ -498,35 +498,86 @@ enum XmlNode {
         attrs: Vec<(String, String)>,
         children: Vec<XmlNode>,
     },
+    /// Text as the file held it, references included.
     Text(String),
+    /// What the merge does not look into, as the file held it: the
+    /// declaration, a doctype, a comment, a processing instruction, CDATA,
+    /// a byte-order mark.
+    Raw(String),
 }
+
+/// An element whose end tag the parse has not reached: its name, its
+/// attributes, and its children so far.
+type Open = (String, Vec<(String, String)>, Vec<XmlNode>);
 
 fn xml_parse(src: &[u8]) -> Option<Vec<XmlNode>> {
     use quick_xml::escape::unescape;
     use quick_xml::events::Event;
     use quick_xml::Reader;
-    // Names and text come out as `str`: input that is not UTF-8 fails
-    // `read_event_into`, and so this parse, as `from_utf8` on them did.
-    // Attribute values are unescaped and nothing more. `unescape_value`
-    // also normalizes them as of quick-xml 0.42, turning a tab or a line
-    // break into a space, so a merge would rewrite values it did not touch.
+    // Names come out as `str`: input that is not UTF-8 fails
+    // `read_event_into`, and so this parse. Attribute values are unescaped
+    // and nothing more. `unescape_value` also normalizes them as of
+    // quick-xml 0.42, turning a tab or a line break into a space, so a merge
+    // would rewrite values it did not touch.
+    //
+    // Text, and what the merge does not look into (the declaration, a
+    // doctype, comments, processing instructions, CDATA), are kept as the
+    // bytes the file held, read off the reader's positions. The reader hands
+    // over an entity or character reference as an event of its own, and
+    // each of those as another; the handler kept none of them, so a merge
+    // dropped them all. The match below names every event, so one a later
+    // quick-xml adds is a compile error here, not a silent loss.
+    //
+    // The reader removes a UTF-8 byte-order mark before the first event, so
+    // it is taken off here and kept.
+    let mut top: Vec<XmlNode> = Vec::new();
+    let src = match src.strip_prefix("\u{feff}".as_bytes()) {
+        Some(rest) => {
+            top.push(XmlNode::Raw("\u{feff}".to_string()));
+            rest
+        }
+        None => src,
+    };
+    let slice = |r: std::ops::Range<usize>| -> Option<String> {
+        Some(std::str::from_utf8(src.get(r)?).ok()?.to_string())
+    };
     let mut reader = Reader::from_reader(src);
     reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
-    let mut stack: Vec<(String, Vec<(String, String)>, Vec<XmlNode>)> = Vec::new();
-    let mut top: Vec<XmlNode> = Vec::new();
+    let mut stack: Vec<Open> = Vec::new();
+    let place =
+        |stack: &mut Vec<Open>, top: &mut Vec<XmlNode>, node: XmlNode| match stack.last_mut() {
+            Some(parent) => parent.2.push(node),
+            None => top.push(node),
+        };
+    let attrs_of = |e: &quick_xml::events::BytesStart| -> Option<Vec<(String, String)>> {
+        let mut attrs = Vec::new();
+        for a in e.attributes().with_checks(false).flatten() {
+            let k = a.key.0.to_string();
+            let v = unescape(&a.value).ok()?.to_string();
+            attrs.push((k, v));
+        }
+        attrs.sort();
+        Some(attrs)
+    };
+    // The text read since the last markup: a run of text and references.
+    let mut text: Option<std::ops::Range<usize>> = None;
     loop {
-        match reader.read_event_into(&mut buf).ok()? {
+        let start = usize::try_from(reader.buffer_position()).ok()?;
+        let event = reader.read_event_into(&mut buf).ok()?;
+        let end = usize::try_from(reader.buffer_position()).ok()?;
+        if let Event::Text(_) | Event::GeneralRef(_) = event {
+            text = Some(text.map_or(start..end, |t| t.start..end));
+            buf.clear();
+            continue;
+        }
+        if let Some(t) = text.take() {
+            place(&mut stack, &mut top, XmlNode::Text(slice(t)?));
+        }
+        match event {
             Event::Start(e) => {
                 let name = e.name().0.to_string();
-                let mut attrs = Vec::new();
-                for a in e.attributes().with_checks(false).flatten() {
-                    let k = a.key.0.to_string();
-                    let v = unescape(&a.value).ok()?.to_string();
-                    attrs.push((k, v));
-                }
-                attrs.sort();
-                stack.push((name, attrs, Vec::new()));
+                stack.push((name, attrs_of(&e)?, Vec::new()));
             }
             Event::End(_) => {
                 let (name, attrs, children) = stack.pop()?;
@@ -535,43 +586,25 @@ fn xml_parse(src: &[u8]) -> Option<Vec<XmlNode>> {
                     attrs,
                     children,
                 };
-                if let Some(parent) = stack.last_mut() {
-                    parent.2.push(node);
-                } else {
-                    top.push(node);
-                }
+                place(&mut stack, &mut top, node);
             }
             Event::Empty(e) => {
-                let name = e.name().0.to_string();
-                let mut attrs = Vec::new();
-                for a in e.attributes().with_checks(false).flatten() {
-                    let k = a.key.0.to_string();
-                    let v = unescape(&a.value).ok()?.to_string();
-                    attrs.push((k, v));
-                }
-                attrs.sort();
                 let node = XmlNode::Element {
-                    name,
-                    attrs,
+                    name: e.name().0.to_string(),
+                    attrs: attrs_of(&e)?,
                     children: Vec::new(),
                 };
-                if let Some(parent) = stack.last_mut() {
-                    parent.2.push(node);
-                } else {
-                    top.push(node);
-                }
+                place(&mut stack, &mut top, node);
             }
-            Event::Text(t) => {
-                let s = String::from(&*t);
-                let node = XmlNode::Text(s);
-                if let Some(parent) = stack.last_mut() {
-                    parent.2.push(node);
-                } else {
-                    top.push(node);
-                }
+            Event::Comment(_)
+            | Event::CData(_)
+            | Event::PI(_)
+            | Event::Decl(_)
+            | Event::DocType(_) => {
+                place(&mut stack, &mut top, XmlNode::Raw(slice(start..end)?));
             }
             Event::Eof => break,
-            _ => {}
+            Event::Text(_) | Event::GeneralRef(_) => unreachable!("taken as text above"),
         }
         buf.clear();
     }
@@ -588,9 +621,7 @@ fn xml_serialize(nodes: &[XmlNode]) -> String {
 
 fn write_node(n: &XmlNode, out: &mut String) {
     match n {
-        XmlNode::Text(t) => {
-            out.push_str(&xml_escape_text(t));
-        }
+        XmlNode::Text(raw) | XmlNode::Raw(raw) => out.push_str(raw),
         XmlNode::Element {
             name,
             attrs,
@@ -618,10 +649,6 @@ fn write_node(n: &XmlNode, out: &mut String) {
             }
         }
     }
-}
-
-fn xml_escape_text(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;")
 }
 
 fn xml_escape_attr(s: &str) -> String {
@@ -955,5 +982,74 @@ mod tests {
         let theirs = br#"<a x="3"/>"#;
         let r = h.merge(Path::new("x.xml"), base, ours, theirs);
         assert!(matches!(r.status, MergeStatus::Conflict { .. }));
+    }
+
+    /// An entity or character reference in text came out of the parser as
+    /// an event of its own, which nothing kept: `a &amp; b` merged as
+    /// `a  b`. Text is now what the file held, references included.
+    #[test]
+    fn xml_merge_keeps_references_in_text() {
+        let h = XmlHandler;
+        let base = b"<root><p>a &amp; b &#169; &lt;c&gt;</p></root>";
+        let ours = b"<root x=\"1\"><p>a &amp; b &#169; &lt;c&gt;</p></root>";
+        let theirs = b"<root><p>a &amp; b &#169; &lt;c&gt;</p><q/></root>";
+        let r = h.merge(Path::new("x.xml"), base, ours, theirs);
+        match r.status {
+            MergeStatus::Merged { content, .. } => assert_eq!(
+                String::from_utf8_lossy(&content),
+                "<root x=\"1\"><p>a &amp; b &#169; &lt;c&gt;</p><q/></root>"
+            ),
+            other => panic!("expected merged, got {other:?}"),
+        }
+    }
+
+    /// The declaration, a doctype, comments, a processing instruction and a
+    /// CDATA section were dropped by the parser, so a merge that touched one
+    /// attribute lost all of them. Each is kept as the bytes it was.
+    #[test]
+    fn xml_merge_keeps_what_it_does_not_merge() {
+        let h = XmlHandler;
+        let doc = |attrs: &str| {
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE root>\n\
+                 <!-- a note -->\n<root{attrs}><?pi some data?><q><![CDATA[x<y & z]]></q>\
+                 <!--inner--></root>\n"
+            )
+        };
+        let (base, ours, theirs) = (doc(""), doc(" a=\"1\""), doc(" b=\"2\""));
+        let r = h.merge(
+            Path::new("x.xml"),
+            base.as_bytes(),
+            ours.as_bytes(),
+            theirs.as_bytes(),
+        );
+        match r.status {
+            MergeStatus::Merged { content, .. } => {
+                assert_eq!(String::from_utf8_lossy(&content), doc(" a=\"1\" b=\"2\""))
+            }
+            other => panic!("expected merged, got {other:?}"),
+        }
+    }
+
+    /// The parser removes a UTF-8 byte-order mark before the first event, and
+    /// an element is written anew, so a file that began with both lost the
+    /// mark. It is kept.
+    #[test]
+    fn xml_merge_keeps_a_byte_order_mark() {
+        let h = XmlHandler;
+        let doc = |attrs: &str| format!("\u{feff}<root{attrs}><p>t</p></root>");
+        let (base, ours, theirs) = (doc(""), doc(" a=\"1\""), doc(" b=\"2\""));
+        let r = h.merge(
+            Path::new("x.xml"),
+            base.as_bytes(),
+            ours.as_bytes(),
+            theirs.as_bytes(),
+        );
+        match r.status {
+            MergeStatus::Merged { content, .. } => {
+                assert_eq!(String::from_utf8_lossy(&content), doc(" a=\"1\" b=\"2\""))
+            }
+            other => panic!("expected merged, got {other:?}"),
+        }
     }
 }

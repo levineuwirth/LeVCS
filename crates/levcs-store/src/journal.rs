@@ -62,9 +62,10 @@ pub enum TailStop {
     /// scope 3.3 condition that rejected it is carried, so a test can assert
     /// which one fired.
     Incomplete(FrameError),
-    /// A positioned read failed. On the frozen profile this is a device that
-    /// lost a write it acknowledged; scope 3.8 step 5 requires it be treated
-    /// as "the tail ends here", never as a fatal store error.
+    /// A positioned read failed: the device failing a read, transiently or
+    /// not. The scan stops here without failing. Recovery then refuses the
+    /// open, changing nothing, unless the operator accepts the tail (scope 3.8
+    /// step 5, amended by contract review 2026-11-02-B).
     ReadError,
 }
 

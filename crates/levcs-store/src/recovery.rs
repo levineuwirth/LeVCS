@@ -8,8 +8,10 @@
 //! of the risk and must be asserted individually rather than in aggregate:
 //! recovery stops at the first incomplete frame and discards everything after
 //! it even when a later frame is complete and checksum-valid (step 6); and the
-//! tail scan treats a zeroed region, stale preallocated content, and `EIO`
-//! alike as "the tail ends here" rather than as a fatal error (step 5).
+//! tail scan ends at a zeroed region, stale preallocated content, or a read
+//! error without failing (step 5) -- though recovery, as contract review
+//! 2026-11-02-B amended step 5, refuses to act on a scan a read error ended
+//! unless the operator accepts the tail.
 //!
 //! # One definition of where a journal ends
 //!
@@ -1488,6 +1490,8 @@ pub struct RecoveryConfig<'a> {
     pub max_open_index_runs: u32,
     pub max_replay_frames: u64,
     pub max_replay_bytes: u64,
+    /// `StoreOptions::accept_unreadable_journal_tail`.
+    pub accept_unreadable_journal_tail: bool,
     pub payload_facts: &'a dyn PayloadFacts,
     /// Staging-owned read-only resolution and lifecycle seam.
     ///
@@ -1512,6 +1516,7 @@ impl<'a> RecoveryConfig<'a> {
             max_open_index_runs: options.max_open_index_runs,
             max_replay_frames: options.max_replay_frames,
             max_replay_bytes: options.max_replay_bytes,
+            accept_unreadable_journal_tail: options.accept_unreadable_journal_tail,
             payload_facts: &CANONICAL,
             projection_recovery_resolver: None,
         }
@@ -1974,8 +1979,18 @@ fn recover_shard_under_lock(
                 } else {
                     JOURNAL_HEADER_LEN as u64
                 };
+                // One scan, from the header, decides everything below: which
+                // frames are sealed, which are replayed, and what is
+                // quarantined. There used to be two -- this one for sealing
+                // and a second from the checkpoint offset for replay -- and a
+                // read error that struck only one of them made recovery seal
+                // one set and replay another. It acted on the sealed set
+                // (sealed it, retired the journal, started a fresh one at the
+                // wrong sequence) before anything compared the two, and the
+                // commits between were lost (audit finding S1).
                 let full_scan =
                     crate::journal::scan_journal(&file, &header, JOURNAL_HEADER_LEN as u64);
+                refuse_an_unrecoverable_scan(shard, &path, &full_scan, from, config)?;
                 let resumes_checkpoint_journal =
                     checkpointed && checkpoint.active_journal_id == header.journal_id;
                 if !resumes_checkpoint_journal {
@@ -1998,16 +2013,22 @@ fn recover_shard_under_lock(
                         }
                     }
                 }
-                let (scan, record) = recover_journal_tail(
-                    &layout.quarantine_dir(),
-                    &file,
-                    &header,
-                    from,
-                    &counters,
-                )?;
+                let record = if full_scan.stopped_early() {
+                    crate::journal::quarantine_tail(
+                        &layout.quarantine_dir(),
+                        &file,
+                        &header,
+                        full_scan.stop_offset,
+                        &counters,
+                    )?
+                } else {
+                    None
+                };
                 quarantined_bytes = record.as_ref().map(|record| record.bytes).unwrap_or(0);
                 report.quarantined = record.map(|record| record.path);
-                for scanned in &scan.frames {
+                // The frames a checkpoint of this journal already covers are
+                // in the checkpoint's state; the rest are replayed.
+                for scanned in full_scan.frames.iter().filter(|frame| frame.offset >= from) {
                     let mut frame_bytes =
                         vec![0u8; usize::try_from(scanned.len).map_err(|_| FrameError::Length)?];
                     sys::pread_exact(&file, scanned.offset, &mut frame_bytes)?;
@@ -2028,12 +2049,12 @@ fn recover_shard_under_lock(
                         len: scanned.len,
                     });
                 }
-                tail_stop_offset = match scan.stop {
+                tail_stop_offset = match full_scan.stop {
                     TailStop::EndOfPreallocation => None,
-                    TailStop::NotAFrame => (quarantined_bytes > 0).then_some(scan.stop_offset),
-                    TailStop::Incomplete(_) | TailStop::ReadError => Some(scan.stop_offset),
+                    TailStop::NotAFrame => (quarantined_bytes > 0).then_some(full_scan.stop_offset),
+                    TailStop::Incomplete(_) | TailStop::ReadError => Some(full_scan.stop_offset),
                 };
-                report.tail_stop = Some(scan.stop.clone());
+                report.tail_stop = Some(full_scan.stop.clone());
 
                 let damaged = matches!(
                     full_scan.stop,
@@ -3133,6 +3154,72 @@ fn fresh_recovery_journal_id(
     out
 }
 
+/// Scope 3.8 step 5 as amended by contract review 2026-11-02-B: refuse an
+/// active-journal scan recovery cannot act on, before this shard's recovery
+/// changes anything. Its journal stays as it was and nothing is adopted from
+/// it.
+///
+/// The guarantee is per shard. Shards recover one after another, so a shard
+/// recovered earlier in the same open keeps its completed recovery: ordinary
+/// recovery, which the next open would otherwise perform, and which adopts
+/// nothing from this shard.
+///
+/// - **Frames end below the checkpoint offset.** The checkpoint says the
+///   journal holds committed frames through `from`, and the scan could not
+///   read that far. Sealing what it did read would retire the journal with
+///   committed frames in it. No option accepts this: it is not a tail.
+/// - **A read error past the checkpoint offset.** A read error is the device
+///   failing a read, not the shape of a crashed tail: under `nodatacow`
+///   (decision 9.2) a torn tail reads back as zeros, stale bytes or garbage,
+///   which end the scan as `NotAFrame` or `Incomplete`. Ending the tail at a
+///   read error made a transient fault permanent, discarding acknowledged
+///   frames a second read would have returned. So the open is refused and
+///   nothing changes: a transient error costs one failed open. For a
+///   persistent one the operator may open with
+///   `StoreOptions::accept_unreadable_journal_tail`, which adopts the frames
+///   before the error and discards the rest, the whole journal preserved in
+///   quarantine.
+fn refuse_an_unrecoverable_scan(
+    shard: u16,
+    path: &Path,
+    scan: &TailScan,
+    from: u64,
+    config: &RecoveryConfig<'_>,
+) -> Result<(), StoreError> {
+    let unreadable = matches!(scan.stop, TailStop::ReadError);
+    if scan.stop_offset < from {
+        let message = format!(
+            "shard {shard}: a checkpoint covers the active journal {} through offset {from}, \
+             but its frames end at offset {} ({:?}); recovery changed nothing in this shard",
+            path.display(),
+            scan.stop_offset,
+            scan.stop
+        );
+        return Err(if unreadable {
+            StoreError::Io(Arc::new(std::io::Error::other(format!(
+                "{message}. The read error lies in frames the checkpoint already covers, so \
+                 accepting an unreadable tail cannot open the shard; the device must be \
+                 repaired"
+            ))))
+        } else {
+            StoreError::Corruption(message)
+        });
+    }
+    if unreadable && !config.accept_unreadable_journal_tail {
+        return Err(StoreError::Io(Arc::new(std::io::Error::other(format!(
+            "shard {shard}: reading the active journal {} failed at offset {}; recovery \
+             changed nothing in this shard. A transient error clears on the next open. If the \
+             device cannot be repaired, opening with accept_unreadable_journal_tail adopts \
+             the frames before offset {} and discards the rest of the journal, which is \
+             preserved in quarantine",
+            path.display(),
+            scan.stop_offset,
+            scan.stop_offset
+        )))));
+    }
+    Ok(())
+}
+
 fn active_journal_path(paths: &ShardPaths) -> Result<Option<PathBuf>, StoreError> {
     let dir = match std::fs::read_dir(paths.active()) {
         Ok(dir) => dir,
@@ -3424,5 +3511,95 @@ mod production_session_tests {
             *resolver.notifications.lock().expect("notifications"),
             recovered.projection_resolutions
         );
+    }
+}
+
+#[cfg(test)]
+mod unrecoverable_scan_tests {
+    use super::*;
+    use crate::format::FrameError;
+
+    fn scan(stop: TailStop, stop_offset: u64) -> TailScan {
+        TailScan {
+            frames: Vec::new(),
+            stop_offset,
+            stop,
+        }
+    }
+
+    fn refuse(scan: &TailScan, from: u64, accept: bool) -> Result<(), StoreError> {
+        let mut options = StoreOptions::new("/nonexistent");
+        options.accept_unreadable_journal_tail = accept;
+        let config = RecoveryConfig::from_store_options(&options);
+        refuse_an_unrecoverable_scan(0, Path::new("active/journal"), scan, from, &config)
+    }
+
+    /// A read error past the checkpoint offset refuses the open unless the
+    /// operator accepts the tail, and the refusal says nothing changed and
+    /// how to accept it.
+    #[test]
+    fn a_read_error_past_the_checkpoint_needs_the_option() {
+        let unreadable = scan(TailStop::ReadError, 4096);
+        let error = refuse(&unreadable, 1024, false).expect_err("refused by default");
+        let message = error.to_string();
+        assert!(matches!(error, StoreError::Io(_)), "{error:?}");
+        assert!(message.contains("failed at offset 4096"), "{message}");
+        assert!(
+            message.contains("changed nothing in this shard"),
+            "{message}"
+        );
+        assert!(
+            message.contains("accept_unreadable_journal_tail"),
+            "{message}"
+        );
+        refuse(&unreadable, 1024, true).expect("accepted when the operator says so");
+        refuse(&unreadable, 4096, true).expect("the error at the checkpoint offset is a tail");
+    }
+
+    /// Frames a checkpoint covers are not a tail: a scan that ends below the
+    /// checkpoint offset is refused whatever stopped it, and the option does
+    /// not change that.
+    #[test]
+    fn a_scan_ending_below_the_checkpoint_is_refused_whatever_stopped_it() {
+        let error = refuse(&scan(TailStop::ReadError, 1024), 4096, true)
+            .expect_err("a read error in checkpointed frames");
+        assert!(matches!(error, StoreError::Io(_)), "{error:?}");
+        assert!(
+            error
+                .to_string()
+                .contains("frames the checkpoint already covers"),
+            "{error}"
+        );
+        for stop in [
+            TailStop::NotAFrame,
+            TailStop::Incomplete(FrameError::FrameDigest),
+            TailStop::EndOfPreallocation,
+        ] {
+            match refuse(&scan(stop.clone(), 1024), 4096, true) {
+                Err(StoreError::Corruption(message)) => {
+                    assert!(
+                        message.contains("changed nothing in this shard"),
+                        "{message}"
+                    )
+                }
+                other => panic!("{stop:?} below the checkpoint: {other:?}"),
+            }
+        }
+    }
+
+    /// The ordinary ends of a crashed tail, at or past the checkpoint offset,
+    /// are not refusals: they are where the tail ends.
+    #[test]
+    fn an_ordinary_tail_end_is_not_refused() {
+        for stop in [
+            TailStop::NotAFrame,
+            TailStop::Incomplete(FrameError::FrameDigest),
+            TailStop::EndOfPreallocation,
+        ] {
+            refuse(&scan(stop.clone(), 4096), 1024, false)
+                .unwrap_or_else(|error| panic!("{stop:?}: {error}"));
+            refuse(&scan(stop.clone(), 4096), 4096, false)
+                .unwrap_or_else(|error| panic!("{stop:?} at the offset: {error}"));
+        }
     }
 }

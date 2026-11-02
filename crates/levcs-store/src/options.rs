@@ -68,6 +68,18 @@ pub struct StoreOptions {
     pub checkpoint_retain: u32,
     pub max_replay_frames: u64,
     pub max_replay_bytes: u64,
+    /// Scope 3.8 step 5, as amended by contract review 2026-11-02-B. A read
+    /// error in a shard's active journal refuses the open before that shard's
+    /// recovery changes anything: the journal stays as it was and nothing is
+    /// adopted from it, so a transient error costs one failed open and no
+    /// commit. Shards recovered earlier in the same open keep their completed,
+    /// ordinary recovery. Set
+    /// this, for an open on a device that cannot be repaired, to accept losing
+    /// what lies past a persistent one: recovery adopts the frames before the
+    /// error and seals them, preserves the whole journal in quarantine, and
+    /// continues in a fresh journal. It never accepts an error in frames a
+    /// checkpoint already covers. Off by default.
+    pub accept_unreadable_journal_tail: bool,
 
     // --- transaction bounds ---------------------------------------------
     pub max_objects_per_transaction: u32,
@@ -130,6 +142,7 @@ impl Default for StoreOptions {
             checkpoint_retain: 2,
             max_replay_frames: 4_000_000,
             max_replay_bytes: 8 * 1024 * 1024 * 1024,
+            accept_unreadable_journal_tail: false,
             max_objects_per_transaction: 65_536,
             max_refs_per_transaction: 4_096,
             // The manifest is a flat canonical vector, so this is the codec's

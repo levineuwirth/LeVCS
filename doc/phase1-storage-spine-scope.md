@@ -798,6 +798,24 @@ in aggregate:
   flush. `acknowledged_loss` becoming non-zero there is a hardware finding, not a store bug,
   and it invalidates the run rather than being tolerated.
 
+  **Amended by contract review 2026-11-02-B: a read error refuses the open.** Ending the tail
+  at an `EIO` made a transient error permanent: recovery sealed the frames before it,
+  retired the journal and started a fresh one, discarding acknowledged frames a second read
+  would have returned (audit finding S1). Under `nodatacow` (9.2) a crashed tail reads back
+  as zeros, stale bytes or garbage, which end the scan as `NotAFrame` or `Incomplete`; an
+  `EIO` is the device failing a read. So recovery refuses the open on a read error in a
+  shard's active journal before it changes anything in that shard: the journal stays as it
+  was and nothing is adopted from it. A transient error costs one failed open and no commit,
+  and an ordinary crash is unaffected. The guarantee is per shard: shards recover one after
+  another, so a shard recovered earlier in the same open keeps its completed recovery, which
+  is ordinary and adopts nothing from this one. For a persistent error the operator
+  opens with `StoreOptions::accept_unreadable_journal_tail`, which applies the rule above
+  deliberately: the frames before the error are adopted and sealed, and the whole journal is
+  preserved in quarantine. A scan that ends below a checkpoint's offset into the same journal
+  is refused whatever ended it, the option included: those frames are committed, not a tail.
+  Recovery scans an active journal once, so the frames it seals and those it replays cannot
+  differ.
+
 ## 4. Wave A work packages
 
 All three start together after D0. Each ends with its own tests green and its deliverables

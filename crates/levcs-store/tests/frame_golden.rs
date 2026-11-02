@@ -1463,10 +1463,11 @@ mod drive_seam {
     }
 
     /// A fault armed for a *positioned read* must survive every write and
-    /// fence in front of it and fire at the `pread`. Scope 3.8 step 5 requires
-    /// an `EIO` in the tail region be treated as "the tail ends here", never
-    /// as a fatal store error: getting that wrong turns an ordinary crash into
-    /// an unopenable store.
+    /// fence in front of it and fire at the `pread`. The scan ends at the
+    /// failed read without failing and reports it; what recovery then does
+    /// (scope 3.8 step 5, amended by contract review 2026-11-02-B: refuse,
+    /// changing nothing, unless the operator accepts the tail) is pinned in
+    /// `recovery_transient_eio.rs`.
     ///
     /// Driven at the journal layer because the fault is one-shot and
     /// `reopen_through_recovery` reads `FORMAT` and the journal header first —

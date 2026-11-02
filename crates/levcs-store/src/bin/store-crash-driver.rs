@@ -738,10 +738,12 @@ struct ReconcileArgs {
     ///
     /// `Fault::ReadEio` is the one that matters: the frozen profile has
     /// `write_cache = enabled` and `power_loss_protection = false`, so the
-    /// device can return `EIO` for a write it acknowledged. Scope 3.8 step 5
-    /// requires recovery to treat that as "the tail ends here", never as a
-    /// fatal store error — getting it wrong turns an ordinary crash into an
-    /// unopenable store. Arming it in *this* process rather than the writer's
+    /// device can return `EIO` for a write it acknowledged. Scope 3.8 step 5,
+    /// as amended by contract review 2026-11-02-B, has recovery refuse the
+    /// open on a read error in an active journal and change nothing, so a
+    /// transient error costs one failed open and no commit; an ordinary
+    /// crash's tail reads back as zeros or garbage instead, which the scan
+    /// ends at. Arming it in *this* process rather than the writer's
     /// is not a detail: the fault registry is process-global, and recovery
     /// runs here.
     fault: Option<Fault>,

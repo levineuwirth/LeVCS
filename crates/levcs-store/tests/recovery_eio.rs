@@ -28,13 +28,15 @@ mod eio {
     use levcs_store::format::JOURNAL_HEADER_LEN;
     use levcs_store::journal::{scan_journal, TailStop};
 
-    /// The rule under test: scope 3.8 step 5 requires an `EIO` in the tail
-    /// region to mean "the tail ends here", never a fatal store error. Getting
-    /// this wrong turns an ordinary crash into an unopenable store.
+    /// The rule under test: the scan ends at a read error without failing and
+    /// reports it as `ReadError`, so the frames before it are known and
+    /// nothing past it is adopted. What recovery does with such a scan is
+    /// scope 3.8 step 5 as amended by contract review 2026-11-02-B: it refuses
+    /// the open and changes nothing unless the operator accepts the tail,
+    /// which `recovery_transient_eio.rs` pins.
     ///
-    /// The residual risk this accepts is named in scope 3.8 and is not closed
-    /// here: an `EIO` over a frame that *was* fenced and that the device then
-    /// lost is indistinguishable by inspection from an unfenced tail. A3's
+    /// With that option the residual risk scope 3.8 names applies by the
+    /// operator's choice: frames past the error, fenced or not, are lost. A3's
     /// external ACK reconciliation is the detector, and a non-zero
     /// `acknowledged_loss` there is a hardware finding.
     #[test]

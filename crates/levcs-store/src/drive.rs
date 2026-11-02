@@ -710,6 +710,7 @@ impl ShardDrive {
             max_open_index_runs: 32,
             max_replay_frames: u64::MAX,
             max_replay_bytes: u64::MAX,
+            accept_unreadable_journal_tail: false,
             payload_facts: &payload_facts,
             projection_recovery_resolver: None,
         };

@@ -1839,6 +1839,58 @@ The integration suite's `cleanup_is_deferred_and_names_its_deliverable` is repla
 deleted — the distinction it stood for, that "nothing to do" and "cannot answer yet" are
 different results, is now asserted the other way round at the public surface.
 
+##### Contract review 2026-11-02-B
+
+Scope 3.8 step 5, `recovery.rs`'s handling of an active journal, and one field of the frozen
+`StoreOptions`. Requested by finding S1 of the 2026-10-03 audit, reproduced on `main` before the
+change: nine commits, a clean shutdown, and one read error injected on the second frame during
+the next open. Recovery scanned the journal twice, from the header to decide what to seal and
+from the checkpoint offset to decide what to replay, and the error struck only the first. It
+sealed one frame, retired the journal and started a fresh one at the second sequence; only then
+did the engine see that nine frames had been replayed, and refuse the open. The healthy open
+after it found operations 2 to 9 `Unknown`. They survived only as quarantined evidence.
+
+**One scan.** The active journal is scanned once, from the header. Replay takes the frames at or
+past the checkpoint offset, and the quarantine record comes from the same scan, so what recovery
+seals and what it replays cannot differ.
+
+**A read error refuses the open, and nothing changes in the affected shard.** Scanning once alone would have
+made the loss silent: under step 5 as written the error would have ended the tail for both, and
+the open would have succeeded without operations 2 to 9. Under `nodatacow` (9.2) a crashed tail
+reads back as zeros, stale bytes or garbage, which end the scan as `NotAFrame` or `Incomplete`,
+and that path is unchanged; an `EIO` is the device failing a read, transiently or not. So
+recovery refuses the open on a read error in a shard's active journal before it changes
+anything in that shard, naming the journal, the offset and the option below: the journal stays
+as it was and nothing is adopted from it. A transient error costs one failed open. The
+guarantee is per shard, as the review of this change found: shards recover one after another,
+so a shard recovered earlier in the same open keeps its completed recovery, which is ordinary
+recovery the next open would otherwise perform and adopts nothing from the refused shard.
+
+**`StoreOptions::accept_unreadable_journal_tail`**, off by default, is the operator's answer to a
+persistent error. It applies step 5's rule deliberately: the frames before the error are adopted
+and sealed, and the whole journal is preserved in quarantine. It is added to the frozen
+`StoreOptions` and carried through `RecoveryConfig`; the drive seam sets it off.
+
+**Frames a checkpoint covers are not a tail.** A scan of a journal a checkpoint resumes into
+that ends below the checkpoint's offset is refused whatever ended it, the option included: as
+corruption, or for a read error as an error naming the device. No current writer produces that
+state, since engine and drive checkpoints both seal their journal, so it is a guard for older
+roots and is tested at the decision function.
+
+**Evidence.** `tests/recovery_transient_eio.rs` pins the reproduction above, now refused with
+every file under the root byte-identical and all nine operations committed after a healthy
+reopen; the same error in the second of two shards, refused with that shard's files
+byte-identical and nothing of its journal in quarantine, after the first shard completed its
+recovery, and every commit on both after a healthy retry; and the option, which opens with operation 1, preserves the journal in quarantine byte
+for byte, takes the next commit, and leaves later opens needing no option. Three unit tests pin
+the decision: past the checkpoint offset the option is needed, below it the scan is refused
+whatever stopped it, and an ordinary tail end is no refusal. The scan-level tests in
+`recovery_eio.rs`, `recovery_tail.rs` and `frame_golden.rs` are unchanged, since the scan still
+ends at a read error and reports it; their comments now say what recovery does with that. The
+Phase 1 gate passes with every existing test unchanged. Mutation-checked, each killed: no
+refusal on a read error, the option ignored, no guard below the checkpoint, replay skipping the
+frame at the checkpoint offset, and the refusal never called.
+
 ##### Contract review 2026-11-02-A
 
 `levcs-protocol::oracle::ExternalAckJournal::append_batch_durable`. Requested by finding S3 of the

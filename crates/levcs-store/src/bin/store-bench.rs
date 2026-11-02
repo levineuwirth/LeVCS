@@ -6826,6 +6826,45 @@ sys.exit(1 if errors else 0)
         );
     }
 
+    /// The hardware fields this host cannot read: those `base_hardware_fields`
+    /// reads off the host and leaves as an `unknown (...)` placeholder when it
+    /// cannot. A virtual machine without cpufreq, such as CI's runner, cannot
+    /// read its governor.
+    fn unreadable_host_hardware_fields() -> Vec<String> {
+        base_hardware_fields("btrfs", Some(35.0))
+            .expect("the hardware fields")
+            .into_iter()
+            .filter_map(|(field, value)| match value {
+                J::Str(text) if text.starts_with("unknown (") => Some(field),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// On a host that cannot read one of its own hardware fields, a pass is
+    /// unreachable by design: a bundle may not name a frozen profile while a
+    /// field it carries says "not measured here". There the refusal is the
+    /// right answer, and it must name exactly the fields the host could not
+    /// read. True when that is what `error` is, so the caller stops short of
+    /// the pass this host cannot reach; false on a host that reads them all.
+    fn refused_for_unreadable_host_fields(error: &str) -> bool {
+        let unreadable = unreadable_host_hardware_fields();
+        if unreadable.is_empty() {
+            return false;
+        }
+        let named = format!("still placeholders ({})", unreadable.join(", "));
+        assert!(
+            error.contains(&named),
+            "this host cannot read {unreadable:?}, so the refusal must name exactly \
+             those fields: {error}"
+        );
+        eprintln!(
+            "this host cannot read {unreadable:?}: a pass is unreachable here, and the \
+             refusal names those fields"
+        );
+        true
+    }
+
     /// The preflight runs the same evaluation the bundle will make, so an
     /// empty template, a missing fact, or a fact file that cannot name a
     /// profile refuses in seconds instead of after three repetitions.
@@ -6835,8 +6874,11 @@ sys.exit(1 if errors else 0)
         let facts = synthetic_host_mirror(directory.path());
         let repo = directory.path().to_path_buf();
 
-        let named = validate_deployed_facts(&repo, "btrfs", &facts, Some(35.0))
-            .expect("a complete fact file names the profile");
+        let named = match validate_deployed_facts(&repo, "btrfs", &facts, Some(35.0)) {
+            Ok(named) => named,
+            Err(error) if refused_for_unreadable_host_fields(&error) => return,
+            Err(error) => panic!("a complete fact file names the profile: {error:?}"),
+        };
         assert_eq!(named.name, "minimum-30k");
 
         let partial: String = facts
@@ -6899,8 +6941,11 @@ sys.exit(1 if errors else 0)
         };
         let inputs = build_inputs();
 
-        let bundle = build_bundle(&directory.path().to_path_buf(), &workload, &inputs)
-            .expect("a complete fact set assembles");
+        let bundle = match build_bundle(&directory.path().to_path_buf(), &workload, &inputs) {
+            Ok(bundle) => bundle,
+            Err(error) if refused_for_unreadable_host_fields(&error) => return,
+            Err(error) => panic!("a complete fact set assembles: {error:?}"),
+        };
         assert!(
             bundle.contains("\"profile\": \"minimum-30k\""),
             "the derivation must name the synthetic profile\n{bundle}"

@@ -54,7 +54,7 @@ tree-sitter-cpp = "0.23"
 tree-sitter-java = "0.23"
 tree-sitter-ruby = "0.23"
 tree-sitter-bash = "0.25"
-serde_yaml = "0.9"
+serde_norway = "0.9"
 quick-xml = { version = "0.42", features = ["serialize"] }
 pulldown-cmark = "0.13"
 wasmtime = { version = "36", default-features = false, features = ["cranelift", "runtime"] }
@@ -64,8 +64,8 @@ clap = { version = "4.5", features = ["derive"] }
 argon2 = "0.5"
 chacha20poly1305 = "0.10"
 zeroize = "1.8"
-ratatui = "0.28"
-crossterm = "0.28"
+ratatui = "0.30"
+crossterm = "0.29"
 tokio = { version = "1.40", features = ["full"] }
 axum = "0.7"
 tower = "0.5"

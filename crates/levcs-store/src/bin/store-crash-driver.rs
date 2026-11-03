@@ -315,16 +315,20 @@ fn parse_fault(value: &str, victim: usize) -> Result<Option<Fault>, String> {
 // ---------------------------------------------------------------------------
 
 /// Whether a writer logs what a power loss would discard (audit S2, contract
-/// review 2026-11-02-C).
+/// reviews 2026-11-02-C and 2026-11-02-D).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PowerLoss {
-    /// Log every write's pre-image and every fence, so `reconcile` can put back
-    /// what no fence covered. The default: every run through this driver models
-    /// a power loss, not only a killed process.
+    /// Log every write's pre-image, every change to a directory entry and
+    /// every fence, so `reconcile` can undo what no fence covered. The default:
+    /// every run through this driver models a power loss, not only a killed
+    /// process.
     On,
     /// Log, but ignore every fence: the self-test that the crash suites catch a
     /// missing one.
     IgnoreFences,
+    /// Log, but ignore every directory fsync: the self-test that the crash
+    /// suites catch a missing one.
+    IgnoreDirectoryFences,
     Off,
 }
 
@@ -333,6 +337,7 @@ impl PowerLoss {
         match value {
             "on" => Some(Self::On),
             "ignore-fences" => Some(Self::IgnoreFences),
+            "ignore-directory-fences" => Some(Self::IgnoreDirectoryFences),
             "off" => Some(Self::Off),
             _ => None,
         }
@@ -350,12 +355,14 @@ fn arm_power_loss(
     root: &Path,
     mode: PowerLoss,
 ) -> Result<(), String> {
-    let honour_fences = match mode {
+    use levcs_store::drive::power_loss::Fences;
+    let fences = match mode {
         PowerLoss::Off => return Ok(()),
-        PowerLoss::On => true,
-        PowerLoss::IgnoreFences => false,
+        PowerLoss::On => Fences::Honoured,
+        PowerLoss::IgnoreFences => Fences::Ignored,
+        PowerLoss::IgnoreDirectoryFences => Fences::DirectoriesIgnored,
     };
-    levcs_store::drive::power_loss::arm(serial, &power_loss_log(root), honour_fences)
+    levcs_store::drive::power_loss::arm(serial, &power_loss_log(root), root, fences)
         .map_err(|error| format!("arming the power-loss model: {error}"))
 }
 
@@ -831,6 +838,7 @@ fn run_reconcile(args: ReconcileArgs) -> ExitCode {
     // cut would leave it, and the log is consumed — the machine has rebooted.
     match levcs_store::drive::power_loss::apply(&args.root, &power_loss_log(&args.root)) {
         Ok(applied) => {
+            println!("power_loss_entries={}", applied.entries);
             println!("power_loss_files={}", applied.files);
             println!("power_loss_bytes={}", applied.bytes);
             println!("power_loss_unreachable={}", applied.unreachable);
@@ -1020,13 +1028,14 @@ store-crash-driver <append|damage|soak|reconcile> [flags]
   ACTION  continue | fail | panic | hard-exit
   FAULT   none | short-write-tears-victim | short-write:BYTES | no-space
           | fence-eio | read-eio | dir-sync-eio
-  MODE    on (default) | off | ignore-fences
+  MODE    on (default) | off | ignore-fences | ignore-directory-fences
 
 append and soak log, beside the root as <root>.power-loss, what a power loss
-would discard: each write's pre-image and each fence. reconcile applies that
-log before recovery, putting back whatever no fence covered, so a crash is a
-power loss and not only a killed process. ignore-fences logs no fence, the
-self-test that a missing fence is caught.
+would discard: each write's pre-image, each change to a directory entry, and
+each fence. reconcile applies that log before recovery, undoing whatever no
+fence covered, so a crash is a power loss and not only a killed process.
+ignore-fences logs no fence and ignore-directory-fences no directory fsync:
+the self-tests that a missing one is caught.
 ";
 
 fn main() -> ExitCode {
@@ -1049,8 +1058,12 @@ fn main() -> ExitCode {
 
 fn power_loss_flag(args: &Args) -> Result<PowerLoss, String> {
     let value = args.get("power-loss").unwrap_or("on");
-    PowerLoss::parse(value)
-        .ok_or_else(|| format!("--power-loss must be on, off or ignore-fences, not {value:?}"))
+    PowerLoss::parse(value).ok_or_else(|| {
+        format!(
+            "--power-loss must be on, off, ignore-fences or ignore-directory-fences, not \
+                 {value:?}"
+        )
+    })
 }
 
 fn dispatch(args: &Args) -> Result<ExitCode, String> {

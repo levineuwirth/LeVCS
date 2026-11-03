@@ -20,14 +20,16 @@
 #
 # SIGKILL alone is not a substitute for power loss (plan §10): the page cache
 # survives it, so a write no fence covered is still there for recovery to read.
-# The crash driver therefore models the page cache (contract review
-# 2026-11-02-C): its writers log every write's pre-image and every fence beside
-# the root, and `reconcile` puts back whatever no fence covered before recovery
-# reads the root, so each cycle's kill is followed by a modelled power loss. The
-# model covers file contents and lengths, not directory entries. dm-flakey,
-# block-device cache and barrier manipulation, and real power cuts live in the
-# reviewed root-only scripts of §10 and are Phase 4/5 work. This script is
-# deliberately unprivileged so the matrix runs in CI.
+# The crash driver therefore models the page cache (contract reviews
+# 2026-11-02-C and 2026-11-02-D): its writers log every write's pre-image, every
+# change to a directory entry and every fence beside the root, and `reconcile`
+# undoes whatever no fence covered before recovery reads the root, so each
+# cycle's kill is followed by a modelled power loss. The model covers file
+# contents and lengths and directory entries, and takes the one outcome in which
+# everything unfenced is lost. dm-flakey, block-device cache and barrier
+# manipulation, and real power cuts live in the reviewed root-only scripts of
+# §10 and are Phase 4/5 work. This script is deliberately unprivileged so the
+# matrix runs in CI.
 #
 # Machine-readable summary on stdout as `key=value` lines, the same shape the
 # crash driver itself emits. Diagnostics go to stderr.

@@ -1102,7 +1102,7 @@ fn install_at(
     counters: &DurabilityCounters,
     replace: bool,
 ) -> Result<PathBuf, StoreError> {
-    std::fs::create_dir_all(dir)?;
+    crate::sys::create_dir_all(dir)?;
     let bytes = checkpoint.encode()?;
     let final_path = dir.join(checkpoint.file_name());
     let tmp_path = dir.join(format!("{}.tmp", checkpoint.file_name()));

@@ -3068,7 +3068,7 @@ fn preserve_crash_journal(
 ) -> Result<PathBuf, StoreError> {
     use std::os::unix::fs::MetadataExt;
 
-    std::fs::create_dir_all(quarantine_dir)?;
+    sys::create_dir_all(quarantine_dir)?;
     let evidence = quarantine_dir.join(format!(
         "{}-{}-{}.journal.evidence",
         hex::encode(header.journal_id),

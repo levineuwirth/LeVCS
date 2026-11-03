@@ -1452,7 +1452,7 @@ fn create_and_fence_root_path(
     // absorb an ancestor another process created in the same instant and leave
     // this one believing it had made the link.
     for path in missing.iter().rev() {
-        match std::fs::create_dir(path) {
+        match crate::sys::create_dir(path) {
             Ok(()) => {}
             // A racing initializer of the same path got there first. Its own
             // fence covers the link either way, and fencing it twice is

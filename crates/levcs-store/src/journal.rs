@@ -276,12 +276,7 @@ impl Journal {
             created_at_micros,
         };
         let existed = temporary.exists();
-        let mut file = File::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&temporary)?;
+        let mut file = sys::open_or_create(&temporary)?;
         let decoded_header = if existed {
             let mut bytes = [0u8; JOURNAL_HEADER_LEN];
             sys::pread_exact(&file, 0, &mut bytes)
@@ -899,16 +894,12 @@ pub fn quarantine_tail(
         return Ok(None);
     }
 
-    std::fs::create_dir_all(quarantine_dir)?;
+    sys::create_dir_all(quarantine_dir)?;
     let stem = format!("{}-{stop_offset}", hex::encode(header.journal_id));
     let path = quarantine_dir.join(format!("{stem}.tail"));
     let tmp = quarantine_dir.join(format!("{stem}.tail.tmp"));
     {
-        let mut out = File::options()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp)?;
+        let mut out = sys::create_truncated(&tmp)?;
         sys::write_vectored_all(&mut out, &[IoSlice::new(&bytes)], counters)?;
         sys::fdatasync(&out, counters)?;
     }

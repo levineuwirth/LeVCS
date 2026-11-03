@@ -2,7 +2,8 @@
 //!
 //! Lead-owned (scope 2.3). Nothing else in this crate may call
 //! `File::sync_all`, `File::sync_data`, `std::fs::rename`, `remove_file`, or
-//! open a directory descriptor. Two reasons:
+//! open a directory descriptor, and nothing else may create, link or remove a
+//! name. Three reasons:
 //!
 //! 1. `DurabilityCounters` turns "exactly one fence per group" and "no
 //!    per-object fsync" into assertions against observed counts rather than
@@ -10,6 +11,9 @@
 //! 2. Fault injection (short write, `ENOSPC`, `EIO` on fence, `EIO` on read)
 //!    has exactly one place to live, so the crash matrix runs unprivileged in
 //!    CI without `dm-flakey`.
+//! 3. The power-loss model ([`power_loss`], `failpoints` only) sees every
+//!    write, every change to a directory entry and every fence here, and only
+//!    here.
 //!
 //! The `check-phase1.sh` gate greps the crate for direct calls that bypass
 //! this module.
@@ -115,7 +119,8 @@ mod fault_state {
     /// that into a cascade of poison errors in every later test would bury the
     /// real one. Clearing on acquire is the other half — a panicking test
     /// cannot run its own cleanup, so without this its armed fault would be
-    /// delivered to whichever test ran next.
+    /// delivered to whichever test ran next. The power-loss model is cleared
+    /// for the same reason.
     pub fn serial() -> FaultSerial {
         let guard = SERIAL
             .lock()
@@ -123,6 +128,7 @@ mod fault_state {
         *ARMED
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        super::power_loss::reset();
         FaultSerial(guard)
     }
 
@@ -300,7 +306,8 @@ pub(crate) fn fsync_dir(path: &Path, counters: &DurabilityCounters) -> io::Resul
         return Err(eio("directory fsync"));
     }
     counters.fsync_dir.fetch_add(1, Relaxed);
-    File::open(path)?.sync_all()
+    let directory = File::open(path)?;
+    directory_fence(&directory)
 }
 
 /// [`fsync_dir`] on a directory descriptor the caller already holds.
@@ -313,7 +320,57 @@ pub(crate) fn fsync_dir_fd(directory: &File, counters: &DurabilityCounters) -> i
         return Err(eio("directory fsync"));
     }
     counters.fsync_dir.fetch_add(1, Relaxed);
+    directory_fence(directory)
+}
+
+/// The directory fsync both entry points share, seen by the power-loss model.
+fn directory_fence(directory: &File) -> io::Result<()> {
+    #[cfg(feature = "failpoints")]
+    return power_loss::directory_fence(directory, || directory.sync_all());
+    #[cfg(not(feature = "failpoints"))]
     directory.sync_all()
+}
+
+// ---------------------------------------------------------------------------
+// Directory entries
+// ---------------------------------------------------------------------------
+
+/// A change to a directory entry, as the power-loss model sees it.
+///
+/// Every function in this module that brings a name into being, removes one or
+/// moves one says which here, and [`entry`] performs it. Without `failpoints`
+/// that is the whole story; with the model armed, [`entry`] logs what undoing
+/// the change needs before performing it (audit S2, contract review
+/// 2026-11-02-D).
+#[derive(Clone, Copy)]
+#[cfg_attr(not(feature = "failpoints"), allow(dead_code))]
+pub(crate) enum Entry<'a> {
+    /// A regular file at a name, if none is there.
+    Create(&'a Path),
+    /// A directory at a name, if none is there.
+    Mkdir(&'a Path),
+    Link {
+        existing: &'a Path,
+        new: &'a Path,
+    },
+    Unlink(&'a Path),
+    Rmdir(&'a Path),
+    Rename {
+        from: &'a Path,
+        to: &'a Path,
+        replace: bool,
+    },
+}
+
+#[inline]
+fn entry<T>(entry: Entry<'_>, perform: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    #[cfg(feature = "failpoints")]
+    return power_loss::entry(entry, perform);
+    #[cfg(not(feature = "failpoints"))]
+    {
+        let _ = entry;
+        perform()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -335,14 +392,21 @@ pub(crate) fn fsync_dir_fd(directory: &File, counters: &DurabilityCounters) -> i
 /// than its replacement. Contract review 2026-07-30-F; the rule stands for
 /// every other name and for any checkpoint name not proved out that way.
 pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
-    rustix::fs::renameat_with(
-        rustix::fs::CWD,
+    let rename = Entry::Rename {
         from,
-        rustix::fs::CWD,
         to,
-        rustix::fs::RenameFlags::NOREPLACE,
-    )
-    .map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))
+        replace: false,
+    };
+    entry(rename, || {
+        rustix::fs::renameat_with(
+            rustix::fs::CWD,
+            from,
+            rustix::fs::CWD,
+            to,
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+        .map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))
+    })
 }
 
 /// Plain atomic replacing rename. Three legitimate call sites, and no others:
@@ -362,7 +426,12 @@ pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
 /// the licence to overwrite is bounded by a proof about the occupant, not by a
 /// flag on a shared writer. Every other site uses `rename_noreplace`.
 pub(crate) fn rename_replace(from: &Path, to: &Path) -> io::Result<()> {
-    std::fs::rename(from, to)
+    let rename = Entry::Rename {
+        from,
+        to,
+        replace: true,
+    };
+    entry(rename, || std::fs::rename(from, to))
 }
 
 /// Hard-link an existing file under a second name, refusing to overwrite.
@@ -377,11 +446,93 @@ pub(crate) fn rename_replace(from: &Path, to: &Path) -> io::Result<()> {
 pub(crate) fn link_noreplace(existing: &Path, new_name: &Path) -> io::Result<()> {
     // `link(2)` never replaces an existing destination, so the no-replace
     // property is inherent rather than a flag.
-    std::fs::hard_link(existing, new_name)
+    let link = Entry::Link {
+        existing,
+        new: new_name,
+    };
+    entry(link, || std::fs::hard_link(existing, new_name))
 }
 
 pub(crate) fn unlink(path: &Path) -> io::Result<()> {
-    std::fs::remove_file(path)
+    entry(Entry::Unlink(path), || std::fs::remove_file(path))
+}
+
+/// Remove an empty directory.
+pub(crate) fn remove_dir(path: &Path) -> io::Result<()> {
+    entry(Entry::Rmdir(path), || std::fs::remove_dir(path))
+}
+
+/// `std::fs::create_dir`, for a path the caller already trusts.
+pub(crate) fn create_dir(path: &Path) -> io::Result<()> {
+    entry(Entry::Mkdir(path), || std::fs::create_dir(path))
+}
+
+/// `std::fs::create_dir_all`, for a path the caller already trusts.
+///
+/// One [`create_dir`] per missing directory, shallowest first, so that each
+/// new entry is logged once the directory holding it exists.
+pub(crate) fn create_dir_all(path: &Path) -> io::Result<()> {
+    let mut missing = Vec::new();
+    let mut cursor = Some(path);
+    while let Some(directory) = cursor.filter(|directory| !directory.as_os_str().is_empty()) {
+        if directory.is_dir() {
+            break;
+        }
+        missing.push(directory);
+        cursor = directory.parent();
+    }
+    for directory in missing.into_iter().rev() {
+        match create_dir(directory) {
+            Ok(()) => {}
+            // Made by someone else since the look, which is what
+            // `std::fs::create_dir_all` accepts too.
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists && directory.is_dir() => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+/// Open `path` read-write, creating it if absent and never truncating, for a
+/// name the caller already trusts.
+///
+/// The trusting counterpart of [`open_or_create_regular_nofollow`]: it follows
+/// a symlink, as the plain `File::options` call it replaces did, and is here so
+/// that the power-loss model sees the name it creates.
+pub(crate) fn open_or_create(path: &Path) -> io::Result<File> {
+    entry(Entry::Create(path), || {
+        File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+    })
+}
+
+/// Open `path` empty, creating it if absent, for a name the caller already
+/// trusts.
+///
+/// `O_TRUNC`, taken apart: the open never truncates, and a file that was not
+/// already empty is cut to zero afterwards, so that the power-loss model sees
+/// both the name it creates and the bytes it cuts. Uncounted, as the `O_TRUNC`
+/// it replaces was. Readable as well as writable, because the model reads what
+/// a truncation cuts through the descriptor that cuts it.
+pub(crate) fn create_truncated(path: &Path) -> io::Result<File> {
+    let file = entry(Entry::Create(path), || {
+        File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+    })?;
+    if file.metadata()?.len() != 0 {
+        #[cfg(feature = "failpoints")]
+        power_loss::before_resize(&file, 0)?;
+        file.set_len(0)?;
+    }
+    Ok(file)
 }
 
 // ---------------------------------------------------------------------------
@@ -488,11 +639,14 @@ pub(crate) fn open_regular_nofollow_classified(path: &Path) -> io::Result<NamedR
 /// this one cannot destroy a byte it did not write.
 pub(crate) fn create_new_nofollow(path: &Path) -> io::Result<Option<File>> {
     use rustix::fs::{Mode, OFlags};
-    match rustix::fs::open(
-        path,
-        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::from_raw_mode(0o644),
-    ) {
+    let opened = entry(Entry::Create(path), || {
+        Ok(rustix::fs::open(
+            path,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o644),
+        ))
+    })?;
+    match opened {
         Ok(fd) => Ok(Some(File::from(fd))),
         Err(rustix::io::Errno::EXIST) => Ok(None),
         Err(e) => Err(io::Error::from_raw_os_error(e.raw_os_error())),
@@ -554,11 +708,14 @@ pub(crate) fn open_or_create_regular_nofollow(path: &Path) -> io::Result<Option<
 /// the durability counters alone when there was nothing to truncate.
 fn open_or_create_regular_nofollow_sized(path: &Path) -> io::Result<Option<(File, u64)>> {
     use rustix::fs::{FileType, Mode, OFlags};
-    let fd = match rustix::fs::open(
-        path,
-        OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
-        Mode::from_raw_mode(0o644),
-    ) {
+    let opened = entry(Entry::Create(path), || {
+        Ok(rustix::fs::open(
+            path,
+            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::from_raw_mode(0o644),
+        ))
+    })?;
+    let fd = match opened {
         Ok(fd) => fd,
         // A symlink at the final component: `ELOOP` on Linux, `EMLINK` on some
         // BSDs. `O_CREAT` through a *dangling* link is the same refusal, which
@@ -661,7 +818,10 @@ pub(crate) fn open_directory_nofollow(path: &Path) -> io::Result<NamedDirectory>
 /// adopted, because two callers racing to create the same tree is ordinary.
 pub(crate) fn create_directory_nofollow(path: &Path) -> io::Result<Option<File>> {
     use rustix::fs::Mode;
-    match rustix::fs::mkdir(path, Mode::from_raw_mode(0o755)) {
+    let made = entry(Entry::Mkdir(path), || {
+        Ok(rustix::fs::mkdir(path, Mode::from_raw_mode(0o755)))
+    })?;
+    match made {
         Ok(()) => {}
         Err(rustix::io::Errno::EXIST) => {}
         Err(e) => return Err(io::Error::from_raw_os_error(e.raw_os_error())),
@@ -786,8 +946,8 @@ pub(crate) fn seek_to(file: &mut File, offset: u64) -> io::Result<()> {
 // Power loss (failpoints only)
 // ---------------------------------------------------------------------------
 
-/// A userspace model of the page cache a power loss discards: audit finding
-/// S2, contract review 2026-11-02-C.
+/// A userspace model of what a power loss discards: audit finding S2, contract
+/// reviews 2026-11-02-C (file contents) and 2026-11-02-D (directory entries).
 ///
 /// `_exit` and `SIGKILL` both leave the page cache intact, so a crash suite that
 /// only kills the writer cannot see a missing fence: an unfenced write is still
@@ -800,45 +960,115 @@ pub(crate) fn seek_to(file: &mut File, offset: u64) -> io::Result<()> {
 /// the worst case a power loss allows — so a missing fence loses exactly the
 /// data it should have made durable.
 ///
-/// The log lives outside the store root and outlives a writer, as a machine's
-/// page cache does: a writer that exits normally leaves its unfenced writes
-/// logged for the next writer to add to, and `apply` is the power loss and the
-/// reboot together, consuming the log.
+/// Directory entries are modelled the same way. Every create, link, unlink,
+/// rename, `mkdir` and `rmdir` through the funnel logs, before it runs, what
+/// undoing it needs; a directory fsync logs that the directory's entries are
+/// durable; and `apply` undoes, newest first, every change no fsync of its
+/// directory covered. That is the worst case POSIX allows — `fsync(2)` on a
+/// file says nothing about the entry that names it — so a missing directory
+/// fsync loses the name it should have made durable, and the data behind the
+/// name. A rename between directories, or of a directory, is refused rather
+/// than modelled; the store makes neither.
 ///
-/// Each record is appended before the write it describes, so a writer killed at
-/// any instant leaves a log `apply` can use, and a torn last record is ignored.
-/// A fence is logged after it returns: a writer killed between the two is
-/// treated as unfenced, which is pessimistic only about work it had not yet
+/// The model is armed for one root and ignores everything outside it, so a
+/// test process can arm it while other tests write elsewhere. The log lives
+/// beside the root and outlives a writer, as a machine's page cache does: a
+/// writer that exits normally leaves its unfenced changes logged for the next
+/// writer to add to, and `apply` is the power loss and the reboot together,
+/// consuming the log.
+///
+/// Each record is appended before the change it describes, so a writer killed
+/// at any instant leaves a log `apply` can use, and a torn last record is
+/// ignored. A fence is logged after it returns: a writer killed between the two
+/// is treated as unfenced, which is pessimistic only about work it had not yet
 /// acknowledged.
-///
-/// Directory entries are not modelled: a missing directory fsync is still
-/// invisible to the crash suites.
 #[cfg(feature = "failpoints")]
 pub mod power_loss {
-    use std::collections::hash_map::Entry;
+    use std::collections::hash_map::Entry as Slot;
     use std::collections::HashMap;
-    use std::fs::{File, OpenOptions};
+    use std::ffi::OsStr;
+    use std::fs::{File, Metadata, OpenOptions};
     use std::io::{self, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{FileExt, MetadataExt};
-    use std::path::{Path, PathBuf};
+    use std::path::{Component, Path, PathBuf};
     use std::sync::{Mutex, MutexGuard};
 
-    use super::FaultSerial;
+    use super::{Entry, FaultSerial};
 
     const MAGIC: &[u8; 8] = b"LVPWRLS1";
     const SEEN: u8 = 1;
     const PRE_IMAGE: u8 = 2;
     const FENCED: u8 = 3;
-    const RECORD_HEAD: usize = 1 + 8 + 8;
+    const DIRECTORY_FENCED: u8 = 4;
+    const ENTRY: u8 = 5;
+
+    // What an `ENTRY` record changed.
+    const CREATE: u8 = 1;
+    const MKDIR: u8 = 2;
+    const LINK: u8 = 3;
+    const UNLINK: u8 = 4;
+    const RMDIR: u8 = 5;
+    const RENAME: u8 = 6;
 
     /// A file by device and inode, which outlives its names.
     type Inode = (u64, u64);
 
+    /// Which fences the model takes at their word.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Fences {
+        /// Every fence: the power loss a correct store survives.
+        Honoured,
+        /// None: the self-test that a crash suite catches a missing fence.
+        Ignored,
+        /// Every `fdatasync` but no directory fsync: the self-test that a crash
+        /// suite catches a missing directory fsync.
+        DirectoriesIgnored,
+    }
+
+    impl Fences {
+        fn files(self) -> bool {
+            self != Fences::Ignored
+        }
+
+        fn directories(self) -> bool {
+            self == Fences::Honoured
+        }
+    }
+
     struct Model {
-        log: File,
-        honour_fences: bool,
+        log: Log,
+        fences: Fences,
+        scope: Scope,
+        /// Where a file that loses a name is kept, by a hard link, so that
+        /// `apply` can give the name back with the same inode — and therefore
+        /// with whatever the log says about the inode's contents.
+        graveyard: PathBuf,
+        /// The next name in the graveyard.
+        buried: u64,
         /// Files this process changed since their last fence.
         dirty: HashMap<Inode, Dirty>,
+    }
+
+    struct Log {
+        file: File,
+        /// Where the next record starts.
+        end: u64,
+    }
+
+    impl Log {
+        /// One record, in one write.
+        fn record(&mut self, tag: u8, inode: Inode, body: &[u8]) -> io::Result<()> {
+            let mut bytes = Vec::with_capacity(1 + 16 + body.len());
+            bytes.push(tag);
+            bytes.extend_from_slice(&inode.0.to_le_bytes());
+            bytes.extend_from_slice(&inode.1.to_le_bytes());
+            bytes.extend_from_slice(body);
+            self.file.write_all(&bytes)?;
+            self.end += bytes.len() as u64;
+            Ok(())
+        }
     }
 
     struct Dirty {
@@ -846,6 +1076,88 @@ pub mod power_loss {
         durable_len: u64,
         /// Ranges, half-open, whose pre-image this process has logged.
         logged: Vec<(u64, u64)>,
+    }
+
+    /// The root the model is armed for, by the path its callers name it with
+    /// and by the path the kernel resolves that to, and the directory holding
+    /// its entry, resolved.
+    struct Scope {
+        given: PathBuf,
+        resolved: PathBuf,
+        parent: PathBuf,
+    }
+
+    impl Scope {
+        fn new(root: &Path) -> io::Result<Self> {
+            let given = std::path::absolute(root)?;
+            let (Some(parent), Some(name)) = (given.parent(), given.file_name()) else {
+                return Err(io::Error::other(format!(
+                    "power-loss model: {} cannot be a modelled root",
+                    root.display()
+                )));
+            };
+            let parent = std::fs::canonicalize(parent)?;
+            // A root that does not exist yet will be made at this name.
+            let resolved = match std::fs::canonicalize(&given) {
+                Ok(resolved) => resolved,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => parent.join(name),
+                Err(error) => return Err(error),
+            };
+            Ok(Self {
+                given,
+                resolved,
+                parent,
+            })
+        }
+
+        /// `path` relative to the root, if it is at or under it.
+        fn relative(&self, path: &Path) -> io::Result<Option<PathBuf>> {
+            let path = std::path::absolute(path)?;
+            let Ok(relative) = path
+                .strip_prefix(&self.given)
+                .or_else(|_| path.strip_prefix(&self.resolved))
+            else {
+                return Ok(None);
+            };
+            if relative
+                .components()
+                .all(|component| matches!(component, Component::Normal(_)))
+            {
+                Ok(Some(relative.to_path_buf()))
+            } else {
+                Err(io::Error::other(format!(
+                    "power-loss model: cannot name {} relative to its root",
+                    path.display()
+                )))
+            }
+        }
+
+        /// Where the kernel says an open file is. `None` when it cannot say,
+        /// which every caller takes as in scope: the model would rather log a
+        /// stranger than miss one of its own.
+        fn located(file: &File) -> Option<PathBuf> {
+            let path = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).ok()?;
+            // An unlinked file reads back as "<path> (deleted)".
+            let bytes = path.as_os_str().as_bytes();
+            let bytes = bytes.strip_suffix(b" (deleted)").unwrap_or(bytes);
+            Some(PathBuf::from(OsStr::from_bytes(bytes)))
+        }
+
+        fn holds(&self, file: &File) -> bool {
+            Self::located(file).is_none_or(|path| {
+                path.starts_with(&self.resolved) || path.starts_with(&self.given)
+            })
+        }
+
+        /// Whether a fence on `directory` can cover an entry in scope: the
+        /// root, a directory under it, or the directory naming the root.
+        fn fences(&self, directory: &File) -> bool {
+            Self::located(directory).is_none_or(|path| {
+                path.starts_with(&self.resolved)
+                    || path.starts_with(&self.given)
+                    || path == self.parent
+            })
+        }
     }
 
     static MODEL: Mutex<Option<Model>> = Mutex::new(None);
@@ -856,10 +1168,44 @@ pub mod power_loss {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Start modelling, appending to `log`. With `honour_fences` false the model
-    /// ignores every fence: the self-test that a crash suite catches a missing
-    /// one.
-    pub fn arm(_serial: &FaultSerial, log: &Path, honour_fences: bool) -> io::Result<()> {
+    /// The graveyard beside `log`.
+    fn graveyard(log: &Path) -> PathBuf {
+        let mut name = log.as_os_str().to_owned();
+        name.push(".d");
+        PathBuf::from(name)
+    }
+
+    /// Start modelling `root`, appending to `log`.
+    pub fn arm(_serial: &FaultSerial, log: &Path, root: &Path, fences: Fences) -> io::Result<()> {
+        let scope = Scope::new(root)?;
+        let graveyard = graveyard(log);
+        std::fs::create_dir_all(&graveyard)?;
+        // A hard link cannot leave its filesystem, so the graveyard has to be
+        // on the root's.
+        let root_device = match lstat(&scope.resolved)? {
+            Some(root) => root.dev(),
+            None => std::fs::metadata(&scope.parent)?.dev(),
+        };
+        if std::fs::metadata(&graveyard)?.dev() != root_device {
+            return Err(io::Error::other(format!(
+                "power-loss model: {} is not on the filesystem of {}, so it cannot keep the \
+                 files the root unlinks",
+                graveyard.display(),
+                root.display()
+            )));
+        }
+        // One past the highest grave an earlier writer of this log left.
+        let mut buried = 0;
+        for grave in std::fs::read_dir(&graveyard)? {
+            if let Some(number) = grave?
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u64>().ok())
+            {
+                buried = buried.max(number + 1);
+            }
+        }
+
         let mut file = OpenOptions::new().create(true).append(true).open(log)?;
         let existing = std::fs::read(log)?;
         if MAGIC.starts_with(&existing) {
@@ -875,9 +1221,13 @@ pub mod power_loss {
                 file.set_len(whole as u64)?;
             }
         }
+        let end = file.metadata()?.len();
         *model() = Some(Model {
-            log: file,
-            honour_fences,
+            log: Log { file, end },
+            fences,
+            scope,
+            graveyard,
+            buried,
             dirty: HashMap::new(),
         });
         Ok(())
@@ -887,31 +1237,55 @@ pub mod power_loss {
         *model() = None;
     }
 
+    /// [`disarm`] for [`serial`](super::serial), which holds no token yet.
+    pub(super) fn reset() {
+        *model() = None;
+    }
+
     fn identify(file: &File) -> io::Result<(Inode, u64)> {
         let metadata = file.metadata()?;
         Ok(((metadata.dev(), metadata.ino()), metadata.len()))
     }
 
-    /// One record, in one write.
-    fn record(log: &mut File, tag: u8, inode: Inode, body: &[u8]) -> io::Result<()> {
-        let mut bytes = Vec::with_capacity(RECORD_HEAD + body.len());
-        bytes.push(tag);
-        bytes.extend_from_slice(&inode.0.to_le_bytes());
-        bytes.extend_from_slice(&inode.1.to_le_bytes());
-        bytes.extend_from_slice(body);
-        log.write_all(&bytes)
+    fn inode_of(metadata: &Metadata) -> Inode {
+        (metadata.dev(), metadata.ino())
     }
+
+    fn lstat(path: &Path) -> io::Result<Option<Metadata>> {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) => Ok(Some(metadata)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The directory holding `path`'s entry: the one whose fsync makes it
+    /// durable.
+    fn parent_of(path: &Path) -> io::Result<Inode> {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        Ok(inode_of(&std::fs::metadata(parent)?))
+    }
+
+    // -- File contents -------------------------------------------------------
 
     /// Log the pre-image of whatever part of `[from, to)` lies within the
     /// durable length and has not been logged since the file's last fence. The
     /// first change since a fence also logs that durable length.
     fn log_pre_image(model: &mut Model, file: &File, from: u64, to: u64) -> io::Result<()> {
         let (inode, len) = identify(file)?;
-        let Model { log, dirty, .. } = model;
+        let Model {
+            log, dirty, scope, ..
+        } = model;
         let entry = match dirty.entry(inode) {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => {
-                record(log, SEEN, inode, &len.to_le_bytes())?;
+            Slot::Occupied(entry) => entry.into_mut(),
+            Slot::Vacant(entry) => {
+                if !scope.holds(file) {
+                    return Ok(());
+                }
+                log.record(SEEN, inode, &len.to_le_bytes())?;
                 entry.insert(Dirty {
                     durable_len: len,
                     logged: Vec::new(),
@@ -940,7 +1314,7 @@ pub mod power_loss {
             body.extend_from_slice(&at.to_le_bytes());
             body.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
             body.extend_from_slice(&bytes);
-            record(log, PRE_IMAGE, inode, &body)?;
+            log.record(PRE_IMAGE, inode, &body)?;
             entry.logged.push((at, next));
             at = next;
         }
@@ -971,13 +1345,267 @@ pub mod power_loss {
         let Some(model) = guard.as_mut() else {
             return Ok(());
         };
-        if !model.honour_fences {
+        if !model.fences.files() {
             return Ok(());
         }
         let (inode, _) = identify(file)?;
-        model.dirty.remove(&inode);
-        record(&mut model.log, FENCED, inode, &[])
+        // A file this writer never changed is still logged: its fence may cover
+        // an earlier writer's changes.
+        if model.dirty.remove(&inode).is_none() && !model.scope.holds(file) {
+            return Ok(());
+        }
+        model.log.record(FENCED, inode, &[])
     }
+
+    // -- Directory entries ---------------------------------------------------
+
+    /// One change to a directory entry, as logged.
+    #[derive(Debug)]
+    struct Change {
+        kind: u8,
+        /// The file the change was about, where one existed before it: what a
+        /// link names again, an unlink removes or a rename moves. Zero for a
+        /// creation.
+        subject: Inode,
+        /// The directory whose fsync makes the change durable. One, because a
+        /// rename between directories is refused rather than modelled.
+        parent: Inode,
+        /// Relative to the root; a rename's source.
+        name: PathBuf,
+        /// A rename's destination, relative to the root; empty otherwise.
+        to: PathBuf,
+        /// The grave keeping the file an unlink removed or a rename replaced.
+        grave: Option<String>,
+    }
+
+    impl Change {
+        fn encode(&self) -> Vec<u8> {
+            let mut body = vec![self.kind];
+            body.extend_from_slice(&self.parent.0.to_le_bytes());
+            body.extend_from_slice(&self.parent.1.to_le_bytes());
+            let grave = self.grave.as_deref().unwrap_or("");
+            for bytes in [
+                self.name.as_os_str().as_bytes(),
+                self.to.as_os_str().as_bytes(),
+                grave.as_bytes(),
+            ] {
+                body.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                body.extend_from_slice(bytes);
+            }
+            body
+        }
+    }
+
+    /// A change to a directory entry. What undoing it needs is logged before
+    /// `perform` runs, and `perform` runs under the model's lock, so that no
+    /// directory fence can begin between the record and the change.
+    pub(crate) fn entry<T>(
+        entry: Entry<'_>,
+        perform: impl FnOnce() -> io::Result<T>,
+    ) -> io::Result<T> {
+        let mut guard = model();
+        let Some(model) = guard.as_mut() else {
+            drop(guard);
+            return perform();
+        };
+        model.log_entry(entry)?;
+        perform()
+    }
+
+    impl Model {
+        /// Log `entry` if it is in scope and will change anything. A change the
+        /// kernel is about to refuse — a name already taken, a source that is
+        /// not there — is not logged, so that `apply` never undoes something
+        /// the change did not do.
+        fn log_entry(&mut self, entry: Entry<'_>) -> io::Result<()> {
+            match entry {
+                Entry::Create(path) => self.log_creation(CREATE, path),
+                Entry::Mkdir(path) => self.log_creation(MKDIR, path),
+                Entry::Link { existing, new } => {
+                    let Some(name) = self.scope.relative(new)? else {
+                        return Ok(());
+                    };
+                    // `link(2)` never replaces, so a taken name is a refusal.
+                    if lstat(new)?.is_some() {
+                        return Ok(());
+                    }
+                    let Some(subject) = lstat(existing)? else {
+                        return Ok(());
+                    };
+                    self.log_change(Change {
+                        kind: LINK,
+                        subject: inode_of(&subject),
+                        parent: parent_of(new)?,
+                        name,
+                        to: PathBuf::new(),
+                        grave: None,
+                    })
+                }
+                Entry::Unlink(path) => {
+                    let Some(name) = self.scope.relative(path)? else {
+                        return Ok(());
+                    };
+                    let Some(subject) = lstat(path)?.filter(|found| !found.is_dir()) else {
+                        return Ok(());
+                    };
+                    let grave = self.bury(path)?;
+                    self.log_change(Change {
+                        kind: UNLINK,
+                        subject: inode_of(&subject),
+                        parent: parent_of(path)?,
+                        name,
+                        to: PathBuf::new(),
+                        grave: Some(grave),
+                    })
+                }
+                Entry::Rmdir(path) => {
+                    let Some(name) = self.scope.relative(path)? else {
+                        return Ok(());
+                    };
+                    let Some(subject) = lstat(path)?.filter(Metadata::is_dir) else {
+                        return Ok(());
+                    };
+                    self.log_change(Change {
+                        kind: RMDIR,
+                        subject: inode_of(&subject),
+                        parent: parent_of(path)?,
+                        name,
+                        to: PathBuf::new(),
+                        grave: None,
+                    })
+                }
+                Entry::Rename { from, to, replace } => {
+                    let (name, destination) =
+                        match (self.scope.relative(from)?, self.scope.relative(to)?) {
+                            (Some(name), Some(destination)) => (name, destination),
+                            (None, None) => return Ok(()),
+                            _ => {
+                                return Err(io::Error::other(format!(
+                                    "power-loss model: a rename from {} to {} crosses the edge \
+                                     of the modelled root",
+                                    from.display(),
+                                    to.display()
+                                )))
+                            }
+                        };
+                    let Some(subject) = lstat(from)? else {
+                        return Ok(());
+                    };
+                    // Neither is modelled, and the store makes neither: every
+                    // rename it makes moves a file within one directory. A
+                    // rename between directories is durable in two places,
+                    // and a directory's rename moves every name beneath it, so
+                    // the model refuses both rather than undo them wrongly.
+                    let parent = parent_of(from)?;
+                    if parent_of(to)? != parent || subject.is_dir() {
+                        return Err(io::Error::other(format!(
+                            "power-loss model: a rename from {} to {} moves a directory or \
+                             crosses directories, which the model does not cover",
+                            from.display(),
+                            to.display()
+                        )));
+                    }
+                    let grave = match lstat(to)? {
+                        None => None,
+                        // Refused.
+                        Some(_) if !replace => return Ok(()),
+                        // Two names for one file: the rename changes nothing.
+                        Some(occupant) if inode_of(&occupant) == inode_of(&subject) => {
+                            return Ok(())
+                        }
+                        Some(occupant) if occupant.is_dir() => {
+                            return Err(io::Error::other(format!(
+                                "power-loss model: cannot keep the directory {} a rename \
+                                 replaces",
+                                to.display()
+                            )))
+                        }
+                        Some(_) => Some(self.bury(to)?),
+                    };
+                    self.log_change(Change {
+                        kind: RENAME,
+                        subject: inode_of(&subject),
+                        parent,
+                        name,
+                        to: destination,
+                        grave,
+                    })
+                }
+            }
+        }
+
+        /// A new file or directory at `path`, if nothing is there yet.
+        fn log_creation(&mut self, kind: u8, path: &Path) -> io::Result<()> {
+            let Some(name) = self.scope.relative(path)? else {
+                return Ok(());
+            };
+            if lstat(path)?.is_some() {
+                return Ok(());
+            }
+            self.log_change(Change {
+                kind,
+                subject: (0, 0),
+                parent: parent_of(path)?,
+                name,
+                to: PathBuf::new(),
+                grave: None,
+            })
+        }
+
+        fn log_change(&mut self, change: Change) -> io::Result<()> {
+            self.log.record(ENTRY, change.subject, &change.encode())
+        }
+
+        /// Keep the file at `path` alive under a name in the graveyard. Linked
+        /// before the record that names the grave is written, so a record never
+        /// names a grave that is not there.
+        fn bury(&mut self, path: &Path) -> io::Result<String> {
+            let grave = self.buried.to_string();
+            self.buried += 1;
+            std::fs::hard_link(path, self.graveyard.join(&grave)).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "power-loss model: keeping {} in {}: {error}",
+                        path.display(),
+                        self.graveyard.display()
+                    ),
+                )
+            })?;
+            Ok(grave)
+        }
+    }
+
+    /// A directory fsync, `sync`, run outside the model's lock. Its record
+    /// covers only the changes logged before `sync` began, since a change made
+    /// while it ran may have missed it.
+    pub(crate) fn directory_fence(
+        directory: &File,
+        sync: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        let began = {
+            let guard = model();
+            match guard.as_ref() {
+                Some(model) if model.fences.directories() && model.scope.fences(directory) => {
+                    Some(model.log.end)
+                }
+                _ => None,
+            }
+        };
+        sync()?;
+        let Some(began) = began else {
+            return Ok(());
+        };
+        let (inode, _) = identify(directory)?;
+        match model().as_mut() {
+            Some(model) => model
+                .log
+                .record(DIRECTORY_FENCED, inode, &began.to_le_bytes()),
+            None => Ok(()),
+        }
+    }
+
+    // -- The log, read back --------------------------------------------------
 
     enum Record {
         Seen {
@@ -992,69 +1620,162 @@ pub mod power_loss {
         Fenced {
             inode: Inode,
         },
+        DirectoryFenced {
+            inode: Inode,
+            /// Where the log ended when the fsync began.
+            began: u64,
+        },
+        Entry(Change),
     }
 
-    /// A log's whole records, and the length they end at. A torn last record
-    /// is where a writer died, so it ends the log: `apply` ignores it and `arm`
-    /// cuts it off before appending.
-    fn parse(log: &Path, bytes: &[u8]) -> io::Result<(Vec<Record>, usize)> {
+    struct Reader<'a> {
+        bytes: &'a [u8],
+        at: usize,
+    }
+
+    impl<'a> Reader<'a> {
+        fn take(&mut self, len: usize) -> Option<&'a [u8]> {
+            let taken = self.bytes.get(self.at..self.at.checked_add(len)?)?;
+            self.at += len;
+            Some(taken)
+        }
+
+        fn u8(&mut self) -> Option<u8> {
+            self.take(1).map(|bytes| bytes[0])
+        }
+
+        fn u64(&mut self) -> Option<u64> {
+            self.take(8)
+                .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
+        }
+
+        fn sized(&mut self) -> Option<&'a [u8]> {
+            let len = self
+                .take(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))?;
+            self.take(usize::try_from(len).ok()?)
+        }
+    }
+
+    /// A log's whole records, each with the offset it starts at, and the length
+    /// they end at. A torn last record is where a writer died, so it ends the
+    /// log: `apply` ignores it and `arm` cuts it off before appending.
+    fn parse(log: &Path, bytes: &[u8]) -> io::Result<(Vec<(u64, Record)>, usize)> {
         if bytes.get(..MAGIC.len()) != Some(&MAGIC[..]) {
             return Err(io::Error::other(format!(
                 "{} is not a power-loss log",
                 log.display()
             )));
         }
-        let u64_at = |at: usize| -> Option<u64> {
-            bytes
-                .get(at..at.checked_add(8)?)
-                .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
-        };
         let mut records = Vec::new();
-        let mut at = MAGIC.len();
-        while at + RECORD_HEAD <= bytes.len() {
-            let inode = (u64_at(at + 1).unwrap(), u64_at(at + 9).unwrap());
-            let body = at + RECORD_HEAD;
-            let (record, next) = match bytes[at] {
-                SEEN => {
-                    let Some(durable_len) = u64_at(body) else {
-                        break;
-                    };
-                    (Record::Seen { inode, durable_len }, body + 8)
-                }
-                PRE_IMAGE => {
-                    let (Some(offset), Some(len)) = (u64_at(body), u64_at(body + 8)) else {
-                        break;
-                    };
-                    let data_at = body + 16;
-                    let Some(data) = usize::try_from(len)
-                        .ok()
-                        .and_then(|len| bytes.get(data_at..data_at.checked_add(len)?))
-                    else {
-                        break;
-                    };
-                    let next = data_at + data.len();
-                    (
-                        Record::PreImage {
-                            inode,
-                            offset,
-                            data: data.to_vec(),
-                        },
-                        next,
-                    )
-                }
-                FENCED => (Record::Fenced { inode }, body),
-                other => {
-                    return Err(io::Error::other(format!(
-                        "{}: unknown power-loss record {other} at byte {at}",
-                        log.display()
-                    )))
-                }
+        let mut whole = MAGIC.len();
+        loop {
+            let mut reader = Reader { bytes, at: whole };
+            let record = read_record(&mut reader).map_err(|error| {
+                io::Error::other(format!("{}: at byte {whole}: {error}", log.display()))
+            })?;
+            let Some(record) = record else {
+                break;
             };
-            records.push(record);
-            at = next;
+            records.push((whole as u64, record));
+            whole = reader.at;
         }
-        Ok((records, at))
+        Ok((records, whole))
     }
+
+    /// One record, or `None` where the log ends inside it.
+    fn read_record(reader: &mut Reader<'_>) -> Result<Option<Record>, String> {
+        let (Some(tag), Some(device), Some(number)) = (reader.u8(), reader.u64(), reader.u64())
+        else {
+            return Ok(None);
+        };
+        let inode = (device, number);
+        let record = match tag {
+            SEEN => {
+                let Some(durable_len) = reader.u64() else {
+                    return Ok(None);
+                };
+                Record::Seen { inode, durable_len }
+            }
+            PRE_IMAGE => {
+                let (Some(offset), Some(len)) = (reader.u64(), reader.u64()) else {
+                    return Ok(None);
+                };
+                let Some(data) = usize::try_from(len).ok().and_then(|len| reader.take(len)) else {
+                    return Ok(None);
+                };
+                Record::PreImage {
+                    inode,
+                    offset,
+                    data: data.to_vec(),
+                }
+            }
+            FENCED => Record::Fenced { inode },
+            DIRECTORY_FENCED => {
+                let Some(began) = reader.u64() else {
+                    return Ok(None);
+                };
+                Record::DirectoryFenced { inode, began }
+            }
+            ENTRY => match read_change(reader, inode)? {
+                Some(change) => Record::Entry(change),
+                None => return Ok(None),
+            },
+            other => return Err(format!("unknown power-loss record {other}")),
+        };
+        Ok(Some(record))
+    }
+
+    fn read_change(reader: &mut Reader<'_>, subject: Inode) -> Result<Option<Change>, String> {
+        let (Some(kind), Some(device), Some(number)) = (reader.u8(), reader.u64(), reader.u64())
+        else {
+            return Ok(None);
+        };
+        let (Some(name), Some(to), Some(grave)) = (reader.sized(), reader.sized(), reader.sized())
+        else {
+            return Ok(None);
+        };
+        if !(CREATE..=RENAME).contains(&kind) {
+            return Err(format!("unknown directory change {kind}"));
+        }
+        let grave = match grave {
+            [] => None,
+            grave => {
+                let grave = std::str::from_utf8(grave)
+                    .ok()
+                    .filter(|grave| grave.bytes().all(|byte| byte.is_ascii_digit()))
+                    .ok_or("a grave that is not a number")?;
+                Some(grave.to_string())
+            }
+        };
+        if kind == UNLINK && grave.is_none() {
+            return Err("an unlink with no grave".into());
+        }
+        Ok(Some(Change {
+            kind,
+            subject,
+            parent: (device, number),
+            name: plain(name)?,
+            to: plain(to)?,
+            grave,
+        }))
+    }
+
+    /// A path a record may name: relative, and made of nothing but names, so
+    /// that `apply` can only ever join it to the root.
+    fn plain(bytes: &[u8]) -> Result<PathBuf, String> {
+        let path = Path::new(OsStr::from_bytes(bytes));
+        if path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+        {
+            Ok(path.to_path_buf())
+        } else {
+            Err(format!("{} is not a plain relative path", path.display()))
+        }
+    }
+
+    // -- The power loss ------------------------------------------------------
 
     /// What [`apply`] put back.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1066,22 +1787,43 @@ pub mod power_loss {
         /// Changed files no name under the root reaches any more, so nothing a
         /// recovery could read; counted, not restored.
         pub unreachable: u64,
+        /// Changes to directory entries undone.
+        pub entries: u64,
+        /// Whole records the log held: everything the model saw, whether or
+        /// not a fence covered it.
+        pub records: u64,
     }
 
-    /// The power loss: put back, in the files under `root`, everything the log
-    /// says no fence covered, then remove the log. No log is no loss.
+    /// The power loss: undo, under `root`, every change to a directory entry and
+    /// every write the log says no fence covered, then remove the log and its
+    /// graveyard. No log is no loss.
     pub fn apply(root: &Path, log: &Path) -> io::Result<Applied> {
+        let graveyard = graveyard(log);
         let bytes = match std::fs::read(log) {
             Ok(bytes) => bytes,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Applied::default()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                remove_graveyard(&graveyard)?;
+                return Ok(Applied::default());
+            }
             Err(error) => return Err(error),
         };
         struct Unfenced {
             durable_len: u64,
             pre_images: Vec<(u64, Vec<u8>)>,
         }
+        /// A change to an entry no fence has covered yet.
+        struct Pending {
+            at: u64,
+            change: Change,
+        }
         let mut unfenced: HashMap<Inode, Unfenced> = HashMap::new();
-        for record in parse(log, &bytes)?.0 {
+        let mut pending: Vec<Pending> = Vec::new();
+        let records = parse(log, &bytes)?.0;
+        let mut applied = Applied {
+            records: records.len() as u64,
+            ..Applied::default()
+        };
+        for (at, record) in records {
             match record {
                 // The first since the last fence wins: a later writer saw this
                 // writer's unfenced length, not the durable one.
@@ -1103,12 +1845,26 @@ pub mod power_loss {
                 Record::Fenced { inode } => {
                     unfenced.remove(&inode);
                 }
+                Record::Entry(change) => pending.push(Pending { at, change }),
+                Record::DirectoryFenced { inode, began } => {
+                    pending
+                        .retain(|pending| !(pending.at < began && pending.change.parent == inode));
+                }
+            }
+        }
+
+        // Newest first, so each change is undone from the state it left.
+        let mut recreated = HashMap::new();
+        for pending in pending.iter().rev() {
+            if undo(root, &graveyard, &pending.change, &mut recreated)? {
+                applied.entries += 1;
             }
         }
 
         let mut paths = HashMap::new();
-        walk(root, &mut paths)?;
-        let mut applied = Applied::default();
+        if lstat(root)?.is_some() {
+            walk(root, &mut paths)?;
+        }
         for (inode, entry) in unfenced {
             let Some(path) = paths.get(&inode) else {
                 applied.unreachable += 1;
@@ -1128,7 +1884,119 @@ pub mod power_loss {
             applied.files += 1;
         }
         std::fs::remove_file(log)?;
+        remove_graveyard(&graveyard)?;
         Ok(applied)
+    }
+
+    fn remove_graveyard(graveyard: &Path) -> io::Result<()> {
+        match std::fs::remove_dir_all(graveyard) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        }
+    }
+
+    /// Undo one change to a directory entry, if it was made. Whether it was.
+    ///
+    /// `recreated` maps each directory an `rmdir` undone here removed to the
+    /// directory this made in its place.
+    fn undo(
+        root: &Path,
+        graveyard: &Path,
+        change: &Change,
+        recreated: &mut HashMap<Inode, Inode>,
+    ) -> io::Result<bool> {
+        let at = |relative: &Path| {
+            if relative.as_os_str().is_empty() {
+                root.to_path_buf()
+            } else {
+                root.join(relative)
+            }
+        };
+        let name = at(&change.name);
+        let to = (change.kind == RENAME).then(|| at(&change.to));
+        // Only in the directory the change was made in, found by inode. A
+        // directory that is gone, or that is now another directory under the
+        // same name, was removed durably, and every name in it is unreachable
+        // whatever its entry says; one this `apply` recreated stands in for
+        // the one it gives back. Found in review, twice: undoing by path alone
+        // acted on whichever directory had the name by then, and trusting a
+        // logged `rmdir` to say a directory was removed also trusted one the
+        // kernel refused, or one its writer died before making. A rename
+        // never crosses directories, so `to` is in the same one.
+        let directory = name.parent().unwrap_or(root);
+        let made_in = recreated
+            .get(&change.parent)
+            .copied()
+            .unwrap_or(change.parent);
+        match std::fs::metadata(directory) {
+            Ok(found) if inode_of(&found) == made_in => {}
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        }
+        let grave = || {
+            change
+                .grave
+                .as_ref()
+                .map(|grave| graveyard.join(grave))
+                .ok_or_else(|| io::Error::other("a directory change with no grave"))
+        };
+        let found = lstat(&name)?;
+        Ok(match change.kind {
+            // Nothing was at the name when the change was logged, and any later
+            // change at that name was in the same directory and undone first.
+            CREATE | MKDIR => match found {
+                None => false,
+                Some(found) if found.is_dir() => {
+                    std::fs::remove_dir_all(&name)?;
+                    true
+                }
+                Some(_) => {
+                    std::fs::remove_file(&name)?;
+                    true
+                }
+            },
+            LINK => match found {
+                Some(found) if inode_of(&found) == change.subject => {
+                    std::fs::remove_file(&name)?;
+                    true
+                }
+                _ => false,
+            },
+            UNLINK => match found {
+                None => {
+                    std::fs::hard_link(grave()?, &name)?;
+                    true
+                }
+                Some(_) => false,
+            },
+            RMDIR => match found {
+                None => {
+                    std::fs::create_dir(&name)?;
+                    recreated.insert(change.subject, inode_of(&std::fs::metadata(&name)?));
+                    true
+                }
+                Some(_) => false,
+            },
+            RENAME => {
+                let to = to.expect("a rename has a destination");
+                match (found, lstat(&to)?) {
+                    (None, Some(moved)) if inode_of(&moved) == change.subject => {
+                        std::fs::rename(&to, &name)?;
+                        if change.grave.is_some() {
+                            std::fs::hard_link(grave()?, &to)?;
+                        }
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            other => {
+                return Err(io::Error::other(format!(
+                    "unknown directory change {other}"
+                )))
+            }
+        })
     }
 
     /// Every regular file under `dir`, by inode, at the first name found.
@@ -1281,6 +2149,7 @@ mod tests {
 #[cfg(all(test, feature = "failpoints"))]
 mod power_loss_tests {
     use super::*;
+    use power_loss::Fences;
     use std::io::Seek;
 
     struct Machine {
@@ -1325,7 +2194,7 @@ mod power_loss_tests {
     fn a_fenced_write_survives_and_an_unfenced_one_is_put_back() {
         let serial = serial();
         let (machine, mut file) = machine();
-        power_loss::arm(&serial, &machine.log, true).expect("arm");
+        power_loss::arm(&serial, &machine.log, &machine.root, Fences::Honoured).expect("arm");
         write_at(&mut file, 0, b"BBBB", &machine.counters);
         fdatasync(&file, &machine.counters).expect("fence");
         write_at(&mut file, 4, b"CCCCCCCC", &machine.counters);
@@ -1343,7 +2212,7 @@ mod power_loss_tests {
     fn a_shrink_and_an_allocation_are_put_back() {
         let serial = serial();
         let (machine, file) = machine();
-        power_loss::arm(&serial, &machine.log, true).expect("arm");
+        power_loss::arm(&serial, &machine.log, &machine.root, Fences::Honoured).expect("arm");
         truncate(&file, 2, &machine.counters).expect("shrink");
         preallocate(&file, 16).expect("allocate");
         power_loss::disarm(&serial);
@@ -1357,7 +2226,7 @@ mod power_loss_tests {
     fn ignoring_fences_puts_back_fenced_writes_too() {
         let serial = serial();
         let (machine, mut file) = machine();
-        power_loss::arm(&serial, &machine.log, false).expect("arm");
+        power_loss::arm(&serial, &machine.log, &machine.root, Fences::Ignored).expect("arm");
         write_at(&mut file, 0, b"BBBB", &machine.counters);
         fdatasync(&file, &machine.counters).expect("fence");
         power_loss::disarm(&serial);
@@ -1373,11 +2242,13 @@ mod power_loss_tests {
     fn a_second_writer_does_not_move_what_was_durable() {
         let serial = serial();
         let (machine, mut file) = machine();
-        power_loss::arm(&serial, &machine.log, true).expect("arm the first writer");
+        power_loss::arm(&serial, &machine.log, &machine.root, Fences::Honoured)
+            .expect("arm the first writer");
         write_at(&mut file, 0, b"BBBBBBBBBBBB", &machine.counters);
         power_loss::disarm(&serial);
 
-        power_loss::arm(&serial, &machine.log, true).expect("arm the second writer");
+        power_loss::arm(&serial, &machine.log, &machine.root, Fences::Honoured)
+            .expect("arm the second writer");
         write_at(&mut file, 0, b"CCCC", &machine.counters);
         power_loss::disarm(&serial);
 
@@ -1389,11 +2260,13 @@ mod power_loss_tests {
     fn a_fence_by_a_later_writer_covers_an_earlier_one() {
         let serial = serial();
         let (machine, mut file) = machine();
-        power_loss::arm(&serial, &machine.log, true).expect("arm the first writer");
+        power_loss::arm(&serial, &machine.log, &machine.root, Fences::Honoured)
+            .expect("arm the first writer");
         write_at(&mut file, 0, b"BBBB", &machine.counters);
         power_loss::disarm(&serial);
 
-        power_loss::arm(&serial, &machine.log, true).expect("arm the second writer");
+        power_loss::arm(&serial, &machine.log, &machine.root, Fences::Honoured)
+            .expect("arm the second writer");
         fdatasync(&file, &machine.counters).expect("fence");
         power_loss::disarm(&serial);
 
@@ -1407,7 +2280,7 @@ mod power_loss_tests {
     fn a_torn_last_record_is_where_the_log_ends() {
         let serial = serial();
         let (machine, mut file) = machine();
-        power_loss::arm(&serial, &machine.log, true).expect("arm");
+        power_loss::arm(&serial, &machine.log, &machine.root, Fences::Honoured).expect("arm");
         write_at(&mut file, 0, b"BBBB", &machine.counters);
         power_loss::disarm(&serial);
         let mut log = File::options()
@@ -1428,7 +2301,8 @@ mod power_loss_tests {
     fn a_writer_after_a_torn_record_keeps_its_own_fence() {
         let serial = serial();
         let (machine, mut file) = machine();
-        power_loss::arm(&serial, &machine.log, true).expect("arm the first writer");
+        power_loss::arm(&serial, &machine.log, &machine.root, Fences::Honoured)
+            .expect("arm the first writer");
         write_at(&mut file, 0, b"BBBB", &machine.counters);
         power_loss::disarm(&serial);
         let mut log = File::options()
@@ -1438,7 +2312,8 @@ mod power_loss_tests {
         std::io::Write::write_all(&mut log, &[2, 0, 0, 0]).expect("a torn record");
         drop(log);
 
-        power_loss::arm(&serial, &machine.log, true).expect("arm the second writer");
+        power_loss::arm(&serial, &machine.log, &machine.root, Fences::Honoured)
+            .expect("arm the second writer");
         write_at(&mut file, 4, b"CCCC", &machine.counters);
         fdatasync(&file, &machine.counters).expect("fence");
         power_loss::disarm(&serial);
@@ -1464,5 +2339,683 @@ mod power_loss_tests {
         let (machine, mut file) = machine();
         write_at(&mut file, 0, b"BBBB", &machine.counters);
         assert!(!machine.log.exists());
+    }
+
+    // -- Directory entries ---------------------------------------------------
+
+    fn arm(serial: &FaultSerial, machine: &Machine, fences: Fences) {
+        power_loss::arm(serial, &machine.log, &machine.root, fences).expect("arm");
+    }
+
+    fn apply(machine: &Machine) -> power_loss::Applied {
+        let applied = power_loss::apply(&machine.root, &machine.log).expect("apply");
+        let mut graveyard = machine.log.clone().into_os_string();
+        graveyard.push(".d");
+        assert!(
+            !std::path::Path::new(&graveyard).exists(),
+            "the graveyard goes with the log"
+        );
+        applied
+    }
+
+    /// Everything under the root, relative to it, directories with a slash.
+    fn names(machine: &Machine) -> Vec<String> {
+        fn walk(root: &Path, dir: &Path, names: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).expect("read_dir") {
+                let path = entry.expect("entry").path();
+                let name = path.strip_prefix(root).unwrap().display().to_string();
+                if path.is_dir() {
+                    names.push(format!("{name}/"));
+                    walk(root, &path, names);
+                } else {
+                    names.push(name);
+                }
+            }
+        }
+        let mut names = Vec::new();
+        if machine.root.exists() {
+            walk(&machine.root, &machine.root, &mut names);
+        }
+        names.sort();
+        names
+    }
+
+    fn read(machine: &Machine, name: &str) -> Vec<u8> {
+        std::fs::read(machine.root.join(name)).expect("read")
+    }
+
+    #[test]
+    fn an_unfenced_creation_is_lost_and_a_fenced_one_kept() {
+        let serial = serial();
+        let (machine, _file) = machine();
+        arm(&serial, &machine, Fences::Honoured);
+        create_new_nofollow(&machine.root.join("kept"))
+            .expect("create")
+            .expect("a new name");
+        fsync_dir(&machine.root, &machine.counters).expect("fence");
+        create_new_nofollow(&machine.root.join("lost"))
+            .expect("create")
+            .expect("a new name");
+        create_dir(&machine.root.join("lost-directory")).expect("mkdir");
+        power_loss::disarm(&serial);
+
+        let applied = apply(&machine);
+        assert_eq!(names(&machine), ["f", "kept"]);
+        assert_eq!(applied.entries, 2);
+    }
+
+    #[test]
+    fn an_unfenced_rename_is_undone() {
+        let serial = serial();
+        let (machine, _file) = machine();
+        std::fs::write(machine.root.join("tmp"), b"new").expect("durable temporary");
+        arm(&serial, &machine, Fences::Honoured);
+        rename_noreplace(&machine.root.join("tmp"), &machine.root.join("final")).expect("rename");
+        power_loss::disarm(&serial);
+
+        apply(&machine);
+        assert_eq!(names(&machine), ["f", "tmp"]);
+        assert_eq!(read(&machine, "tmp"), b"new");
+    }
+
+    #[test]
+    fn an_unfenced_replacing_rename_gives_back_what_it_replaced() {
+        let serial = serial();
+        let (machine, _file) = machine();
+        std::fs::write(machine.root.join("CURRENT"), b"old").expect("durable pointer");
+        std::fs::write(machine.root.join("CURRENT.tmp"), b"new").expect("durable temporary");
+        arm(&serial, &machine, Fences::Honoured);
+        rename_replace(
+            &machine.root.join("CURRENT.tmp"),
+            &machine.root.join("CURRENT"),
+        )
+        .expect("install");
+        power_loss::disarm(&serial);
+        assert_eq!(read(&machine, "CURRENT"), b"new");
+
+        apply(&machine);
+        assert_eq!(names(&machine), ["CURRENT", "CURRENT.tmp", "f"]);
+        assert_eq!(read(&machine, "CURRENT"), b"old");
+        assert_eq!(read(&machine, "CURRENT.tmp"), b"new");
+    }
+
+    #[test]
+    fn a_fenced_replacing_rename_is_kept() {
+        let serial = serial();
+        let (machine, _file) = machine();
+        std::fs::write(machine.root.join("CURRENT"), b"old").expect("durable pointer");
+        std::fs::write(machine.root.join("CURRENT.tmp"), b"new").expect("durable temporary");
+        arm(&serial, &machine, Fences::Honoured);
+        rename_replace(
+            &machine.root.join("CURRENT.tmp"),
+            &machine.root.join("CURRENT"),
+        )
+        .expect("install");
+        fsync_dir(&machine.root, &machine.counters).expect("fence");
+        power_loss::disarm(&serial);
+
+        assert_eq!(apply(&machine).entries, 0);
+        assert_eq!(names(&machine), ["CURRENT", "f"]);
+        assert_eq!(read(&machine, "CURRENT"), b"new");
+    }
+
+    /// The file comes back as the same inode, so the log's account of its
+    /// contents still applies to it.
+    #[test]
+    fn an_unfenced_unlink_gives_the_file_back_with_its_durable_contents() {
+        let serial = serial();
+        let (machine, mut file) = machine();
+        arm(&serial, &machine, Fences::Honoured);
+        write_at(&mut file, 0, b"BBBB", &machine.counters);
+        unlink(&machine.root.join("f")).expect("unlink");
+        power_loss::disarm(&serial);
+
+        let applied = apply(&machine);
+        assert_eq!(names(&machine), ["f"]);
+        assert_eq!(content(&machine), b"AAAAAAAA");
+        assert_eq!((applied.entries, applied.files), (1, 1));
+    }
+
+    #[test]
+    fn a_fenced_unlink_is_kept() {
+        let serial = serial();
+        let (machine, _file) = machine();
+        arm(&serial, &machine, Fences::Honoured);
+        unlink(&machine.root.join("f")).expect("unlink");
+        fsync_dir(&machine.root, &machine.counters).expect("fence");
+        power_loss::disarm(&serial);
+
+        apply(&machine);
+        assert!(names(&machine).is_empty());
+    }
+
+    #[test]
+    fn an_unfenced_link_is_undone() {
+        let serial = serial();
+        let (machine, _file) = machine();
+        arm(&serial, &machine, Fences::Honoured);
+        link_noreplace(&machine.root.join("f"), &machine.root.join("g")).expect("link");
+        power_loss::disarm(&serial);
+
+        apply(&machine);
+        assert_eq!(names(&machine), ["f"]);
+        assert_eq!(content(&machine), b"AAAAAAAA");
+    }
+
+    /// A directory whose own entry was never fenced takes everything in it,
+    /// however durable that was inside it.
+    #[test]
+    fn an_unfenced_directory_takes_what_was_fenced_inside_it() {
+        let serial = serial();
+        let (machine, _file) = machine();
+        arm(&serial, &machine, Fences::Honoured);
+        let directory = machine.root.join("d");
+        create_directory_nofollow(&directory)
+            .expect("mkdir")
+            .expect("a directory");
+        let mut inner = create_new_nofollow(&directory.join("x"))
+            .expect("create")
+            .expect("a new name");
+        write_at(&mut inner, 0, b"xx", &machine.counters);
+        fdatasync(&inner, &machine.counters).expect("fence the data");
+        fsync_dir(&directory, &machine.counters).expect("fence the inner entry");
+        power_loss::disarm(&serial);
+
+        apply(&machine);
+        assert_eq!(names(&machine), ["f"]);
+    }
+
+    #[test]
+    fn an_unfenced_rmdir_is_undone() {
+        let serial = serial();
+        let (machine, _file) = machine();
+        std::fs::create_dir(machine.root.join("d")).expect("durable directory");
+        arm(&serial, &machine, Fences::Honoured);
+        remove_dir(&machine.root.join("d")).expect("rmdir");
+        power_loss::disarm(&serial);
+
+        apply(&machine);
+        assert_eq!(names(&machine), ["d/", "f"]);
+    }
+
+    /// Each directory `create_dir_all` makes is its own entry: the deepest is
+    /// durable once its parent is fenced, and is still lost with that parent.
+    #[test]
+    fn create_dir_all_logs_every_directory_it_makes() {
+        let serial = serial();
+        let (machine, _file) = machine();
+        arm(&serial, &machine, Fences::Honoured);
+        create_dir_all(&machine.root.join("a/b/c")).expect("mkdir -p");
+        fsync_dir(&machine.root.join("a/b"), &machine.counters).expect("fence c");
+        power_loss::disarm(&serial);
+
+        let applied = apply(&machine);
+        assert_eq!(names(&machine), ["f"]);
+        assert_eq!(
+            applied.entries, 2,
+            "a and b were undone; c was durable in b"
+        );
+    }
+
+    #[test]
+    fn a_fence_on_another_directory_covers_nothing_here() {
+        let serial = serial();
+        let (machine, _file) = machine();
+        std::fs::create_dir(machine.root.join("a")).expect("durable directory");
+        std::fs::create_dir(machine.root.join("b")).expect("durable directory");
+        arm(&serial, &machine, Fences::Honoured);
+        create_new_nofollow(&machine.root.join("a/x"))
+            .expect("create")
+            .expect("a new name");
+        fsync_dir(&machine.root.join("b"), &machine.counters).expect("fence b");
+        fsync_dir(&machine.root, &machine.counters).expect("fence the root");
+        power_loss::disarm(&serial);
+
+        apply(&machine);
+        assert_eq!(names(&machine), ["a/", "b/", "f"]);
+    }
+
+    #[test]
+    fn a_fence_by_descriptor_covers_like_a_fence_by_name() {
+        let serial = serial();
+        let (machine, _file) = machine();
+        arm(&serial, &machine, Fences::Honoured);
+        create_new_nofollow(&machine.root.join("x"))
+            .expect("create")
+            .expect("a new name");
+        let root = File::open(&machine.root).expect("open the root");
+        fsync_dir_fd(&root, &machine.counters).expect("fence");
+        power_loss::disarm(&serial);
+
+        apply(&machine);
+        assert_eq!(names(&machine), ["f", "x"]);
+    }
+
+    /// A change made while a directory fsync runs may have missed it, so the
+    /// fsync's record covers only what was logged before it began.
+    #[test]
+    fn a_fence_that_began_before_a_change_does_not_cover_it() {
+        let serial = serial();
+        let (machine, _file) = machine();
+        arm(&serial, &machine, Fences::Honoured);
+        let root = File::open(&machine.root).expect("open the root");
+        power_loss::directory_fence(&root, || {
+            create_new_nofollow(&machine.root.join("during"))
+                .expect("create")
+                .expect("a new name");
+            root.sync_all()
+        })
+        .expect("fence");
+        power_loss::disarm(&serial);
+
+        apply(&machine);
+        assert_eq!(names(&machine), ["f"]);
+    }
+
+    /// The store makes neither, and the model would undo either wrongly, so it
+    /// refuses both before the rename runs.
+    #[test]
+    fn a_rename_between_directories_or_of_a_directory_is_refused() {
+        let serial = serial();
+        let (machine, _file) = machine();
+        std::fs::create_dir(machine.root.join("a")).expect("durable directory");
+        std::fs::create_dir(machine.root.join("b")).expect("durable directory");
+        std::fs::write(machine.root.join("a/x"), b"x").expect("durable file");
+        arm(&serial, &machine, Fences::Honoured);
+        rename_noreplace(&machine.root.join("a/x"), &machine.root.join("b/x"))
+            .expect_err("between directories");
+        rename_noreplace(&machine.root.join("a"), &machine.root.join("c"))
+            .expect_err("a directory");
+        power_loss::disarm(&serial);
+
+        assert_eq!(apply(&machine).records, 0);
+        assert_eq!(names(&machine), ["a/", "a/x", "b/", "f"]);
+    }
+
+    /// Found in review. The old `d`'s unlink was never fenced, but `d`'s own
+    /// removal was, so nothing of the old `d` may come back into the new one.
+    #[test]
+    fn a_recreated_directory_does_not_receive_the_old_ones_files() {
+        let serial = serial();
+        let (machine, _file) = machine();
+        let d = machine.root.join("d");
+        std::fs::create_dir(&d).expect("durable directory");
+        std::fs::write(d.join("y"), b"old").expect("durable file");
+        arm(&serial, &machine, Fences::Honoured);
+        unlink(&d.join("y")).expect("unlink, unfenced in the old d");
+        remove_dir(&d).expect("rmdir");
+        fsync_dir(&machine.root, &machine.counters).expect("the rmdir is durable");
+        create_dir(&d).expect("mkdir again");
+        fsync_dir(&machine.root, &machine.counters).expect("the new d is durable");
+        power_loss::disarm(&serial);
+
+        apply(&machine);
+        assert_eq!(names(&machine), ["d/", "f"]);
+    }
+
+    /// Found in review. Every step of the new `x` is fenced; only the old
+    /// `d`'s history is not, and undoing it must not reach the new `x`.
+    #[test]
+    fn a_fenced_file_in_a_recreated_directory_survives() {
+        let serial = serial();
+        let (machine, _file) = machine();
+        let d = machine.root.join("d");
+        std::fs::create_dir(&d).expect("durable directory");
+        arm(&serial, &machine, Fences::Honoured);
+        create_new_nofollow(&d.join("x"))
+            .expect("create")
+            .expect("a new name");
+        unlink(&d.join("x")).expect("unlink");
+        remove_dir(&d).expect("rmdir");
+        fsync_dir(&machine.root, &machine.counters).expect("the rmdir is durable");
+        create_dir(&d).expect("mkdir again");
+        fsync_dir(&machine.root, &machine.counters).expect("the new d is durable");
+        let mut x = create_new_nofollow(&d.join("x"))
+            .expect("create")
+            .expect("a new name");
+        write_at(&mut x, 0, b"new", &machine.counters);
+        fdatasync(&x, &machine.counters).expect("fence the data");
+        fsync_dir(&d, &machine.counters).expect("fence the entry");
+        power_loss::disarm(&serial);
+
+        apply(&machine);
+        assert_eq!(names(&machine), ["d/", "d/x", "f"]);
+        assert_eq!(read(&machine, "d/x"), b"new");
+    }
+
+    /// Found in review: an `rmdir` the kernel refuses is still logged, and a
+    /// fence on its parent covers the record. That must not stand for the
+    /// directory's removal, or the unfenced change inside it survives.
+    #[test]
+    fn a_refused_rmdir_does_not_take_the_changes_inside_it() {
+        let serial = serial();
+        let (machine, _file) = machine();
+        let d = machine.root.join("d");
+        std::fs::create_dir(&d).expect("durable directory");
+        arm(&serial, &machine, Fences::Honoured);
+        create_new_nofollow(&d.join("x"))
+            .expect("create")
+            .expect("a new name");
+        let error = remove_dir(&d).expect_err("a directory with a file in it");
+        assert_eq!(error.raw_os_error(), Some(libc::ENOTEMPTY));
+        fsync_dir(&machine.root, &machine.counters).expect("fence the parent only");
+        power_loss::disarm(&serial);
+
+        let applied = apply(&machine);
+        assert_eq!(names(&machine), ["d/", "f"], "{applied:?}");
+        assert_eq!(applied.entries, 1);
+    }
+
+    /// The same, for a writer killed between logging an `rmdir` and making it.
+    #[test]
+    fn an_rmdir_logged_but_never_made_does_not_take_the_changes_inside_it() {
+        let serial = serial();
+        let (machine, _file) = machine();
+        let d = machine.root.join("d");
+        std::fs::create_dir(&d).expect("durable directory");
+        arm(&serial, &machine, Fences::Honoured);
+        create_new_nofollow(&d.join("x"))
+            .expect("create")
+            .expect("a new name");
+        power_loss::entry(Entry::Rmdir(&d), || Ok(())).expect("logged");
+        fsync_dir(&machine.root, &machine.counters).expect("fence the parent only");
+        power_loss::disarm(&serial);
+
+        apply(&machine);
+        assert_eq!(names(&machine), ["d/", "f"]);
+    }
+
+    /// A directory the power loss gives back is made again, as a new inode,
+    /// and the older changes inside it must still be undone there.
+    #[test]
+    fn an_unfenced_rmdir_gives_back_what_was_unlinked_inside_it() {
+        let serial = serial();
+        let (machine, _file) = machine();
+        let d = machine.root.join("d");
+        std::fs::create_dir(&d).expect("durable directory");
+        std::fs::write(d.join("y"), b"y").expect("durable file");
+        arm(&serial, &machine, Fences::Honoured);
+        unlink(&d.join("y")).expect("unlink");
+        remove_dir(&d).expect("rmdir");
+        power_loss::disarm(&serial);
+
+        assert_eq!(apply(&machine).entries, 2);
+        assert_eq!(names(&machine), ["d/", "d/y", "f"]);
+        assert_eq!(read(&machine, "d/y"), b"y");
+    }
+
+    /// The root's own entry is in the directory that holds it, and a fence
+    /// there keeps it.
+    #[test]
+    fn a_root_fenced_in_its_parent_is_kept() {
+        let serial = serial();
+        let (machine, _file) = machine();
+        std::fs::remove_dir_all(&machine.root).expect("no root yet");
+        arm(&serial, &machine, Fences::Honoured);
+        create_dir_all(&machine.root).expect("the root");
+        let parent = machine.root.parent().expect("a parent");
+        fsync_dir(parent, &machine.counters).expect("fence the root's entry");
+        power_loss::disarm(&serial);
+
+        apply(&machine);
+        assert!(machine.root.is_dir());
+    }
+
+    /// Found in review: a writer killed in the middle of a directory change's
+    /// record. The next writer's arm cuts it, and its own fence still covers
+    /// what came before.
+    #[test]
+    fn a_torn_directory_change_is_cut_by_the_next_writer() {
+        let serial = serial();
+        let (machine, _file) = machine();
+        arm(&serial, &machine, Fences::Honoured);
+        create_new_nofollow(&machine.root.join("x"))
+            .expect("create")
+            .expect("a new name");
+        power_loss::disarm(&serial);
+        // An ENTRY record that ends inside its name.
+        let mut torn = vec![5u8];
+        torn.extend([0u8; 16]);
+        torn.push(1);
+        torn.extend([0u8; 16]);
+        torn.extend(5u32.to_le_bytes());
+        torn.extend(b"ab");
+        let mut log = File::options()
+            .append(true)
+            .open(&machine.log)
+            .expect("the log");
+        std::io::Write::write_all(&mut log, &torn).expect("a torn record");
+        drop(log);
+
+        arm(&serial, &machine, Fences::Honoured);
+        create_new_nofollow(&machine.root.join("y"))
+            .expect("create")
+            .expect("a new name");
+        fsync_dir(&machine.root, &machine.counters).expect("fence");
+        power_loss::disarm(&serial);
+
+        apply(&machine);
+        assert_eq!(names(&machine), ["f", "x", "y"]);
+    }
+
+    /// Found in review: the lock discipline the fence-begin rule rests on. A
+    /// fence that starts while a change is logged but not yet made must wait
+    /// for the change, so its sync can only run once the change is on disk.
+    #[test]
+    fn a_fence_cannot_slip_between_a_record_and_its_change() {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        use std::sync::{Arc, Barrier};
+        let serial = serial();
+        let (machine, _file) = machine();
+        arm(&serial, &machine, Fences::Honoured);
+        let made = Arc::new(AtomicBool::new(false));
+        let logged = Arc::new(Barrier::new(2));
+        let x = machine.root.join("x");
+        let writer = {
+            let (made, logged, x) = (made.clone(), logged.clone(), x.clone());
+            std::thread::spawn(move || {
+                power_loss::entry(Entry::Create(&x), || {
+                    logged.wait();
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    std::fs::write(&x, b"x")?;
+                    made.store(true, SeqCst);
+                    Ok(())
+                })
+                .expect("create");
+            })
+        };
+        logged.wait();
+        let root = File::open(&machine.root).expect("open the root");
+        let mut made_before_the_sync = None;
+        power_loss::directory_fence(&root, || {
+            made_before_the_sync = Some(made.load(SeqCst));
+            root.sync_all()
+        })
+        .expect("fence");
+        writer.join().expect("the writer");
+        power_loss::disarm(&serial);
+
+        assert_eq!(
+            made_before_the_sync,
+            Some(true),
+            "the fence's sync began between the change's record and the change"
+        );
+        apply(&machine);
+        assert_eq!(names(&machine), ["f", "x"]);
+    }
+
+    /// A change the kernel refuses changed nothing, so it is never undone.
+    #[test]
+    fn a_refused_change_is_not_undone() {
+        let serial = serial();
+        let (machine, _file) = machine();
+        std::fs::write(machine.root.join("g"), b"g").expect("durable file");
+        arm(&serial, &machine, Fences::Honoured);
+        let f = machine.root.join("f");
+        let g = machine.root.join("g");
+        rename_noreplace(&f, &g).expect_err("a taken name");
+        link_noreplace(&f, &g).expect_err("a taken name");
+        assert!(create_new_nofollow(&g).expect("create").is_none());
+        create_dir(&g).expect_err("a taken name");
+        power_loss::disarm(&serial);
+
+        assert_eq!(apply(&machine).entries, 0);
+        assert_eq!(names(&machine), ["f", "g"]);
+        assert_eq!(read(&machine, "g"), b"g");
+    }
+
+    /// A writer killed between logging a change and making it: the record is
+    /// there and the change is not, and `apply` must see that.
+    #[test]
+    fn a_change_logged_but_never_made_is_not_undone() {
+        let serial = serial();
+        let (machine, _file) = machine();
+        std::fs::write(machine.root.join("tmp"), b"tmp").expect("durable file");
+        arm(&serial, &machine, Fences::Honoured);
+        let f = machine.root.join("f");
+        let tmp = machine.root.join("tmp");
+        let never = |entry: Entry<'_>| power_loss::entry(entry, || Ok(())).expect("logged");
+        never(Entry::Unlink(&f));
+        never(Entry::Rename {
+            from: &tmp,
+            to: &f,
+            replace: true,
+        });
+        never(Entry::Link {
+            existing: &f,
+            new: &machine.root.join("g"),
+        });
+        never(Entry::Create(&machine.root.join("h")));
+        power_loss::disarm(&serial);
+
+        assert_eq!(apply(&machine).entries, 0);
+        assert_eq!(names(&machine), ["f", "tmp"]);
+        assert_eq!(content(&machine), b"AAAAAAAA");
+    }
+
+    #[test]
+    fn entries_outside_the_root_are_not_modelled() {
+        let serial = serial();
+        let (machine, _file) = machine();
+        let outside = machine.root.parent().expect("a parent").join("outside");
+        arm(&serial, &machine, Fences::Honoured);
+        create_new_nofollow(&outside)
+            .expect("create")
+            .expect("a new name");
+        power_loss::disarm(&serial);
+
+        assert_eq!(apply(&machine).entries, 0);
+        assert!(outside.exists());
+    }
+
+    /// The model is armed for one root, so another test's writes elsewhere in
+    /// the same process are not its business.
+    #[test]
+    fn writes_outside_the_root_are_not_modelled() {
+        let serial = serial();
+        let (machine, _file) = machine();
+        let outside = machine.root.parent().expect("a parent").join("outside");
+        std::fs::write(&outside, b"durable").expect("a file outside the root");
+        let mut file = File::options()
+            .read(true)
+            .write(true)
+            .open(&outside)
+            .expect("open");
+        arm(&serial, &machine, Fences::Honoured);
+        write_at(&mut file, 0, b"unfenced", &machine.counters);
+        fdatasync(&file, &machine.counters).expect("fence");
+        power_loss::disarm(&serial);
+
+        assert_eq!(apply(&machine).records, 0);
+    }
+
+    /// A test that panics while armed cannot disarm, so the next to take the
+    /// token must not inherit its model.
+    #[test]
+    fn taking_the_serial_token_disarms_the_model() {
+        let (machine, mut file) = machine();
+        {
+            let serial = serial();
+            arm(&serial, &machine, Fences::Honoured);
+        }
+        let _serial = serial();
+        write_at(&mut file, 0, b"BBBB", &machine.counters);
+
+        assert_eq!(apply(&machine).records, 0);
+        assert_eq!(content(&machine), b"BBBBAAAA");
+    }
+
+    /// The self-test mode: file fences hold, directory fences do not.
+    #[test]
+    fn ignoring_directory_fences_keeps_fenced_data() {
+        let serial = serial();
+        let (machine, mut file) = machine();
+        arm(&serial, &machine, Fences::DirectoriesIgnored);
+        create_new_nofollow(&machine.root.join("x"))
+            .expect("create")
+            .expect("a new name");
+        fsync_dir(&machine.root, &machine.counters).expect("fence");
+        write_at(&mut file, 0, b"BBBB", &machine.counters);
+        fdatasync(&file, &machine.counters).expect("fence");
+        power_loss::disarm(&serial);
+
+        apply(&machine);
+        assert_eq!(names(&machine), ["f"]);
+        assert_eq!(content(&machine), b"BBBBAAAA");
+    }
+
+    /// The root's own entry is in its parent, and modelled like any other.
+    #[test]
+    fn an_unfenced_root_is_lost_with_everything_in_it() {
+        let serial = serial();
+        let (machine, _file) = machine();
+        std::fs::remove_dir_all(&machine.root).expect("no root yet");
+        arm(&serial, &machine, Fences::Honoured);
+        create_dir_all(&machine.root).expect("the root");
+        create_new_nofollow(&machine.root.join("x"))
+            .expect("create")
+            .expect("a new name");
+        fsync_dir(&machine.root, &machine.counters).expect("fence inside the root");
+        power_loss::disarm(&serial);
+
+        apply(&machine);
+        assert!(!machine.root.exists());
+    }
+
+    /// A later writer of the same log numbers its graves after the earlier
+    /// writer's, and the two unlinks of one name undo in order.
+    #[test]
+    fn a_second_writer_keeps_its_own_graves() {
+        let serial = serial();
+        let (machine, _file) = machine();
+        let f = machine.root.join("f");
+        arm(&serial, &machine, Fences::Honoured);
+        unlink(&f).expect("unlink the durable file");
+        power_loss::disarm(&serial);
+
+        arm(&serial, &machine, Fences::Honoured);
+        let mut again = create_new_nofollow(&f)
+            .expect("create")
+            .expect("a new name");
+        write_at(&mut again, 0, b"new", &machine.counters);
+        unlink(&f).expect("unlink the new file");
+        power_loss::disarm(&serial);
+
+        assert_eq!(apply(&machine).entries, 3);
+        assert_eq!(names(&machine), ["f"]);
+        assert_eq!(content(&machine), b"AAAAAAAA");
+    }
+
+    #[test]
+    fn create_truncated_logs_what_it_cuts() {
+        let serial = serial();
+        let (machine, _file) = machine();
+        arm(&serial, &machine, Fences::Honoured);
+        let file = create_truncated(&machine.root.join("f")).expect("open");
+        assert_eq!(file.metadata().expect("stat").len(), 0);
+        power_loss::disarm(&serial);
+
+        apply(&machine);
+        assert_eq!(content(&machine), b"AAAAAAAA");
     }
 }

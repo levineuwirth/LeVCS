@@ -1325,6 +1325,105 @@ fn the_crash_driver_models_a_power_loss_by_default() {
     assert_eq!(reconcile.get("acknowledged_loss"), Some("0"));
 }
 
+/// A missing directory fsync is acknowledged loss once a crash is a power loss
+/// (audit S2, contract review 2026-11-02-D).
+///
+/// A first writer builds the store and acknowledges a group. A second
+/// acknowledges a group and seals, which links the journal into a segment,
+/// installs a manifest and `CURRENT`, unlinks the active name and starts a new
+/// journal. A third acknowledges a group into that new journal. The control:
+/// with every fence honoured, the power loss costs nothing. The self-test: the
+/// later two writers with every directory fsync ignored, as if each were
+/// missing, while every `fdatasync` holds. The seal is undone whole, so the
+/// second writer's group survives in the journal it was fenced into; the new
+/// journal's name is lost, and the third writer's fenced, acknowledged frames
+/// with it.
+#[test]
+fn a_missing_directory_fsync_is_acknowledged_loss_once_a_crash_is_a_power_loss() {
+    fn three_writers_then_power_lost(later_writers: &str) -> harness::ChildRun {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = directory.path().join("root");
+        let ack = directory.path().join("ack.journal");
+        let first = harness::run_append(&harness::AppendRun {
+            root: &root,
+            shard: 0,
+            shard_count: 1,
+            seed: 0x5335,
+            group_len: 2,
+            victim: 0,
+            point: Failpoint::BeforeAppend,
+            action: "continue",
+            fault: "none",
+            ack_journal: &ack,
+            create: true,
+        });
+        assert_eq!(first.exit_code, Some(0), "{}", first.stderr);
+
+        for (seed, group_len, seal) in [("21302", "3", true), ("21303", "4", false)] {
+            let mut writer = std::process::Command::new(harness::DRIVER);
+            writer
+                .arg("append")
+                .arg("--root")
+                .arg(&root)
+                .args(["--shard", "0", "--shard-count", "1", "--seed", seed])
+                .args(["--group-len", group_len])
+                .args(["--point", Failpoint::BeforeAppend.name()])
+                .args(["--action", "continue", "--fault", "none", "--path", "drive"])
+                .arg("--ack-journal")
+                .arg(&ack)
+                .args(["--power-loss", later_writers]);
+            if seal {
+                writer.arg("--seal");
+            }
+            let run = writer.output().expect("spawning a later writer");
+            let stdout = String::from_utf8_lossy(&run.stdout);
+            assert_eq!(
+                run.status.code(),
+                Some(0),
+                "{stdout}{}",
+                String::from_utf8_lossy(&run.stderr)
+            );
+            assert!(
+                stdout.contains(&format!("acknowledged_count={group_len}")),
+                "{stdout}"
+            );
+            if seal {
+                assert!(stdout.contains("sealed_generation="), "{stdout}");
+            }
+        }
+
+        harness::run_reconcile(&root, 0, &ack)
+    }
+
+    let honoured = three_writers_then_power_lost("on");
+    assert_eq!(
+        honoured.get("recovery_ok"),
+        Some("true"),
+        "{}",
+        honoured.stderr
+    );
+    assert_eq!(honoured.get("acknowledged_loss"), Some("0"));
+
+    let missing = three_writers_then_power_lost("ignore-directory-fences");
+    assert_eq!(
+        missing.get("recovery_ok"),
+        Some("true"),
+        "{}",
+        missing.stderr
+    );
+    assert_ne!(
+        missing.get("power_loss_entries"),
+        Some("0"),
+        "the power loss undid no directory entry, so the model saw no unfenced one"
+    );
+    assert_eq!(
+        missing.get("acknowledged_loss"),
+        Some("4"),
+        "the third writer's four acknowledgments, in a journal whose name no \
+         directory fsync made durable, must be lost, and only they"
+    );
+}
+
 /// A read `EIO` anywhere in the reopen path is a clean refusal, never a panic
 /// and never a partial adoption.
 ///
@@ -1667,6 +1766,24 @@ fn assert_full_expectation(
         "{row}: physical state class {} implies {expected_fences} durability fence(s) \
          for this group, and DurabilityCounters reports {fences}",
         class.name()
+    );
+
+    // The power loss between the close and the reopen (contract review
+    // 2026-11-02-D). The model must have seen the row's I/O, or the reopen
+    // above was asserted against the page cache. And it must have had nothing
+    // to undo: the store fences everything a row does before the close
+    // returns, so anything left unfenced is a missing fence, including one
+    // whose loss none of the six fields above can see (found in review).
+    let power_loss = observation.power_loss;
+    assert!(
+        power_loss.records > 0,
+        "{row}: the power-loss model logged nothing, so it was not armed"
+    );
+    assert_eq!(
+        (power_loss.entries, power_loss.files),
+        (0, 0),
+        "{row}: the power loss after the close undid {power_loss:?}, so something this \
+         row did was never fenced"
     );
 }
 

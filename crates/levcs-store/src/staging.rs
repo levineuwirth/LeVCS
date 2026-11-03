@@ -616,7 +616,6 @@ impl fmt::Debug for StagedProjectionAdoption {
 // the file, so the ownership boundary is visible in the diff.
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
 use std::io::IoSlice;
 use std::ops::{Deref, DerefMut};
 use std::os::unix::fs::MetadataExt;
@@ -1319,7 +1318,7 @@ impl ProjectionStaging {
 
         let staging_root = options.root.join(STAGING_DIR);
         if !staging_root.exists() {
-            std::fs::create_dir_all(&staging_root)?;
+            crate::sys::create_dir_all(&staging_root)?;
             crate::sys::fsync_dir(&options.root, &durability)?;
         }
         let maintenance = MaintenancePool::new(&options.root);
@@ -3841,7 +3840,7 @@ fn create_session_directory(
         .parent()
         .expect("a session directory always has a shard parent");
     let parent_is_new = !parent.exists();
-    std::fs::create_dir_all(directory)?;
+    crate::sys::create_dir_all(directory)?;
     if parent_is_new {
         // `staging/<shard>`'s own entry, in `staging/`. Without this the shard
         // directory can vanish on a crash and take a fully fenced session
@@ -4140,11 +4139,7 @@ fn write_artifact(
     let final_path = directory.join(name);
     let tmp_path = directory.join(format!("{name}.tmp"));
     {
-        let mut file = File::options()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp_path)?;
+        let mut file = crate::sys::create_truncated(&tmp_path)?;
         let end = crate::sys::write_vectored_all(&mut file, &[IoSlice::new(bytes)], durability)?;
         if end != bytes.len() as u64 {
             return Err(StoreError::from(std::io::Error::new(
@@ -4228,7 +4223,7 @@ fn reclaim_session_directory(
         unlinked += 1;
     }
     crate::sys::fsync_dir(directory, durability)?;
-    std::fs::remove_dir(directory)?;
+    crate::sys::remove_dir(directory)?;
     if let Some(parent) = directory.parent() {
         crate::sys::fsync_dir(parent, durability)?;
     }

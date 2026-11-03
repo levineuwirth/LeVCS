@@ -990,8 +990,12 @@ Deliverables:
    layer now includes a model of the page cache a power loss discards. The crash
    driver's writers log every write's pre-image and every fence, and `reconcile` puts
    back what no fence covered before recovery, so the runs through the crash driver (the
-   Wave A rows and the SIGKILL cycles) see a missing `fdatasync`. Directory entries, and
-   the Wave B rows, which drive the engine in-process, are not modelled.
+   Wave A rows and the SIGKILL cycles) see a missing `fdatasync`. **Amended by contract
+   review 2026-11-02-D:** the model covers directory entries as well — every create,
+   link, unlink, rename, `mkdir` and `rmdir` through the funnel is undone at the power
+   loss unless an fsync of its directory covered it — and the Wave B rows, which drive
+   the engine in-process, arm it and lose power between their close and their reopen, so
+   a missing directory fsync is seen too.
 5. **External ACK reconciliation** — reuse `oracle::ExternalAckJournal`. Every
    acknowledged operation is durably journaled before it is counted; after each crash the
    harness proves zero acknowledged loss and zero torn transactions against the recovered

@@ -36,7 +36,7 @@
 #![allow(dead_code)]
 
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
@@ -45,6 +45,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use levcs_core::{ObjectId, ObjectType};
 use levcs_protocol::oracle::{ImmediateStatus, RecoveredTailFact};
 use levcs_protocol::v2::TransactionEvidenceV1;
+use levcs_store::drive::power_loss::{self, Applied, Fences};
 use levcs_store::failpoints::{Failpoint, FailpointAction};
 use levcs_store::options::StoreOptions;
 use levcs_store::segment::RootLayout;
@@ -658,6 +659,36 @@ pub fn disarm(serial: &Serial) {
 }
 
 // ---------------------------------------------------------------------------
+// The power loss between the close and the reopen
+// ---------------------------------------------------------------------------
+//
+// A row's engine is dropped, not killed, and a clean close fences nothing it
+// was not already going to fence: a power loss straight after it may take
+// every change no fence covered. So every row loses power between the close
+// and the reopen (audit S2, contract review 2026-11-02-D), and the oracle's
+// `recovery_outcome` — and the prior transaction's survival — are asserted
+// against what a power loss leaves, not against the page cache.
+
+/// The power-loss log for a row's root: beside it, in the row's own tempdir.
+fn power_loss_log(root: &Path) -> PathBuf {
+    root.with_extension("power-loss")
+}
+
+/// Model, from here on, what a power loss would discard under `root`. Armed
+/// before the root is built, so that building it is modelled too.
+pub fn arm_power_loss(serial: &Serial, root: &Path) {
+    power_loss::arm(serial, &power_loss_log(root), root, Fences::Honoured)
+        .expect("arm the power-loss model");
+}
+
+/// The power loss: undo, under `root`, whatever no fence covered. Called once
+/// the engine is dropped, so nothing is still writing.
+pub fn lose_power(serial: &Serial, root: &Path) -> Applied {
+    power_loss::disarm(serial);
+    power_loss::apply(root, &power_loss_log(root)).expect("apply the power-loss log")
+}
+
+// ---------------------------------------------------------------------------
 // Reopening after a close
 // ---------------------------------------------------------------------------
 
@@ -747,6 +778,8 @@ pub struct RowObservation {
     /// from "took a pin and settled it zero times", and collapsing the two
     /// would let a row that silently stopped adopting keep passing.
     pub adoption: Option<AdoptionCounters>,
+    /// What the power loss between the close and the reopen undid.
+    pub power_loss: Applied,
 }
 
 /// The four ways an admitted pin can end, as staging counts them.
@@ -844,7 +877,9 @@ pub fn drive_submit_row(
     let prior_operation = OperationId([0x11; 16]);
     let victim_operation = OperationId([0x22; 16]);
 
-    // Built by production, not merely exercised through it.
+    // Built by production, not merely exercised through it, and with the power
+    // loss modelled from the first directory it makes.
+    arm_power_loss(serial, &root);
     let engine = open_absent_root(&root, 1, DEFAULT_MAX_INDEX_RUNS);
 
     let prior = submit(&engine, create_transaction(namespace, 0x11));
@@ -896,6 +931,7 @@ pub fn drive_submit_row(
     // arming to whoever submits next.
     disarm(serial);
     drop(engine);
+    let power_loss = lose_power(serial, &root);
 
     let reopened = reopen_after_close(&root, 1, DEFAULT_MAX_INDEX_RUNS);
     let recovered = reopened
@@ -917,6 +953,7 @@ pub fn drive_submit_row(
         fences_before,
         fences_after,
         adoption,
+        power_loss,
     }
 }
 
@@ -1038,6 +1075,7 @@ pub fn drive_root_cas_retry_row(
         .map(|shard| namespace_on_shard(shard, CONTENTION_SHARDS, 0x0CA5_0000 + shard as u64))
         .collect();
 
+    arm_power_loss(serial, &root);
     let engine = open_absent_root(&root, CONTENTION_SHARDS, DEFAULT_MAX_INDEX_RUNS);
     for (index, namespace) in namespaces.iter().enumerate() {
         let created = submit_plain(&engine, create_transaction(*namespace, 0x40 + index as u8));
@@ -1134,6 +1172,7 @@ pub fn drive_root_cas_retry_row(
     let Some((shard, namespace, victim_operation, victim_outcome, fences_before)) = victim else {
         disarm(serial);
         drop(engine);
+        power_loss::disarm(serial);
         return ContentionRun {
             observation: None,
             anomaly,
@@ -1152,6 +1191,7 @@ pub fn drive_root_cas_retry_row(
     let probe = submit_plain(&engine, contending_transaction(namespace, u64::MAX / 2));
     disarm(serial);
     drop(engine);
+    let power_loss = lose_power(serial, &root);
 
     let reopened = reopen_after_close(&root, CONTENTION_SHARDS, DEFAULT_MAX_INDEX_RUNS);
     let recovered = reopened
@@ -1182,6 +1222,7 @@ pub fn drive_root_cas_retry_row(
             // root CAS and never adopts; the payload axis is driven by
             // `drive_submit_row`.
             adoption: None,
+            power_loss,
         }),
     }
 }

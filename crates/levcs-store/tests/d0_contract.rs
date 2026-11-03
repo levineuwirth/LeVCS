@@ -270,6 +270,12 @@ fn privileged_construction_is_not_reachable_from_an_engine() {
 /// seam could not reach checkpoint installation at all. The original guard
 /// scanned only sync, rename, and unlink, so it passed. A funnel that covers
 /// durability but not the writes being made durable is not a funnel.
+///
+/// Creating a name is here for the same reason (audit S2, contract review
+/// 2026-11-02-D). The power-loss model undoes every change to a directory entry
+/// no directory fsync covered, and sees only the changes that come through the
+/// funnel: a file, directory or link made around it would survive a modelled
+/// power loss that a real one could take away.
 const FORBIDDEN: &[&str] = &[
     "sync_all(",
     "sync_data(",
@@ -282,6 +288,23 @@ const FORBIDDEN: &[&str] = &[
     ".set_len(",
     "std::fs::write(",
     "fs::write(",
+    ".create(",
+    ".create_new(",
+    "File::create(",
+    "File::create_new(",
+    "OFlags::CREATE",
+    "DirBuilder",
+    "fs::create_dir(",
+    "fs::create_dir_all(",
+    "fs::mkdir(",
+    "fs::remove_dir(",
+    "fs::remove_dir_all(",
+    "fs::hard_link(",
+    "fs::copy(",
+    "symlink(",
+    "renameat",
+    "unlinkat",
+    "linkat",
 ];
 
 /// Scan one file's text for [`FORBIDDEN`] calls outside test-only code.

@@ -186,7 +186,7 @@ pub fn initialize_root(
     // The root itself, and everything above it, is the caller's path. Resolving
     // it is explicitly out of scope (§3.1): an operator who configures a root
     // behind a symlink has said where the store goes.
-    std::fs::create_dir_all(&layout.root)?;
+    sys::create_dir_all(&layout.root)?;
 
     // Everything below is a name *the store invents*, and none of it may be
     // reached through a link. Two passes, because a refusal must not leave the
@@ -575,12 +575,7 @@ pub fn seal_recovered_prefix(
         return Ok(destination);
     }
 
-    let mut copied = File::options()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&artifact)?;
+    let mut copied = sys::open_or_create(&artifact)?;
     let existing_len = copied.metadata()?.len();
     let compare_len = existing_len.min(scan.stop_offset);
     compare_prefix(source, &copied, compare_len, &artifact)?;

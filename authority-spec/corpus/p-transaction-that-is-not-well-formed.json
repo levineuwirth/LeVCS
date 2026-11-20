@@ -1,0 +1,326 @@
+{
+  "expect": {
+    "admit": [
+      {
+        "refused": "invalid"
+      },
+      {
+        "refused": "invalid"
+      },
+      {
+        "refused": "invalid"
+      },
+      {
+        "refused": "invalid"
+      },
+      {
+        "refused": "invalid"
+      },
+      {
+        "refused": "invalid"
+      },
+      {
+        "refused": "invalid"
+      },
+      {
+        "refused": "invalid"
+      },
+      {
+        "admitted": {
+          "commits": 1,
+          "new_current": null,
+          "releases": 0
+        }
+      }
+    ],
+    "receive": [],
+    "verify": null
+  },
+  "name": "p-transaction-that-is-not-well-formed",
+  "note": "What is not a transaction is refused as one, before anything else about it is looked at. A branch with no name, a name with an empty or a dot component, a ref named twice, and a deletion of a ref expected to be absent are all refused as invalid: for a Contributor, for a stranger (k3) who would otherwise be refused as unauthorized, and alongside an update that would otherwise be stale. A name with several components is a name.",
+  "ratified": {
+    "admit": [
+      {
+        "refused": "invalid"
+      },
+      {
+        "refused": "invalid"
+      },
+      {
+        "refused": "invalid"
+      },
+      {
+        "refused": "invalid"
+      },
+      {
+        "refused": "invalid"
+      },
+      {
+        "refused": "invalid"
+      },
+      {
+        "refused": "invalid"
+      },
+      {
+        "refused": "invalid"
+      },
+      {
+        "admitted": {
+          "commits": 1,
+          "new_current": null,
+          "releases": 0
+        }
+      }
+    ],
+    "receive": [],
+    "verify": null
+  },
+  "request": {
+    "admit": [
+      {
+        "state": {
+          "current": 0,
+          "refs": []
+        },
+        "tx": {
+          "authority": null,
+          "signer": 1,
+          "updates": [
+            {
+              "expected": null,
+              "force": false,
+              "new": {
+                "commit": 0
+              },
+              "ref": "refs/branches/"
+            }
+          ]
+        }
+      },
+      {
+        "state": {
+          "current": 0,
+          "refs": []
+        },
+        "tx": {
+          "authority": null,
+          "signer": 1,
+          "updates": [
+            {
+              "expected": null,
+              "force": false,
+              "new": {
+                "commit": 0
+              },
+              "ref": "refs/branches/a//b"
+            }
+          ]
+        }
+      },
+      {
+        "state": {
+          "current": 0,
+          "refs": []
+        },
+        "tx": {
+          "authority": null,
+          "signer": 1,
+          "updates": [
+            {
+              "expected": null,
+              "force": false,
+              "new": {
+                "commit": 0
+              },
+              "ref": "refs/branches/a/../b"
+            }
+          ]
+        }
+      },
+      {
+        "state": {
+          "current": 0,
+          "refs": []
+        },
+        "tx": {
+          "authority": null,
+          "signer": 1,
+          "updates": [
+            {
+              "expected": null,
+              "force": false,
+              "new": {
+                "commit": 0
+              },
+              "ref": "refs/releases/."
+            }
+          ]
+        }
+      },
+      {
+        "state": {
+          "current": 0,
+          "refs": []
+        },
+        "tx": {
+          "authority": null,
+          "signer": 1,
+          "updates": [
+            {
+              "expected": null,
+              "force": false,
+              "new": {
+                "commit": 0
+              },
+              "ref": "refs/branches/b0"
+            },
+            {
+              "expected": null,
+              "force": false,
+              "new": {
+                "commit": 0
+              },
+              "ref": "refs/branches/b0"
+            }
+          ]
+        }
+      },
+      {
+        "state": {
+          "current": 0,
+          "refs": []
+        },
+        "tx": {
+          "authority": null,
+          "signer": 1,
+          "updates": [
+            {
+              "expected": null,
+              "force": false,
+              "new": null,
+              "ref": "refs/branches/b0"
+            }
+          ]
+        }
+      },
+      {
+        "state": {
+          "current": 0,
+          "refs": []
+        },
+        "tx": {
+          "authority": null,
+          "signer": 3,
+          "updates": [
+            {
+              "expected": null,
+              "force": false,
+              "new": {
+                "commit": 0
+              },
+              "ref": "refs/branches/"
+            }
+          ]
+        }
+      },
+      {
+        "state": {
+          "current": 0,
+          "refs": [
+            {
+              "ref": "refs/branches/b0",
+              "target": {
+                "commit": 0
+              }
+            }
+          ]
+        },
+        "tx": {
+          "authority": null,
+          "signer": 1,
+          "updates": [
+            {
+              "expected": null,
+              "force": false,
+              "new": {
+                "commit": 0
+              },
+              "ref": "refs/branches/b0"
+            },
+            {
+              "expected": null,
+              "force": false,
+              "new": {
+                "commit": 0
+              },
+              "ref": "refs/branches/"
+            }
+          ]
+        }
+      },
+      {
+        "state": {
+          "current": 0,
+          "refs": []
+        },
+        "tx": {
+          "authority": null,
+          "signer": 1,
+          "updates": [
+            {
+              "expected": null,
+              "force": false,
+              "new": {
+                "commit": 0
+              },
+              "ref": "refs/branches/a/b"
+            }
+          ]
+        }
+      }
+    ],
+    "pin": 0,
+    "receive": [],
+    "store": {
+      "authorities": [
+        {
+          "id": 0,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            },
+            {
+              "key": 1,
+              "role": "contributor"
+            }
+          ],
+          "prev": null,
+          "protected": [],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 1
+        }
+      ],
+      "commits": [
+        {
+          "cites": 0,
+          "id": 0,
+          "installs": null,
+          "parents": [],
+          "signature": {
+            "key": 1,
+            "valid": true
+          }
+        }
+      ],
+      "releases": []
+    },
+    "verify": null
+  }
+}

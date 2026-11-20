@@ -1,0 +1,157 @@
+{
+  "expect": {
+    "admit": [],
+    "receive": [
+      {
+        "refused": true
+      },
+      {
+        "refused": true
+      },
+      {
+        "recorded": []
+      },
+      {
+        "recorded": []
+      }
+    ],
+    "verify": null
+  },
+  "name": "div-g-a-source-that-is-not-the-repository-expected",
+  "note": "Divergence (g). The receiver expects the repository of genesis 0. A source whose current authority is 1, another repository's genesis, is asked for nothing: no commit is received, so read literally none fails and nothing is recorded. A source whose current authority is 2, which only k1 signed and so succeeds nothing, is asked for the valid c0: read literally it is recorded. The Rust looks at the source's current authority before anything it sent and refuses both. Asked for nothing by a receiver expecting the repository it is, a source is recorded as nothing under either reading.",
+  "ratified": {
+    "admit": [],
+    "receive": [
+      {
+        "recorded": []
+      },
+      {
+        "recorded": [
+          {
+            "commit": 0
+          }
+        ]
+      },
+      {
+        "recorded": []
+      },
+      {
+        "recorded": []
+      }
+    ],
+    "verify": null
+  },
+  "request": {
+    "admit": [],
+    "pin": 0,
+    "receive": [
+      {
+        "current": 1,
+        "expected": 0,
+        "roots": []
+      },
+      {
+        "current": 2,
+        "expected": 0,
+        "roots": [
+          {
+            "commit": 0
+          }
+        ]
+      },
+      {
+        "current": 0,
+        "expected": 0,
+        "roots": []
+      },
+      {
+        "current": 1,
+        "expected": 1,
+        "roots": []
+      }
+    ],
+    "store": {
+      "authorities": [
+        {
+          "id": 0,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            },
+            {
+              "key": 1,
+              "role": "contributor"
+            }
+          ],
+          "prev": null,
+          "protected": [],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 1
+        },
+        {
+          "id": 1,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            }
+          ],
+          "prev": null,
+          "protected": [],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 1
+        },
+        {
+          "id": 2,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            },
+            {
+              "key": 1,
+              "role": "owner"
+            }
+          ],
+          "prev": 0,
+          "protected": [],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 1,
+              "valid": true
+            }
+          ],
+          "version": 2
+        }
+      ],
+      "commits": [
+        {
+          "cites": 0,
+          "id": 0,
+          "installs": null,
+          "parents": [],
+          "signature": {
+            "key": 0,
+            "valid": true
+          }
+        }
+      ],
+      "releases": []
+    },
+    "verify": null
+  }
+}

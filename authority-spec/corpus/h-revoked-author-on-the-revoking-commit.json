@@ -1,0 +1,196 @@
+{
+  "expect": {
+    "admit": [],
+    "receive": [],
+    "verify": {
+      "conflicting": [],
+      "current_rejected": false,
+      "invalid": [
+        {
+          "commit": 2
+        },
+        {
+          "commit": 4
+        }
+      ],
+      "reached": [
+        {
+          "commit": 0
+        },
+        {
+          "commit": 1
+        },
+        {
+          "commit": 2
+        },
+        {
+          "commit": 3
+        },
+        {
+          "commit": 4
+        }
+      ]
+    }
+  },
+  "name": "h-revoked-author-on-the-revoking-commit",
+  "note": "H.3, the revocation rule. c1 installs an authority without k1. On top of it, k1 can neither go on citing the old authority (c2) nor cite the new one, of which it is not a member (c4). The owner's commit under the new authority (c3) is valid.",
+  "ratified": {
+    "admit": [],
+    "receive": [],
+    "verify": {
+      "conflicting": [],
+      "current_rejected": false,
+      "invalid": [
+        {
+          "commit": 2
+        },
+        {
+          "commit": 4
+        }
+      ],
+      "reached": [
+        {
+          "commit": 0
+        },
+        {
+          "commit": 1
+        },
+        {
+          "commit": 2
+        },
+        {
+          "commit": 3
+        },
+        {
+          "commit": 4
+        }
+      ]
+    }
+  },
+  "request": {
+    "admit": [],
+    "pin": 0,
+    "receive": [],
+    "store": {
+      "authorities": [
+        {
+          "id": 0,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            },
+            {
+              "key": 1,
+              "role": "contributor"
+            }
+          ],
+          "prev": null,
+          "protected": [],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 1
+        },
+        {
+          "id": 1,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            }
+          ],
+          "prev": 0,
+          "protected": [],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 2
+        }
+      ],
+      "commits": [
+        {
+          "cites": 0,
+          "id": 0,
+          "installs": null,
+          "parents": [],
+          "signature": {
+            "key": 1,
+            "valid": true
+          }
+        },
+        {
+          "cites": 0,
+          "id": 1,
+          "installs": 1,
+          "parents": [
+            0
+          ],
+          "signature": {
+            "key": 0,
+            "valid": true
+          }
+        },
+        {
+          "cites": 0,
+          "id": 2,
+          "installs": null,
+          "parents": [
+            1
+          ],
+          "signature": {
+            "key": 1,
+            "valid": true
+          }
+        },
+        {
+          "cites": 1,
+          "id": 3,
+          "installs": null,
+          "parents": [
+            1
+          ],
+          "signature": {
+            "key": 0,
+            "valid": true
+          }
+        },
+        {
+          "cites": 1,
+          "id": 4,
+          "installs": null,
+          "parents": [
+            1
+          ],
+          "signature": {
+            "key": 1,
+            "valid": true
+          }
+        }
+      ],
+      "releases": []
+    },
+    "verify": {
+      "current": 1,
+      "roots": [
+        {
+          "commit": 2
+        },
+        {
+          "commit": 3
+        },
+        {
+          "commit": 4
+        }
+      ]
+    }
+  }
+}

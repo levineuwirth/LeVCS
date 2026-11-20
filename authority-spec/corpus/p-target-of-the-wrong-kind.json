@@ -1,0 +1,253 @@
+{
+  "expect": {
+    "admit": [
+      {
+        "refused": "invalid"
+      },
+      {
+        "refused": "invalid"
+      },
+      {
+        "refused": "invalid"
+      },
+      {
+        "refused": "unauthorized"
+      },
+      {
+        "admitted": {
+          "commits": 0,
+          "new_current": null,
+          "releases": 1
+        }
+      }
+    ],
+    "receive": [],
+    "verify": null
+  },
+  "name": "p-target-of-the-wrong-kind",
+  "note": "A branch names a commit and a release ref a release. b0 is protected. Pointing it at the valid release r0 is refused as invalid, for the Contributor k1 as for the Maintainer k2: what the ref would hold is wrong whoever asks, and that is found before the branch's protection is looked at. So is a release ref pointed at a commit. The stranger k3 is refused as unauthorized first (P.1).",
+  "ratified": {
+    "admit": [
+      {
+        "refused": "invalid"
+      },
+      {
+        "refused": "invalid"
+      },
+      {
+        "refused": "invalid"
+      },
+      {
+        "refused": "unauthorized"
+      },
+      {
+        "admitted": {
+          "commits": 0,
+          "new_current": null,
+          "releases": 1
+        }
+      }
+    ],
+    "receive": [],
+    "verify": null
+  },
+  "request": {
+    "admit": [
+      {
+        "state": {
+          "current": 0,
+          "refs": [
+            {
+              "ref": "refs/branches/b1",
+              "target": {
+                "commit": 0
+              }
+            }
+          ]
+        },
+        "tx": {
+          "authority": null,
+          "signer": 1,
+          "updates": [
+            {
+              "expected": null,
+              "force": false,
+              "new": {
+                "release": 0
+              },
+              "ref": "refs/branches/b0"
+            }
+          ]
+        }
+      },
+      {
+        "state": {
+          "current": 0,
+          "refs": [
+            {
+              "ref": "refs/branches/b1",
+              "target": {
+                "commit": 0
+              }
+            }
+          ]
+        },
+        "tx": {
+          "authority": null,
+          "signer": 2,
+          "updates": [
+            {
+              "expected": null,
+              "force": false,
+              "new": {
+                "release": 0
+              },
+              "ref": "refs/branches/b0"
+            }
+          ]
+        }
+      },
+      {
+        "state": {
+          "current": 0,
+          "refs": [
+            {
+              "ref": "refs/branches/b1",
+              "target": {
+                "commit": 0
+              }
+            }
+          ]
+        },
+        "tx": {
+          "authority": null,
+          "signer": 2,
+          "updates": [
+            {
+              "expected": null,
+              "force": false,
+              "new": {
+                "commit": 0
+              },
+              "ref": "refs/releases/r0"
+            }
+          ]
+        }
+      },
+      {
+        "state": {
+          "current": 0,
+          "refs": [
+            {
+              "ref": "refs/branches/b1",
+              "target": {
+                "commit": 0
+              }
+            }
+          ]
+        },
+        "tx": {
+          "authority": null,
+          "signer": 3,
+          "updates": [
+            {
+              "expected": null,
+              "force": false,
+              "new": {
+                "release": 0
+              },
+              "ref": "refs/branches/b0"
+            }
+          ]
+        }
+      },
+      {
+        "state": {
+          "current": 0,
+          "refs": [
+            {
+              "ref": "refs/branches/b1",
+              "target": {
+                "commit": 0
+              }
+            }
+          ]
+        },
+        "tx": {
+          "authority": null,
+          "signer": 2,
+          "updates": [
+            {
+              "expected": null,
+              "force": false,
+              "new": {
+                "release": 0
+              },
+              "ref": "refs/releases/r0"
+            }
+          ]
+        }
+      }
+    ],
+    "pin": 0,
+    "receive": [],
+    "store": {
+      "authorities": [
+        {
+          "id": 0,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            },
+            {
+              "key": 1,
+              "role": "contributor"
+            },
+            {
+              "key": 2,
+              "role": "maintainer"
+            }
+          ],
+          "prev": null,
+          "protected": [
+            "b0"
+          ],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 1
+        }
+      ],
+      "commits": [
+        {
+          "cites": 0,
+          "id": 0,
+          "installs": null,
+          "parents": [],
+          "signature": {
+            "key": 0,
+            "valid": true
+          }
+        }
+      ],
+      "releases": [
+        {
+          "cites": 0,
+          "id": 0,
+          "parent": null,
+          "predecessor": 0,
+          "signature": {
+            "key": 2,
+            "valid": true
+          }
+        }
+      ]
+    },
+    "verify": null
+  }
+}

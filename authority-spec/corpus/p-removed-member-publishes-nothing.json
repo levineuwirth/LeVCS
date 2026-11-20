@@ -1,0 +1,223 @@
+{
+  "expect": {
+    "admit": [
+      {
+        "refused": "unauthorized"
+      },
+      {
+        "refused": "invalid"
+      },
+      {
+        "refused": "invalid"
+      }
+    ],
+    "receive": [],
+    "verify": null
+  },
+  "name": "p-removed-member-publishes-nothing",
+  "note": "Revocation, for publication. Authority 1 removes k1. k1 cannot sign a transaction (P.1), and the Owner cannot publish k1's commits for it: c2 cites the current authority, of which k1 is not a member (H.1), and c3 cites the old one on top of the commit that replaced it (H.3).",
+  "ratified": {
+    "admit": [
+      {
+        "refused": "unauthorized"
+      },
+      {
+        "refused": "invalid"
+      },
+      {
+        "refused": "invalid"
+      }
+    ],
+    "receive": [],
+    "verify": null
+  },
+  "request": {
+    "admit": [
+      {
+        "state": {
+          "current": 1,
+          "refs": [
+            {
+              "ref": "refs/branches/b0",
+              "target": {
+                "commit": 1
+              }
+            }
+          ]
+        },
+        "tx": {
+          "authority": null,
+          "signer": 1,
+          "updates": [
+            {
+              "expected": {
+                "commit": 1
+              },
+              "force": false,
+              "new": {
+                "commit": 2
+              },
+              "ref": "refs/branches/b0"
+            }
+          ]
+        }
+      },
+      {
+        "state": {
+          "current": 1,
+          "refs": [
+            {
+              "ref": "refs/branches/b0",
+              "target": {
+                "commit": 1
+              }
+            }
+          ]
+        },
+        "tx": {
+          "authority": null,
+          "signer": 0,
+          "updates": [
+            {
+              "expected": {
+                "commit": 1
+              },
+              "force": false,
+              "new": {
+                "commit": 2
+              },
+              "ref": "refs/branches/b0"
+            }
+          ]
+        }
+      },
+      {
+        "state": {
+          "current": 1,
+          "refs": [
+            {
+              "ref": "refs/branches/b0",
+              "target": {
+                "commit": 1
+              }
+            }
+          ]
+        },
+        "tx": {
+          "authority": null,
+          "signer": 0,
+          "updates": [
+            {
+              "expected": {
+                "commit": 1
+              },
+              "force": false,
+              "new": {
+                "commit": 3
+              },
+              "ref": "refs/branches/b0"
+            }
+          ]
+        }
+      }
+    ],
+    "pin": 0,
+    "receive": [],
+    "store": {
+      "authorities": [
+        {
+          "id": 0,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            },
+            {
+              "key": 1,
+              "role": "contributor"
+            }
+          ],
+          "prev": null,
+          "protected": [],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 1
+        },
+        {
+          "id": 1,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            }
+          ],
+          "prev": 0,
+          "protected": [],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 2
+        }
+      ],
+      "commits": [
+        {
+          "cites": 0,
+          "id": 0,
+          "installs": null,
+          "parents": [],
+          "signature": {
+            "key": 0,
+            "valid": true
+          }
+        },
+        {
+          "cites": 0,
+          "id": 1,
+          "installs": 1,
+          "parents": [
+            0
+          ],
+          "signature": {
+            "key": 0,
+            "valid": true
+          }
+        },
+        {
+          "cites": 1,
+          "id": 2,
+          "installs": null,
+          "parents": [
+            1
+          ],
+          "signature": {
+            "key": 1,
+            "valid": true
+          }
+        },
+        {
+          "cites": 0,
+          "id": 3,
+          "installs": null,
+          "parents": [
+            1
+          ],
+          "signature": {
+            "key": 1,
+            "valid": true
+          }
+        }
+      ],
+      "releases": []
+    },
+    "verify": null
+  }
+}

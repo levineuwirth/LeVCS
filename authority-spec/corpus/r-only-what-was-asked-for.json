@@ -1,0 +1,166 @@
+{
+  "expect": {
+    "admit": [],
+    "receive": [
+      {
+        "recorded": [
+          {
+            "commit": 0
+          },
+          {
+            "commit": 2
+          }
+        ]
+      },
+      {
+        "recorded": [
+          {
+            "commit": 0
+          },
+          {
+            "commit": 1
+          },
+          {
+            "commit": 2
+          },
+          {
+            "commit": 3
+          }
+        ]
+      }
+    ],
+    "verify": null
+  },
+  "name": "r-only-what-was-asked-for",
+  "note": "A transfer is of the roots asked for, not of everything the source has. c0 and c1 are two unrelated roots, each with a commit on it. Asking for the branch at c2 records c0 and c2 and nothing of the other; asking for both records all four.",
+  "ratified": {
+    "admit": [],
+    "receive": [
+      {
+        "recorded": [
+          {
+            "commit": 0
+          },
+          {
+            "commit": 2
+          }
+        ]
+      },
+      {
+        "recorded": [
+          {
+            "commit": 0
+          },
+          {
+            "commit": 1
+          },
+          {
+            "commit": 2
+          },
+          {
+            "commit": 3
+          }
+        ]
+      }
+    ],
+    "verify": null
+  },
+  "request": {
+    "admit": [],
+    "pin": 0,
+    "receive": [
+      {
+        "current": 0,
+        "expected": 0,
+        "roots": [
+          {
+            "commit": 2
+          }
+        ]
+      },
+      {
+        "current": 0,
+        "expected": 0,
+        "roots": [
+          {
+            "commit": 2
+          },
+          {
+            "commit": 3
+          }
+        ]
+      }
+    ],
+    "store": {
+      "authorities": [
+        {
+          "id": 0,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            }
+          ],
+          "prev": null,
+          "protected": [],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 1
+        }
+      ],
+      "commits": [
+        {
+          "cites": 0,
+          "id": 0,
+          "installs": null,
+          "parents": [],
+          "signature": {
+            "key": 0,
+            "valid": true
+          }
+        },
+        {
+          "cites": 0,
+          "id": 1,
+          "installs": null,
+          "parents": [],
+          "signature": {
+            "key": 0,
+            "valid": true
+          }
+        },
+        {
+          "cites": 0,
+          "id": 2,
+          "installs": null,
+          "parents": [
+            0
+          ],
+          "signature": {
+            "key": 0,
+            "valid": true
+          }
+        },
+        {
+          "cites": 0,
+          "id": 3,
+          "installs": null,
+          "parents": [
+            1
+          ],
+          "signature": {
+            "key": 0,
+            "valid": true
+          }
+        }
+      ],
+      "releases": []
+    },
+    "verify": null
+  }
+}

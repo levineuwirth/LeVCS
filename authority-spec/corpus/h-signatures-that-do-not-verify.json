@@ -1,0 +1,152 @@
+{
+  "expect": {
+    "admit": [],
+    "receive": [],
+    "verify": {
+      "conflicting": [],
+      "current_rejected": false,
+      "invalid": [
+        {
+          "commit": 1
+        },
+        {
+          "release": 0
+        }
+      ],
+      "reached": [
+        {
+          "commit": 0
+        },
+        {
+          "commit": 1
+        },
+        {
+          "release": 0
+        },
+        {
+          "release": 1
+        }
+      ]
+    }
+  },
+  "name": "h-signatures-that-do-not-verify",
+  "note": "H.1, and the same for a release. c1 and r0 are signed by an Owner's key, with a signature that does not verify.",
+  "ratified": {
+    "admit": [],
+    "receive": [],
+    "verify": {
+      "conflicting": [],
+      "current_rejected": false,
+      "invalid": [
+        {
+          "commit": 1
+        },
+        {
+          "release": 0
+        }
+      ],
+      "reached": [
+        {
+          "commit": 0
+        },
+        {
+          "commit": 1
+        },
+        {
+          "release": 0
+        },
+        {
+          "release": 1
+        }
+      ]
+    }
+  },
+  "request": {
+    "admit": [],
+    "pin": 0,
+    "receive": [],
+    "store": {
+      "authorities": [
+        {
+          "id": 0,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            }
+          ],
+          "prev": null,
+          "protected": [],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 1
+        }
+      ],
+      "commits": [
+        {
+          "cites": 0,
+          "id": 0,
+          "installs": null,
+          "parents": [],
+          "signature": {
+            "key": 0,
+            "valid": true
+          }
+        },
+        {
+          "cites": 0,
+          "id": 1,
+          "installs": null,
+          "parents": [
+            0
+          ],
+          "signature": {
+            "key": 0,
+            "valid": false
+          }
+        }
+      ],
+      "releases": [
+        {
+          "cites": 0,
+          "id": 0,
+          "parent": null,
+          "predecessor": 0,
+          "signature": {
+            "key": 0,
+            "valid": false
+          }
+        },
+        {
+          "cites": 0,
+          "id": 1,
+          "parent": null,
+          "predecessor": 0,
+          "signature": {
+            "key": 0,
+            "valid": true
+          }
+        }
+      ]
+    },
+    "verify": {
+      "current": 0,
+      "roots": [
+        {
+          "commit": 1
+        },
+        {
+          "release": 0
+        },
+        {
+          "release": 1
+        }
+      ]
+    }
+  }
+}

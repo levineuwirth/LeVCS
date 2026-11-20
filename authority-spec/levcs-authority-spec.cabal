@@ -1,0 +1,115 @@
+cabal-version:      3.0
+name:               levcs-authority-spec
+version:            0.1.0.0
+synopsis:           Executable specification of LeVCS authority semantics
+description:
+  Rules H, R and P of doc/authority-semantics.md as pure functions over an
+  abstract object model, with property tests of the rules themselves and a
+  differential run against the Rust implementation in levcs-identity.
+license:            NONE
+build-type:         Simple
+extra-doc-files:    README.md
+                    DIVERGENCES.md
+-- The property suite reads these, so a source archive must carry them.
+extra-source-files: corpus/*.json
+
+common shared
+  default-language: GHC2021
+  ghc-options:      -Wall -Wcompat -Wincomplete-uni-patterns
+                    -Wincomplete-record-updates -Wredundant-constraints
+
+-- The specification proper. It depends on nothing but base and containers,
+-- and on nothing in the harness.
+library
+  import:           shared
+  hs-source-dirs:   src
+  exposed-modules:  LeVCS.Authority.Model
+                    LeVCS.Authority.Reading
+                    LeVCS.Authority.RuleH
+                    LeVCS.Authority.RuleR
+                    LeVCS.Authority.RuleP
+  build-depends:    base >=4.18 && <5
+                  , containers >=0.6 && <0.9
+
+-- Generators, the scenario scripts they emit, and the wire format the Rust
+-- oracle reads.
+library harness
+  import:           shared
+  visibility:       private
+  hs-source-dirs:   harness
+  exposed-modules:  LeVCS.Harness.Script
+                    LeVCS.Harness.Gen
+                    LeVCS.Harness.Wire
+                    LeVCS.Harness.Cases
+  build-depends:    base
+                  , containers
+                  , levcs-authority-spec
+                  , hedgehog >=1.4 && <1.8
+                  , aeson >=2.1 && <2.3
+                  , bytestring
+                  , scientific
+                  , text
+
+-- Writes the named cases to corpus/, where the Rust test suite replays them.
+executable write-corpus
+  import:           shared
+  hs-source-dirs:   app
+  main-is:          WriteCorpus.hs
+  build-depends:    base
+                  , aeson
+                  , aeson-pretty >=0.8 && <0.9
+                  , bytestring
+                  , directory
+                  , filepath
+                  , levcs-authority-spec
+                  , levcs-authority-spec:harness
+
+-- The model answering as an oracle, under the reading LEVCS_SPEC_READING
+-- names. A conforming implementation of every reading, to check the harness
+-- against and to compare another implementation with.
+executable model-oracle
+  import:           shared
+  hs-source-dirs:   app
+  main-is:          ModelOracle.hs
+  build-depends:    base
+                  , aeson
+                  , bytestring
+                  , levcs-authority-spec
+                  , levcs-authority-spec:harness
+
+-- The rules checked against themselves, and the corpus against the rules.
+-- No Rust involved.
+test-suite properties
+  import:           shared
+  type:             exitcode-stdio-1.0
+  hs-source-dirs:   test
+  main-is:          Properties.hs
+  build-depends:    base
+                  , aeson
+                  , bytestring
+                  , containers
+                  , directory
+                  , filepath
+                  , hedgehog
+                  , text
+                  , levcs-authority-spec
+                  , levcs-authority-spec:harness
+
+-- The rules checked against levcs-identity, through the spec_oracle example.
+test-suite differential
+  import:           shared
+  type:             exitcode-stdio-1.0
+  hs-source-dirs:   test
+  main-is:          Differential.hs
+  other-modules:    Oracle
+  build-depends:    base
+                  , containers
+                  , hedgehog
+                  , aeson
+                  , bytestring
+                  , directory
+                  , filepath
+                  , process
+                  , text
+                  , levcs-authority-spec
+                  , levcs-authority-spec:harness

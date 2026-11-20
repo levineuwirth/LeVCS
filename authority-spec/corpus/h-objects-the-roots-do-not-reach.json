@@ -1,0 +1,126 @@
+{
+  "expect": {
+    "admit": [],
+    "receive": [],
+    "verify": {
+      "conflicting": [],
+      "current_rejected": false,
+      "invalid": [],
+      "reached": [
+        {
+          "commit": 0
+        },
+        {
+          "commit": 1
+        }
+      ]
+    }
+  },
+  "name": "h-objects-the-roots-do-not-reach",
+  "note": "A verdict is given to what the roots reach and to nothing else. c2 carries a signature that does not verify, and r0 is declared by a Contributor. Neither is behind the root c1, so neither is reported, as invalid or at all.",
+  "ratified": {
+    "admit": [],
+    "receive": [],
+    "verify": {
+      "conflicting": [],
+      "current_rejected": false,
+      "invalid": [],
+      "reached": [
+        {
+          "commit": 0
+        },
+        {
+          "commit": 1
+        }
+      ]
+    }
+  },
+  "request": {
+    "admit": [],
+    "pin": 0,
+    "receive": [],
+    "store": {
+      "authorities": [
+        {
+          "id": 0,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            },
+            {
+              "key": 1,
+              "role": "contributor"
+            }
+          ],
+          "prev": null,
+          "protected": [],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 1
+        }
+      ],
+      "commits": [
+        {
+          "cites": 0,
+          "id": 0,
+          "installs": null,
+          "parents": [],
+          "signature": {
+            "key": 0,
+            "valid": true
+          }
+        },
+        {
+          "cites": 0,
+          "id": 1,
+          "installs": null,
+          "parents": [
+            0
+          ],
+          "signature": {
+            "key": 0,
+            "valid": true
+          }
+        },
+        {
+          "cites": 0,
+          "id": 2,
+          "installs": null,
+          "parents": [
+            0
+          ],
+          "signature": {
+            "key": 0,
+            "valid": false
+          }
+        }
+      ],
+      "releases": [
+        {
+          "cites": 0,
+          "id": 0,
+          "parent": null,
+          "predecessor": 0,
+          "signature": {
+            "key": 1,
+            "valid": true
+          }
+        }
+      ]
+    },
+    "verify": {
+      "current": 0,
+      "roots": [
+        {
+          "commit": 1
+        }
+      ]
+    }
+  }
+}

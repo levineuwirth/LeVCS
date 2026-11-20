@@ -1,0 +1,191 @@
+{
+  "expect": {
+    "admit": [],
+    "receive": [],
+    "verify": {
+      "conflicting": [],
+      "current_rejected": false,
+      "invalid": [],
+      "reached": [
+        {
+          "commit": 1
+        },
+        {
+          "commit": 2
+        },
+        {
+          "commit": 7
+        },
+        {
+          "release": 4
+        },
+        {
+          "release": 9
+        }
+      ]
+    }
+  },
+  "name": "h-objects-numbered-out-of-order",
+  "note": "An object's number is a name and says nothing of order. Here everything refers to something with a higher number than its own: authority 3 succeeds authority 5, commit 1 is on commit 2, which is on the root commit 7, and release 4 follows release 9. It is honest history, two changes of authority and two releases, and all of it is valid.",
+  "ratified": {
+    "admit": [],
+    "receive": [],
+    "verify": {
+      "conflicting": [],
+      "current_rejected": false,
+      "invalid": [],
+      "reached": [
+        {
+          "commit": 1
+        },
+        {
+          "commit": 2
+        },
+        {
+          "commit": 7
+        },
+        {
+          "release": 4
+        },
+        {
+          "release": 9
+        }
+      ]
+    }
+  },
+  "request": {
+    "admit": [],
+    "pin": 0,
+    "receive": [],
+    "store": {
+      "authorities": [
+        {
+          "id": 0,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            }
+          ],
+          "prev": null,
+          "protected": [],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 1
+        },
+        {
+          "id": 3,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            }
+          ],
+          "prev": 5,
+          "protected": [],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 3
+        },
+        {
+          "id": 5,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            }
+          ],
+          "prev": 0,
+          "protected": [],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 2
+        }
+      ],
+      "commits": [
+        {
+          "cites": 5,
+          "id": 1,
+          "installs": 3,
+          "parents": [
+            2
+          ],
+          "signature": {
+            "key": 0,
+            "valid": true
+          }
+        },
+        {
+          "cites": 0,
+          "id": 2,
+          "installs": 5,
+          "parents": [
+            7
+          ],
+          "signature": {
+            "key": 0,
+            "valid": true
+          }
+        },
+        {
+          "cites": 0,
+          "id": 7,
+          "installs": null,
+          "parents": [],
+          "signature": {
+            "key": 0,
+            "valid": true
+          }
+        }
+      ],
+      "releases": [
+        {
+          "cites": 3,
+          "id": 4,
+          "parent": 9,
+          "predecessor": 1,
+          "signature": {
+            "key": 0,
+            "valid": true
+          }
+        },
+        {
+          "cites": 0,
+          "id": 9,
+          "parent": null,
+          "predecessor": 7,
+          "signature": {
+            "key": 0,
+            "valid": true
+          }
+        }
+      ]
+    },
+    "verify": {
+      "current": 3,
+      "roots": [
+        {
+          "commit": 1
+        },
+        {
+          "release": 4
+        }
+      ]
+    }
+  }
+}

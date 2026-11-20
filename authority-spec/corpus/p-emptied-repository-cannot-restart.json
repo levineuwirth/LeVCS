@@ -1,0 +1,164 @@
+{
+  "expect": {
+    "admit": [
+      {
+        "refused": "invalid"
+      },
+      {
+        "refused": "invalid"
+      }
+    ],
+    "receive": [],
+    "verify": null
+  },
+  "name": "p-emptied-repository-cannot-restart",
+  "note": "H.4 with P.2. current is authority 1 and every ref has been deleted, so nothing is published any more. The history that was published before (c1, on the root c0) is now newly exposed and cites the genesis, not the current authority. A fresh root citing the current authority (c2) breaks H.4. Nothing can be published again.",
+  "ratified": {
+    "admit": [
+      {
+        "refused": "invalid"
+      },
+      {
+        "refused": "invalid"
+      }
+    ],
+    "receive": [],
+    "verify": null
+  },
+  "request": {
+    "admit": [
+      {
+        "state": {
+          "current": 1,
+          "refs": []
+        },
+        "tx": {
+          "authority": null,
+          "signer": 0,
+          "updates": [
+            {
+              "expected": null,
+              "force": false,
+              "new": {
+                "commit": 1
+              },
+              "ref": "refs/branches/b0"
+            }
+          ]
+        }
+      },
+      {
+        "state": {
+          "current": 1,
+          "refs": []
+        },
+        "tx": {
+          "authority": null,
+          "signer": 0,
+          "updates": [
+            {
+              "expected": null,
+              "force": false,
+              "new": {
+                "commit": 2
+              },
+              "ref": "refs/branches/b0"
+            }
+          ]
+        }
+      }
+    ],
+    "pin": 0,
+    "receive": [],
+    "store": {
+      "authorities": [
+        {
+          "id": 0,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            },
+            {
+              "key": 1,
+              "role": "contributor"
+            }
+          ],
+          "prev": null,
+          "protected": [],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 1
+        },
+        {
+          "id": 1,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            },
+            {
+              "key": 1,
+              "role": "contributor"
+            },
+            {
+              "key": 2,
+              "role": "contributor"
+            }
+          ],
+          "prev": 0,
+          "protected": [],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 2
+        }
+      ],
+      "commits": [
+        {
+          "cites": 0,
+          "id": 0,
+          "installs": null,
+          "parents": [],
+          "signature": {
+            "key": 0,
+            "valid": true
+          }
+        },
+        {
+          "cites": 0,
+          "id": 1,
+          "installs": 1,
+          "parents": [
+            0
+          ],
+          "signature": {
+            "key": 0,
+            "valid": true
+          }
+        },
+        {
+          "cites": 1,
+          "id": 2,
+          "installs": null,
+          "parents": [],
+          "signature": {
+            "key": 0,
+            "valid": true
+          }
+        }
+      ],
+      "releases": []
+    },
+    "verify": null
+  }
+}

@@ -1,0 +1,149 @@
+{
+  "expect": {
+    "admit": [],
+    "receive": [
+      {
+        "refused": true
+      },
+      {
+        "recorded": [
+          {
+            "commit": 1
+          }
+        ]
+      },
+      {
+        "recorded": [
+          {
+            "commit": 0
+          }
+        ]
+      }
+    ],
+    "verify": null
+  },
+  "name": "r-expecting-another-repository",
+  "note": "R.1: a chain that ends at a different genesis is a different repository. Authority 1 is another repository's genesis, and c1 is valid history of it. A receiver expecting this repository refuses it; a receiver expecting that one records it. The genesis is what the receiver expects, whatever the source holds.",
+  "ratified": {
+    "admit": [],
+    "receive": [
+      {
+        "refused": true
+      },
+      {
+        "recorded": [
+          {
+            "commit": 1
+          }
+        ]
+      },
+      {
+        "recorded": [
+          {
+            "commit": 0
+          }
+        ]
+      }
+    ],
+    "verify": null
+  },
+  "request": {
+    "admit": [],
+    "pin": 0,
+    "receive": [
+      {
+        "current": 1,
+        "expected": 0,
+        "roots": [
+          {
+            "commit": 1
+          }
+        ]
+      },
+      {
+        "current": 1,
+        "expected": 1,
+        "roots": [
+          {
+            "commit": 1
+          }
+        ]
+      },
+      {
+        "current": 0,
+        "expected": 0,
+        "roots": [
+          {
+            "commit": 0
+          }
+        ]
+      }
+    ],
+    "store": {
+      "authorities": [
+        {
+          "id": 0,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            }
+          ],
+          "prev": null,
+          "protected": [],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 1
+        },
+        {
+          "id": 1,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            }
+          ],
+          "prev": null,
+          "protected": [],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 1
+        }
+      ],
+      "commits": [
+        {
+          "cites": 0,
+          "id": 0,
+          "installs": null,
+          "parents": [],
+          "signature": {
+            "key": 0,
+            "valid": true
+          }
+        },
+        {
+          "cites": 1,
+          "id": 1,
+          "installs": null,
+          "parents": [],
+          "signature": {
+            "key": 0,
+            "valid": true
+          }
+        }
+      ],
+      "releases": []
+    },
+    "verify": null
+  }
+}

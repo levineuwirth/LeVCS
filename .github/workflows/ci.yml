@@ -102,6 +102,47 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: bash scripts/check-phase1.sh
 
+  # Gate: the executable specification of the authority rules
+  # (authority-spec/README.md). Its properties hold, and levcs-identity gives
+  # every generated scenario the verdicts the specification gives it. The
+  # corpus replay needs no Haskell and runs with the workspace tests above.
+  authority-spec:
+    name: authority spec
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: haskell-actions/setup@v2
+        id: haskell
+        with:
+          ghc-version: "9.10.3"
+          cabal-version: "3.16"
+
+      - name: Cache cabal store
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.haskell.outputs.cabal-store }}
+          key: cabal-${{ runner.os }}-ghc-9.10.3-${{ hashFiles('authority-spec/cabal.project.freeze') }}
+
+      # Built first, so that a Rust build failure is reported as one.
+      - name: Build the oracle
+        run: cargo build --release --locked -p levcs-identity --example spec_oracle
+
+      - name: The rules against themselves
+        working-directory: authority-spec
+        run: cabal test properties --test-show-details=direct
+
+      - name: The rules against levcs-identity
+        working-directory: authority-spec
+        run: cabal test differential --test-show-details=direct
+        env:
+          LEVCS_SPEC_TESTS: "20000"
+
   # Gate: the codebase is fmt-clean; keep it that way.
   fmt:
     name: fmt

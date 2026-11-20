@@ -1,0 +1,87 @@
+{
+  "expect": {
+    "admit": [],
+    "receive": [],
+    "verify": {
+      "conflicting": [],
+      "current_rejected": false,
+      "invalid": [],
+      "reached": [
+        {
+          "commit": 0
+        }
+      ]
+    }
+  },
+  "name": "h-contributor-commit-under-a-protected-branch",
+  "note": "H.1 has no protected-ref requirement: a commit does not record the ref it was made for. A Contributor's commit is valid whatever the branch policy.",
+  "ratified": {
+    "admit": [],
+    "receive": [],
+    "verify": {
+      "conflicting": [],
+      "current_rejected": false,
+      "invalid": [],
+      "reached": [
+        {
+          "commit": 0
+        }
+      ]
+    }
+  },
+  "request": {
+    "admit": [],
+    "pin": 0,
+    "receive": [],
+    "store": {
+      "authorities": [
+        {
+          "id": 0,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            },
+            {
+              "key": 1,
+              "role": "contributor"
+            }
+          ],
+          "prev": null,
+          "protected": [
+            "b0"
+          ],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 1
+        }
+      ],
+      "commits": [
+        {
+          "cites": 0,
+          "id": 0,
+          "installs": null,
+          "parents": [],
+          "signature": {
+            "key": 1,
+            "valid": true
+          }
+        }
+      ],
+      "releases": []
+    },
+    "verify": {
+      "current": 0,
+      "roots": [
+        {
+          "commit": 0
+        }
+      ]
+    }
+  }
+}

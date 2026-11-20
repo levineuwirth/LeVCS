@@ -1,0 +1,6 @@
+packages: .
+
+-- Pinned so that a run next year resolves the same dependencies.
+index-state: 2026-11-19T21:31:42Z
+
+tests: True

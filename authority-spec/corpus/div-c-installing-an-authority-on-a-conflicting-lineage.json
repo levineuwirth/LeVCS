@@ -1,0 +1,127 @@
+{
+  "expect": {
+    "admit": [],
+    "receive": [],
+    "verify": {
+      "conflicting": [
+        {
+          "commit": 0
+        }
+      ],
+      "current_rejected": false,
+      "invalid": [],
+      "reached": [
+        {
+          "commit": 0
+        }
+      ]
+    }
+  },
+  "name": "div-c-installing-an-authority-on-a-conflicting-lineage",
+  "note": "Divergence (c). This replica's current authority is 1. c0 cites the genesis, which is on the replica's lineage, and installs authority 2, which is not. The text classifies a commit by the authority it cites. The Rust classifies what it installs as well.",
+  "ratified": {
+    "admit": [],
+    "receive": [],
+    "verify": {
+      "conflicting": [],
+      "current_rejected": false,
+      "invalid": [],
+      "reached": [
+        {
+          "commit": 0
+        }
+      ]
+    }
+  },
+  "request": {
+    "admit": [],
+    "pin": 0,
+    "receive": [],
+    "store": {
+      "authorities": [
+        {
+          "id": 0,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            }
+          ],
+          "prev": null,
+          "protected": [],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 1
+        },
+        {
+          "id": 1,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            }
+          ],
+          "prev": 0,
+          "protected": [],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 2
+        },
+        {
+          "id": 2,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            },
+            {
+              "key": 1,
+              "role": "contributor"
+            }
+          ],
+          "prev": 0,
+          "protected": [],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 2
+        }
+      ],
+      "commits": [
+        {
+          "cites": 0,
+          "id": 0,
+          "installs": 2,
+          "parents": [],
+          "signature": {
+            "key": 0,
+            "valid": true
+          }
+        }
+      ],
+      "releases": []
+    },
+    "verify": {
+      "current": 1,
+      "roots": [
+        {
+          "commit": 0
+        }
+      ]
+    }
+  }
+}

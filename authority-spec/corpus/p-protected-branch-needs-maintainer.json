@@ -1,0 +1,163 @@
+{
+  "expect": {
+    "admit": [
+      {
+        "refused": "unauthorized"
+      },
+      {
+        "admitted": {
+          "commits": 1,
+          "new_current": null,
+          "releases": 0
+        }
+      },
+      {
+        "admitted": {
+          "commits": 1,
+          "new_current": null,
+          "releases": 0
+        }
+      }
+    ],
+    "receive": [],
+    "verify": null
+  },
+  "name": "p-protected-branch-needs-maintainer",
+  "note": "P.4. b0 is protected. A Contributor's update of it is refused, a Maintainer's is admitted, and the Contributor may still publish the same commit to an unprotected branch.",
+  "ratified": {
+    "admit": [
+      {
+        "refused": "unauthorized"
+      },
+      {
+        "admitted": {
+          "commits": 1,
+          "new_current": null,
+          "releases": 0
+        }
+      },
+      {
+        "admitted": {
+          "commits": 1,
+          "new_current": null,
+          "releases": 0
+        }
+      }
+    ],
+    "receive": [],
+    "verify": null
+  },
+  "request": {
+    "admit": [
+      {
+        "state": {
+          "current": 0,
+          "refs": []
+        },
+        "tx": {
+          "authority": null,
+          "signer": 1,
+          "updates": [
+            {
+              "expected": null,
+              "force": false,
+              "new": {
+                "commit": 0
+              },
+              "ref": "refs/branches/b0"
+            }
+          ]
+        }
+      },
+      {
+        "state": {
+          "current": 0,
+          "refs": []
+        },
+        "tx": {
+          "authority": null,
+          "signer": 2,
+          "updates": [
+            {
+              "expected": null,
+              "force": false,
+              "new": {
+                "commit": 0
+              },
+              "ref": "refs/branches/b0"
+            }
+          ]
+        }
+      },
+      {
+        "state": {
+          "current": 0,
+          "refs": []
+        },
+        "tx": {
+          "authority": null,
+          "signer": 1,
+          "updates": [
+            {
+              "expected": null,
+              "force": false,
+              "new": {
+                "commit": 0
+              },
+              "ref": "refs/branches/b1"
+            }
+          ]
+        }
+      }
+    ],
+    "pin": 0,
+    "receive": [],
+    "store": {
+      "authorities": [
+        {
+          "id": 0,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            },
+            {
+              "key": 1,
+              "role": "contributor"
+            },
+            {
+              "key": 2,
+              "role": "maintainer"
+            }
+          ],
+          "prev": null,
+          "protected": [
+            "b0"
+          ],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 1
+        }
+      ],
+      "commits": [
+        {
+          "cites": 0,
+          "id": 0,
+          "installs": null,
+          "parents": [],
+          "signature": {
+            "key": 1,
+            "valid": true
+          }
+        }
+      ],
+      "releases": []
+    },
+    "verify": null
+  }
+}

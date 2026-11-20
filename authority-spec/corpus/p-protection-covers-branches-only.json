@@ -1,0 +1,154 @@
+{
+  "expect": {
+    "admit": [
+      {
+        "refused": "unauthorized"
+      },
+      {
+        "admitted": {
+          "commits": 0,
+          "new_current": null,
+          "releases": 1
+        }
+      }
+    ],
+    "receive": [],
+    "verify": null
+  },
+  "name": "p-protection-covers-branches-only",
+  "note": "P.4. The policy is protected_branches. The glob * protects every branch, so a Contributor cannot create b1. It protects no release ref: the same Contributor publishes a release that a Maintainer declared.",
+  "ratified": {
+    "admit": [
+      {
+        "refused": "unauthorized"
+      },
+      {
+        "admitted": {
+          "commits": 0,
+          "new_current": null,
+          "releases": 1
+        }
+      }
+    ],
+    "receive": [],
+    "verify": null
+  },
+  "request": {
+    "admit": [
+      {
+        "state": {
+          "current": 0,
+          "refs": [
+            {
+              "ref": "refs/branches/b0",
+              "target": {
+                "commit": 0
+              }
+            }
+          ]
+        },
+        "tx": {
+          "authority": null,
+          "signer": 1,
+          "updates": [
+            {
+              "expected": null,
+              "force": false,
+              "new": {
+                "commit": 0
+              },
+              "ref": "refs/branches/b1"
+            }
+          ]
+        }
+      },
+      {
+        "state": {
+          "current": 0,
+          "refs": [
+            {
+              "ref": "refs/branches/b0",
+              "target": {
+                "commit": 0
+              }
+            }
+          ]
+        },
+        "tx": {
+          "authority": null,
+          "signer": 1,
+          "updates": [
+            {
+              "expected": null,
+              "force": false,
+              "new": {
+                "release": 0
+              },
+              "ref": "refs/releases/r0"
+            }
+          ]
+        }
+      }
+    ],
+    "pin": 0,
+    "receive": [],
+    "store": {
+      "authorities": [
+        {
+          "id": 0,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            },
+            {
+              "key": 1,
+              "role": "contributor"
+            },
+            {
+              "key": 2,
+              "role": "maintainer"
+            }
+          ],
+          "prev": null,
+          "protected": [
+            "*"
+          ],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 1
+        }
+      ],
+      "commits": [
+        {
+          "cites": 0,
+          "id": 0,
+          "installs": null,
+          "parents": [],
+          "signature": {
+            "key": 0,
+            "valid": true
+          }
+        }
+      ],
+      "releases": [
+        {
+          "cites": 0,
+          "id": 0,
+          "parent": null,
+          "predecessor": 0,
+          "signature": {
+            "key": 2,
+            "valid": true
+          }
+        }
+      ]
+    },
+    "verify": null
+  }
+}

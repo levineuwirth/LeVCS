@@ -1,0 +1,116 @@
+{
+  "expect": {
+    "admit": [
+      {
+        "refused": "invalid"
+      }
+    ],
+    "receive": [],
+    "verify": null
+  },
+  "name": "div-a-publishing-a-successor-its-author-did-not-sign",
+  "note": "Divergence (a), for publication. The boundary commit of div-a-successor-not-signed-by-the-boundary-author, published with the move of current it calls for. Read literally it is a valid boundary by an Owner and is admitted. The Rust finds the commit invalid and refuses the transaction.",
+  "ratified": {
+    "admit": [
+      {
+        "admitted": {
+          "commits": 1,
+          "new_current": 1,
+          "releases": 0
+        }
+      }
+    ],
+    "receive": [],
+    "verify": null
+  },
+  "request": {
+    "admit": [
+      {
+        "state": {
+          "current": 0,
+          "refs": []
+        },
+        "tx": {
+          "authority": 1,
+          "signer": 1,
+          "updates": [
+            {
+              "expected": null,
+              "force": false,
+              "new": {
+                "commit": 0
+              },
+              "ref": "refs/branches/b0"
+            }
+          ]
+        }
+      }
+    ],
+    "pin": 0,
+    "receive": [],
+    "store": {
+      "authorities": [
+        {
+          "id": 0,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            },
+            {
+              "key": 1,
+              "role": "owner"
+            }
+          ],
+          "prev": null,
+          "protected": [],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 1
+        },
+        {
+          "id": 1,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            },
+            {
+              "key": 1,
+              "role": "owner"
+            }
+          ],
+          "prev": 0,
+          "protected": [],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 2
+        }
+      ],
+      "commits": [
+        {
+          "cites": 0,
+          "id": 0,
+          "installs": 1,
+          "parents": [],
+          "signature": {
+            "key": 1,
+            "valid": true
+          }
+        }
+      ],
+      "releases": []
+    },
+    "verify": null
+  }
+}

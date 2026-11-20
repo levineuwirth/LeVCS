@@ -1,0 +1,85 @@
+{
+  "expect": {
+    "admit": [
+      {
+        "refused": "unauthorized"
+      }
+    ],
+    "receive": [],
+    "verify": null
+  },
+  "name": "p-no-current-authority",
+  "note": "D6. A replica with no current authority can publish nothing, even for an Owner of the genesis.",
+  "ratified": {
+    "admit": [
+      {
+        "refused": "unauthorized"
+      }
+    ],
+    "receive": [],
+    "verify": null
+  },
+  "request": {
+    "admit": [
+      {
+        "state": {
+          "current": null,
+          "refs": []
+        },
+        "tx": {
+          "authority": null,
+          "signer": 0,
+          "updates": [
+            {
+              "expected": null,
+              "force": false,
+              "new": {
+                "commit": 0
+              },
+              "ref": "refs/branches/b0"
+            }
+          ]
+        }
+      }
+    ],
+    "pin": 0,
+    "receive": [],
+    "store": {
+      "authorities": [
+        {
+          "id": 0,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            }
+          ],
+          "prev": null,
+          "protected": [],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 1
+        }
+      ],
+      "commits": [
+        {
+          "cites": 0,
+          "id": 0,
+          "installs": null,
+          "parents": [],
+          "signature": {
+            "key": 0,
+            "valid": true
+          }
+        }
+      ],
+      "releases": []
+    },
+    "verify": null
+  }
+}

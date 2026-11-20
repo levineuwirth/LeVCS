@@ -1,0 +1,131 @@
+{
+  "expect": {
+    "admit": [],
+    "receive": [],
+    "verify": {
+      "conflicting": [],
+      "current_rejected": true,
+      "invalid": [],
+      "reached": [
+        {
+          "commit": 0
+        }
+      ]
+    }
+  },
+  "name": "div-g-verify-with-another-repository-as-current",
+  "note": "Divergence (g), for verify. The replica's current authority is 1, the genesis of another repository. c0 is valid and cites genesis 0. Read literally the canonical lineage is the one ending at current, whatever current is, so c0 is on a conflicting lineage. The Rust reports the current authority as not descending from the genesis and classifies nothing against it.",
+  "ratified": {
+    "admit": [],
+    "receive": [],
+    "verify": {
+      "conflicting": [
+        {
+          "commit": 0
+        }
+      ],
+      "current_rejected": false,
+      "invalid": [],
+      "reached": [
+        {
+          "commit": 0
+        }
+      ]
+    }
+  },
+  "request": {
+    "admit": [],
+    "pin": 0,
+    "receive": [],
+    "store": {
+      "authorities": [
+        {
+          "id": 0,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            },
+            {
+              "key": 1,
+              "role": "contributor"
+            }
+          ],
+          "prev": null,
+          "protected": [],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 1
+        },
+        {
+          "id": 1,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            }
+          ],
+          "prev": null,
+          "protected": [],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 1
+        },
+        {
+          "id": 2,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            },
+            {
+              "key": 1,
+              "role": "owner"
+            }
+          ],
+          "prev": 0,
+          "protected": [],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 1,
+              "valid": true
+            }
+          ],
+          "version": 2
+        }
+      ],
+      "commits": [
+        {
+          "cites": 0,
+          "id": 0,
+          "installs": null,
+          "parents": [],
+          "signature": {
+            "key": 0,
+            "valid": true
+          }
+        }
+      ],
+      "releases": []
+    },
+    "verify": {
+      "current": 1,
+      "roots": [
+        {
+          "commit": 0
+        }
+      ]
+    }
+  }
+}

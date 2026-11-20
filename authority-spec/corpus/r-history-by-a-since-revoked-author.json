@@ -1,0 +1,144 @@
+{
+  "expect": {
+    "admit": [],
+    "receive": [
+      {
+        "recorded": [
+          {
+            "commit": 0
+          },
+          {
+            "commit": 1
+          },
+          {
+            "commit": 2
+          }
+        ]
+      }
+    ],
+    "verify": null
+  },
+  "name": "r-history-by-a-since-revoked-author",
+  "note": "R.3, and the document's test. The source's current authority, 1, has removed k1. k1's commit c2, made beside the revoking commit c1, is received all the same.",
+  "ratified": {
+    "admit": [],
+    "receive": [
+      {
+        "recorded": [
+          {
+            "commit": 0
+          },
+          {
+            "commit": 1
+          },
+          {
+            "commit": 2
+          }
+        ]
+      }
+    ],
+    "verify": null
+  },
+  "request": {
+    "admit": [],
+    "pin": 0,
+    "receive": [
+      {
+        "current": 1,
+        "expected": 0,
+        "roots": [
+          {
+            "commit": 1
+          },
+          {
+            "commit": 2
+          }
+        ]
+      }
+    ],
+    "store": {
+      "authorities": [
+        {
+          "id": 0,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            },
+            {
+              "key": 1,
+              "role": "contributor"
+            }
+          ],
+          "prev": null,
+          "protected": [],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 1
+        },
+        {
+          "id": 1,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            }
+          ],
+          "prev": 0,
+          "protected": [],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 2
+        }
+      ],
+      "commits": [
+        {
+          "cites": 0,
+          "id": 0,
+          "installs": null,
+          "parents": [],
+          "signature": {
+            "key": 1,
+            "valid": true
+          }
+        },
+        {
+          "cites": 0,
+          "id": 1,
+          "installs": 1,
+          "parents": [
+            0
+          ],
+          "signature": {
+            "key": 0,
+            "valid": true
+          }
+        },
+        {
+          "cites": 0,
+          "id": 2,
+          "installs": null,
+          "parents": [
+            0
+          ],
+          "signature": {
+            "key": 1,
+            "valid": true
+          }
+        }
+      ],
+      "releases": []
+    },
+    "verify": null
+  }
+}

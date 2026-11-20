@@ -1,0 +1,253 @@
+{
+  "expect": {
+    "admit": [
+      {
+        "refused": "invalid"
+      },
+      {
+        "refused": "invalid"
+      },
+      {
+        "refused": "invalid"
+      },
+      {
+        "admitted": {
+          "commits": 0,
+          "new_current": null,
+          "releases": 0
+        }
+      }
+    ],
+    "receive": [],
+    "verify": null
+  },
+  "name": "div-g-publishing-over-a-current-that-does-not-stand",
+  "note": "Divergence (g), for publication. c0 is published on b0, and the transaction puts a second branch on it, which newly exposes nothing. Rule P reads the signer's role in the current authority and takes that authority as given: with current at another repository's genesis (1), or at an authority that succeeds nothing (2), the Owner k0 is admitted, and the stranger k3 refused as no member. The Rust checks that current descends from the pinned genesis before it reads any role, and refuses all of it as invalid. With current at the pinned genesis the readings agree.",
+  "ratified": {
+    "admit": [
+      {
+        "admitted": {
+          "commits": 0,
+          "new_current": null,
+          "releases": 0
+        }
+      },
+      {
+        "admitted": {
+          "commits": 0,
+          "new_current": null,
+          "releases": 0
+        }
+      },
+      {
+        "refused": "unauthorized"
+      },
+      {
+        "admitted": {
+          "commits": 0,
+          "new_current": null,
+          "releases": 0
+        }
+      }
+    ],
+    "receive": [],
+    "verify": null
+  },
+  "request": {
+    "admit": [
+      {
+        "state": {
+          "current": 1,
+          "refs": [
+            {
+              "ref": "refs/branches/b0",
+              "target": {
+                "commit": 0
+              }
+            }
+          ]
+        },
+        "tx": {
+          "authority": null,
+          "signer": 0,
+          "updates": [
+            {
+              "expected": null,
+              "force": false,
+              "new": {
+                "commit": 0
+              },
+              "ref": "refs/branches/b1"
+            }
+          ]
+        }
+      },
+      {
+        "state": {
+          "current": 2,
+          "refs": [
+            {
+              "ref": "refs/branches/b0",
+              "target": {
+                "commit": 0
+              }
+            }
+          ]
+        },
+        "tx": {
+          "authority": null,
+          "signer": 0,
+          "updates": [
+            {
+              "expected": null,
+              "force": false,
+              "new": {
+                "commit": 0
+              },
+              "ref": "refs/branches/b1"
+            }
+          ]
+        }
+      },
+      {
+        "state": {
+          "current": 1,
+          "refs": [
+            {
+              "ref": "refs/branches/b0",
+              "target": {
+                "commit": 0
+              }
+            }
+          ]
+        },
+        "tx": {
+          "authority": null,
+          "signer": 3,
+          "updates": [
+            {
+              "expected": null,
+              "force": false,
+              "new": {
+                "commit": 0
+              },
+              "ref": "refs/branches/b1"
+            }
+          ]
+        }
+      },
+      {
+        "state": {
+          "current": 0,
+          "refs": [
+            {
+              "ref": "refs/branches/b0",
+              "target": {
+                "commit": 0
+              }
+            }
+          ]
+        },
+        "tx": {
+          "authority": null,
+          "signer": 0,
+          "updates": [
+            {
+              "expected": null,
+              "force": false,
+              "new": {
+                "commit": 0
+              },
+              "ref": "refs/branches/b1"
+            }
+          ]
+        }
+      }
+    ],
+    "pin": 0,
+    "receive": [],
+    "store": {
+      "authorities": [
+        {
+          "id": 0,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            },
+            {
+              "key": 1,
+              "role": "contributor"
+            }
+          ],
+          "prev": null,
+          "protected": [],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 1
+        },
+        {
+          "id": 1,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            }
+          ],
+          "prev": null,
+          "protected": [],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 1
+        },
+        {
+          "id": 2,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            },
+            {
+              "key": 1,
+              "role": "owner"
+            }
+          ],
+          "prev": 0,
+          "protected": [],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 1,
+              "valid": true
+            }
+          ],
+          "version": 2
+        }
+      ],
+      "commits": [
+        {
+          "cites": 0,
+          "id": 0,
+          "installs": null,
+          "parents": [],
+          "signature": {
+            "key": 0,
+            "valid": true
+          }
+        }
+      ],
+      "releases": []
+    },
+    "verify": null
+  }
+}

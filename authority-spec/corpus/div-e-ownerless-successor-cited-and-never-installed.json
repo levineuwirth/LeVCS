@@ -1,0 +1,122 @@
+{
+  "expect": {
+    "admit": [],
+    "receive": [],
+    "verify": {
+      "conflicting": [],
+      "current_rejected": false,
+      "invalid": [
+        {
+          "commit": 1
+        }
+      ],
+      "reached": [
+        {
+          "commit": 0
+        },
+        {
+          "commit": 1
+        }
+      ]
+    }
+  },
+  "name": "div-e-ownerless-successor-cited-and-never-installed",
+  "note": "Divergence (e). Authority 1 has no Owner. No commit installs it, so H.5 never looks at it; c1 only cites it, and k0 is a Contributor there. Read literally the commit is valid. The Rust rejects an ownerless successor wherever it appears in a chain.",
+  "ratified": {
+    "admit": [],
+    "receive": [],
+    "verify": {
+      "conflicting": [],
+      "current_rejected": false,
+      "invalid": [],
+      "reached": [
+        {
+          "commit": 0
+        },
+        {
+          "commit": 1
+        }
+      ]
+    }
+  },
+  "request": {
+    "admit": [],
+    "pin": 0,
+    "receive": [],
+    "store": {
+      "authorities": [
+        {
+          "id": 0,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            }
+          ],
+          "prev": null,
+          "protected": [],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 1
+        },
+        {
+          "id": 1,
+          "members": [
+            {
+              "key": 0,
+              "role": "contributor"
+            }
+          ],
+          "prev": 0,
+          "protected": [],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 2
+        }
+      ],
+      "commits": [
+        {
+          "cites": 0,
+          "id": 0,
+          "installs": null,
+          "parents": [],
+          "signature": {
+            "key": 0,
+            "valid": true
+          }
+        },
+        {
+          "cites": 1,
+          "id": 1,
+          "installs": null,
+          "parents": [
+            0
+          ],
+          "signature": {
+            "key": 0,
+            "valid": true
+          }
+        }
+      ],
+      "releases": []
+    },
+    "verify": {
+      "current": null,
+      "roots": [
+        {
+          "commit": 1
+        }
+      ]
+    }
+  }
+}

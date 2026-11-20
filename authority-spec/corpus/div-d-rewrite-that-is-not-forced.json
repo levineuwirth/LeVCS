@@ -1,0 +1,130 @@
+{
+  "expect": {
+    "admit": [
+      {
+        "refused": "not_fast_forward"
+      }
+    ],
+    "receive": [],
+    "verify": null
+  },
+  "name": "div-d-rewrite-that-is-not-forced",
+  "note": "Divergence (d). A Maintainer moves b0 from c1 to c2, which does not descend from it, without marking the update as forced. P.4 asks for a Maintainer and says nothing of forcing. The Rust refuses an unforced rewrite from anyone.",
+  "ratified": {
+    "admit": [
+      {
+        "admitted": {
+          "commits": 1,
+          "new_current": null,
+          "releases": 0
+        }
+      }
+    ],
+    "receive": [],
+    "verify": null
+  },
+  "request": {
+    "admit": [
+      {
+        "state": {
+          "current": 0,
+          "refs": [
+            {
+              "ref": "refs/branches/b0",
+              "target": {
+                "commit": 1
+              }
+            }
+          ]
+        },
+        "tx": {
+          "authority": null,
+          "signer": 2,
+          "updates": [
+            {
+              "expected": {
+                "commit": 1
+              },
+              "force": false,
+              "new": {
+                "commit": 2
+              },
+              "ref": "refs/branches/b0"
+            }
+          ]
+        }
+      }
+    ],
+    "pin": 0,
+    "receive": [],
+    "store": {
+      "authorities": [
+        {
+          "id": 0,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            },
+            {
+              "key": 1,
+              "role": "contributor"
+            },
+            {
+              "key": 2,
+              "role": "maintainer"
+            }
+          ],
+          "prev": null,
+          "protected": [],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 1
+        }
+      ],
+      "commits": [
+        {
+          "cites": 0,
+          "id": 0,
+          "installs": null,
+          "parents": [],
+          "signature": {
+            "key": 0,
+            "valid": true
+          }
+        },
+        {
+          "cites": 0,
+          "id": 1,
+          "installs": null,
+          "parents": [
+            0
+          ],
+          "signature": {
+            "key": 0,
+            "valid": true
+          }
+        },
+        {
+          "cites": 0,
+          "id": 2,
+          "installs": null,
+          "parents": [
+            0
+          ],
+          "signature": {
+            "key": 0,
+            "valid": true
+          }
+        }
+      ],
+      "releases": []
+    },
+    "verify": null
+  }
+}

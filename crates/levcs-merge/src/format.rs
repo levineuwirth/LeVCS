@@ -288,6 +288,20 @@ mod tests {
     }
 
     #[test]
+    fn json_decimal_respellings_do_not_conflict_with_value_edits() {
+        let path = Path::new("x.json");
+        let result = JsonHandler.merge(path, b"[1.0, 1.10]", b"[1.00, 1.10]", b"[2, 1.10]");
+        let MergeStatus::Merged { content, .. } = result.status else {
+            panic!("expected the edit to merge: {:?}", result.status);
+        };
+        assert_eq!(std::str::from_utf8(&content).unwrap(), "[\n  2,\n  1.1\n]");
+        assert!(matches!(
+            JsonHandler.merge(path, b"0", b"1e400", b"0").status,
+            MergeStatus::NotApplicable
+        ));
+    }
+
+    #[test]
     fn json_scalar_conflict() {
         let h = JsonHandler;
         let base = br#"{"a":1}"#;

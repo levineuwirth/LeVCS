@@ -157,12 +157,14 @@ impl AuthorityBody {
                     w[0].key
                 )));
             }
-            if w[0].key.len() > 255 {
+        }
+        for entry in &self.policy {
+            if entry.key.len() > usize::from(u8::MAX) {
                 return Err(IdentityError::MalformedAuthority(
                     "policy key too long".into(),
                 ));
             }
-            if w[0].value.len() > u16::MAX as usize {
+            if entry.value.len() > usize::from(u16::MAX) {
                 return Err(IdentityError::MalformedAuthority(
                     "policy value too large".into(),
                 ));
@@ -657,6 +659,50 @@ mod tests {
         let bytes = body.encode().unwrap();
         let decoded = AuthorityBody::parse(&bytes).unwrap();
         assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn policy_lengths_fit_their_wire_fields() {
+        let at_limit = PolicyEntry {
+            key: "z".repeat(usize::from(u8::MAX)),
+            value: vec![1; usize::from(u16::MAX)],
+        };
+        let mut body = AuthorityBody {
+            schema_version: AUTHORITY_SCHEMA_VERSION,
+            repo_id: ZERO_ID,
+            previous_authority: ZERO_ID,
+            version: 1,
+            created_micros: 0,
+            members: vec![],
+            policy: vec![at_limit.clone()],
+        };
+        assert_eq!(AuthorityBody::parse(&body.encode().unwrap()).unwrap(), body);
+
+        let mut long_key = at_limit.clone();
+        long_key.key.push('z');
+        let mut long_value = at_limit;
+        long_value.value.push(1);
+        for (entry, reason) in [
+            (long_key, "policy key too long"),
+            (long_value, "policy value too large"),
+        ] {
+            // Exercise the sole entry, then the last entry in sorted order.
+            let first = PolicyEntry {
+                key: "a".into(),
+                value: vec![],
+            };
+            for policy in [vec![entry.clone()], vec![entry, first]] {
+                body.policy = policy;
+                assert!(matches!(
+                    body.normalize(),
+                    Err(IdentityError::MalformedAuthority(msg)) if msg == reason
+                ));
+                assert!(matches!(
+                    body.encode(),
+                    Err(IdentityError::MalformedAuthority(msg)) if msg == reason
+                ));
+            }
+        }
     }
 
     #[test]

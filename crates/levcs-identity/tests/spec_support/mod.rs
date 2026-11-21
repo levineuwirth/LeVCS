@@ -12,13 +12,17 @@
 //! was decided, and whether each transfer would be recorded and as what. The
 //! reasons given here travel beside them so that a disagreement can be read.
 //!
-//! A transfer is decided as `levcs-cli`'s `receive` decides one: by
+//! A transfer is decided here as `levcs-cli`'s `receive` decides one: by
 //! `verify_history` against the genesis expected and the source's current
 //! authority, kept if `HistoryReport::ok` and refused whole if not. That
-//! function itself is not run here; it needs an instance to fetch from.
+//! function itself is not run here; it needs an instance to fetch from, and
+//! this crate cannot depend on the one it is in. `levcs-cli` runs it, over
+//! the same scenarios, through [`answer_with`]
+//! (`crates/levcs-cli/tests/spec_receive_support`).
 //!
 //! Shared by `examples/spec_oracle.rs`, which the Haskell differential run
-//! drives, and `tests/spec_corpus.rs`, which replays the committed corpus.
+//! drives, `tests/spec_corpus.rs`, which replays the committed corpus, and
+//! the two of the same in `levcs-cli`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -41,7 +45,7 @@ type Res<T> = Result<T, String>;
 /// The model's key `n`. Fixed, so that a scenario always becomes the same
 /// objects.
 fn key(n: u64) -> SecretKey {
-    SecretKey::from_seed(*blake3::hash(format!("levcs-spec-key-{n}").as_bytes()).as_bytes())
+    SecretKey::from_seed(levcs_core::blake3_hash(format!("levcs-spec-key-{n}").as_bytes()).0)
 }
 
 /// A signature by `by` over `signed`, or, for one the model calls invalid, a
@@ -204,6 +208,10 @@ struct World {
     /// Each authority's body, for the `repo_id` its successors carry.
     bodies: HashMap<u64, AuthorityBody>,
     empty_tree: ObjectId,
+    /// What each object refers to, written down as the object is made and
+    /// never read back out of it: a second account of what reaches what,
+    /// beside the one the implementation's walk gives.
+    links: HashMap<ObjectId, Vec<ObjectId>>,
 }
 
 impl World {
@@ -217,6 +225,8 @@ impl World {
         t.sort_and_validate().map_err(|e| e.to_string())?;
         let id = t.object_id();
         self.src.0.insert(id, t.serialize());
+        self.links
+            .insert(id, t.entries.iter().map(|e| e.hash).collect());
         Ok(id)
     }
 
@@ -265,6 +275,7 @@ impl World {
             authority_names: HashMap::new(),
             bodies: HashMap::new(),
             empty_tree: ZERO_ID,
+            links: HashMap::new(),
         };
         w.empty_tree = w.put_tree(Tree::default())?;
         in_dependency_order(list(store, "authorities")?, "authority", |a| {
@@ -284,6 +295,10 @@ impl World {
         if prev.is_some_and(|p| !self.authorities.contains_key(&p)) {
             return Ok(false);
         }
+        let prev_id = match prev {
+            Some(p) => Some(self.authority(p)?),
+            None => None,
+        };
         let mut members = Vec::new();
         for m in list(a, "members")? {
             let k = int(m, "key")?;
@@ -344,10 +359,7 @@ impl World {
                 Some(p) => self.bodies[&p].repo_id,
                 None => ZERO_ID,
             },
-            previous_authority: match prev {
-                Some(p) => self.authority(p)?,
-                None => ZERO_ID,
-            },
+            previous_authority: prev_id.unwrap_or(ZERO_ID),
             version: u32::try_from(int(a, "version")?).map_err(|e| e.to_string())?,
             // The model's objects are distinct even when their fields are
             // equal; the timestamp keeps their ids distinct too.
@@ -373,6 +385,7 @@ impl World {
             signed.signatures.push(entry);
         }
         let id = self.put(&signed);
+        self.links.insert(id, prev_id.into_iter().collect());
         self.authorities.insert(n, id);
         self.authority_names.insert(id, n);
         self.bodies.insert(n, body);
@@ -419,10 +432,13 @@ impl World {
                 (outer, CommitFlags::MODIFIES_AUTHORITY)
             }
         };
+        let cites = self.authority(int(c, "cites")?)?;
+        let mut linked = vec![tree, cites];
+        linked.extend(&parents);
         let commit = Commit {
             tree,
             parents,
-            authority: self.authority(int(c, "cites")?)?,
+            authority: cites,
             author_key: by.public().0,
             timestamp_micros: n as i64 + 1,
             flags,
@@ -433,6 +449,7 @@ impl World {
         let entry = signature(&signed, &by, valid);
         signed.signatures.push(entry);
         let id = self.put(&signed);
+        self.links.insert(id, linked);
         self.commits.insert(n, id);
         self.objects.insert(id, (0, n));
         Ok(true)
@@ -451,11 +468,17 @@ impl World {
             },
             None => ZERO_ID,
         };
+        let predecessor = self.commit(int(r, "predecessor")?)?;
+        let cites = self.authority(int(r, "cites")?)?;
+        let mut linked = vec![self.empty_tree, predecessor, cites];
+        if !parent_release.is_zero() {
+            linked.push(parent_release);
+        }
         let release = Release {
             tree: self.empty_tree,
             parent_release,
-            predecessor: self.commit(int(r, "predecessor")?)?,
-            authority: self.authority(int(r, "cites")?)?,
+            predecessor,
+            authority: cites,
             declarer_key: by.public().0,
             timestamp_micros: n as i64 + 1,
             label: format!("r{n}"),
@@ -466,6 +489,7 @@ impl World {
         let entry = signature(&signed, &by, valid);
         signed.signatures.push(entry);
         let id = self.put(&signed);
+        self.links.insert(id, linked);
         self.releases.insert(n, id);
         self.objects.insert(id, (1, n));
         Ok(true)
@@ -597,14 +621,93 @@ fn verify(w: &World, pin: ObjectId, v: &Value) -> Res<Value> {
     }))
 }
 
-/// One transfer: the history the roots reach, sent by a source whose current
-/// authority is the one named, to a receiver expecting the genesis named.
-/// Kept or refused as `levcs-cli`'s `receive` does it (`receive.rs`).
-fn receive(w: &World, v: &Value) -> Res<Value> {
-    let expected = w.authority(int(v, "expected")?)?;
-    let current = w.authority(int(v, "current")?)?;
-    let roots = roots(w, v)?;
-    let report = verify_history(&w.src, expected, Some(current), &roots);
+/// One transfer, as the objects it is made of: the history the roots reach,
+/// sent by a source whose current authority is `current`, to a receiver
+/// expecting the genesis `expected`.
+///
+/// The objects and the repository's id are read where the transfer is
+/// really made, in `levcs-cli`, and not by the report here.
+#[allow(dead_code)]
+pub struct Transfer<'a> {
+    /// Every object of the scenario, by id: all that a source could send.
+    pub objects: &'a HashMap<ObjectId, Vec<u8>>,
+    /// The repository the receiver asks for: the one the authority it
+    /// expects says it is an authority of.
+    pub repo_id: ObjectId,
+    pub expected: ObjectId,
+    pub current: ObjectId,
+    /// What is asked for, each under a ref of its kind.
+    pub roots: Vec<(String, ObjectId)>,
+    world: &'a World,
+}
+
+#[allow(dead_code)]
+impl Transfer<'_> {
+    /// The answer for a transfer recorded as the objects with these ids.
+    /// Only commits and releases are named in an answer; trees and
+    /// authorities travel with them and are not.
+    pub fn recorded(&self, ids: impl IntoIterator<Item = ObjectId>) -> Value {
+        let recorded: BTreeSet<(u8, u64)> = ids
+            .into_iter()
+            .filter_map(|id| self.world.objects.get(&id).copied())
+            .collect();
+        json!({
+            "recorded": recorded.iter().map(|(k, n)| named(*k, *n)).collect::<Vec<_>>(),
+            "damage": [],
+        })
+    }
+
+    /// What an object is, in the model's terms.
+    pub fn about(&self, object: &ObjectId) -> String {
+        about(self.world, object)
+    }
+
+    /// Every object these reach, themselves included: commits and releases,
+    /// and the trees and authorities that travel with them. Followed
+    /// through what each object was made to refer to, not through the
+    /// implementation's walk.
+    pub fn reached(&self, from: impl IntoIterator<Item = ObjectId>) -> BTreeSet<ObjectId> {
+        let mut reached = BTreeSet::new();
+        let mut next: Vec<ObjectId> = from.into_iter().collect();
+        while let Some(id) = next.pop() {
+            if reached.insert(id) {
+                next.extend(self.world.links.get(&id).into_iter().flatten());
+            }
+        }
+        reached
+    }
+
+    /// Whether every root asked for is a commit, as every root `pull` asks
+    /// for is.
+    pub fn only_commits(&self) -> bool {
+        self.roots
+            .iter()
+            .all(|(_, id)| matches!(self.world.objects.get(id), Some((0, _))))
+    }
+}
+
+/// The transfer a request asks for.
+fn transfer<'a>(w: &'a World, v: &Value) -> Res<Transfer<'a>> {
+    let expected = int(v, "expected")?;
+    Ok(Transfer {
+        objects: &w.src.0,
+        repo_id: w
+            .bodies
+            .get(&expected)
+            .ok_or_else(|| format!("no authority {expected}"))?
+            .repo_id,
+        expected: w.authority(expected)?,
+        current: w.authority(int(v, "current")?)?,
+        roots: roots(w, v)?,
+        world: w,
+    })
+}
+
+/// A transfer kept or refused as `levcs-cli`'s `receive` does it
+/// (`receive.rs`), from the report of the same walk, without running it.
+fn by_the_report(t: &Transfer) -> Res<Value> {
+    let w = t.world;
+    let report = verify_history(&w.src, t.expected, Some(t.current), &t.roots);
     let damage: Vec<String> = report
         .problems
         .iter()
@@ -612,15 +715,9 @@ fn receive(w: &World, v: &Value) -> Res<Value> {
         .map(|p| format!("{}: {}", about(w, &p.object), p.what))
         .collect();
     if report.ok() {
-        let recorded: BTreeSet<(u8, u64)> = report
-            .reachable
-            .iter()
-            .filter_map(|id| w.objects.get(id).copied())
-            .collect();
-        return Ok(json!({
-            "recorded": recorded.iter().map(|(k, n)| named(*k, *n)).collect::<Vec<_>>(),
-            "damage": damage,
-        }));
+        let mut recorded = t.recorded(report.reachable.iter().copied());
+        recorded["damage"] = json!(damage);
+        return Ok(recorded);
     }
     let reasons: Vec<String> = report
         .problems
@@ -726,8 +823,20 @@ fn decide(w: &World, pin: ObjectId, v: &Value) -> Res<Value> {
     })
 }
 
-/// Answer one request.
+/// Answer one request, with each transfer decided from the report of
+/// `verify_history`.
+#[allow(dead_code)]
 pub fn answer(request: &Value) -> Res<Value> {
+    answer_with(request, &mut by_the_report)
+}
+
+/// Answer one request, with each transfer decided by `decide_transfer`:
+/// `{"recorded": [...]}` or `{"refused": true}`, with the reasons and any
+/// damage beside it.
+pub fn answer_with(
+    request: &Value,
+    decide_transfer: &mut dyn FnMut(&Transfer) -> Res<Value>,
+) -> Res<Value> {
     let w = World::build(field(request, "store")?)?;
     let pin = w.authority(int(request, "pin")?)?;
     let verified = match request.get("verify") {
@@ -744,7 +853,7 @@ pub fn answer(request: &Value) -> Res<Value> {
         None | Some(Value::Null) => {}
         Some(Value::Array(asked)) => {
             for t in asked {
-                transfers.push(receive(&w, t)?);
+                transfers.push(decide_transfer(&transfer(&w, t)?)?);
             }
         }
         // Anything else is a transfer that would go unanswered.

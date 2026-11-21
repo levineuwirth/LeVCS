@@ -29,6 +29,7 @@ module LeVCS.Harness.Wire
   , encodeResponse
   , parseResponse
   , parseRemarks
+  , parseTransferDamage
 
     -- * What the model expects
   , expected
@@ -590,6 +591,13 @@ parseRemarks = withObject "response" $ \o -> do
     )
   where
     prefix p = map (p ++)
+
+-- | The damage reported of the transfers alone, for a run that is about
+-- them and nothing else in the response.
+parseTransferDamage :: Value -> Parser [String]
+parseTransferDamage = withObject "response" $ \o ->
+  o .:? "receive"
+    >>= fmap concat . mapM (withObject "receive" (\x -> fromMaybe [] <$> x .:? "damage")) . fromMaybe []
 
 -- * What the model expects
 

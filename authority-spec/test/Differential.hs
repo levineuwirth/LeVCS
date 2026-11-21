@@ -1,6 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 
--- | The rules checked against @levcs-identity@.
+-- | The rules checked against @levcs-identity@, and Rule R's receiver
+-- against @receive@ in @levcs-cli@.
 --
 -- Every generated scenario is put to the model and, as real signed objects,
 -- to the Rust. The two must agree on every verdict: which commits and
@@ -8,6 +9,11 @@
 -- replica's current authority was rejected, how every
 -- transaction is decided, down to the kind of refusal and the number of
 -- objects newly exposed, and whether every transfer is recorded and as what.
+--
+-- There are two oracles ("Oracle"). The first calls 'verify_history' and
+-- 'admit' directly. The second answers the same requests with every
+-- transfer made by the function the CLI receives with, against a source
+-- that sends everything it has whatever was asked for.
 --
 -- The model is run under the 'implemented' reading, so agreement means that
 -- the Rust implements the ratified rules amended by exactly the divergences
@@ -26,6 +32,7 @@ import Text.Read (readMaybe)
 import Data.Map.Strict qualified as Map
 import Hedgehog hiding (Update)
 import Hedgehog.Gen qualified as Gen
+import Hedgehog.Range qualified as Range
 
 import LeVCS.Authority.Model
 import LeVCS.Authority.RuleP
@@ -50,7 +57,7 @@ main = do
   asked <- lookupEnv "LEVCS_SPEC_READING"
   let name = fromMaybe "implemented" asked
   rd <- maybe (die ("LEVCS_SPEC_READING: unknown reading " ++ name)) pure (readingNamed name)
-  ok <- withOracle $ \o ->
+  rules <- withOracle Rules $ \o ->
     checkSequential $
       Group
         (fromString ("the oracle against the " ++ name ++ " reading"))
@@ -58,7 +65,16 @@ main = do
         , ("Rule P: admit", withTests (fromIntegral n) (agrees rd o (genTraceRequest rd)))
         , ("named cases", withTests 1 (named rd o))
         ]
-  unless ok exitFailure
+  -- The same again where it bears on Rule R, with every transfer made by
+  -- the function the CLI receives with.
+  receiver <- withOracle Receiver $ \o ->
+    checkSequential $
+      Group
+        (fromString ("receive in levcs-cli against the " ++ name ++ " reading"))
+        [ ("Rule R: receive", withTests (fromIntegral n) (receives rd o genTransfersRequest))
+        , ("named cases", withTests 1 (namedTransfers rd o))
+        ]
+  unless (and rules && and receiver) exitFailure
 
 -- | A history to verify, with the transfers 'historyRequest' makes of it and
 -- one more that a well-behaved receiver and source would not make: any
@@ -67,12 +83,27 @@ main = do
 genHistoryRequest :: Gen Request
 genHistoryRequest = do
   h <- genHistory
+  extra <- genTransfer h
   let rq = historyRequest h
-      authorities = Map.keys (sAuthorities (hStore h))
+  pure rq {rqReceive = rqReceive rq ++ [extra]}
+
+-- | A transfer of some of a history's roots that a well-behaved receiver
+-- and source might not make.
+genTransfer :: History -> Gen (AuthId, AuthId, [Object])
+genTransfer h = do
+  let authorities = Map.keys (sAuthorities (hStore h))
   expects <- Gen.frequency [(3, pure pinId), (1, Gen.element authorities)]
   source <- Gen.element authorities
   roots <- Gen.subsequence (hRoots h)
-  pure rq {rqReceive = rqReceive rq ++ [(expects, source, roots)]}
+  pure (expects, source, roots)
+
+-- | A history and several transfers of it, for the oracle that makes them.
+genTransfersRequest :: Gen Request
+genTransfersRequest = do
+  h <- genHistory
+  extra <- Gen.list (Range.linear 1 4) (genTransfer h)
+  let rq = historyRequest h
+  pure rq {rqReceive = rqReceive rq ++ extra}
 
 -- | A publication trace, and one of its transactions put again in a way the
 -- trace never would: over a state whose current authority is any authority
@@ -125,6 +156,46 @@ named rd o = property $
     when (rd == implemented) $ anResponse answer === caseImplemented c
     forM_ (caseUnder c) $ \(reading, written) ->
       when (readingNamed reading == Just rd) $ anResponse answer === written
+
+-- | @receive@ gives each transfer of each named case the answer the rules
+-- give it. Nothing else in a response is compared here: a case with no
+-- transfer in it says nothing about @receive@, whatever the reading.
+namedTransfers :: Reading -> Oracle -> Property
+namedTransfers rd o = property $
+  forM_ cases $ \c -> do
+    annotate (caseName c)
+    answer <- evalEither =<< evalIO (ask o (caseRequest c))
+    annotate (unlines (anRemarks answer))
+    anTransferDamage answer === []
+    let made = rsReceive (anResponse answer)
+    made === rsReceive (expected rd (caseRequest c))
+    when (rd == ratified) $ made === rsReceive (caseRatified c)
+    when (rd == implemented) $ made === rsReceive (caseImplemented c)
+    forM_ (caseUnder c) $ \(reading, written) ->
+      when (readingNamed reading == Just rd) $ made === rsReceive written
+
+-- | @receive@ keeps or refuses every transfer as the rules do under the
+-- reading. Only the transfers are compared, so that a failure here is a
+-- failure of @receive@: the verdicts on the same history are the first
+-- oracle's to answer for.
+receives :: Reading -> Oracle -> Gen Request -> Property
+receives rd o gen = property $ do
+  rq <- forAllWith (BL.unpack . encode . encodeRequest) gen
+  unrepresentable rq === []
+  let specified = rsReceive (expected rd rq)
+  cover 1 "the readings disagree on a transfer" (rsReceive (expected ratified rq) /= rsReceive (expected implemented rq))
+  cover 20 "a transfer recorded" (or [True | ReceiveRecorded _ <- specified])
+  cover 20 "a transfer refused" (ReceiveRefused `elem` specified)
+  cover 5 "a transfer of several roots recorded" (or [True | ((_, _, _ : _ : _), ReceiveRecorded _) <- zip (rqReceive rq) specified])
+  cover 5 "a transfer of branches alone recorded" (or [True | ((_, _, roots@(_ : _)), ReceiveRecorded _) <- zip (rqReceive rq) specified, all isCommit roots])
+  cover 1 "a transfer of nothing recorded" (or [True | ((_, _, []), ReceiveRecorded _) <- zip (rqReceive rq) specified])
+  answer <- evalEither =<< evalIO (ask o rq)
+  annotate (unlines (anRemarks answer))
+  anTransferDamage answer === []
+  rsReceive (anResponse answer) === specified
+  where
+    isCommit (OCommit _) = True
+    isCommit _ = False
 
 -- | The Rust gives the response the rules give under the reading.
 agrees :: Reading -> Oracle -> Gen Request -> Property

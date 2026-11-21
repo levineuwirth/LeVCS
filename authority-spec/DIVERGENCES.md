@@ -135,8 +135,8 @@ Two switches, `d-force` and `d-delete`.
   published object on the lineage of `current`. So this bites on a source
   that took history in some other way: before these rules, by mirroring, or
   dishonestly.
-- **What is compared:** the oracle makes the same two calls as `receive`.
-  `receive` itself is not run.
+- **What is compared:** `receive` itself, on every generated transfer, and
+  the same two calls made directly.
 - **Witness:** `div-f-receiving-history-on-a-conflicting-lineage`.
 
 ### (g) A current authority must be on the pinned chain
@@ -242,10 +242,36 @@ Two switches, `d-force` and `d-delete`.
 - **Read permission (R.2) in the Rust.** The model's `mayRead` is tested
   against itself. The Rust enforces read permission in `levcs-instance` and
   the CLI, which the oracle does not call.
-- **`receive` itself.** The oracle decides a transfer with the calls
-  `receive` makes. The function, its check that the genesis sent derives
-  the `repo_id` asked for (`receive.rs:90`), and its use of the receiver's
-  own copy of an object, are not run.
+- **What `clone`, `pull` and `fork` do with a transfer.** `receive` is run,
+  on every generated transfer, against a source that will say anything
+  (`crates/levcs-cli/tests/spec_receive_support`). Beyond its answer it is
+  held to things a transfer must do that are no part of the model:
+  - *Of every call:* it asks the repository expected for exactly the roots,
+    the genesis and the current authority, and says exactly what the
+    receiver has. A refusal over intact objects must report no damage. A
+    successful transfer is written to its destination, including when that
+    store already holds some of the history. Its final object IDs and bytes
+    are checked against the objects it held and everything the roots reach,
+    trees and authorities included.
+  - *Of every transfer:* asked for with roots named as `clone` names them,
+    and as `pull` does where every root is a commit, it is kept or refused
+    the same.
+  - *Of every transfer kept:* a receiver that holds all of it accepts it
+    from a source that sends none of that, and adds nothing. One that holds
+    what the first root reaches accepts the rest, where there is more than
+    one root. The same genesis offered for another repository's id is
+    refused (`receive.rs:90`). And a receiver whose own copy of the first
+    root is damaged refuses, where there is a root: two of the nine
+    recorded transfers in the corpus have none.
+
+  What is not run is the three commands. That each writes nothing when
+  `receive` refuses, and which refs each records, is covered by hand and
+  not by the generators: `clone` and `pull` in
+  `crates/levcs-cli/tests/clone.rs`, a refused `fork` in `publication.rs`
+  and a successful one in `fork.rs`. `pull` is tried here only as a
+  receiver holding the genesis and nothing else, or one of the two cases
+  above; what it says it has in a repository with history of its own is
+  not generated. Nor is a real instance's choice of what to send.
 
 ## Gaps
 

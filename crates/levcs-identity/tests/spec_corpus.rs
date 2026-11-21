@@ -37,6 +37,17 @@ fn corpus() -> Vec<(String, Value)> {
     entries
 }
 
+/// A compared response with its reads taken out. A read is an instance's to
+/// answer, and nothing in this crate is one: `levcs-cli`'s
+/// `tests/spec_receive.rs` replays those, against a real instance.
+fn rules_only(compared: Value) -> Value {
+    let mut compared = compared;
+    if let Some(fields) = compared.as_object_mut() {
+        fields.remove("serve");
+    }
+    compared
+}
+
 #[test]
 fn the_implementation_gives_every_corpus_entry_the_specified_verdicts() {
     let entries = corpus();
@@ -60,7 +71,7 @@ fn the_implementation_gives_every_corpus_entry_the_specified_verdicts() {
             failures.push(format!("{name}: the scenario is damaged: {damage:?}"));
         }
         let compared = spec_support::compared(&answer)
-            .and_then(|got| Ok((got, spec_support::compared(&entry["expect"])?)));
+            .and_then(|got| Ok((got, rules_only(spec_support::compared(&entry["expect"])?))));
         let (got, want) = match compared {
             Ok(both) => both,
             Err(e) => {
@@ -108,14 +119,23 @@ fn every_divergence_witness_still_departs_from_the_ratified_text() {
         "only {} divergence witnesses found",
         witnesses.len()
     );
+    let mut seen = 0;
     for (name, entry) in &witnesses {
+        let ratified = rules_only(spec_support::compared(&entry["ratified"]).unwrap());
+        // A witness that departs only in what an instance answers is not
+        // one this crate can see either way.
+        if ratified == rules_only(spec_support::compared(&entry["expect"]).unwrap()) {
+            continue;
+        }
         let answer = spec_support::answer(&entry["request"]).unwrap();
         assert_ne!(
             spec_support::compared(&answer).unwrap(),
-            spec_support::compared(&entry["ratified"]).unwrap(),
+            ratified,
             "{name}: the implementation now agrees with the ratified text here"
         );
+        seen += 1;
     }
+    assert!(seen >= 13, "only {seen} divergence witnesses are seen here");
 }
 
 /// The `protected_branches` policy is one string, the patterns joined by

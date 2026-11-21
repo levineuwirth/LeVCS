@@ -21,6 +21,7 @@ import Data.Set qualified as Set
 
 import LeVCS.Authority.Model
 import LeVCS.Authority.RuleP
+import LeVCS.Authority.RuleR (Requester (..))
 import LeVCS.Harness.Wire
 
 data Case = Case
@@ -122,14 +123,14 @@ history name note st current roots literal strict =
   Case
     { caseName = name
     , caseNote = note
-    , caseRequest = Request st (AuthId 0) (Just (AuthId <$> current, roots)) [] []
+    , caseRequest = Request st (AuthId 0) (Just (AuthId <$> current, roots)) [] [] []
     , caseRatified = answer literal
     , caseImplemented = answer strict
     , caseUnder = []
     }
   where
     answer (invalid, conflicting) =
-      Response (Just (VerifyResponse everything (Set.fromList invalid) (Set.fromList conflicting) False)) [] []
+      Response (Just (VerifyResponse everything (Set.fromList invalid) (Set.fromList conflicting) False)) [] [] []
     -- In every case but the one built with 'reaching', the roots have every
     -- commit and release in the store behind them.
     everything =
@@ -173,9 +174,9 @@ publication name note st attempts =
   Case
     { caseName = name
     , caseNote = note
-    , caseRequest = Request st (AuthId 0) Nothing [(s, t) | (s, t, _, _) <- attempts] []
-    , caseRatified = Response Nothing [d | (_, _, d, _) <- attempts] []
-    , caseImplemented = Response Nothing [d | (_, _, _, d) <- attempts] []
+    , caseRequest = Request st (AuthId 0) Nothing [(s, t) | (s, t, _, _) <- attempts] [] []
+    , caseRatified = Response Nothing [d | (_, _, d, _) <- attempts] [] []
+    , caseImplemented = Response Nothing [d | (_, _, _, d) <- attempts] [] []
     , caseUnder = []
     }
 
@@ -187,11 +188,45 @@ replication name note st transfers =
   Case
     { caseName = name
     , caseNote = note
-    , caseRequest = Request st (AuthId 0) Nothing [] [(AuthId e, AuthId cur, roots) | (e, cur, roots, _, _) <- transfers]
-    , caseRatified = Response Nothing [] [d | (_, _, _, d, _) <- transfers]
-    , caseImplemented = Response Nothing [] [d | (_, _, _, _, d) <- transfers]
+    , caseRequest = Request st (AuthId 0) Nothing [] [(AuthId e, AuthId cur, roots) | (e, cur, roots, _, _) <- transfers] []
+    , caseRatified = Response Nothing [] [d | (_, _, _, d, _) <- transfers] []
+    , caseImplemented = Response Nothing [] [d | (_, _, _, _, d) <- transfers] []
     , caseUnder = []
     }
+
+-- | A read-permission case: reads asked of an instance that holds the store
+-- as the repository of genesis 0. Each is the current authority the
+-- instance has for it, if any, the key the reader signs with, if any, the
+-- roots asked for, and what the read comes to under each reading.
+permission :: String -> String -> Store -> [(Maybe Int, Maybe Int, [Object], ServeResponse, ServeResponse)] -> Case
+permission name note st asked =
+  Case
+    { caseName = name
+    , caseNote = note
+    , caseRequest =
+        Request
+          st
+          (AuthId 0)
+          Nothing
+          []
+          []
+          [(AuthId <$> cur, maybe Anonymous (Holding . Key) who, roots) | (cur, who, roots, _, _) <- asked]
+    , caseRatified = Response Nothing [] [] [d | (_, _, _, d, _) <- asked]
+    , caseImplemented = Response Nothing [] [] [d | (_, _, _, _, d) <- asked]
+    , caseUnder = []
+    }
+
+-- | A read the two readings agree on, of a source whose current authority
+-- is the one numbered.
+readOf :: Int -> Maybe Int -> [Object] -> ServeResponse -> (Maybe Int, Maybe Int, [Object], ServeResponse, ServeResponse)
+readOf cur who roots d = (Just cur, who, roots, d, d)
+
+served :: [Object] -> ServeResponse
+served = Served . Set.fromList
+
+-- | An authority anyone may read.
+public :: Authority -> Authority
+public a = a {aPublicRead = True}
 
 recorded :: [Object] -> ReceiveResponse
 recorded = ReceiveRecorded . Set.fromList
@@ -237,6 +272,8 @@ cases =
     ++ divergentPublicationCases
     ++ replicationCases
     ++ divergentReplicationCases
+    ++ permissionCases
+    ++ divergentPermissionCases
 
 -- | Two authorities used throughout: a genesis with @k1@ a Contributor, and
 -- a successor that removes @k1@.
@@ -918,5 +955,128 @@ divergentReplicationCases =
       twoSuccessors
       [ (0, 1, [c 2, c 3], recorded [c 0, c 1, c 2, c 3], ReceiveRefused)
       , alike 0 1 [c 2] (recorded [c 0, c 1, c 2])
+      ]
+  ]
+
+permissionCases :: [Case]
+permissionCases =
+  [ permission
+      "r-a-public-repository-is-read-by-anyone"
+      "R.2. The current authority has public_read. A reader who signs with no key, one who \
+      \signs with a key that is no member's, and a member are all sent the history, and \
+      \record it."
+      (store [public (genesis [(1, Reader)])] [commit [] 0 0] [])
+      [ readOf 0 Nothing [c 0] (served [c 0])
+      , readOf 0 (Just 7) [c 0] (served [c 0])
+      , readOf 0 (Just 1) [c 0] (served [c 0])
+      ]
+  , permission
+      "r-a-private-repository-is-read-by-its-members"
+      "R.2: \"a role of at least Reader there\". The current authority has no public_read. \
+      \Every member reads it, whatever the role: k0 an Owner, k1 a Reader, k2 a Contributor \
+      \and k3 a Maintainer. A reader with no key and one whose key is no member's are sent \
+      \nothing."
+      (store [genesis [(1, Reader), (2, Contributor), (3, Maintainer)]] [commit [] 0 0] [])
+      ( [readOf 0 (Just k) [c 0] (served [c 0]) | k <- [0, 1, 2, 3]]
+          ++ [readOf 0 Nothing [c 0] ServeDenied, readOf 0 (Just 7) [c 0] ServeDenied]
+      )
+  , permission
+      "r-read-permission-is-decided-in-the-current-authority"
+      "R.2 is decided in the source's current authority and no other. The genesis has k1 a \
+      \Reader. Authority 1 removes k1 and adds k2; authority 2, its successor, is public. \
+      \While the source's current authority is the genesis, k1 reads and k2 does not. Once \
+      \it is authority 1, k2 reads and k1 does not, though k1's commit c2 is still in the \
+      \history k2 receives. Once it is authority 2, anyone reads."
+      ( store
+          [ genesis [(1, Contributor)]
+          , successor 0 2 [(0, Owner), (2, Reader)] [0]
+          , public (successor 1 3 [(0, Owner), (2, Reader)] [0])
+          ]
+          [commit [] 0 0, installing 1 (commit [0] 0 0), commit [0] 0 1, installing 2 (commit [1] 1 0)]
+          []
+      )
+      [ readOf 0 (Just 1) [c 0] (served [c 0])
+      , readOf 0 (Just 2) [c 0] ServeDenied
+      , readOf 1 (Just 2) [c 1, c 2] (served [c 0, c 1, c 2])
+      , readOf 1 (Just 1) [c 1, c 2] ServeDenied
+      , readOf 1 Nothing [c 1] ServeDenied
+      , readOf 2 Nothing [c 3] (served [c 0, c 1, c 3])
+      , readOf 2 (Just 1) [c 3] (served [c 0, c 1, c 3])
+      ]
+  , permission
+      "r-a-repository-with-no-current-authority-is-read-by-no-one"
+      "D6 leaves a repository with no current authority unspecified, and R.2 has no policy \
+      \to read: no one is sent anything, not the Owner of its genesis."
+      (store [public (genesis [])] [commit [] 0 0] [])
+      [ (Nothing, Nothing, [c 0], ServeDenied, ServeDenied)
+      , (Nothing, Just 0, [c 0], ServeDenied, ServeDenied)
+      ]
+  , permission
+      "r-history-citing-an-authority-no-commit-installs"
+      "What is sent with history is everything it reaches, and a commit reaches the \
+      \authority it cites. Authority 1 is a successor of the genesis that no commit \
+      \installs; H.3 lets c1 cite it all the same, since it descends from what c1's parent \
+      \put in effect. The source's current authority is still the genesis. A reader asking \
+      \for c1 is sent authority 1 with it, through that citation and nothing else, and \
+      \records both commits."
+      (store [public (genesis [(1, Contributor)]), successor 0 2 [(0, Owner), (1, Contributor)] [0]] [commit [] 0 0, commit [0] 1 1] [])
+      [readOf 0 Nothing [c 1] (served [c 0, c 1])]
+  , permission
+      "r-a-reader-is-sent-history-it-then-refuses"
+      "R.2 and R.1 are two decisions. k1 is a Reader, so the source sends what it asks \
+      \for. c1 carries a signature that does not verify, so k1 refuses the transfer that \
+      \reaches it, and records the one that does not. A reader the source does not serve \
+      \is told nothing of either."
+      (store [genesis [(1, Reader)]] [commit [] 0 0, (commit [0] 0 0) {cSig = Sig (Key 0) False}, commit [0] 0 0] [])
+      [ readOf 0 (Just 1) [c 1] ServeRefused
+      , readOf 0 (Just 1) [c 2] (served [c 0, c 2])
+      , readOf 0 Nothing [c 1] ServeDenied
+      , readOf 0 Nothing [c 2] ServeDenied
+      ]
+  ]
+
+divergentPermissionCases :: [Case]
+divergentPermissionCases =
+  [ permission
+      "div-g-a-source-serves-no-one-under-an-authority-it-cannot-prove"
+      "Divergence (g), at the source. The repository asked for is that of genesis 0. \
+      \Authority 1 is another repository's genesis, and public; authority 2 names genesis \
+      \0 as its predecessor, is public, and only k1 signed it, so it succeeds nothing. \
+      \Read literally, R.2 looks at the policy of whatever the source has as current, and \
+      \both let anyone in: asked for nothing under authority 1 a reader records nothing, \
+      \and asked for c0 under authority 2 a reader records it. An instance serves no one \
+      \from a repository whose current authority it cannot follow back to the genesis the \
+      \id pins: not the public, and not k0, who is an Owner of all three."
+      ( store
+          [genesis [(1, Contributor)], public (genesis []), public (successor 0 2 [(0, Owner), (1, Owner)] [1])]
+          [commit [] 0 0]
+          []
+      )
+      [ (Just 1, Nothing, [], served [], ServeDenied)
+      , (Just 2, Nothing, [c 0], served [c 0], ServeDenied)
+      , (Just 2, Just 0, [c 0], served [c 0], ServeDenied)
+      , readOf 0 (Just 1) [c 0] (served [c 0])
+      ]
+  , permission
+      "div-be-an-instance-serves-under-an-authority-its-reader-refuses"
+      "Divergences (b) and (e), and where they are not asked. Authority 1 is a public \
+      \successor of the genesis that k0 signed, with a second signature on it that does \
+      \not verify. Authority 2 is a public successor that k0 signed and that has no Owner. \
+      \Read literally each is a successor, and a reader of a source under either records \
+      \c0. The Rust's verify and admit accept neither as an authority of the repository. \
+      \An instance proves its current authority by its steps alone, so it serves anyone \
+      \under either, by that authority's policy; the reader then refuses what it was sent, \
+      \over the authority the instance served it under."
+      ( store
+          [ genesis [(1, Contributor)]
+          , public ((successor 0 2 [(0, Owner)] [0]) {aSigs = [Sig (Key 0) True, Sig (Key 1) False]})
+          , public (successor 0 2 [(1, Contributor)] [0])
+          ]
+          [commit [] 0 0]
+          []
+      )
+      [ (Just 1, Nothing, [c 0], served [c 0], ServeRefused)
+      , (Just 2, Nothing, [c 0], served [c 0], ServeRefused)
+      , readOf 0 (Just 1) [c 0] (served [c 0])
       ]
   ]

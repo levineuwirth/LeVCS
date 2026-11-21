@@ -1,0 +1,130 @@
+{
+  "expect": {
+    "admit": [],
+    "receive": [],
+    "serve": [
+      {
+        "recorded": [
+          {
+            "commit": 0
+          },
+          {
+            "commit": 1
+          }
+        ]
+      }
+    ],
+    "verify": null
+  },
+  "name": "r-history-citing-an-authority-no-commit-installs",
+  "note": "What is sent with history is everything it reaches, and a commit reaches the authority it cites. Authority 1 is a successor of the genesis that no commit installs; H.3 lets c1 cite it all the same, since it descends from what c1's parent put in effect. The source's current authority is still the genesis. A reader asking for c1 is sent authority 1 with it, through that citation and nothing else, and records both commits.",
+  "ratified": {
+    "admit": [],
+    "receive": [],
+    "serve": [
+      {
+        "recorded": [
+          {
+            "commit": 0
+          },
+          {
+            "commit": 1
+          }
+        ]
+      }
+    ],
+    "verify": null
+  },
+  "request": {
+    "admit": [],
+    "pin": 0,
+    "receive": [],
+    "serve": [
+      {
+        "current": 0,
+        "requester": null,
+        "roots": [
+          {
+            "commit": 1
+          }
+        ]
+      }
+    ],
+    "store": {
+      "authorities": [
+        {
+          "id": 0,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            },
+            {
+              "key": 1,
+              "role": "contributor"
+            }
+          ],
+          "prev": null,
+          "protected": [],
+          "public_read": true,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 1
+        },
+        {
+          "id": 1,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            },
+            {
+              "key": 1,
+              "role": "contributor"
+            }
+          ],
+          "prev": 0,
+          "protected": [],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 2
+        }
+      ],
+      "commits": [
+        {
+          "cites": 0,
+          "id": 0,
+          "installs": null,
+          "parents": [],
+          "signature": {
+            "key": 0,
+            "valid": true
+          }
+        },
+        {
+          "cites": 1,
+          "id": 1,
+          "installs": null,
+          "parents": [
+            0
+          ],
+          "signature": {
+            "key": 1,
+            "valid": true
+          }
+        }
+      ],
+      "releases": []
+    },
+    "verify": null
+  }
+}

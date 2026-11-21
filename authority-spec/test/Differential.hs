@@ -13,7 +13,8 @@
 -- There are two oracles ("Oracle"). The first calls 'verify_history' and
 -- 'admit' directly. The second answers the same requests with every
 -- transfer made by the function the CLI receives with, against a source
--- that sends everything it has whatever was asked for.
+-- that sends everything it has whatever was asked for, and with every read
+-- asked of a real instance, which decides for itself whom to answer.
 --
 -- The model is run under the 'implemented' reading, so agreement means that
 -- the Rust implements the ratified rules amended by exactly the divergences
@@ -36,6 +37,7 @@ import Hedgehog.Range qualified as Range
 
 import LeVCS.Authority.Model
 import LeVCS.Authority.RuleP
+import LeVCS.Authority.RuleR (Requester (..))
 
 import LeVCS.Authority.Reading
 import LeVCS.Harness.Cases
@@ -72,6 +74,7 @@ main = do
       Group
         (fromString ("receive in levcs-cli against the " ++ name ++ " reading"))
         [ ("Rule R: receive", withTests (fromIntegral n) (receives rd o genTransfersRequest))
+        , ("Rule R: read permission at an instance", withTests (fromIntegral n) (serves' rd o genReadsRequest))
         , ("named cases", withTests 1 (namedTransfers rd o))
         ]
   unless (and rules && and receiver) exitFailure
@@ -151,15 +154,65 @@ named rd o = property $
     anDamage answer === []
     -- Under whichever reading the oracle is held to, and for the two
     -- readings the cases have answers written out for, those answers too.
-    anResponse answer === expected rd (caseRequest c)
-    when (rd == ratified) $ anResponse answer === caseRatified c
-    when (rd == implemented) $ anResponse answer === caseImplemented c
+    -- The reads are left out: this oracle has no instance to ask, and the
+    -- second one answers for them.
+    let rules r = r {rsServe = []}
+        given = rules (anResponse answer)
+    given === rules (expected rd (caseRequest c))
+    when (rd == ratified) $ given === rules (caseRatified c)
+    when (rd == implemented) $ given === rules (caseImplemented c)
     forM_ (caseUnder c) $ \(reading, written) ->
-      when (readingNamed reading == Just rd) $ anResponse answer === written
+      when (readingNamed reading == Just rd) $ given === rules written
+
+-- | A history held by an instance, and several reads asked of it: by no
+-- one in particular, by each key the scenario could have made a member, and
+-- by one it could not. The instance's current authority for the repository
+-- is mostly the history's own, and now and then any authority in the store
+-- or none. Some authorities are made public first, which changes no other
+-- fact about the history.
+genReadsRequest :: Gen Request
+genReadsRequest = do
+  h <- genHistory
+  open <- Gen.subsequence (Map.keys (sAuthorities (hStore h)))
+  let st = (hStore h) {sAuthorities = Map.mapWithKey (\a x -> if a `elem` open then x {aPublicRead = True} else x) (sAuthorities (hStore h))}
+      authorities = Map.keys (sAuthorities st)
+      stranger = Key keyCount
+  asked <- Gen.list (Range.linear 1 5) $ do
+    current <- Gen.frequency [(6, pure (hCurrent h)), (2, Just <$> Gen.element authorities), (1, pure Nothing)]
+    who <- Gen.frequency [(2, pure Anonymous), (5, Holding . Key <$> genKey), (1, pure (Holding stranger))]
+    roots <- Gen.subsequence (hRoots h)
+    pure (current, who, roots)
+  pure (Request st pinId Nothing [] [] asked)
+
+-- | An instance answers every read as the rules do under the reading: sent
+-- nothing, sent history that is kept, or sent history that is refused. Only
+-- the reads are compared.
+serves' :: Reading -> Oracle -> Gen Request -> Property
+serves' rd o gen = property $ do
+  rq <- forAllWith (BL.unpack . encode . encodeRequest) gen
+  unrepresentable rq === []
+  let st = rqStore rq
+      specified = rsServe (expected rd rq)
+      asked = zip (rqServe rq) specified
+      private current = maybe False (not . aPublicRead) (current >>= lookupAuthority st)
+      kept r = case r of Served _ -> True; _ -> False
+  cover 1 "the readings disagree on a read" (rsServe (expected ratified rq) /= rsServe (expected implemented rq))
+  cover 20 "a read kept" (any (kept . snd) asked)
+  cover 20 "a reader sent nothing" (ServeDenied `elem` specified)
+  cover 5 "a reader sent history it refuses" (ServeRefused `elem` specified)
+  cover 5 "a member reads what the public may not" (or [True | ((current, Holding _, _), r) <- asked, private current, r /= ServeDenied])
+  cover 5 "a key that is no member's is sent nothing" (or [True | ((current, Holding _, _), ServeDenied) <- asked, private current])
+  cover 5 "the public reads" (or [True | ((_, Anonymous, _), r) <- asked, r /= ServeDenied])
+  cover 2 "no current authority" (or [True | (Nothing, _, _) <- rqServe rq])
+  answer <- evalEither =<< evalIO (ask o rq)
+  annotate (unlines (anRemarks answer))
+  anReadDamage answer === []
+  rsServe (anResponse answer) === specified
 
 -- | @receive@ gives each transfer of each named case the answer the rules
--- give it. Nothing else in a response is compared here: a case with no
--- transfer in it says nothing about @receive@, whatever the reading.
+-- give it, and an instance each read. Nothing else in a response is
+-- compared here: a case with neither in it says nothing about replication,
+-- whatever the reading.
 namedTransfers :: Reading -> Oracle -> Property
 namedTransfers rd o = property $
   forM_ cases $ \c -> do
@@ -167,12 +220,14 @@ namedTransfers rd o = property $
     answer <- evalEither =<< evalIO (ask o (caseRequest c))
     annotate (unlines (anRemarks answer))
     anTransferDamage answer === []
-    let made = rsReceive (anResponse answer)
-    made === rsReceive (expected rd (caseRequest c))
-    when (rd == ratified) $ made === rsReceive (caseRatified c)
-    when (rd == implemented) $ made === rsReceive (caseImplemented c)
+    anReadDamage answer === []
+    let replicated r = (rsReceive r, rsServe r)
+        made = replicated (anResponse answer)
+    made === replicated (expected rd (caseRequest c))
+    when (rd == ratified) $ made === replicated (caseRatified c)
+    when (rd == implemented) $ made === replicated (caseImplemented c)
     forM_ (caseUnder c) $ \(reading, written) ->
-      when (readingNamed reading == Just rd) $ made === rsReceive written
+      when (readingNamed reading == Just rd) $ made === replicated written
 
 -- | @receive@ keeps or refuses every transfer as the rules do under the
 -- reading. Only the transfers are compared, so that a failure here is a

@@ -18,7 +18,9 @@
 //! function itself is not run here; it needs an instance to fetch from, and
 //! this crate cannot depend on the one it is in. `levcs-cli` runs it, over
 //! the same scenarios, through [`answer_with`]
-//! (`crates/levcs-cli/tests/spec_receive_support`).
+//! (`crates/levcs-cli/tests/spec_receive_support`). A read, which is asked
+//! of an instance, is answered only there: an answer made here says nothing
+//! of the reads a request asks.
 //!
 //! Shared by `examples/spec_oracle.rs`, which the Haskell differential run
 //! drives, `tests/spec_corpus.rs`, which replays the committed corpus, and
@@ -44,7 +46,7 @@ type Res<T> = Result<T, String>;
 
 /// The model's key `n`. Fixed, so that a scenario always becomes the same
 /// objects.
-fn key(n: u64) -> SecretKey {
+pub fn key(n: u64) -> SecretKey {
     SecretKey::from_seed(levcs_core::blake3_hash(format!("levcs-spec-key-{n}").as_bytes()).0)
 }
 
@@ -677,6 +679,34 @@ impl Transfer<'_> {
         reached
     }
 
+    /// The authorities behind an authority that these reach through a tree:
+    /// every predecessor, to its genesis, of an authority some commit among
+    /// them installs.
+    ///
+    /// An instance sends an installed authority and does not look inside
+    /// it (`closure` in `levcs-instance` takes what a tree calls a blob to
+    /// link to nothing), so these it may not send. In valid history the
+    /// predecessor of an installed authority is the authority its commit
+    /// cites, which is sent for that. Where it is not, the commit is
+    /// invalid, and the receiver refuses over it and over what is missing.
+    pub fn behind_installed(&self, from: impl IntoIterator<Item = ObjectId>) -> BTreeSet<ObjectId> {
+        let authorities = &self.world.authority_names;
+        let installed: Vec<ObjectId> = self
+            .reached(from)
+            .into_iter()
+            .filter(|id| !authorities.contains_key(id) && !self.world.objects.contains_key(id))
+            .flat_map(|tree| self.world.links.get(&tree).into_iter().flatten().copied())
+            .filter(|id| authorities.contains_key(id))
+            .collect();
+        let mut behind = BTreeSet::new();
+        for a in installed {
+            let mut reached = self.reached([a]);
+            reached.remove(&a);
+            behind.extend(reached);
+        }
+        behind
+    }
+
     /// Whether every root asked for is a commit, as every root `pull` asks
     /// for is.
     pub fn only_commits(&self) -> bool {
@@ -703,8 +733,69 @@ fn transfer<'a>(w: &'a World, v: &Value) -> Res<Transfer<'a>> {
     })
 }
 
+/// A read asked of an instance that holds the scenario as the repository
+/// the pin is the genesis of.
+#[allow(dead_code)]
+pub struct Read<'a> {
+    /// The current authority the instance has for the repository, if it has
+    /// one.
+    pub current: Option<ObjectId>,
+    /// The model's key the reader signs its requests with, if it signs
+    /// them ([`key`]).
+    pub requester: Option<u64>,
+    /// What the reader asks for, expecting the pin. Its `current` is the
+    /// instance's where the instance has one. Where it has none it is the
+    /// genesis and stands for nothing: such an instance serves no one, and
+    /// the transfer is never made.
+    pub asked: Transfer<'a>,
+}
+
+/// The read a request asks for.
+fn read<'a>(w: &'a World, pin: u64, v: &Value) -> Res<Read<'a>> {
+    let genesis = w.authority(pin)?;
+    let current = match opt_int(v, "current")? {
+        Some(a) => Some(w.authority(a)?),
+        None => None,
+    };
+    Ok(Read {
+        current,
+        requester: opt_int(v, "requester")?,
+        asked: Transfer {
+            objects: &w.src.0,
+            repo_id: w.bodies[&pin].repo_id,
+            expected: genesis,
+            current: current.unwrap_or(genesis),
+            roots: roots(w, v)?,
+            world: w,
+        },
+    })
+}
+
+/// How the parts of a request that are about replication are answered.
+pub trait Replication {
+    /// One transfer: `{"recorded": [...]}` or `{"refused": true}`, with the
+    /// reasons and any damage beside it.
+    fn transfer(&mut self, t: &Transfer) -> Res<Value>;
+
+    /// One read: `{"recorded": [...]}`, `{"denied": true}` or
+    /// `{"refused": true}`. `None` where there is no instance to ask, and
+    /// the answer then says nothing of reads.
+    fn read(&mut self, _: &Read) -> Res<Option<Value>> {
+        Ok(None)
+    }
+}
+
 /// A transfer kept or refused as `levcs-cli`'s `receive` does it
 /// (`receive.rs`), from the report of the same walk, without running it.
+/// Reads are not answered: they are an instance's to answer.
+struct ByTheReport;
+
+impl Replication for ByTheReport {
+    fn transfer(&mut self, t: &Transfer) -> Res<Value> {
+        by_the_report(t)
+    }
+}
+
 fn by_the_report(t: &Transfer) -> Res<Value> {
     let w = t.world;
     let report = verify_history(&w.src, t.expected, Some(t.current), &t.roots);
@@ -827,18 +918,15 @@ fn decide(w: &World, pin: ObjectId, v: &Value) -> Res<Value> {
 /// `verify_history`.
 #[allow(dead_code)]
 pub fn answer(request: &Value) -> Res<Value> {
-    answer_with(request, &mut by_the_report)
+    answer_with(request, &mut ByTheReport)
 }
 
-/// Answer one request, with each transfer decided by `decide_transfer`:
-/// `{"recorded": [...]}` or `{"refused": true}`, with the reasons and any
-/// damage beside it.
-pub fn answer_with(
-    request: &Value,
-    decide_transfer: &mut dyn FnMut(&Transfer) -> Res<Value>,
-) -> Res<Value> {
+/// Answer one request, with its transfers and its reads answered by
+/// `replication`.
+pub fn answer_with(request: &Value, replication: &mut dyn Replication) -> Res<Value> {
     let w = World::build(field(request, "store")?)?;
-    let pin = w.authority(int(request, "pin")?)?;
+    let pin_number = int(request, "pin")?;
+    let pin = w.authority(pin_number)?;
     let verified = match request.get("verify") {
         None | Some(Value::Null) => Value::Null,
         Some(v) => verify(&w, pin, v)?,
@@ -853,13 +941,39 @@ pub fn answer_with(
         None | Some(Value::Null) => {}
         Some(Value::Array(asked)) => {
             for t in asked {
-                transfers.push(decide_transfer(&transfer(&w, t)?)?);
+                transfers.push(replication.transfer(&transfer(&w, t)?)?);
             }
         }
         // Anything else is a transfer that would go unanswered.
         Some(other) => return Err(format!("field `receive` is not a list: {other}")),
     }
-    Ok(json!({ "verify": verified, "admit": decisions, "receive": transfers }))
+    let mut answer = json!({ "verify": verified, "admit": decisions, "receive": transfers });
+    match request.get("serve") {
+        // Absent from requests saved before reads were compared, and from
+        // every request that asks none.
+        None | Some(Value::Null) => {}
+        Some(Value::Array(asked)) => {
+            // A repository is asked for by its id, and the id is derived
+            // from a genesis: a pin that is not one names no repository.
+            if !asked.is_empty() && !w.bodies[&pin_number].previous_authority.is_zero() {
+                return Err(
+                    "reads are asked of the repository the pin is the genesis of, and the pin \
+                     is not a genesis"
+                        .into(),
+                );
+            }
+            let mut reads = Vec::new();
+            for r in asked {
+                reads.push(replication.read(&read(&w, pin_number, r)?)?);
+            }
+            // Answered all or not at all: by an instance, or by no one.
+            if let Some(reads) = reads.into_iter().collect::<Option<Vec<Value>>>() {
+                answer["serve"] = json!(reads);
+            }
+        }
+        Some(other) => return Err(format!("field `serve` is not a list: {other}")),
+    }
+    Ok(answer)
 }
 
 /// A list of `{"commit": n}` and `{"release": n}`, as the set it is: in the
@@ -934,7 +1048,28 @@ pub fn compared(response: &Value) -> Res<Value> {
         }
         Some(other) => return Err(format!("field `receive` is not a list: {other}")),
     }
-    Ok(json!({ "verify": verified, "admit": decisions, "receive": transfers }))
+    let mut compared = json!({ "verify": verified, "admit": decisions, "receive": transfers });
+    match response.get("serve") {
+        // Absent where no read was asked, and from an answer that had no
+        // instance to ask.
+        None | Some(Value::Null) => {}
+        Some(Value::Array(rs)) => {
+            let mut reads = Vec::new();
+            for r in rs {
+                reads.push(
+                    match (r.get("recorded"), r.get("denied"), r.get("refused")) {
+                        (Some(_), None, None) => json!({ "recorded": objects(r, "recorded")? }),
+                        (None, Some(Value::Bool(true)), None) => json!({ "denied": true }),
+                        (None, None, Some(Value::Bool(true))) => json!({ "refused": true }),
+                        _ => return Err(format!("not recorded, denied or refused: {r}")),
+                    },
+                );
+            }
+            compared["serve"] = json!(reads);
+        }
+        Some(other) => return Err(format!("field `serve` is not a list: {other}")),
+    }
+    Ok(compared)
 }
 
 /// Damage the implementation reported. The harness never sends a damaged
@@ -951,9 +1086,11 @@ pub fn damage(response: &Value) -> Vec<String> {
             .unwrap_or_default()
     };
     let mut damage = listed(&response["verify"]["damage"]);
-    if let Some(transfers) = response["receive"].as_array() {
-        for t in transfers {
-            damage.extend(listed(&t["damage"]));
+    for part in ["receive", "serve"] {
+        if let Some(answers) = response[part].as_array() {
+            for a in answers {
+                damage.extend(listed(&a["damage"]));
+            }
         }
     }
     damage

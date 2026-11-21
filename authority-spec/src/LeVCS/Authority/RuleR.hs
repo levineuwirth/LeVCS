@@ -2,13 +2,14 @@
 -- elsewhere\".
 --
 -- The rule is decided in two places, and so it is two functions here.
--- 'mayRead' is the source's decision: whether to send anything. 'examine' is
--- the receiver's: whether to keep what was sent. 'receive' is the two in
--- order.
+-- 'serves' is the source's decision: whether to send anything, of which
+-- 'mayRead' is the part the text states. 'examine' is the receiver's:
+-- whether to keep what was sent. 'receive' is the two in order.
 module LeVCS.Authority.RuleR
   ( -- * At the source
     Requester (..)
   , mayRead
+  , serves
 
     -- * At the receiver
   , Received (..)
@@ -40,6 +41,34 @@ mayRead :: Authority -> Requester -> Bool
 mayRead source who = aPublicRead source || case who of
   Anonymous -> False
   Holding k -> holds source k Reader
+
+-- | Whether a source sends a requester anything of the repository whose
+-- pinned genesis is the one given, and whose current authority there is the
+-- other.
+--
+-- Read literally this is R.2 and no more: the policy of whatever authority
+-- the source has as current. A source with no current authority has no
+-- policy to permit anyone, so nobody reads it.
+--
+-- Under divergence (g) the source has to stand behind that authority first.
+-- One it cannot follow, step by step, back to the genesis of the repository
+-- asked for is no authority of that repository, and its policy lets no one
+-- in: not a member of it, and not the public.
+--
+-- Step by step is all it follows. Divergences (b) and (e) are what
+-- 'verify' and 'admit' ask of an authority beyond its steps, and a source
+-- does not ask them: an authority with a signature on it that does not
+-- verify, or a successor with no @Owner@, is one it serves under, by that
+-- authority's policy. The receiver does ask ('examine'), and refuses what
+-- such a source sends.
+serves :: Reading -> Store -> AuthId -> Maybe AuthId -> Requester -> Bool
+serves rd st pin sourceCurrent who = case sourceCurrent of
+  Just current
+    | Just there <- lookupAuthority st current ->
+        mayRead there who && currentStands bySteps st pin current
+  _ -> False
+  where
+    bySteps = rd {everyAuthoritySignatureVerifies = False, ownerlessRejectedWhenCited = False}
 
 -- * At the receiver
 
@@ -115,14 +144,17 @@ data Transfer = Transfer
   }
   deriving (Eq, Show)
 
--- | A transfer from a source whose current authority is the one given.
+-- | A transfer from a source that is asked for the repository the receiver
+-- expects, and whose current authority for it is the one given.
 --
--- R.2 is decided first, in the source's current authority. A source with no
--- current authority has no policy to permit anyone, so nobody reads it.
+-- The source decides first ('serves'), and what it sends the receiver then
+-- examines. Under divergence (g) both look at the source's current
+-- authority, and not alike: the receiver holds it to (b) and (e) as well.
+-- So 'NotThatRepository' is the receiver's answer to a source that serves
+-- under an authority the receiver does not accept as one.
 receive :: Reading -> Store -> Maybe AuthId -> Transfer -> Received
 receive rd st sourceCurrent t = case sourceCurrent of
   Just current
-    | Just there <- lookupAuthority st current
-    , mayRead there (tfRequester t) ->
+    | serves rd st (tfExpected t) sourceCurrent (tfRequester t) ->
         examine rd st (tfExpected t) current (tfRoots t)
   _ -> ReadDenied

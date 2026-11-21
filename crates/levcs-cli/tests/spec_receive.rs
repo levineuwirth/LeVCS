@@ -1,6 +1,7 @@
-//! Rule R's receiver against the executable specification in
-//! `authority-spec/`: every transfer of the committed corpus, made by
-//! `receive`, the function `clone`, `pull` and `fork` call.
+//! Rule R against the executable specification in `authority-spec/`: every
+//! transfer of the committed corpus, made by `receive`, the function
+//! `clone`, `pull` and `fork` call, and every read in it, asked of an
+//! instance of `levcs-instance`.
 //!
 //! `levcs-identity`'s `tests/spec_corpus.rs` replays the same corpus with a
 //! transfer decided from the report of `verify_history`, which is the last
@@ -46,12 +47,24 @@ fn transfers(response: &Value) -> Vec<Value> {
         .clone()
 }
 
+/// The reads of a response, as they are compared.
+fn reads(response: &Value) -> Vec<Value> {
+    spec_support::compared(response)
+        .unwrap()
+        .get("serve")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
 /// `receive` gives every transfer in the corpus the answer the rules give
-/// it, and the rest of each response is as it was.
+/// it, an instance gives every read the answer they give that, and the rest
+/// of each response is as it was.
 #[test]
-fn receive_gives_every_corpus_transfer_the_specified_answer() {
+fn receive_and_an_instance_give_the_corpus_the_specified_answers() {
     let mut receiver = spec_receive_support::Receiver::start();
     let (mut recorded, mut refused) = (0, 0);
+    let (mut kept, mut denied, mut turned_away) = (0, 0, 0);
     for (name, entry) in corpus() {
         let answer = receiver
             .answer(&entry["request"])
@@ -73,6 +86,15 @@ fn receive_gives_every_corpus_transfer_the_specified_answer() {
                 refused += 1;
             }
         }
+        for r in reads(&answer) {
+            if r.get("recorded").is_some() {
+                kept += 1;
+            } else if r.get("denied").is_some() {
+                denied += 1;
+            } else {
+                turned_away += 1;
+            }
+        }
     }
     // Enough of each that agreeing is not agreeing on nothing.
     assert!(
@@ -83,34 +105,52 @@ fn receive_gives_every_corpus_transfer_the_specified_answer() {
         refused >= 5,
         "only {refused} transfers in the corpus are refused"
     );
+    assert!(
+        kept >= 14 && denied >= 12 && turned_away >= 3,
+        "of the reads in the corpus, {kept} are kept, {denied} are sent nothing and \
+         {turned_away} are sent history that is refused"
+    );
 }
 
-/// The two divergences that are about replication, (f) and (g), are
-/// divergences of `receive` itself: on their witnesses it does not do what
-/// the ratified text says, read literally.
+/// The divergences that show in replication are divergences of `receive`
+/// and of an instance themselves: on their witnesses, what is transferred
+/// and what is read is not what the ratified text says, read literally.
 #[test]
-fn the_replication_witnesses_depart_from_the_ratified_text_in_receive() {
+fn the_replication_witnesses_depart_from_the_ratified_text_as_run() {
     let mut receiver = spec_receive_support::Receiver::start();
-    let mut seen = Vec::new();
+    let (mut transferred, mut read) = (Vec::new(), Vec::new());
     for (name, entry) in corpus() {
-        let ratified = transfers(&entry["ratified"]);
-        if ratified == transfers(&entry["expect"]) {
+        let replicated = |response: &Value| (transfers(response), reads(response));
+        let ratified = replicated(&entry["ratified"]);
+        let specified = replicated(&entry["expect"]);
+        if ratified == specified {
             continue;
         }
         let answer = receiver
             .answer(&entry["request"])
             .unwrap_or_else(|e| panic!("{name}: {e}"));
         assert_ne!(
-            transfers(&answer),
+            replicated(&answer),
             ratified,
-            "{name}: receive does what the ratified text says"
+            "{name}: replication does what the ratified text says"
         );
-        seen.push(name);
+        if ratified.0 != specified.0 {
+            transferred.push(name.clone());
+        }
+        if ratified.1 != specified.1 {
+            read.push(name);
+        }
     }
     for letter in ["div-f-", "div-g-"] {
         assert!(
-            seen.iter().any(|name| name.starts_with(letter)),
-            "no witness of {letter} is a transfer: {seen:?}"
+            transferred.iter().any(|name| name.starts_with(letter)),
+            "no witness of {letter} is a transfer: {transferred:?}"
+        );
+    }
+    for letter in ["div-g-", "div-be-"] {
+        assert!(
+            read.iter().any(|name| name.starts_with(letter)),
+            "no witness of {letter} is a read: {read:?}"
         );
     }
 }
@@ -129,4 +169,21 @@ fn a_transfer_that_was_not_made_is_not_a_refusal() {
     let mut receiver = spec_receive_support::Receiver::nowhere();
     let refusal = receiver.answer(&entry["request"]).unwrap_err();
     assert!(refusal.contains("the transfer was not made"), "{refusal}");
+}
+
+/// A read is asked of a repository by its id, and the id is derived from a
+/// genesis. A request that asks reads under a pin that is not one names no
+/// repository, and is answered by neither side.
+#[test]
+fn reads_under_a_pin_that_is_not_a_genesis_are_not_answered() {
+    let (_, entry) = corpus()
+        .into_iter()
+        .find(|(name, _)| name == "r-read-permission-is-decided-in-the-current-authority")
+        .unwrap();
+    let mut receiver = spec_receive_support::Receiver::start();
+    assert!(receiver.answer(&entry["request"]).is_ok());
+    let mut request = entry["request"].clone();
+    request["pin"] = serde_json::json!(1);
+    let refusal = receiver.answer(&request).unwrap_err();
+    assert!(refusal.contains("the pin is not a genesis"), "{refusal}");
 }

@@ -1,0 +1,196 @@
+{
+  "expect": {
+    "admit": [],
+    "receive": [],
+    "serve": [
+      {
+        "recorded": [
+          {
+            "commit": 0
+          }
+        ]
+      },
+      {
+        "recorded": [
+          {
+            "commit": 0
+          }
+        ]
+      },
+      {
+        "recorded": [
+          {
+            "commit": 0
+          }
+        ]
+      },
+      {
+        "recorded": [
+          {
+            "commit": 0
+          }
+        ]
+      },
+      {
+        "denied": true
+      },
+      {
+        "denied": true
+      }
+    ],
+    "verify": null
+  },
+  "name": "r-a-private-repository-is-read-by-its-members",
+  "note": "R.2: \"a role of at least Reader there\". The current authority has no public_read. Every member reads it, whatever the role: k0 an Owner, k1 a Reader, k2 a Contributor and k3 a Maintainer. A reader with no key and one whose key is no member's are sent nothing.",
+  "ratified": {
+    "admit": [],
+    "receive": [],
+    "serve": [
+      {
+        "recorded": [
+          {
+            "commit": 0
+          }
+        ]
+      },
+      {
+        "recorded": [
+          {
+            "commit": 0
+          }
+        ]
+      },
+      {
+        "recorded": [
+          {
+            "commit": 0
+          }
+        ]
+      },
+      {
+        "recorded": [
+          {
+            "commit": 0
+          }
+        ]
+      },
+      {
+        "denied": true
+      },
+      {
+        "denied": true
+      }
+    ],
+    "verify": null
+  },
+  "request": {
+    "admit": [],
+    "pin": 0,
+    "receive": [],
+    "serve": [
+      {
+        "current": 0,
+        "requester": 0,
+        "roots": [
+          {
+            "commit": 0
+          }
+        ]
+      },
+      {
+        "current": 0,
+        "requester": 1,
+        "roots": [
+          {
+            "commit": 0
+          }
+        ]
+      },
+      {
+        "current": 0,
+        "requester": 2,
+        "roots": [
+          {
+            "commit": 0
+          }
+        ]
+      },
+      {
+        "current": 0,
+        "requester": 3,
+        "roots": [
+          {
+            "commit": 0
+          }
+        ]
+      },
+      {
+        "current": 0,
+        "requester": null,
+        "roots": [
+          {
+            "commit": 0
+          }
+        ]
+      },
+      {
+        "current": 0,
+        "requester": 7,
+        "roots": [
+          {
+            "commit": 0
+          }
+        ]
+      }
+    ],
+    "store": {
+      "authorities": [
+        {
+          "id": 0,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            },
+            {
+              "key": 1,
+              "role": "reader"
+            },
+            {
+              "key": 2,
+              "role": "contributor"
+            },
+            {
+              "key": 3,
+              "role": "maintainer"
+            }
+          ],
+          "prev": null,
+          "protected": [],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 1
+        }
+      ],
+      "commits": [
+        {
+          "cites": 0,
+          "id": 0,
+          "installs": null,
+          "parents": [],
+          "signature": {
+            "key": 0,
+            "valid": true
+          }
+        }
+      ],
+      "releases": []
+    },
+    "verify": null
+  }
+}

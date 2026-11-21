@@ -340,7 +340,9 @@ impl AppState {
             in_flight: Arc::new(Semaphore::new(l.max_in_flight)),
             pushes: Arc::new(Semaphore::new(l.max_concurrent_pushes)),
             transfers: Arc::new(Semaphore::new(l.max_concurrent_transfers)),
-            proved: Arc::new(Mutex::new(ChainVerifier::bounded(MAX_PROVED, MAX_CHAIN))),
+            proved: Arc::new(Mutex::new(
+                ChainVerifier::bounded(MAX_PROVED, MAX_CHAIN).as_history(),
+            )),
             config: Arc::new(config),
         }
     }
@@ -1041,13 +1043,18 @@ enum Readers {
 }
 
 /// Who may read `repo`: its current authority's `public_read`, with that
-/// authority proved back to the genesis the id pins. Decided under the
-/// repository's lock, where no push is part way. A transaction record found
-/// even so is one a recovery could not roll back, and the authority it would
-/// replace decides: a change to `current` is not in effect until its push
-/// has landed. Fails closed: an authority that is missing, unreadable or
-/// unproved, and a `public_read` that is neither true nor false, let no one
-/// read.
+/// authority proved back to the genesis the id pins, as `verify_history`
+/// proves one: every step, every signature on every authority in the chain,
+/// and an owner on every successor. It was proved by its steps alone, and
+/// an authority `verify` and `admit` reject then decided who was sent the
+/// repository.
+///
+/// Decided under the repository's lock, where no push is part way. A
+/// transaction record found even so is one a recovery could not roll back,
+/// and the authority it would replace decides: a change to `current` is not
+/// in effect until its push has landed. Fails closed: an authority that is
+/// missing, unreadable or unproved, and a `public_read` that is neither true
+/// nor false, let no one read.
 fn readers(s: &AppState, repo: &RepoId) -> Result<Readers, String> {
     let refs = levcs_core::Refs::new(s.repo_dir(repo).join(".levcs"));
     let pending = levcs_core::ref_tx::RefStore::pending(&refs)

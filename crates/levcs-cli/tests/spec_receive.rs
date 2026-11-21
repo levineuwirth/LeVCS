@@ -106,7 +106,7 @@ fn receive_and_an_instance_give_the_corpus_the_specified_answers() {
         "only {refused} transfers in the corpus are refused"
     );
     assert!(
-        kept >= 14 && denied >= 12 && turned_away >= 3,
+        kept >= 15 && denied >= 14 && turned_away >= 1,
         "of the reads in the corpus, {kept} are kept, {denied} are sent nothing and \
          {turned_away} are sent history that is refused"
     );

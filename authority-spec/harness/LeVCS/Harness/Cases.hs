@@ -479,6 +479,21 @@ historyCases =
         [c 1]
         []
         []
+  , agreed
+      "h-two-owners-hand-over-a-successor"
+      "H.5. k0 and k1 are both Owners. Both sign the successor, and k1 authors the commit \
+      \that installs it. The successor bears the signature of the Owner who puts it into \
+      \effect, so the commit is valid. div-a-successor-not-signed-by-the-boundary-author is \
+      \the same handover with k0's signature alone."
+      ( store
+          [genesis [(1, Owner)], successor 0 2 [(0, Owner), (1, Owner)] [0, 1]]
+          [installing 1 (commit [] 0 1)]
+          []
+      )
+      Nothing
+      [c 0]
+      []
+      []
   ]
 
 divergentHistoryCases :: [Case]
@@ -749,6 +764,25 @@ publicationCases =
       , both onC1 (tx 2 [forced (move (b 0) (Just (c 1)) (Just (c 2)))]) (admitted 1)
       ]
   , publication
+      "p-replacing-a-branch-in-one-transaction"
+      "P.4. A deletion is a rewrite when no ref reaches its target once every update in the \
+      \transaction is applied. Creating b1 at c1 and deleting b0, which held c1, unpublishes \
+      \nothing: a Contributor does it unforced, in either order. A move is judged otherwise. \
+      \With b1 still on c1, moving b0 to c2, which does not descend from c1, is a rewrite \
+      \all the same, refused for a Contributor and admitted for a Maintainer."
+      rewrite
+      [ both
+          onC1
+          (tx 1 [move (b 1) Nothing (Just (c 1)), move (b 0) (Just (c 1)) Nothing])
+          (admitted 0)
+      , both
+          onC1
+          (tx 1 [move (b 0) (Just (c 1)) Nothing, move (b 1) Nothing (Just (c 1))])
+          (admitted 0)
+      , both onBoth (tx 1 [forced (move (b 0) (Just (c 1)) (Just (c 2)))]) (Refused Unauthorized)
+      , both onBoth (tx 2 [forced (move (b 0) (Just (c 1)) (Just (c 2)))]) (admitted 1)
+      ]
+  , publication
       "p-transaction-that-is-not-well-formed"
       "What is not a transaction is refused as one, before anything else about it is \
       \looked at. A branch with no name, a name with an empty or a dot component, a ref \
@@ -797,6 +831,7 @@ publicationCases =
     published1 = state (Just 1) [(b 0, c 1)]
     empty = state (Just 0) []
     onB1 = state (Just 0) [(b 1, c 0)]
+    onBoth = state (Just 0) [(b 0, c 1), (b 1, c 1)]
 
 -- | One root commit by the Contributor @k1@, under a policy protecting one
 -- glob. @k2@ is a Maintainer.

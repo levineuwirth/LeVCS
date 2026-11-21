@@ -1,11 +1,12 @@
 # Authority semantics: history, replication, publication
 
-**Status: ratified by the owner on 2026-10-04.** Ratified: the terms;
-rules H, R and P; decisions D1, D2, D4 and D5 as written. D3 and D6 are
-deferred. D6 needs an independent trust decision, so its recommendation
-below is a proposal only. This note is the specification that `verify`,
-replication and admission enforce (audit 2026-10-03, revised: step 7;
-findings C1, C2).
+**Status: ratified by the owner on 2026-10-04, and amended by the owner
+on 2026-11-21** (see "Amendments"). Ratified: the terms; rules H, R and
+P; decisions D1, D2, D4 and D5 as written. D3 and D6 are deferred. D6
+needs an independent trust decision, so its recommendation below is a
+proposal only. This note is the specification that `verify`, replication
+and admission enforce (audit 2026-10-03, revised: step 7; findings C1,
+C2).
 
 **Implementation.**
 - **Rule H** is `levcs-identity/src/history.rs`. `verify` applies it to
@@ -33,7 +34,10 @@ was already published.
 ## Terms
 
 An **authority** is a signed membership object: `repo_id`,
-`previous_authority`, `version`, members with roles, and policy.
+`previous_authority`, `version`, members with roles, and policy. Every
+signature an authority carries must verify. One that carries a signature
+that does not verify is invalid, however else it is signed, and the
+genesis is no exception. So is every authority that descends from it.
 
 **Genesis** is the authority with a zero `previous_authority` and
 `version = 1`. The `repo_id` is the BLAKE3 of the genesis body with
@@ -41,7 +45,11 @@ An **authority** is a signed membership object: `repo_id`,
 genesis.
 
 A **successor** of authority `A` names `A` as previous, has version
-`A.version + 1`, and is signed by an `Owner` of `A` (`verify_successor`).
+`A.version + 1`, is signed by an `Owner` of `A` (`verify_successor`), and
+has at least one `Owner` itself (D4). An authority with no `Owner` could
+never be succeeded. It is no successor wherever it appears: where a
+commit installs it, and where a commit or release only cites it. H.5 says
+which `Owner` signs a successor that a commit installs.
 
 `B` **descends from** `A` when following `previous_authority` from `B`
 reaches `A`. Two authorities are **comparable** when one descends from
@@ -65,6 +73,26 @@ A repository's **authoritative state** depends on where it is published:
 
 **`S0`** is the authoritative state before a transaction, with
 `A0 = refs/authority/current`.
+
+A `current` is **proved** when its chain reaches the genesis pinned by
+`repo_id` through successors alone. It is not taken on trust. Rule P
+keeps a proved `current` proved (P.3), but a state can come from outside
+these rules: before them, by a bootstrap or mirror transition, or
+dishonestly. Three decisions rest on a proved `current`, and each is
+refused where there is none, or one that is not proved:
+- **Reads (R.2).** The source serves no one, its members included,
+  whatever the policy of that authority says.
+- **Receipt (R.1).** The receiver records nothing from a source whose
+  `current` is not proved for the `repo_id` the receiver expects.
+- **Admission (Rule P).** Nothing is admitted over such a state, whoever
+  signs the transaction.
+
+`verify` does not rest on it. Given a `current` that is not proved,
+`verify` reports that authority, and still checks every object and
+reports each commit's and release's own faults under Rule H. It
+classifies nothing as on a conflicting lineage, because there is no
+canonical lineage to compare with. Given no `current` at all, it reports
+nothing about one and classifies nothing either.
 
 **`R0`** contains the commits admitted to the destination's authoritative
 state before the transaction. Object presence, remote refs and workspace
@@ -101,8 +129,17 @@ hold:
 3. **Monotone in every parent.** For every parent `Pi`, `A(C)` equals or
    descends from `E(Pi)`.
 4. **Root commits.** A commit with no parents cites the pinned genesis.
-5. **Authority changes.** If `C` modifies authority, `E(C)` is a valid
-   direct successor of `A(C)` with at least one `Owner` (D4).
+5. **Authority changes.** If `C` modifies authority, `E(C)` is a direct
+   successor of `A(C)`, and carries the signature of `C`'s author.
+
+   A successor bears the signature of the `Owner` who puts it into
+   effect. The commit already names the successor by its id, which covers
+   its signatures, so its author attests to that exact successor either
+   way. This puts the attestation on the authority itself, apart from any
+   commit. It changes the record and no one's power: any `Owner` can sign
+   and install a successor alone. Two `Owner`s hand a change over by both
+   signing it: the one who commits adds a signature to the successor the
+   other signed.
 
 **Releases.** A release is valid if its declarer holds `Maintainer` or
 above in `A(release)`, and `A(release)` equals or descends from
@@ -122,9 +159,9 @@ distinct:
 - **valid**;
 - **invalid**: a bad signature, an unauthorized role, or a broken or
   foreign chain;
-- **valid on a conflicting lineage**: the commit is historically valid,
-  but cites an authority that is incomparable with this replica's
-  canonical lineage (D2).
+- **valid on a conflicting lineage**: the commit or release is
+  historically valid, but cites an authority that is incomparable with
+  this replica's canonical lineage, or as a commit installs one (D2).
 
 ## Rule R: replication
 
@@ -132,10 +169,18 @@ Replication is receiving history that was already published elsewhere:
 `pull`, `clone`, the read side of `fork`, mirroring, and the receiving
 side of `dial`. The last two are refused until they apply this rule.
 
-1. **Every received commit and release passes Rule H** against the
+1. **Every received commit and release must pass Rule H** against the
    genesis pinned by the expected `repo_id`. If a chain ends at a
    different genesis, the transfer is refused: that is a different
    repository.
+
+   If any commit or release reachable from the requested roots is
+   classified as valid on a conflicting lineage against the source's
+   verified current authority, the receiver reports the conflict and
+   records none of the transfer. "Verified" is proved, as the Terms
+   define it. The lineage is the source's because a transfer records the
+   source's state (R.4). The receiver's own `current` is consulted when
+   received history is promoted, under Rule P.
 2. **No membership is required of the receiver.** The receiver needs only
    the source's read permission: `public_read`, or a role of at least
    `Reader` there. A reader of a public repository is not a contributor.
@@ -175,7 +220,7 @@ single pre-transaction state `S0`.
      contract.
    - The one exception is a single authority-transition boundary commit.
      It cites `A0`, installs a direct successor `A1`, and is authored by
-     an `Owner` of `A0`.
+     an `Owner` of `A0`, whose signature `A1` carries (H.5).
    - No newly exposed commit may cite `A1`. Commits that do are accepted
      in a later transaction, whose `A0` is `A1`.
    - Releases follow the same rule.
@@ -185,8 +230,18 @@ single pre-transaction state `S0`.
 4. **Ref updates.** These rules are separate from H:
    - Updating a protected ref requires the transaction's signer to hold
      `Maintainer` in `A0`.
-   - A non-fast-forward update also requires `Maintainer` in `A0`, with
-     ancestry walked over verified objects only.
+   - A **rewrite** must be marked as forced in the transaction, whoever
+     signs it, and requires the signer to hold `Maintainer` in `A0`.
+     Ancestry is walked over verified objects only. Two updates are
+     rewrites:
+     - moving a ref to a target that does not descend from the one it
+       held, whatever else still reaches the old target;
+     - deleting a ref whose target no authoritative ref reaches once
+       every update in the transaction is applied.
+   - A deletion that leaves its target reachable is not a rewrite. A
+     transaction that creates a branch at a tip and deletes the branch
+     that held it unpublishes nothing, in whichever order it lists the
+     two.
 5. **Nothing self-authorizes.**
    - `A0` and `R0` are fixed before the transaction, so incoming refs
      cannot grandfather their own commits.
@@ -240,10 +295,13 @@ wrote is correct.
 
 **D2. Authority equivocation.**
 - **Recommendation:** within a replica, the lineage ending at that
-  replica's accepted `current` is canonical. P.3 keeps it linear there.
+  replica's accepted `current` is canonical, where that `current` is
+  proved. P.3 keeps it linear there.
 - **When replicas meet:** an incomparable lineage is a detected
-  disagreement. `verify` reports commits on it as valid on a conflicting
-  lineage, not as invalid signatures.
+  disagreement. `verify` reports commits and releases that cite an
+  authority on it, and commits that install one, as valid on a
+  conflicting lineage, not as invalid signatures. A receiver records
+  nothing of a transfer that reaches one (R.1).
 - **What this does not do:** prevent equivocation globally. See "Global
   agreement" above.
 
@@ -251,8 +309,10 @@ wrote is correct.
 across them are a hard conflict until an explicit reconciliation object
 exists.
 
-**D4. Ownerless successors.** Adopt rejection, per H.5, in verification
-and in `authority remove` and `promote`.
+**D4. Ownerless successors.** Adopt rejection: an authority with no
+`Owner` is not a successor (Terms). Verification rejects one wherever it
+is installed or cited, and `authority remove` and `promote` refuse to
+make one.
 
 **D5. Release declarers.** Adopt: `Maintainer` or above in `A(release)`.
 Implemented in Rule H's release check, so `verify` and every admission
@@ -279,6 +339,28 @@ proposal, not ratified policy.
 - **Under v2:** the authenticated bootstrap and its signed evidence take
   this role, and D6 does not arise.
 
+## Amendments
+
+**2026-11-21.** Seven clauses now say what the implementation enforces.
+The executable specification in `authority-spec/` had shown the
+implementation refusing more than the text read literally, in the seven
+places `authority-spec/DIVERGENCES.md` records as (a) to (g). The owner
+decided each for the implementation. No behaviour changed.
+- **(a) H.5, P.2:** a successor carries the signature of the author of
+  the commit that installs it.
+- **(b) Terms:** every signature an authority carries must verify.
+- **(c) `verify` outcomes, D2:** installing an authority on a conflicting
+  lineage counts, as citing one does.
+- **(d) P.4:** a rewrite must be marked as forced, and a deletion that
+  unpublishes is a rewrite, judged over the refs after the whole
+  transaction.
+- **(e) Terms, D4:** an authority with no `Owner` is no successor,
+  wherever it appears.
+- **(f) R.1:** a transfer that reaches a conflicting lineage is reported
+  and not recorded.
+- **(g) Terms:** a `current` must be proved for reads, receipt and
+  admission; `verify` reports one that is not and goes on.
+
 ## Implementation notes
 
 These are not part of the ratification.
@@ -289,6 +371,9 @@ These are not part of the ratification.
 - **Pinning.** `verify` takes `refs/authority/genesis`, checked against
   `repo_id`. Admission and replication take the genesis derived from the
   validated 64-hex `repo_id` they were asked for.
+- **The executable specification.** `authority-spec/` states these rules
+  as a model, and CI compares it with the implementation on generated
+  scenarios and on a committed corpus of named cases.
 - **Tests:**
   - **Rule H (verify):**
     - a revoked author's commit on the revoking commit (invalid);
@@ -310,6 +395,8 @@ These are not part of the ratification.
       citing it (refused);
     - a rollback of `current` (refused);
     - a Contributor updating a protected ref (refused);
+    - a branch replaced by another at the same tip in one transaction
+      (admitted, unforced, for a Contributor);
     - a stale-authority commit replicated under `refs/remote/…`, then
       promoted: replication succeeds, but promotion is refused unless the
       commit is adopted.

@@ -1,14 +1,26 @@
 # Where the implementation and the ratified text part ways
 
-This records what writing the executable specification turned up. Nothing
-here has been decided: each divergence is either an amendment to
-`doc/authority-semantics.md` or a change to the Rust, and that is the owner's
+This records what writing the executable specification turned up.
+
+**The seven divergences are settled.** On 2026-11-21 the owner decided each
+for the Rust and amended `doc/authority-semantics.md` to say what it
+enforces (that document's "Amendments"). The text and the Rust no longer
+part ways there. Each entry keeps what the text said as first ratified, on
+2026-10-04, because the switches, the witnesses and the runs that confirm
+them are built on it:
+
+- the reading the model calls `ratified` is the text as first ratified;
+- the reading it calls `implemented` is the text as amended.
+
+Nothing else here has been decided. The readings, the untested
+requirements and the gaps are as they were, and each is still the owner's
 call.
 
 There are six kinds of entry:
 
-- **Divergences:** the text says one thing and the Rust enforces more. Each
-  is a switch in `LeVCS.Authority.Reading` and has a witness in `corpus/`.
+- **Divergences:** the text as first ratified said one thing and the Rust
+  enforces more. Each is a switch in `LeVCS.Authority.Reading` and has a
+  witness in `corpus/`. All are settled by amendment.
 - **Readings:** the text leaves something implicit and the model had to
   choose.
 - **Untested contract requirements:** the text does say, and nothing here
@@ -19,9 +31,9 @@ There are six kinds of entry:
 - **Defects found on the way:** faults in the Rust that are no part of the
   authority rules.
 
-## Divergences
+## Divergences, settled by the amendment of 2026-11-21
 
-In every one the Rust is stricter than the text, never looser. Three
+In every one the Rust is stricter than the text was, never looser. Three
 properties named "the implemented reading only ever refuses more" check
 that:
 
@@ -40,8 +52,9 @@ agree.
 
 ### (a) A successor must be signed by the author of the commit that installs it
 
-- **Text:** a successor "is signed by an `Owner` of `A`" (Terms), and H.5
-  asks for "a valid direct successor of `A(C)` with at least one `Owner`".
+- **Text, as first ratified:** a successor "is signed by an `Owner` of
+  `A`" (Terms), and H.5 asks for "a valid direct successor of `A(C)` with
+  at least one `Owner`".
 - **Rust:** the boundary commit's author must also be among the successor's
   signers. `verify_successor` (`verify.rs:365`), called from `check_commit`
   (`history.rs:417`).
@@ -49,6 +62,12 @@ agree.
   commits.
 - **Note:** the Terms section names `verify_successor` as the definition, so
   the text may be meant to include this.
+- **Settled:** H.5 and P.2 now ask for it. The reason the owner took: a
+  successor bears the signature of the Owner who puts it into effect. The
+  commit already names the successor by its id, so its author attests to
+  it either way; this puts the attestation on the authority itself. It
+  changes the record and no one's power. Two Owners hand a change over by
+  both signing it, which is case `h-two-owners-hand-over-a-successor`.
 - **With (b):** the author's signature must be one that verifies. An entry
   bearing the author's key that does not verify is no signature. In the Rust
   the question never arises, because (b) rejects the successor first; the
@@ -60,7 +79,10 @@ agree.
 
 ### (b) Every signature on an authority must verify
 
-- **Text:** one signature by an Owner of the predecessor.
+- **Text, as first ratified:** one signature by an Owner of the
+  predecessor.
+- **Settled:** the Terms now say every signature an authority carries must
+  verify.
 - **Rust:** an authority is rejected if any signature on it fails, on every
   authority in a chain, the genesis included (`history.rs:219`).
 - **Effect:** an authority carrying a valid Owner signature and one more
@@ -76,8 +98,10 @@ agree.
 
 ### (c) An installed authority can put a commit on a conflicting lineage
 
-- **Text:** a commit is on a conflicting lineage when it "cites an authority
-  that is incomparable with this replica's canonical lineage" (D2).
+- **Text, as first ratified:** a commit is on a conflicting lineage when it
+  "cites an authority that is incomparable with this replica's canonical
+  lineage" (D2).
+- **Settled:** the `verify` outcomes and D2 now count installing one.
 - **Rust:** the authority a commit installs is classified as well
   (`history.rs:760`).
 - **Effect:** a boundary commit that cites an authority on the replica's
@@ -89,8 +113,16 @@ agree.
 
 Two switches, `d-force` and `d-delete`.
 
-- **Text:** "A non-fast-forward update also requires `Maintainer` in `A0`"
-  (P.4). Nothing about a force flag, and nothing about deletion.
+- **Text, as first ratified:** "A non-fast-forward update also requires
+  `Maintainer` in `A0`" (P.4). Nothing about a force flag, and nothing
+  about deletion.
+- **Settled:** P.4 now holds both the force flag and the Maintainer
+  requirement, and names two rewrites: a move to a target that does not
+  descend from the old one, and a deletion whose target no authoritative
+  ref reaches once every update in the transaction is applied. A branch
+  replaced by another at the same tip in one transaction is therefore no
+  rewrite, while a move is judged by descent whatever else reaches the old
+  target. Case: `p-replacing-a-branch-in-one-transaction`.
 - **Rust:**
   - a non-fast-forward update must be marked as forced, whoever makes it
     (`admission.rs:697`);
@@ -104,9 +136,11 @@ Two switches, `d-force` and `d-delete`.
 
 ### (e) An ownerless successor is invalid wherever it is cited
 
-- **Text:** H.5 rejects an ownerless successor where a commit installs it.
-  D4 says "adopt rejection, per H.5, in verification", which can be read as
-  covering only that.
+- **Text, as first ratified:** H.5 rejects an ownerless successor where a
+  commit installs it. D4 says "adopt rejection, per H.5, in verification",
+  which can be read as covering only that.
+- **Settled:** having an Owner is now part of what a successor is (Terms,
+  D4), so it holds wherever one is installed or cited.
 - **Rust:** an ownerless successor is rejected anywhere in a chain
   (`history.rs:244`).
 - **Effect:** a commit that cites an ownerless successor no commit ever
@@ -119,10 +153,16 @@ Two switches, `d-force` and `d-delete`.
 
 ### (f) History on a conflicting lineage refuses a transfer
 
-- **Text:** "Every received commit and release passes Rule H" (R.1). A
-  commit on a conflicting lineage "is historically valid" (`verify`
-  outcomes), so it passes. D2 has an incomparable lineage "detected" and
-  reported "as valid on a conflicting lineage, not as invalid".
+- **Text, as first ratified:** "Every received commit and release passes
+  Rule H" (R.1). A commit on a conflicting lineage "is historically valid"
+  (`verify` outcomes), so it passes. D2 has an incomparable lineage
+  "detected" and reported "as valid on a conflicting lineage, not as
+  invalid".
+- **Settled:** R.1 now says that if anything reachable from the requested
+  roots is on a conflicting lineage against the source's verified current
+  authority, the receiver reports the conflict and records none of the
+  transfer. The lineage is the source's; the receiver's own `current` is
+  consulted when received history is promoted, under Rule P.
 - **Rust:** `receive` in `levcs-cli` classifies what was sent against the
   source's current authority and refuses the whole transfer unless
   `HistoryReport::ok`, which requires that nothing be conflicting
@@ -150,17 +190,23 @@ Two switches, `d-force` and `d-delete`.
 
 ### (g) A current authority must be on the pinned chain
 
-- **Text:** `current` is taken as given. "The lineage ending at that
-  replica's accepted `current` is canonical" (D2); `A0` is
-  `refs/authority/current` (Terms); and R.1 refuses a transfer for the chain
-  of something received, which the source's own current authority is not.
+- **Text, as first ratified:** `current` is taken as given. "The lineage
+  ending at that replica's accepted `current` is canonical" (D2); `A0` is
+  `refs/authority/current` (Terms); and R.1 refuses a transfer for the
+  chain of something received, which the source's own current authority is
+  not.
+- **Settled:** the Terms now define a proved `current` and say which
+  decisions rest on one: reads, receipt and admission. `verify` does not.
+  Given a `current` that is not proved it reports that authority, still
+  checks every object and reports each one's own faults, and classifies
+  nothing as on a conflicting lineage.
 - **Rust:** before anything else is read, the current authority must have
   an unbroken chain ending at the pinned genesis. `verify_history`
   (`history.rs:521`) and `admit` (`admission.rs:480`) each check it, and an
   instance checks it before it answers any read (`readers`,
   `levcs-instance/src/lib.rs:1051`).
-- **Effect:** four places where the text read literally goes on and the
-  Rust stops.
+- **Effect:** four places where the text read literally goes on. In three
+  the Rust refuses; in `verify` it reports and goes on.
   - **Reading.** R.2 looks at the policy of the source's current authority,
     whatever that is: a public one lets anyone in. An instance serves no
     one, the public and the members alike, from a repository whose current

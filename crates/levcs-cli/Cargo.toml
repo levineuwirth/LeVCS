@@ -28,6 +28,7 @@ name = "levcs"
 path = "src/main.rs"
 
 [dev-dependencies]
+tempfile = { workspace = true }
 levcs-instance = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }

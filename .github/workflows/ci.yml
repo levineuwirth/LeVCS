@@ -103,9 +103,11 @@ jobs:
       - run: bash scripts/check-phase1.sh
 
   # Gate: the executable specification of the authority rules
-  # (authority-spec/README.md). Its properties hold, and levcs-identity gives
-  # every generated scenario the verdicts the specification gives it. The
-  # corpus replay needs no Haskell and runs with the workspace tests above.
+  # (authority-spec/README.md). Its properties hold, levcs-identity gives
+  # every generated scenario the verdicts the specification gives it, and
+  # levcs-cli's receive keeps or refuses every generated transfer as it
+  # says. The corpus replays need no Haskell and run with the workspace
+  # tests above.
   authority-spec:
     name: authority spec
     runs-on: ubuntu-latest
@@ -130,14 +132,16 @@ jobs:
           key: cabal-${{ runner.os }}-ghc-9.10.3-${{ hashFiles('authority-spec/cabal.project.freeze') }}
 
       # Built first, so that a Rust build failure is reported as one.
-      - name: Build the oracle
-        run: cargo build --release --locked -p levcs-identity --example spec_oracle
+      - name: Build the oracles
+        run: |
+          cargo build --release --locked -p levcs-identity --example spec_oracle
+          cargo build --release --locked -p levcs-cli --example spec_receive_oracle
 
       - name: The rules against themselves
         working-directory: authority-spec
         run: cabal test properties --test-show-details=direct
 
-      - name: The rules against levcs-identity
+      - name: The rules against levcs-identity and levcs-cli
         working-directory: authority-spec
         run: cabal test differential --test-show-details=direct
         env:

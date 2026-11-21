@@ -1,7 +1,8 @@
--- | The Rust oracle, as a process that is asked one scenario at a time.
+-- | A Rust oracle, as a process that is asked one scenario at a time.
 module Oracle
   ( Oracle
   , Answer (..)
+  , Which (..)
   , withOracle
   , ask
   ) where
@@ -27,24 +28,50 @@ data Answer = Answer
   , anDamage :: [String]
   -- ^ Damage the implementation found. The harness never sends any, so a
   -- non-empty list is a fault in the harness.
+  , anTransferDamage :: [String]
+  -- ^ The part of that damage found in making the transfers.
   , anRemarks :: [String]
   -- ^ The implementation's own account of each problem and refusal.
   }
 
--- | Start the oracle: the program named by @LEVCS_SPEC_ORACLE@ or, with that
--- unset, the @spec_oracle@ example built and run through cargo from the
--- repository root.
-withOracle :: (Oracle -> IO a) -> IO a
-withOracle use = do
-  named <- lookupEnv "LEVCS_SPEC_ORACLE"
-  let command = case named of
-        Just path | not (null path) -> proc path []
-        _ ->
-          (proc "cargo" ["run", "--quiet", "--release", "-p", "levcs-identity", "--example", "spec_oracle"])
-            { cwd = Just ".."
-            }
-  bracket (start command) stop (\(o, _) -> use o)
+-- | The two oracles. Both answer a whole request, and they differ in one
+-- thing: how a transfer is decided.
+data Which
+  = -- | @spec_oracle@ in @levcs-identity@: 'verify_history' and 'admit'
+    -- called directly, and a transfer decided from the report of the walk.
+    Rules
+  | -- | @spec_receive_oracle@ in @levcs-cli@: the same, with every transfer
+    -- made by the @receive@ that @clone@, @pull@ and @fork@ call.
+    Receiver
+
+-- | Start an oracle, built and run through cargo from the repository root,
+-- or the program an environment variable names in its place:
+-- @LEVCS_SPEC_ORACLE@ for 'Rules', @LEVCS_SPEC_RECEIVE_ORACLE@ for
+-- 'Receiver'.
+--
+-- With @LEVCS_SPEC_ORACLE@ set and the other not, there is no second oracle
+-- and the answer is 'Nothing': the program named is some other
+-- implementation, answering transfers its own way, and @levcs-cli@ has no
+-- part in the run.
+withOracle :: Which -> (Oracle -> IO a) -> IO (Maybe a)
+withOracle which use = do
+  rules <- named "LEVCS_SPEC_ORACLE"
+  receiver <- named "LEVCS_SPEC_RECEIVE_ORACLE"
+  let cargo package example =
+        (proc "cargo" ["run", "--quiet", "--release", "-p", package, "--example", example])
+          { cwd = Just ".."
+          }
+      command = case (which, rules, receiver) of
+        (Rules, Just path, _) -> Just (proc path [])
+        (Rules, Nothing, _) -> Just (cargo "levcs-identity" "spec_oracle")
+        (Receiver, _, Just path) -> Just (proc path [])
+        (Receiver, Just _, Nothing) -> Nothing
+        (Receiver, Nothing, Nothing) -> Just (cargo "levcs-cli" "spec_receive_oracle")
+  traverse (\c -> bracket (start c) stop (\(o, _) -> use o)) command
   where
+    named variable = do
+      value <- lookupEnv variable
+      pure (case value of Just path | not (null path) -> Just path; _ -> Nothing)
     start command = do
       (Just hin, Just hout, _, ph) <-
         createProcess command {std_in = CreatePipe, std_out = CreatePipe}
@@ -67,4 +94,5 @@ ask o rq = do
       Left e -> Left (e ++ " in " ++ BS.unpack line)
       Right response -> do
         (damage, remarks) <- parseEither parseRemarks value
-        Right (Answer response damage remarks)
+        transfers <- parseEither parseTransferDamage value
+        Right (Answer response damage transfers remarks)

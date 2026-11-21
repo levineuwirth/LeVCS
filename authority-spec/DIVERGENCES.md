@@ -67,7 +67,13 @@ agree.
   that fails is accepted by the text and rejected by the Rust, along with
   every commit citing it. Signatures are part of the object id, so such an
   authority is a different object from the one without the bad signature.
-- **Witness:** `div-b-authority-with-a-signature-that-does-not-verify`.
+- **Not asked by an instance.** When `levcs-instance` decides who may read,
+  it proves its current authority with `ChainVerifier::verify_chain`
+  (`verify.rs:275`), which checks each step and not every signature. See
+  "An instance proves its current authority by its steps alone" below.
+- **Witnesses:** `div-b-authority-with-a-signature-that-does-not-verify`,
+  and at an instance
+  `div-be-an-instance-serves-under-an-authority-its-reader-refuses`.
 
 ### (c) An installed authority can put a commit on a conflicting lineage
 
@@ -106,7 +112,11 @@ Two switches, `d-force` and `d-delete`.
   (`history.rs:244`).
 - **Effect:** a commit that cites an ownerless successor no commit ever
   installed is valid under the literal text and invalid in the Rust.
-- **Witness:** `div-e-ownerless-successor-cited-and-never-installed`.
+- **Not asked by an instance.** As for (b): the chain an instance proves
+  before it lets a reader in may include a successor with no Owner.
+- **Witnesses:** `div-e-ownerless-successor-cited-and-never-installed`, and
+  at an instance
+  `div-be-an-instance-serves-under-an-authority-its-reader-refuses`.
 
 ### (f) History on a conflicting lineage refuses a transfer
 
@@ -147,9 +157,16 @@ Two switches, `d-force` and `d-delete`.
   of something received, which the source's own current authority is not.
 - **Rust:** before anything else is read, the current authority must have
   an unbroken chain ending at the pinned genesis. `verify_history`
-  (`history.rs:521`) and `admit` (`admission.rs:480`) each check it.
-- **Effect:** three places where the text read literally goes on and the
+  (`history.rs:521`) and `admit` (`admission.rs:480`) each check it, and an
+  instance checks it before it answers any read (`readers`,
+  `levcs-instance/src/lib.rs:1051`).
+- **Effect:** four places where the text read literally goes on and the
   Rust stops.
+  - **Reading.** R.2 looks at the policy of the source's current authority,
+    whatever that is: a public one lets anyone in. An instance serves no
+    one, the public and the members alike, from a repository whose current
+    authority it cannot follow back to the genesis the repository's id
+    pins. It answers as if the repository did not exist.
   - **Replication.** A transfer of nothing from another repository is
     recorded as nothing, and valid history from a source whose current
     authority has a broken chain is recorded. The Rust refuses both.
@@ -172,7 +189,38 @@ Two switches, `d-force` and `d-delete`.
 - **Witnesses:** `div-g-a-source-that-is-not-the-repository-expected`,
   `div-g-publishing-over-a-current-that-does-not-stand`,
   `div-g-verify-with-another-repository-as-current`,
-  `div-g-verify-with-a-broken-current`.
+  `div-g-verify-with-a-broken-current`,
+  `div-g-a-source-serves-no-one-under-an-authority-it-cannot-prove`.
+
+### An instance proves its current authority by its steps alone
+
+This is not a divergence from the text. It is two places in the Rust that
+ask different things of the same authority, found by asking a real instance
+for every generated read.
+
+- **`verify_history` and `admit`:** an authority is one of the repository's
+  if every step of its chain is a successor step, every signature on every
+  authority in it verifies (b), and every successor in it has an Owner (e).
+- **An instance deciding who may read:** every step is a successor step,
+  and the chain ends at the genesis the id pins (g). Nothing more.
+- **Effect:** a current authority that carries a signature that does not
+  verify, or that has no Owner, is one `verify` and `admit` reject and an
+  instance serves under. If that authority is public, anyone is sent the
+  repository. The reader's `receive` then refuses the transfer, over the
+  authority it was served under, so nothing is recorded; but the objects
+  were sent.
+- **How it can arise:** not by a push. `admit` refuses to install such an
+  authority. It takes a repository that came to the instance some other
+  way: before these rules, by mirroring, or by hand.
+- **The model:** `serves` in `RuleR.hs` has the source follow the chain by
+  its steps, with (b) and (e) left out there and nowhere else. Run without
+  that, the instance and the model part ways within a hundred generated
+  reads.
+- **The decision it leaves:** whether an instance should prove its current
+  authority as `verify` does, so that the two agree on what an authority of
+  the repository is.
+- **Witness:**
+  `div-be-an-instance-serves-under-an-authority-its-reader-refuses`.
 
 ## Readings
 
@@ -239,9 +287,27 @@ Two switches, `d-force` and `d-delete`.
   - **Model:** a commit records an installed authority only when it modifies
     authority, so the case cannot be expressed and neither side is tested on
     it. Testing it means giving a commit's tree its own field.
-- **Read permission (R.2) in the Rust.** The model's `mayRead` is tested
-  against itself. The Rust enforces read permission in `levcs-instance` and
-  the CLI, which the oracle does not call.
+- **What an instance asks of a request, beyond R.2.** Read permission is
+  compared: every generated read is asked of a real instance
+  (`crates/levcs-cli/tests/spec_receive_support`), as `clone` asks, by no
+  one in particular, by each key the scenario could have made a member, and
+  by one it could not. Beyond its answer the instance is held to things
+  R.2 must mean and the model does not say:
+  - *One decision.* What it publishes, its refs, an object and a pack are
+    all answered or none is, and what it publishes is what it holds.
+  - *Holding a key is proving it.* Where a member reads what the public may
+    not, a request naming the member's key and signed with another is
+    refused, and so is one the member signed for a different read.
+  - *What it sends.* A transfer it serves is kept as exactly what the roots
+    reach, and a receiver that says what it holds is sent what it lacks.
+
+  Not run: the rest of what the instance asks of a signed request, which is
+  a clock within its skew and a nonce not seen before; a read while a push
+  is part way, which the instance decides by the authority the push would
+  replace; a `public_read` that is neither true nor false, which the model
+  cannot express; the same gate where it decides who may push
+  (`may_push`); and the check `fork` makes for itself in the CLI
+  (`fed_cmds.rs:611`).
 - **What `clone`, `pull` and `fork` do with a transfer.** `receive` is run,
   on every generated transfer, against a source that will say anything
   (`crates/levcs-cli/tests/spec_receive_support`). Beyond its answer it is
@@ -271,7 +337,8 @@ Two switches, `d-force` and `d-delete`.
   and a successful one in `fork.rs`. `pull` is tried here only as a
   receiver holding the genesis and nothing else, or one of the two cases
   above; what it says it has in a repository with history of its own is
-  not generated. Nor is a real instance's choice of what to send.
+  not generated. A real instance's choice of what to send is run where
+  reads are, for a repository it serves.
 
 ## Gaps
 
@@ -371,3 +438,17 @@ The generators avoid each of these, so neither side is tested on it.
   65,535-byte limit. The `policy_lengths_fit_their_wire_fields` test covers
   the round trip at both limits and rejects oversized entries in both the
   singleton and final positions.
+- **Not fixed: an instance's pack leaves out what an installed authority
+  reaches.** `closure` in `levcs-instance` (`lib.rs`, the walk behind
+  `build_pack`) takes every tree entry a tree calls a blob to link to
+  nothing. The authority a commit installs is such an entry, so it is sent
+  and its predecessors are not followed from it. `verify_history`'s walk
+  does follow them. In valid history nothing is lost: the predecessor of an
+  installed authority is the authority its commit cites, and that is sent
+  for the citation. Where a commit installs an authority that does not
+  succeed the one it cites, the commit is invalid and the receiver refuses
+  the transfer, as it should; but its refusal also names the predecessors
+  it was not sent as objects that cannot be read, which blames the
+  instance's copy for what the instance chose not to send. Found by the
+  generated reads. The harness lets exactly that report through
+  (`Transfer::behind_installed`) and no other damage.

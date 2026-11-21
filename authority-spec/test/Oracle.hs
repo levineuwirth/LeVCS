@@ -30,6 +30,8 @@ data Answer = Answer
   -- non-empty list is a fault in the harness.
   , anTransferDamage :: [String]
   -- ^ The part of that damage found in making the transfers.
+  , anReadDamage :: [String]
+  -- ^ The part found in the reads asked of an instance.
   , anRemarks :: [String]
   -- ^ The implementation's own account of each problem and refusal.
   }
@@ -41,7 +43,9 @@ data Which
     -- called directly, and a transfer decided from the report of the walk.
     Rules
   | -- | @spec_receive_oracle@ in @levcs-cli@: the same, with every transfer
-    -- made by the @receive@ that @clone@, @pull@ and @fork@ call.
+    -- made by the @receive@ that @clone@, @pull@ and @fork@ call, and every
+    -- read asked of an instance of @levcs-instance@. The first oracle has no
+    -- instance to ask, and says nothing of reads.
     Receiver
 
 -- | Start an oracle, built and run through cargo from the repository root,
@@ -95,4 +99,5 @@ ask o rq = do
       Right response -> do
         (damage, remarks) <- parseEither parseRemarks value
         transfers <- parseEither parseTransferDamage value
-        Right (Answer response damage transfers remarks)
+        asked <- parseEither parseServeDamage value
+        Right (Answer response damage transfers asked remarks)

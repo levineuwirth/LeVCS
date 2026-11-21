@@ -1,12 +1,13 @@
 //! The oracle the Haskell differential run in `authority-spec/` drives for
-//! Rule R's receiver: `receive`, the function `clone`, `pull` and `fork`
-//! call, run on every transfer of every scenario.
+//! Rule R: `receive`, the function `clone`, `pull` and `fork` call, run on
+//! every transfer of every scenario, and an instance of `levcs-instance`
+//! asked every read.
 //!
 //! Reads one scenario per line on stdin and writes one answer per line on
 //! stdout, until stdin closes, in the format of `levcs-identity`'s
 //! `spec_oracle`. See `tests/spec_receive_support/mod.rs` for how a transfer
-//! is made, and `authority-spec/README.md` for how to run the two sides
-//! against each other.
+//! is made and a read asked, and `authority-spec/README.md` for how to run
+//! the two sides against each other.
 
 use std::io::{self, BufRead, Write};
 

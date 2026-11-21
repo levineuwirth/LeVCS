@@ -1,0 +1,169 @@
+{
+  "expect": {
+    "admit": [],
+    "receive": [],
+    "serve": [
+      {
+        "refused": true
+      },
+      {
+        "refused": true
+      },
+      {
+        "recorded": [
+          {
+            "commit": 0
+          }
+        ]
+      }
+    ],
+    "verify": null
+  },
+  "name": "div-be-an-instance-serves-under-an-authority-its-reader-refuses",
+  "note": "Divergences (b) and (e), and where they are not asked. Authority 1 is a public successor of the genesis that k0 signed, with a second signature on it that does not verify. Authority 2 is a public successor that k0 signed and that has no Owner. Read literally each is a successor, and a reader of a source under either records c0. The Rust's verify and admit accept neither as an authority of the repository. An instance proves its current authority by its steps alone, so it serves anyone under either, by that authority's policy; the reader then refuses what it was sent, over the authority the instance served it under.",
+  "ratified": {
+    "admit": [],
+    "receive": [],
+    "serve": [
+      {
+        "recorded": [
+          {
+            "commit": 0
+          }
+        ]
+      },
+      {
+        "recorded": [
+          {
+            "commit": 0
+          }
+        ]
+      },
+      {
+        "recorded": [
+          {
+            "commit": 0
+          }
+        ]
+      }
+    ],
+    "verify": null
+  },
+  "request": {
+    "admit": [],
+    "pin": 0,
+    "receive": [],
+    "serve": [
+      {
+        "current": 1,
+        "requester": null,
+        "roots": [
+          {
+            "commit": 0
+          }
+        ]
+      },
+      {
+        "current": 2,
+        "requester": null,
+        "roots": [
+          {
+            "commit": 0
+          }
+        ]
+      },
+      {
+        "current": 0,
+        "requester": 1,
+        "roots": [
+          {
+            "commit": 0
+          }
+        ]
+      }
+    ],
+    "store": {
+      "authorities": [
+        {
+          "id": 0,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            },
+            {
+              "key": 1,
+              "role": "contributor"
+            }
+          ],
+          "prev": null,
+          "protected": [],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 1
+        },
+        {
+          "id": 1,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            }
+          ],
+          "prev": 0,
+          "protected": [],
+          "public_read": true,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            },
+            {
+              "key": 1,
+              "valid": false
+            }
+          ],
+          "version": 2
+        },
+        {
+          "id": 2,
+          "members": [
+            {
+              "key": 1,
+              "role": "contributor"
+            }
+          ],
+          "prev": 0,
+          "protected": [],
+          "public_read": true,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 2
+        }
+      ],
+      "commits": [
+        {
+          "cites": 0,
+          "id": 0,
+          "installs": null,
+          "parents": [],
+          "signature": {
+            "key": 0,
+            "valid": true
+          }
+        }
+      ],
+      "releases": []
+    },
+    "verify": null
+  }
+}

@@ -26,10 +26,12 @@ module LeVCS.Harness.Wire
   , AdmitResponse (..)
   , RefusalKind (..)
   , ReceiveResponse (..)
+  , ServeResponse (..)
   , encodeResponse
   , parseResponse
   , parseRemarks
   , parseTransferDamage
+  , parseServeDamage
 
     -- * What the model expects
   , expected
@@ -77,6 +79,11 @@ data Request = Request
   -- expects, the source's current authority, and the roots asked for. There
   -- is no requester. Whether to send is the source's decision (R.2), and
   -- this is the receiver's check of what was sent.
+  , rqServe :: [(Maybe AuthId, Requester, [Object])]
+  -- ^ Reads asked of an instance that holds the store as the repository the
+  -- pin is the genesis of: the current authority it has for it, if any, who
+  -- is asking, and the roots asked for. The source decides first, and this
+  -- is that decision and then the receiver's.
   }
   deriving (Eq, Show)
 
@@ -84,7 +91,7 @@ data Request = Request
 -- history is also put as a transfer from a source with that authority: once
 -- whole, and once for its first root alone.
 historyRequest :: History -> Request
-historyRequest h = Request (hStore h) pinId (Just (hCurrent h, hRoots h)) [] transfers
+historyRequest h = Request (hStore h) pinId (Just (hCurrent h, hRoots h)) [] transfers []
   where
     transfers = case hCurrent h of
       Nothing -> []
@@ -92,18 +99,27 @@ historyRequest h = Request (hStore h) pinId (Just (hCurrent h, hRoots h)) [] tra
         (pinId, current, hRoots h) : [(pinId, current, take 1 (hRoots h)) | length (hRoots h) > 1]
 
 traceRequest :: Trace -> Request
-traceRequest tr = Request (tStore tr) pinId Nothing [(atState at, atTx at) | at <- tAttempts tr] []
+traceRequest tr = Request (tStore tr) pinId Nothing [(atState at, atTx at) | at <- tAttempts tr] [] []
 
 encodeRequest :: Request -> Value
 encodeRequest rq =
-  object
+  object $
     [ "store" .= encodeStore (rqStore rq)
     , "pin" .= authInt (rqPin rq)
     , "verify" .= fmap encodeVerify (rqVerify rq)
     , "admit" .= map encodeAdmit (rqAdmit rq)
     , "receive" .= map encodeReceive (rqReceive rq)
     ]
+      -- Written only where there are any, so that a request with none
+      -- reads as it did before reads were compared.
+      ++ ["serve" .= map encodeServe (rqServe rq) | not (null (rqServe rq))]
   where
+    encodeServe (current, who, roots) =
+      object
+        [ "current" .= fmap authInt current
+        , "requester" .= (case who of Anonymous -> Nothing; Holding k -> Just (keyInt k))
+        , "roots" .= map encodeObject roots
+        ]
     encodeVerify (current, roots) =
       object ["current" .= fmap authInt current, "roots" .= map encodeObject roots]
     encodeAdmit (s, tx) = object ["state" .= encodeState s, "tx" .= encodeTx tx]
@@ -118,7 +134,9 @@ parseRequest = withObject "request" $ \o -> do
   a <- o .: "admit" >>= mapM (parseAdmit pin)
   -- Absent from requests saved before transfers were compared.
   t <- o .:? "receive" >>= mapM parseReceive . fromMaybe []
-  let rq = Request st pin v a t
+  -- Absent from requests saved before reads were compared.
+  s <- o .:? "serve" >>= mapM parseServe . fromMaybe []
+  let rq = Request st pin v a t s
   case unrepresentable rq of
     [] -> pure rq
     why -> fail (unlines why)
@@ -129,6 +147,11 @@ parseRequest = withObject "request" $ \o -> do
       (,) <$> (o .: "state" >>= parseState pin) <*> (o .: "tx" >>= parseTx)
     parseReceive = withObject "receive" $ \o ->
       (,,) <$> (AuthId <$> num o "expected") <*> (AuthId <$> num o "current") <*> (o .: "roots" >>= mapM parseObject)
+    parseServe = withObject "serve" $ \o ->
+      (,,)
+        <$> (fmap AuthId <$> optNum o "current")
+        <*> (maybe Anonymous (Holding . Key) <$> optNum o "requester")
+        <*> (o .: "roots" >>= mapM parseObject)
 
 -- | What in a request the implementation's objects cannot hold, so that the
 -- two sides would be answering different questions. A request with any of
@@ -144,6 +167,8 @@ parseRequest = withObject "request" $ \o -> do
 -- * __References.__ Everything named exists, and nothing is behind itself.
 --   An object's id is the hash of what it names, so an object naming one
 --   that is missing, or one that names it back, cannot be made.
+-- * __Reads.__ A read is asked of a repository by its id, and the id is
+--   derived from a genesis. So where reads are asked the pin is a genesis.
 -- * __States.__ A state is given, not judged: its refs are branches naming
 --   commits and release refs naming releases, each with a name a ref can
 --   have. A transaction is judged, so it may name any ref; the objects it
@@ -164,6 +189,11 @@ unrepresentable rq =
     ++ ["commit " ++ show i ++ " has more than 255 parents" | (CommitId i, k) <- commits, length (cParents k) > 255]
     ++ [what ++ " " ++ show n ++ " is not a u32" | (what, n) <- numbers, n < 0 || toInteger n > 4294967295]
     ++ [what ++ " names something that is missing, or that is behind itself" | (what, False) <- named]
+    ++ [ "reads are asked of the repository the pin is the genesis of, and the pin is not a genesis"
+       | not (null (rqServe rq))
+       , Just a <- [Map.lookup (rqPin rq) (sAuthorities st)]
+       , aPrev a /= Nothing
+       ]
     ++ [ "a state holds " ++ refText ref ++ ", which is not a ref a state can hold, or not at that kind of object"
        | (s, _) <- rqAdmit rq
        , (ref, o) <- Map.toList (sRefs s)
@@ -218,6 +248,10 @@ unrepresentable rq =
           [ ("a transfer", auth expects && auth current) : [("a root of a transfer", obj o) | o <- roots]
           | (expects, current, roots) <- rqReceive rq
           ]
+        ++ concat
+          [ ("a read", all auth current) : [("a root of a read", obj o) | o <- roots]
+          | (current, _, roots) <- rqServe rq
+          ]
 
     numbers =
       [("the pin", authInt (rqPin rq))]
@@ -255,6 +289,12 @@ unrepresentable rq =
         ++ concat
           [ ("authority", authInt expects) : ("authority", authInt current) : map object' roots
           | (expects, current, roots) <- rqReceive rq
+          ]
+        ++ concat
+          [ [("authority", a) | Just (AuthId a) <- [current]]
+              ++ [("key", k) | Holding (Key k) <- [who]]
+              ++ map object' roots
+          | (current, who, roots) <- rqServe rq
           ]
     object' (OCommit (CommitId i)) = ("commit", i)
     object' (ORelease (ReleaseId i)) = ("release", i)
@@ -470,6 +510,7 @@ data Response = Response
   { rsVerify :: Maybe VerifyResponse
   , rsAdmit :: [AdmitResponse]
   , rsReceive :: [ReceiveResponse]
+  , rsServe :: [ServeResponse]
   }
   deriving (Eq, Show)
 
@@ -504,6 +545,14 @@ data ReceiveResponse
   | ReceiveRefused
   deriving (Eq, Show)
 
+-- | What a read asked of an instance comes to: kept, and as what; not
+-- served at all; or served, and refused by the receiver for what was sent.
+data ServeResponse
+  = Served (Set Object)
+  | ServeDenied
+  | ServeRefused
+  deriving (Eq, Show)
+
 -- | @levcs-identity@'s kinds of refusal: what a caller can do about it.
 data RefusalKind = Stale | NotFastForward | Unauthorized | NotAdmissible
   deriving (Eq, Show, Enum, Bounded)
@@ -516,12 +565,16 @@ kindText NotAdmissible = "invalid"
 
 encodeResponse :: Response -> Value
 encodeResponse rs =
-  object
+  object $
     [ "verify" .= fmap verify' (rsVerify rs)
     , "admit" .= map admit' (rsAdmit rs)
     , "receive" .= map receive' (rsReceive rs)
     ]
+      ++ ["serve" .= map serve' (rsServe rs) | not (null (rsServe rs))]
   where
+    serve' (Served objects) = object ["recorded" .= map encodeObject (Set.toList objects)]
+    serve' ServeDenied = object ["denied" .= True]
+    serve' ServeRefused = object ["refused" .= True]
     receive' (ReceiveRecorded objects) = object ["recorded" .= map encodeObject (Set.toList objects)]
     receive' ReceiveRefused = object ["refused" .= True]
     verify' v =
@@ -541,7 +594,19 @@ parseResponse = withObject "response" $ \o ->
     <$> (o .:? "verify" >>= traverse verify')
     <*> (o .: "admit" >>= mapM admit')
     <*> (o .:? "receive" >>= mapM receive' . fromMaybe [])
+    -- Absent from responses saved before reads were compared, and from the
+    -- answers of an oracle that has no instance to ask.
+    <*> (o .:? "serve" >>= mapM serve' . fromMaybe [])
   where
+    serve' = withObject "serve" $ \x -> do
+      kept <- x .:? "recorded"
+      denied <- x .:? "denied"
+      refused <- x .:? "refused"
+      case (kept, denied :: Maybe Bool, refused :: Maybe Bool) of
+        (Just objects, Nothing, Nothing) -> Served . Set.fromList <$> mapM parseObject objects
+        (Nothing, Just True, Nothing) -> pure ServeDenied
+        (Nothing, Nothing, Just True) -> pure ServeRefused
+        _ -> fail "a read is {\"recorded\": […]}, {\"denied\": true} or {\"refused\": true}"
     receive' = withObject "receive" $ \x -> do
       kept <- x .:? "recorded"
       refused <- x .:? "refused"
@@ -579,18 +644,27 @@ parseRemarks = withObject "response" $ \o -> do
     Just vo -> flip (withObject "verify") vo $ \x ->
       (,) <$> (maybe [] id <$> x .:? "damage") <*> (maybe [] id <$> x .:? "problems")
   decisions <- o .: "admit" >>= mapM (withObject "admit" (\x -> fromMaybe [] <$> x .:? "reasons"))
-  transfers <-
-    o .:? "receive"
-      >>= mapM (withObject "receive" (\x -> (,) <$> (fromMaybe [] <$> x .:? "damage") <*> (fromMaybe [] <$> x .:? "reasons")))
-        . fromMaybe []
+  let remarked name =
+        o .:? name
+          >>= mapM (withObject "remarked" (\x -> (,) <$> (fromMaybe [] <$> x .:? "damage") <*> (fromMaybe [] <$> x .:? "reasons")))
+            . fromMaybe []
+  transfers <- remarked "receive"
+  asked <- remarked "serve"
   pure
-    ( damage ++ concatMap fst transfers
+    ( damage ++ concatMap fst transfers ++ concatMap fst asked
     , said
         ++ concat [("transaction " ++ show i ++ ": ") `prefix` rs | (i, rs) <- zip [0 :: Int ..] decisions]
         ++ concat [("transfer " ++ show i ++ ": ") `prefix` rs | (i, (_, rs)) <- zip [0 :: Int ..] transfers]
+        ++ concat [("read " ++ show i ++ ": ") `prefix` rs | (i, (_, rs)) <- zip [0 :: Int ..] asked]
     )
   where
     prefix p = map (p ++)
+
+-- | The damage reported of the reads alone.
+parseServeDamage :: Value -> Parser [String]
+parseServeDamage = withObject "response" $ \o ->
+  o .:? "serve"
+    >>= fmap concat . mapM (withObject "serve" (\x -> fromMaybe [] <$> x .:? "damage")) . fromMaybe []
 
 -- | The damage reported of the transfers alone, for a run that is about
 -- them and nothing else in the response.
@@ -608,9 +682,14 @@ expected rd rq =
     { rsVerify = verified <$> rqVerify rq
     , rsAdmit = map decided (rqAdmit rq)
     , rsReceive = map transferred (rqReceive rq)
+    , rsServe = map served (rqServe rq)
     }
   where
     st = rqStore rq
+    served (current, who, roots) = case receive rd st current (Transfer (rqPin rq) roots who) of
+      Recorded objects -> Served objects
+      ReadDenied -> ServeDenied
+      _ -> ServeRefused
     transferred (expects, current, roots) = case examine rd st expects current roots of
       Recorded objects -> ReceiveRecorded objects
       _ -> ReceiveRefused

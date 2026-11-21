@@ -8,7 +8,8 @@ functions over an abstract object model, and checked two ways:
 - **against the implementation:** every generated scenario is rebuilt as real
   signed objects and put to `verify_history` and `admit` in `levcs-identity`,
   and the verdicts must match. Every transfer is also made for real, by the
-  `receive` in `levcs-cli` that `clone`, `pull` and `fork` call.
+  `receive` in `levcs-cli` that `clone`, `pull` and `fork` call, and every
+  read is asked of a real instance of `levcs-instance`.
 
 The document stays normative. Where the Rust enforces something the document
 does not say, the rule is a named switch, and `DIVERGENCES.md` records it.
@@ -26,8 +27,8 @@ does not say, the rule is a named switch, and `DIVERGENCES.md` records it.
 | `corpus/` | The named cases as JSON, with the specified answers. |
 | `../crates/levcs-identity/examples/spec_oracle.rs` | The Rust oracle the differential run drives. |
 | `../crates/levcs-identity/tests/spec_corpus.rs` | Replays `corpus/` in `cargo test`. Needs no Haskell. |
-| `../crates/levcs-cli/examples/spec_receive_oracle.rs` | A second Rust oracle, with every transfer made by `receive`. |
-| `../crates/levcs-cli/tests/spec_receive.rs` | Replays the transfers of `corpus/` through `receive` in `cargo test`. |
+| `../crates/levcs-cli/examples/spec_receive_oracle.rs` | A second Rust oracle, with every transfer made by `receive` and every read asked of an instance. |
+| `../crates/levcs-cli/tests/spec_receive.rs` | Replays the transfers and reads of `corpus/` in `cargo test`. |
 
 ## Running
 
@@ -50,7 +51,9 @@ cargo test -p levcs-cli --test spec_receive
 The differential run asks two oracles. The first is `spec_oracle` in
 `levcs-identity`, for Rules H and P. The second is `spec_receive_oracle` in
 `levcs-cli`, for Rule R: it answers the same requests, with every transfer
-made by `receive`. The run reads these variables:
+made by `receive`, and it answers reads, each asked of an instance of
+`levcs-instance` that holds the scenario. The first oracle has no instance
+and says nothing of reads. The run reads these variables:
 
 - **`LEVCS_SPEC_TESTS`**: scenarios per property. The default is 2000.
 - **`LEVCS_SPEC_READING`**: the reading the Rust is held to.
@@ -104,12 +107,13 @@ every file in `corpus/` holds a request with its responses.
 - **Against any other reading:** `model-oracle` gives the model's answer to
   a request under the reading `LEVCS_SPEC_READING` names.
 
-A response is compared on six things only: which commits and releases were
-given a verdict, which of those are invalid, which are on a conflicting
-lineage, whether the replica's current authority was itself rejected, how
-each transaction is decided, and whether each transfer is recorded and as
-which objects. Reasons are shown when the two sides disagree and never
-compared.
+A response is compared on seven things only: which commits and releases
+were given a verdict, which of those are invalid, which are on a
+conflicting lineage, whether the replica's current authority was itself
+rejected, how each transaction is decided, whether each transfer is
+recorded and as which objects, and what each read comes to: sent nothing,
+sent history that is kept, or sent history that is refused. Reasons are
+shown when the two sides disagree and never compared.
 
 Some requests are answered by neither side, because the implementation's
 objects could not hold them and the two sides would be answering different
@@ -133,6 +137,9 @@ questions:
 - **States:** a state's refs are branches at commits and release refs at
   releases, under names a ref can have. A transaction may name anything;
   that is for the rules to judge.
+- **Reads:** a read is asked of a repository by its id, and the id is
+  derived from a genesis. So where a request asks reads, its pin is a
+  genesis.
 
 The object lists in a response are sets, and are compared as sets. The
 decisions and the transfers are lists, each answering the request in its
@@ -144,15 +151,16 @@ place.
   a key and whether it verifies; a commit records the authority it installs.
 - **Damage.** Missing, corrupt and mis-typed objects.
 - **Fork commits.** The document leaves them to their implemented rule.
-- **The source's side of Rule R.** The receiver's side (R.1, R.3) is
-  compared twice: from the report of `verify_history`, and by running
-  `receive` in `levcs-cli` against a source that will say anything. That
-  source sends every object of the scenario whatever was asked for, and the
-  generated transfers include ones no honest pair would make: any authority
-  as the source's current one or as the genesis expected, and any of the
-  roots or none. Read permission (R.2) is the source's decision. It is
-  enforced in `levcs-instance` and the CLI, and is checked against the
-  model only.
+- **Parts of a request that are not R.2.** The receiver's side of Rule R
+  (R.1, R.3) is compared twice: from the report of `verify_history`, and by
+  running `receive` in `levcs-cli` against a source that will say anything.
+  That source sends every object of the scenario whatever was asked for,
+  and the generated transfers include ones no honest pair would make: any
+  authority as the source's current one or as the genesis expected, and any
+  of the roots or none. The source's side (R.2) is compared by asking a
+  real instance, which decides for itself whom to answer and what to send.
+  What an instance asks of a signed request besides the signature, its
+  clock and its nonce, is not run, nor a read while a push is part way.
 - **Wiring, for publication.** `receive` is run with roots named as each of
   its three callers names them. The differential run still calls
   `verify_history` and `admit` directly, so it cannot see a caller that

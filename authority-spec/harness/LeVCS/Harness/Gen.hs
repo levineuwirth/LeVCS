@@ -9,6 +9,7 @@ module LeVCS.Harness.Gen
     genHScenario
   , genHonestHScenario
   , genHistory
+  , genKey
 
     -- * Publication scenarios
   , genPScenario

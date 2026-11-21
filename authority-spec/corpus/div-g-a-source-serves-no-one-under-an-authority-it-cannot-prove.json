@@ -1,0 +1,180 @@
+{
+  "expect": {
+    "admit": [],
+    "receive": [],
+    "serve": [
+      {
+        "denied": true
+      },
+      {
+        "denied": true
+      },
+      {
+        "denied": true
+      },
+      {
+        "recorded": [
+          {
+            "commit": 0
+          }
+        ]
+      }
+    ],
+    "verify": null
+  },
+  "name": "div-g-a-source-serves-no-one-under-an-authority-it-cannot-prove",
+  "note": "Divergence (g), at the source. The repository asked for is that of genesis 0. Authority 1 is another repository's genesis, and public; authority 2 names genesis 0 as its predecessor, is public, and only k1 signed it, so it succeeds nothing. Read literally, R.2 looks at the policy of whatever the source has as current, and both let anyone in: asked for nothing under authority 1 a reader records nothing, and asked for c0 under authority 2 a reader records it. An instance serves no one from a repository whose current authority it cannot follow back to the genesis the id pins: not the public, and not k0, who is an Owner of all three.",
+  "ratified": {
+    "admit": [],
+    "receive": [],
+    "serve": [
+      {
+        "recorded": []
+      },
+      {
+        "recorded": [
+          {
+            "commit": 0
+          }
+        ]
+      },
+      {
+        "recorded": [
+          {
+            "commit": 0
+          }
+        ]
+      },
+      {
+        "recorded": [
+          {
+            "commit": 0
+          }
+        ]
+      }
+    ],
+    "verify": null
+  },
+  "request": {
+    "admit": [],
+    "pin": 0,
+    "receive": [],
+    "serve": [
+      {
+        "current": 1,
+        "requester": null,
+        "roots": []
+      },
+      {
+        "current": 2,
+        "requester": null,
+        "roots": [
+          {
+            "commit": 0
+          }
+        ]
+      },
+      {
+        "current": 2,
+        "requester": 0,
+        "roots": [
+          {
+            "commit": 0
+          }
+        ]
+      },
+      {
+        "current": 0,
+        "requester": 1,
+        "roots": [
+          {
+            "commit": 0
+          }
+        ]
+      }
+    ],
+    "store": {
+      "authorities": [
+        {
+          "id": 0,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            },
+            {
+              "key": 1,
+              "role": "contributor"
+            }
+          ],
+          "prev": null,
+          "protected": [],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 1
+        },
+        {
+          "id": 1,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            }
+          ],
+          "prev": null,
+          "protected": [],
+          "public_read": true,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 1
+        },
+        {
+          "id": 2,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            },
+            {
+              "key": 1,
+              "role": "owner"
+            }
+          ],
+          "prev": 0,
+          "protected": [],
+          "public_read": true,
+          "signatures": [
+            {
+              "key": 1,
+              "valid": true
+            }
+          ],
+          "version": 2
+        }
+      ],
+      "commits": [
+        {
+          "cites": 0,
+          "id": 0,
+          "installs": null,
+          "parents": [],
+          "signature": {
+            "key": 0,
+            "valid": true
+          }
+        }
+      ],
+      "releases": []
+    },
+    "verify": null
+  }
+}

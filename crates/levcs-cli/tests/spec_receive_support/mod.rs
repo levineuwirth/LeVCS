@@ -1,5 +1,8 @@
-//! Rule R's receiver, run for real, over the scenarios of the executable
-//! specification in `authority-spec/`.
+//! Rule R, run for real, over the scenarios of the executable specification
+//! in `authority-spec/`: the receiver's side by `receive`, and the source's
+//! by an instance of `levcs-instance`.
+//!
+//! # Transfers
 //!
 //! `levcs-identity`'s side of the specification
 //! (`crates/levcs-identity/tests/spec_support`) decides a transfer from the
@@ -49,18 +52,38 @@
 //!   refused: that copy is the one the refs would reach. A transfer of no
 //!   roots has none to damage, and this is not tried on it.
 //!
+//! # Reads
+//!
+//! Whether to send anything is the source's decision (R.2), and a scripted
+//! source decides nothing. So a read is asked of a real instance, started
+//! here over a repository that was put in its root by hand: every object of
+//! the scenario, and the refs the read is asked of. No push made it, and
+//! nothing admitted what it holds, so it can hold history the rules refuse
+//! and a current authority they would never install. The reader asks as
+//! `clone` does, for what the instance publishes and then for the history,
+//! and what it is sent it checks with `receive`. What the instance is held
+//! to beyond its answer is said at `Receiver::make_read`.
+//!
+//! An instance is honest in one way the scripted source is not: asked for a
+//! repository, it answers from the one stored under that id. So a read is
+//! always of the repository the reader expects, and what is varied is the
+//! current authority the instance has for it.
+//!
 //! Shared by `examples/spec_receive_oracle.rs`, which the Haskell
 //! differential run drives, and `tests/spec_receive.rs`, which replays the
 //! committed corpus.
 
 use std::collections::BTreeSet;
-use std::io::{BufRead, BufReader, Write};
-use std::net::TcpListener;
+use std::io::{BufRead, BufReader, Read as _, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use levcs_client::{Client, ClientError};
-use levcs_core::{ObjectId, ObjectStore};
+use levcs_core::{ObjectId, ObjectStore, Refs};
+use levcs_identity::keys::SecretKey;
+use levcs_instance::{router, AppState, InstanceConfig, Limits};
+use levcs_protocol::auth::{sign_request, AuthRequest};
 use levcs_protocol::Pack;
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -70,7 +93,7 @@ mod receive;
 #[path = "../../../levcs-identity/tests/spec_support/mod.rs"]
 pub mod spec_support;
 
-use spec_support::Transfer;
+use spec_support::{Read, Transfer};
 
 type Res<T> = Result<T, String>;
 
@@ -159,6 +182,21 @@ pub struct Receiver {
     source: Source,
     client: Client,
     scratch: TempDir,
+    /// What the instances that answer reads run on.
+    runtime: tokio::runtime::Runtime,
+    /// The instance holding the scenario of the request being answered,
+    /// once a read has needed one.
+    instance: Option<Instance>,
+}
+
+impl spec_support::Replication for Receiver {
+    fn transfer(&mut self, t: &Transfer) -> Res<Value> {
+        self.make_transfer(t)
+    }
+
+    fn read(&mut self, r: &Read) -> Res<Option<Value>> {
+        self.make_read(r).map(Some)
+    }
 }
 
 impl Receiver {
@@ -171,10 +209,17 @@ impl Receiver {
             .prefix("levcs-spec-receive-")
             .tempdir_in(parent)
             .expect("create a private receiver scratch directory");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("a runtime for instances");
         Receiver {
             source,
             client,
             scratch,
+            runtime,
+            instance: None,
         }
     }
 
@@ -187,9 +232,14 @@ impl Receiver {
         receiver
     }
 
-    /// Answer one request, with every transfer in it made by `receive`.
+    /// Answer one request, with every transfer in it made by `receive`, and
+    /// every read in it asked of an instance.
     pub fn answer(&mut self, request: &Value) -> Res<Value> {
-        spec_support::answer_with(request, &mut |t| self.transfer(t))
+        // Another request is another scenario, and another instance.
+        self.instance = None;
+        let answer = spec_support::answer_with(request, self);
+        self.instance = None;
+        answer
     }
 
     /// An object store of this receiver's own, holding the objects named.
@@ -314,7 +364,7 @@ impl Receiver {
         Ok(outcome)
     }
 
-    fn transfer(&mut self, t: &Transfer) -> Res<Value> {
+    fn make_transfer(&mut self, t: &Transfer) -> Res<Value> {
         let nothing = BTreeSet::new();
         let root_ids: Vec<ObjectId> = t.roots.iter().map(|(_, id)| *id).collect();
         let owed = t.reached(root_ids.iter().copied());
@@ -485,6 +535,386 @@ impl Receiver {
         }
         Ok(t.recorded(owed))
     }
+}
+
+/// An instance of `levcs-instance`, serving one repository that was put in
+/// its root by hand: no push made it, and nothing admitted what it holds.
+struct Instance {
+    addr: SocketAddr,
+    base: String,
+    /// The `.levcs` directory of the one repository it holds.
+    levcs: PathBuf,
+    _root: TempDir,
+    serving: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Instance {
+    fn drop(&mut self) {
+        self.serving.abort();
+    }
+}
+
+/// What an instance answered a read: what was asked for, or that there is
+/// no such repository, which is how it refuses a reader.
+fn answered<T>(what: &str, answer: Result<T, ClientError>) -> Res<Option<T>> {
+    match answer {
+        Ok(found) => Ok(Some(found)),
+        Err(ClientError::Server { status: 404, .. }) => Ok(None),
+        Err(fault) => Err(format!("{what} was not answered: {fault}")),
+    }
+}
+
+impl Receiver {
+    /// The instance holding the scenario, as the repository the read asks
+    /// for: every object, its genesis, the current authority it is to have
+    /// if any, and a ref at each root.
+    ///
+    /// The objects are put there once for a request, and the instance
+    /// started once. Each read then gives the repository the refs it asks
+    /// of: an instance reads them again for every request it answers.
+    fn instance(&mut self, r: &Read) -> Res<(SocketAddr, String)> {
+        let t = &r.asked;
+        if self.instance.is_none() {
+            let root = tempfile::tempdir_in(self.scratch.path()).map_err(|e| e.to_string())?;
+            let levcs = root.path().join(t.repo_id.to_hex()).join(".levcs");
+            let store = ObjectStore::new(levcs.join("objects"));
+            for bytes in t.objects.values() {
+                store.write_raw(bytes).map_err(|e| e.to_string())?;
+            }
+            let app = router(AppState::new(InstanceConfig {
+                root: root.path().to_path_buf(),
+                storage_mode: "full".into(),
+                federation_peers: Vec::new(),
+                allowed_handlers: Vec::new(),
+                mirrors: Vec::new(),
+                creators: Vec::new(),
+                limits: Limits::default(),
+            }));
+            let (addr, serving) = self.runtime.block_on(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let addr = listener.local_addr().map_err(|e| e.to_string())?;
+                let serving = tokio::spawn(async move {
+                    axum::serve(listener, app).await.ok();
+                });
+                Ok::<_, String>((addr, serving))
+            })?;
+            self.instance = Some(Instance {
+                addr,
+                base: format!("http://{addr}/levcs/v1"),
+                levcs,
+                _root: root,
+                serving,
+            });
+        }
+        let instance = self
+            .instance
+            .as_ref()
+            .expect("an instance was just started");
+        let held = instance.levcs.join("refs");
+        if held.exists() {
+            std::fs::remove_dir_all(&held).map_err(|e| e.to_string())?;
+        }
+        let refs = Refs::new(&instance.levcs);
+        let mut hold = vec![("refs/authority/genesis".to_string(), t.expected)];
+        hold.extend(r.current.map(|c| ("refs/authority/current".to_string(), c)));
+        hold.extend(t.roots.iter().cloned());
+        for (name, id) in &hold {
+            refs.write(name, *id).map_err(|e| e.to_string())?;
+        }
+        Ok((instance.addr, instance.base.clone()))
+    }
+
+    /// A read, asked of a real instance as `clone` asks: what it publishes
+    /// first, and then the history, which `receive` checks.
+    ///
+    /// Beyond the answer, the instance is held to what R.2 must mean, and a
+    /// failure of these is an error and not an answer:
+    /// - its four reads are one decision: what it publishes, its refs, an
+    ///   object and a pack are all answered, or none is;
+    /// - what it publishes is the genesis, the current authority and the
+    ///   refs it was given;
+    /// - a repository with no current authority is read by no one;
+    /// - where a member reads what the public may not, holding the key is
+    ///   proving it: a request that names the member's key and is signed
+    ///   with another, and one the member signed for a different read, are
+    ///   refused.
+    ///
+    /// And of a transfer kept, with the instance choosing what to send:
+    /// - it is kept as exactly what the roots reach;
+    /// - a receiver that holds all of it, and says so, is sent what it
+    ///   lacks, accepts, and adds nothing;
+    /// - one that holds what the first root reaches adds the rest, where
+    ///   there is more than one root.
+    fn make_read(&mut self, r: &Read) -> Res<Value> {
+        let t = &r.asked;
+        let (addr, base) = self.instance(r)?;
+        let repo = t.repo_id.to_hex();
+        let anonymous = Client::new(&base);
+        let client = match r.requester {
+            Some(k) => Client::new(&base).with_reader(Arc::new(spec_support::key(k))),
+            None => Client::new(&base),
+        };
+
+        let info = answered("what the instance publishes", client.repo_info(&repo))?;
+        let others = [
+            (
+                "its refs",
+                answered("the instance's refs", client.refs(&repo))?.is_some(),
+            ),
+            (
+                "an object",
+                answered("an object", client.get_object(&repo, t.expected))?.is_some(),
+            ),
+            (
+                "a pack",
+                answered("a pack", client.get_pack(&repo, &[], &[t.expected]))?.is_some(),
+            ),
+        ];
+        for (what, served) in others {
+            if served != info.is_some() {
+                return Err(format!(
+                    "the instance {} this reader what it publishes and {} it {what}",
+                    if info.is_some() { "sends" } else { "refuses" },
+                    if served { "sends" } else { "refuses" },
+                ));
+            }
+        }
+        let Some(info) = info else {
+            return Ok(json!({ "denied": true, "damage": [] }));
+        };
+        let Some(current) = r.current else {
+            return Err("an instance with no current authority for it served a repository".into());
+        };
+        let published: BTreeSet<(String, String)> = [
+            ("refs/authority/genesis".to_string(), info.genesis_authority),
+            ("refs/authority/current".to_string(), info.current_authority),
+        ]
+        .into_iter()
+        .chain(
+            info.branches
+                .into_iter()
+                .map(|(n, id)| (format!("refs/branches/{n}"), id)),
+        )
+        .chain(
+            info.releases
+                .into_iter()
+                .map(|(n, id)| (format!("refs/releases/{n}"), id)),
+        )
+        .collect();
+        let given: BTreeSet<(String, String)> = [
+            ("refs/authority/genesis".to_string(), t.expected.to_hex()),
+            ("refs/authority/current".to_string(), current.to_hex()),
+        ]
+        .into_iter()
+        .chain(t.roots.iter().map(|(n, id)| (n.clone(), id.to_hex())))
+        .collect();
+        if info.repo_id != repo || published != given {
+            return Err(format!(
+                "the instance publishes {published:?} as {}, and was given {given:?} as {repo}",
+                info.repo_id
+            ));
+        }
+
+        // Holding a key is proving it, where the key is what lets the
+        // reader in.
+        if let Some(k) = r.requester {
+            if answered("an unsigned read", anonymous.repo_info(&repo))?.is_none() {
+                let member = spec_support::key(k);
+                let path = format!("/repos/{repo}/info");
+                let sign = |by: &SecretKey, path: &str| {
+                    sign_request(
+                        by,
+                        &AuthRequest {
+                            method: "GET",
+                            path_with_query: path,
+                            body: b"",
+                        },
+                    )
+                    .map_err(|e| e.to_string())
+                };
+                // Signed by a key that is no member's, naming the member's.
+                let (_, ts, nonce, sig) = sign(&spec_support::key(u64::from(u32::MAX) + 1), &path)?;
+                let forged = (member.public().to_levcs(), ts, nonce, sig);
+                // Signed by the member, for another read.
+                let elsewhere = sign(&member, &format!("/repos/{repo}/refs"))?;
+                for (what, headers) in [
+                    ("signed with another key in this member's name", forged),
+                    ("this member signed for another read", elsewhere),
+                ] {
+                    let status = raw_get(addr, &format!("/levcs/v1{path}"), &headers)?;
+                    if status != 404 {
+                        return Err(format!(
+                            "a read {what} was answered {status} by a repository the public may \
+                             not read"
+                        ));
+                    }
+                }
+                // And the same request signed as it should be is answered.
+                let status = raw_get(addr, &format!("/levcs/v1{path}"), &sign(&member, &path)?)?;
+                if status != 200 {
+                    return Err(format!("a member's signed read was answered {status}"));
+                }
+            }
+        }
+
+        let nothing = BTreeSet::new();
+        let root_ids: Vec<ObjectId> = t.roots.iter().map(|(_, id)| *id).collect();
+        let owed = t.reached(root_ids.iter().copied());
+        let fresh = Asking {
+            repo_id: t.repo_id,
+            roots: &t.roots,
+            have: &[],
+            local: None,
+        };
+        let received = match receive_from(&client, t, &fresh)? {
+            Ok(received) => received,
+            Err(refusal) => {
+                return Ok(json!({ "refused": true, "reasons": [refusal], "damage": [] }));
+            }
+        };
+        let (_dir, store) = self.store(t, &nothing)?;
+        check_write(t, "from an instance", &received, &store, &nothing, &owed)?;
+        let again = receive_from(
+            &client,
+            t,
+            &Asking {
+                have: &root_ids,
+                local: Some(&store),
+                ..fresh
+            },
+        )?
+        .map_err(|refusal| {
+            format!(
+                "recorded once, the transfer was refused of a receiver that holds it all: \
+                 {refusal}"
+            )
+        })?;
+        check_write(
+            t,
+            "from an instance, by a receiver that holds it all",
+            &again,
+            &store,
+            &owed,
+            &owed,
+        )?;
+        if let [first, _, ..] = root_ids.as_slice() {
+            let held = t.reached([*first]);
+            let (_dir, partial) = self.store(t, &held)?;
+            let rest = receive_from(
+                &client,
+                t,
+                &Asking {
+                    have: &[*first],
+                    local: Some(&partial),
+                    ..fresh
+                },
+            )?
+            .map_err(|refusal| {
+                format!(
+                    "recorded once, the transfer was refused of a receiver that holds one \
+                     root: {refusal}"
+                )
+            })?;
+            check_write(
+                t,
+                "from an instance, by a receiver that holds one root",
+                &rest,
+                &partial,
+                &held,
+                &owed,
+            )?;
+        }
+        Ok(t.recorded(owed))
+    }
+}
+
+/// One call of `receive`, of an instance that is trusted to answer: a
+/// transfer that was not made, and a refusal that names damage where
+/// nothing is damaged, are errors.
+///
+/// One kind of damage is not an error, because an instance does cause it.
+/// It sends an authority that a commit installs without what is behind that
+/// authority (`Transfer::behind_installed`). A receiver refusing such a
+/// commit, as it must where anything is missing, reports the predecessors
+/// it was not sent as objects that cannot be read. Those reports are let
+/// through where the object is one of those, is said to be missing, and
+/// was in fact not sent. The refusal stands either way, and whether it was
+/// called for is the specification's to say.
+fn receive_from(
+    client: &Client,
+    t: &Transfer,
+    asking: &Asking,
+) -> Res<Result<receive::Received, String>> {
+    let outcome = receive::receive(
+        client,
+        &asking.repo_id.to_hex(),
+        t.expected,
+        t.current,
+        asking.roots,
+        asking.have,
+        asking.local,
+    );
+    match outcome {
+        Ok(received) => Ok(Ok(received)),
+        Err(e) => {
+            if let Some(fault) = e.downcast_ref::<ClientError>() {
+                return Err(format!("the transfer was not made: {fault}"));
+            }
+            let refusal = format!("{e:#}");
+            if damage_reports(&refusal).next().is_some() {
+                let roots = asking.roots.iter().map(|(_, id)| *id);
+                let unsent_behind = t.behind_installed(roots.clone());
+                let mut want: Vec<ObjectId> = roots.chain([t.expected, t.current]).collect();
+                want.sort();
+                want.dedup();
+                let sent: BTreeSet<ObjectId> = client
+                    .get_pack(&asking.repo_id.to_hex(), asking.have, &want)
+                    .map_err(|fault| format!("the pack was not sent a second time: {fault}"))?
+                    .entries
+                    .iter()
+                    .map(|e| levcs_core::blake3_hash(&e.bytes))
+                    .collect();
+                for report in damage_reports(&refusal) {
+                    let explained = report.split_once(": ").is_some_and(|(id, what)| {
+                        what.contains("missing object")
+                            && unsent_behind
+                                .iter()
+                                .any(|a| a.to_hex() == id && !sent.contains(a))
+                    });
+                    if !explained {
+                        return Err(format!(
+                            "receive reported damage on an intact transfer: {refusal}"
+                        ));
+                    }
+                }
+            }
+            Ok(Err(refusal))
+        }
+    }
+}
+
+/// A GET with these four signature headers and nothing else, and the status
+/// it was answered with.
+fn raw_get(addr: SocketAddr, path: &str, signed: &(String, String, String, String)) -> Res<u16> {
+    let (key, timestamp, nonce, signature) = signed;
+    let mut stream = TcpStream::connect(addr).map_err(|e| e.to_string())?;
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nLeVCS-Key: {key}\r\n\
+         LeVCS-Timestamp: {timestamp}\r\nLeVCS-Nonce: {nonce}\r\nLeVCS-Signature: {signature}\r\n\r\n"
+    )
+    .map_err(|e| e.to_string())?;
+    let mut answer = String::new();
+    stream
+        .read_to_string(&mut answer)
+        .map_err(|e| e.to_string())?;
+    answer
+        .split(' ')
+        .nth(1)
+        .and_then(|status| status.parse().ok())
+        .ok_or_else(|| format!("not an HTTP answer: {answer:?}"))
 }
 
 fn damage_reports(refusal: &str) -> impl Iterator<Item = &str> {

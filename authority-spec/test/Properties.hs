@@ -122,7 +122,7 @@ generators =
         let st = applyOp noCtx (OpCommit [] (CiteFloor 0) (Any 0) True Nothing) (genesisStore [(1, Contributor)] [])
             c0 = OCommit (CommitId 0)
             s0 = State pinId (Just pinId) (Map.fromList [(Branch "b0", c0)])
-            base = Request st pinId (Just (Just pinId, [c0])) [(s0, Transaction (Key 0) [] Nothing)] [(pinId, pinId, [c0])]
+            base = Request st pinId (Just (Just pinId, [c0])) [(s0, Transaction (Key 0) [] Nothing)] [(pinId, pinId, [c0])] [(Just pinId, Holding (Key 0), [c0])]
             authority f rq = rq {rqStore = (rqStore rq) {sAuthorities = Map.map f (sAuthorities (rqStore rq))}}
             commit f rq = rq {rqStore = (rqStore rq) {sCommits = Map.map f (sCommits (rqStore rq))}}
             holding ref o = base {rqAdmit = [(s0 {sRefs = Map.fromList [(ref, o)]}, Transaction (Key 0) [] Nothing)]}
@@ -215,6 +215,10 @@ generators =
           versioned text >>= (=== Right base)
         forM_ ["1.0000000000000000001", "0.99999999999999999", "1e-400"] $ \text ->
           versioned text >>= assert . isLeft
+        -- Reads are asked of a repository by the id its genesis derives.
+        forM_ [c | c <- cases, caseName c == "r-read-permission-is-decided-in-the-current-authority"] $ \c -> do
+          unrepresentable (caseRequest c) === []
+          refused (caseRequest c) {rqPin = AuthId 1}
         -- One name given twice, which a map would have kept one of.
         unread [K "store", K "authorities"] twice
         unread [K "store", K "commits"] twice
@@ -227,7 +231,7 @@ generators =
     invalid _ = False
     verdictClasses = map (\v -> (v == Valid, v == ConflictingLineage))
     protecting glob =
-      Request (genesisStore [] []) {sAuthorities = protect glob} pinId Nothing [] []
+      Request (genesisStore [] []) {sAuthorities = protect glob} pinId Nothing [] [] []
     protect glob = Map.map (\a -> a {aProtected = Set.singleton glob}) (sAuthorities (genesisStore [] []))
 
 isRight, isLeft :: Either a b -> Bool

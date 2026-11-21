@@ -1,0 +1,135 @@
+{
+  "expect": {
+    "admit": [],
+    "receive": [],
+    "serve": [
+      {
+        "recorded": [
+          {
+            "commit": 0
+          }
+        ]
+      },
+      {
+        "recorded": [
+          {
+            "commit": 0
+          }
+        ]
+      },
+      {
+        "recorded": [
+          {
+            "commit": 0
+          }
+        ]
+      }
+    ],
+    "verify": null
+  },
+  "name": "r-a-public-repository-is-read-by-anyone",
+  "note": "R.2. The current authority has public_read. A reader who signs with no key, one who signs with a key that is no member's, and a member are all sent the history, and record it.",
+  "ratified": {
+    "admit": [],
+    "receive": [],
+    "serve": [
+      {
+        "recorded": [
+          {
+            "commit": 0
+          }
+        ]
+      },
+      {
+        "recorded": [
+          {
+            "commit": 0
+          }
+        ]
+      },
+      {
+        "recorded": [
+          {
+            "commit": 0
+          }
+        ]
+      }
+    ],
+    "verify": null
+  },
+  "request": {
+    "admit": [],
+    "pin": 0,
+    "receive": [],
+    "serve": [
+      {
+        "current": 0,
+        "requester": null,
+        "roots": [
+          {
+            "commit": 0
+          }
+        ]
+      },
+      {
+        "current": 0,
+        "requester": 7,
+        "roots": [
+          {
+            "commit": 0
+          }
+        ]
+      },
+      {
+        "current": 0,
+        "requester": 1,
+        "roots": [
+          {
+            "commit": 0
+          }
+        ]
+      }
+    ],
+    "store": {
+      "authorities": [
+        {
+          "id": 0,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            },
+            {
+              "key": 1,
+              "role": "reader"
+            }
+          ],
+          "prev": null,
+          "protected": [],
+          "public_read": true,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 1
+        }
+      ],
+      "commits": [
+        {
+          "cites": 0,
+          "id": 0,
+          "installs": null,
+          "parents": [],
+          "signature": {
+            "key": 0,
+            "valid": true
+          }
+        }
+      ],
+      "releases": []
+    },
+    "verify": null
+  }
+}

@@ -67,13 +67,12 @@ agree.
   that fails is accepted by the text and rejected by the Rust, along with
   every commit citing it. Signatures are part of the object id, so such an
   authority is a different object from the one without the bad signature.
-- **Not asked by an instance.** When `levcs-instance` decides who may read,
-  it proves its current authority with `ChainVerifier::verify_chain`
-  (`verify.rs:275`), which checks each step and not every signature. See
-  "An instance proves its current authority by its steps alone" below.
+- **At an instance.** When `levcs-instance` decides who may read, it
+  proves its current authority the same way, and serves no one under one
+  that fails this (`readers`, with `ChainVerifier::as_history`).
 - **Witnesses:** `div-b-authority-with-a-signature-that-does-not-verify`,
   and at an instance
-  `div-be-an-instance-serves-under-an-authority-its-reader-refuses`.
+  `div-be-an-instance-serves-no-one-under-an-authority-verify-rejects`.
 
 ### (c) An installed authority can put a commit on a conflicting lineage
 
@@ -112,11 +111,11 @@ Two switches, `d-force` and `d-delete`.
   (`history.rs:244`).
 - **Effect:** a commit that cites an ownerless successor no commit ever
   installed is valid under the literal text and invalid in the Rust.
-- **Not asked by an instance.** As for (b): the chain an instance proves
-  before it lets a reader in may include a successor with no Owner.
+- **At an instance.** As for (b): the chain an instance proves before it
+  lets a reader in has no successor without an Owner.
 - **Witnesses:** `div-e-ownerless-successor-cited-and-never-installed`, and
   at an instance
-  `div-be-an-instance-serves-under-an-authority-its-reader-refuses`.
+  `div-be-an-instance-serves-no-one-under-an-authority-verify-rejects`.
 
 ### (f) History on a conflicting lineage refuses a transfer
 
@@ -191,36 +190,6 @@ Two switches, `d-force` and `d-delete`.
   `div-g-verify-with-another-repository-as-current`,
   `div-g-verify-with-a-broken-current`,
   `div-g-a-source-serves-no-one-under-an-authority-it-cannot-prove`.
-
-### An instance proves its current authority by its steps alone
-
-This is not a divergence from the text. It is two places in the Rust that
-ask different things of the same authority, found by asking a real instance
-for every generated read.
-
-- **`verify_history` and `admit`:** an authority is one of the repository's
-  if every step of its chain is a successor step, every signature on every
-  authority in it verifies (b), and every successor in it has an Owner (e).
-- **An instance deciding who may read:** every step is a successor step,
-  and the chain ends at the genesis the id pins (g). Nothing more.
-- **Effect:** a current authority that carries a signature that does not
-  verify, or that has no Owner, is one `verify` and `admit` reject and an
-  instance serves under. If that authority is public, anyone is sent the
-  repository. The reader's `receive` then refuses the transfer, over the
-  authority it was served under, so nothing is recorded; but the objects
-  were sent.
-- **How it can arise:** not by a push. `admit` refuses to install such an
-  authority. It takes a repository that came to the instance some other
-  way: before these rules, by mirroring, or by hand.
-- **The model:** `serves` in `RuleR.hs` has the source follow the chain by
-  its steps, with (b) and (e) left out there and nowhere else. Run without
-  that, the instance and the model part ways within a hundred generated
-  reads.
-- **The decision it leaves:** whether an instance should prove its current
-  authority as `verify` does, so that the two agree on what an authority of
-  the repository is.
-- **Witness:**
-  `div-be-an-instance-serves-under-an-authority-its-reader-refuses`.
 
 ## Readings
 
@@ -438,6 +407,33 @@ The generators avoid each of these, so neither side is tested on it.
   65,535-byte limit. The `policy_lengths_fit_their_wire_fields` test covers
   the round trip at both limits and rejects oversized entries in both the
   singleton and final positions.
+- **Fixed: an instance proved its current authority by its steps alone.**
+  Found by asking a real instance for every generated read. `verify_history`
+  and `admit` take an authority as one of the repository's if every step of
+  its chain is a successor step, every signature on every authority in it
+  verifies (b), and every successor in it has an Owner (e). The instance's
+  read gate asked only the first, through `ChainVerifier::verify_chain`. So
+  under a current authority that carried a signature that did not verify,
+  or that had no Owner, it served the repository by that authority's
+  policy: to anyone, if the authority was public. Every reader's `receive`
+  then refused what it was sent, so nothing was recorded, but the objects
+  had left the instance. Such an authority cannot be installed by a push,
+  since `admit` refuses it; it takes a repository that came some other way.
+  - **The fix:** `ChainVerifier::as_history` proves a chain as
+    `verify_history` does, and the read gate uses it. A repository in that
+    state is now answered as one that does not exist. It could already be
+    neither received nor pushed to.
+  - **The model:** `serves` in `RuleR.hs` follows the same chain as
+    `verify`. While the gate proved by steps it had to leave (b) and (e)
+    out there and nowhere else; that exception is gone.
+  - **Tests:** `an_authority_verify_rejects_lets_no_one_read` in
+    `levcs-instance`, three unit tests of the verifier, and the witness
+    `div-be-an-instance-serves-no-one-under-an-authority-verify-rejects`.
+  - **Left as it was:** `ChainVerifier` without `as_history`, which
+    `verify_commit` and `verify_release` use, and the mirror code in
+    `levcs-instance/src/mirror.rs`, which proves its source's current
+    authority by steps. An instance does not start with a mirror
+    configured, so that path is not live.
 - **Not fixed: an instance's pack leaves out what an installed authority
   reaches.** `closure` in `levcs-instance` (`lib.rs`, the walk behind
   `build_pack`) takes every tree entry a tree calls a blob to link to

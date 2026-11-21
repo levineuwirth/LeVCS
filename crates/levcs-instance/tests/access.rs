@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use levcs_client::{Client, ClientError};
 use levcs_core::hash::blake3_hash;
-use levcs_core::object::ObjectType;
+use levcs_core::object::{ObjectType, SignatureEntry, SignedObject};
 use levcs_core::{
     Blob, Commit, CommitFlags, EntryType, FileMode, ObjectId, ObjectStore, Tree, TreeEntry, ZERO_ID,
 };
@@ -684,6 +684,64 @@ async fn a_policy_that_cannot_be_established_lets_no_one_read() {
             }
         }
         set_current(&h, &h.genesis.0.to_hex());
+        assert!(reads(&base, &h.id, h.commit, None)
+            .iter()
+            .all(|r| r.is_ok()));
+    })
+    .await;
+}
+
+/// A current authority is proved as `verify` proves one, and one it rejects
+/// lets no one read, the owner included, though every step of its chain is
+/// a successor's: a successor that carries a signature that does not verify
+/// beside its owner's, which does; a sound successor of that one; and a
+/// successor with no owner. Each of them is public, over a genesis that is
+/// not. The chain used to be proved by its steps alone, and the repository
+/// was then sent to anyone under all three. Under a sound public successor
+/// it is read by anyone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_authority_verify_rejects_lets_no_one_read() {
+    run(vec![named(OWNER)], |base, root| {
+        let owner = key(OWNER);
+        let h = host(&base, &root, &[], public(0), 0);
+        let sound = successor(&owner, &h.genesis, public(1));
+        let marked = {
+            let mut signed = SignedObject::parse(&sound.2).unwrap();
+            let stranger = key(STRANGER);
+            signed.signatures.push(SignatureEntry {
+                public_key: stranger.public().0,
+                signature: stranger.sign(b"not what was signed"),
+            });
+            let bytes = signed.serialize();
+            (blake3_hash(&bytes), sound.1.clone(), bytes)
+        };
+        let after_marked = successor(&owner, &marked, public(1));
+        let ownerless = {
+            let mut body = sound.1.clone();
+            body.members[0].role = Role::Maintainer;
+            body.normalize().unwrap();
+            let bytes = sign_authority(&body, &owner).unwrap().serialize();
+            (blake3_hash(&bytes), body, bytes)
+        };
+        for a in [&sound, &marked, &after_marked, &ownerless] {
+            store(&h).write_raw(&a.2).unwrap();
+        }
+        let missing = as_missing(&base);
+        for (why, rejected) in [
+            ("a signature that does not verify", &marked),
+            ("behind it, a signature that does not verify", &after_marked),
+            ("no owner", &ownerless),
+        ] {
+            set_current(&h, &rejected.0.to_hex());
+            for who in [None, Some(OWNER)] {
+                assert_eq!(
+                    reads(&base, &h.id, h.commit, who),
+                    missing,
+                    "{why}, {who:?}"
+                );
+            }
+        }
+        set_current(&h, &sound.0.to_hex());
         assert!(reads(&base, &h.id, h.commit, None)
             .iter()
             .all(|r| r.is_ok()));

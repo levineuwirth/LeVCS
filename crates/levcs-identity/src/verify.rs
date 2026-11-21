@@ -222,6 +222,9 @@ pub struct ChainVerifier {
     max_cached: usize,
     /// Authorities of a chain walked at most, beyond what is cached.
     max_depth: usize,
+    /// Whether each authority is held to what `verify_history` asks of one
+    /// beyond its step ([`ChainVerifier::as_history`]).
+    as_history: bool,
 }
 
 impl Default for ChainVerifier {
@@ -230,6 +233,7 @@ impl Default for ChainVerifier {
             verified: HashMap::new(),
             max_cached: usize::MAX,
             max_depth: usize::MAX,
+            as_history: false,
         }
     }
 }
@@ -249,7 +253,28 @@ impl ChainVerifier {
             verified: HashMap::new(),
             max_cached,
             max_depth,
+            as_history: false,
         }
+    }
+
+    /// Prove a chain as `verify_history` proves one (`history.rs`): beyond
+    /// each step from an authority to its predecessor, every signature on
+    /// every authority verifies, not only the one owner signature a step
+    /// needs, and every successor has an owner (D4: an ownerless authority
+    /// can never be succeeded).
+    ///
+    /// Without this a chain is proved by its steps alone, and an authority
+    /// that `verify_history` and `admit` reject can be proved here: one
+    /// that carries a signature that does not verify beside the one that
+    /// does, or a successor with no owner. An instance decided who may read
+    /// by such a proof, and so served, under that authority's policy, a
+    /// repository whose every reader then refused what it was sent.
+    ///
+    /// What this has proved before is forgotten: it was proved by less.
+    pub fn as_history(mut self) -> Self {
+        self.verified.clear();
+        self.as_history = true;
+        self
     }
 
     /// The ids this keeps at most, and the authorities it walks at most
@@ -296,6 +321,20 @@ impl ChainVerifier {
                 )));
             }
             walked.push(cur_id);
+            if self.as_history {
+                verify_signed_object(&cur_signed).map_err(|e| {
+                    VerifyError::Authority(format!(
+                        "authority {cur_id} carries an invalid signature: {e}"
+                    ))
+                })?;
+                if !cur_body.previous_authority.is_zero()
+                    && !cur_body.members.iter().any(|m| m.role == Role::Owner)
+                {
+                    return Err(VerifyError::Authority(format!(
+                        "authority {cur_id} has no owner; it could never be changed again"
+                    )));
+                }
+            }
             if cur_body.previous_authority.is_zero() {
                 break Arc::new(verify_genesis(&cur_signed)?);
             }
@@ -786,6 +825,119 @@ mod tests {
         assert!(ChainVerifier::bounded(64, 20)
             .verify_chain(&src, tip)
             .is_ok());
+    }
+
+    /// The successor of `prev` in `src`, as `edit` leaves it, signed by the
+    /// owner of [`chain`]'s `seed` and then as `resign` leaves it: its id.
+    fn succeed(
+        src: &mut MemorySource,
+        prev: ObjectId,
+        seed: u8,
+        edit: impl FnOnce(&mut AuthorityBody),
+        resign: impl FnOnce(&mut SignedObject),
+    ) -> ObjectId {
+        let sk = SecretKey::from_seed([seed; 32]);
+        let mut body =
+            AuthorityBody::parse(&SignedObject::parse(&src.0[&prev]).unwrap().body).unwrap();
+        body.previous_authority = prev;
+        body.version += 1;
+        body.created_micros += 1;
+        edit(&mut body);
+        body.normalize().unwrap();
+        let mut signed = sign_authority(&body, &sk).unwrap();
+        resign(&mut signed);
+        let bytes = signed.serialize();
+        let id = levcs_core::blake3_hash(&bytes);
+        src.0.insert(id, bytes);
+        id
+    }
+
+    /// A second signature, by a key that is no member's, that does not
+    /// verify over the object it is on.
+    fn and_one_that_does_not_verify(signed: &mut SignedObject) {
+        let other = SecretKey::from_seed([0xee; 32]);
+        signed.signatures.push(SignatureEntry {
+            public_key: other.public().0,
+            signature: other.sign(b"not what was signed"),
+        });
+    }
+
+    /// Proved by its steps alone, a chain passes with an authority in it
+    /// that `verify_history` rejects: one carrying a signature that does
+    /// not verify beside the owner's, which does. Proved as history is, it
+    /// does not pass, wherever in the chain that authority is, the genesis
+    /// included, and nothing of it is kept.
+    #[test]
+    fn a_chain_proved_as_history_has_no_signature_that_does_not_verify() {
+        let (mut src, tip) = chain(3, 7);
+        let marked = succeed(&mut src, tip, 7, |_| {}, and_one_that_does_not_verify);
+        let after = succeed(&mut src, marked, 7, |_| {}, |_| {});
+        for at in [marked, after] {
+            assert!(ChainVerifier::new().verify_chain(&src, at).is_ok());
+            let mut strict = ChainVerifier::new().as_history();
+            let e = strict.verify_chain(&src, at).unwrap_err();
+            assert!(
+                e.to_string()
+                    .contains(&format!("authority {marked} carries an invalid signature")),
+                "{e}"
+            );
+            assert!(strict.is_empty());
+            // What is before it in the chain is proved either way.
+            assert!(strict.verify_chain(&src, tip).is_ok());
+        }
+
+        // A genesis so marked is another object, and another repository's:
+        // the id is derived from the body, which the mark leaves alone.
+        let (mut src, genesis) = chain(1, 8);
+        let mut signed = SignedObject::parse(&src.0[&genesis]).unwrap();
+        and_one_that_does_not_verify(&mut signed);
+        let bytes = signed.serialize();
+        let marked = levcs_core::blake3_hash(&bytes);
+        src.0.insert(marked, bytes);
+        assert!(ChainVerifier::new().verify_chain(&src, marked).is_ok());
+        let e = ChainVerifier::new()
+            .as_history()
+            .verify_chain(&src, marked)
+            .unwrap_err();
+        assert!(
+            e.to_string().contains("carries an invalid signature"),
+            "{e}"
+        );
+    }
+
+    /// The same of a successor with no owner, which could never be changed
+    /// again (D4).
+    #[test]
+    fn a_chain_proved_as_history_has_no_ownerless_successor() {
+        use crate::authority::Role;
+        let (mut src, tip) = chain(2, 9);
+        let ownerless = succeed(
+            &mut src,
+            tip,
+            9,
+            |body| body.members[0].role = Role::Maintainer,
+            |_| {},
+        );
+        assert!(ChainVerifier::new().verify_chain(&src, ownerless).is_ok());
+        let mut strict = ChainVerifier::new().as_history();
+        let e = strict.verify_chain(&src, ownerless).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains(&format!("authority {ownerless} has no owner")),
+            "{e}"
+        );
+        assert!(strict.is_empty());
+        assert!(strict.verify_chain(&src, tip).is_ok());
+    }
+
+    /// A chain with nothing wrong in it is proved either way, and kept.
+    #[test]
+    fn a_sound_chain_is_proved_as_history_and_kept() {
+        let (src, tip) = chain(5, 10);
+        let mut strict = ChainVerifier::bounded(64, 1024).as_history();
+        assert_eq!(strict.limits(), (64, 1024));
+        assert!(strict.verify_chain(&src, tip).is_ok());
+        assert_eq!(strict.len(), 5);
     }
 
     #[test]

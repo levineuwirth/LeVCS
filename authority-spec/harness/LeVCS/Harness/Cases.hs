@@ -1058,15 +1058,16 @@ divergentPermissionCases =
       , readOf 0 (Just 1) [c 0] (served [c 0])
       ]
   , permission
-      "div-be-an-instance-serves-under-an-authority-its-reader-refuses"
-      "Divergences (b) and (e), and where they are not asked. Authority 1 is a public \
-      \successor of the genesis that k0 signed, with a second signature on it that does \
-      \not verify. Authority 2 is a public successor that k0 signed and that has no Owner. \
-      \Read literally each is a successor, and a reader of a source under either records \
-      \c0. The Rust's verify and admit accept neither as an authority of the repository. \
-      \An instance proves its current authority by its steps alone, so it serves anyone \
-      \under either, by that authority's policy; the reader then refuses what it was sent, \
-      \over the authority the instance served it under."
+      "div-be-an-instance-serves-no-one-under-an-authority-verify-rejects"
+      "Divergences (b) and (e), at the source. Authority 1 is a public successor of the \
+      \genesis that k0 signed, with a second signature on it that does not verify. \
+      \Authority 2 is a public successor that k0 signed and that has no Owner. Read \
+      \literally each is a successor, and a reader of a source under either records c0. \
+      \The Rust's verify and admit accept neither as an authority of the repository, and \
+      \an instance proves its current authority as they do: under either it serves no \
+      \one, though the authority's own policy would let anyone in. It used to prove the \
+      \chain by its steps alone, serve anyone, and leave the reader to refuse what it was \
+      \sent."
       ( store
           [ genesis [(1, Contributor)]
           , public ((successor 0 2 [(0, Owner)] [0]) {aSigs = [Sig (Key 0) True, Sig (Key 1) False]})
@@ -1075,8 +1076,8 @@ divergentPermissionCases =
           [commit [] 0 0]
           []
       )
-      [ (Just 1, Nothing, [c 0], served [c 0], ServeRefused)
-      , (Just 2, Nothing, [c 0], served [c 0], ServeRefused)
+      [ (Just 1, Nothing, [c 0], served [c 0], ServeDenied)
+      , (Just 2, Nothing, [c 0], served [c 0], ServeDenied)
       , readOf 0 (Just 1) [c 0] (served [c 0])
       ]
   ]

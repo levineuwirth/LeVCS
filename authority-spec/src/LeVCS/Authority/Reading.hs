@@ -1,11 +1,17 @@
--- | Where the implementation enforces something the ratified text does not
--- say, the rule is a named switch here instead of a silent part of the model.
+-- | Where the implementation enforced something the text as first ratified
+-- did not say, the rule is a named switch here instead of a silent part of
+-- the model.
 --
--- 'ratified' is the text of @doc/authority-semantics.md@ read literally.
--- 'implemented' is that text plus every switch, and is what the differential
--- run holds @levcs-identity@ to. So the claim the run makes is exact: the
--- Rust implements the ratified rules amended by these switches and nothing
--- else. @DIVERGENCES.md@ has one entry per switch.
+-- 'ratified' is the text of @doc/authority-semantics.md@ as first ratified,
+-- on 2026-10-04, read literally. 'implemented' is that text plus every
+-- switch, and is what the differential run holds @levcs-identity@ to. So the
+-- claim the run makes is exact: the Rust implements the rules as first
+-- ratified, amended by these switches and nothing else. @DIVERGENCES.md@ has
+-- one entry per switch.
+--
+-- The document was amended on 2026-11-21 to say what every switch says, so
+-- 'implemented' is the document as it stands. Where a comment in this model
+-- sets "the text" against a switch, it means the text as first ratified.
 module LeVCS.Authority.Reading
   ( Reading (..)
   , ratified

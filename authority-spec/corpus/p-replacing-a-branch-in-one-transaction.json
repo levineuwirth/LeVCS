@@ -1,0 +1,279 @@
+{
+  "expect": {
+    "admit": [
+      {
+        "admitted": {
+          "commits": 0,
+          "new_current": null,
+          "releases": 0
+        }
+      },
+      {
+        "admitted": {
+          "commits": 0,
+          "new_current": null,
+          "releases": 0
+        }
+      },
+      {
+        "refused": "unauthorized"
+      },
+      {
+        "admitted": {
+          "commits": 1,
+          "new_current": null,
+          "releases": 0
+        }
+      }
+    ],
+    "receive": [],
+    "verify": null
+  },
+  "name": "p-replacing-a-branch-in-one-transaction",
+  "note": "P.4. A deletion is a rewrite when no ref reaches its target once every update in the transaction is applied. Creating b1 at c1 and deleting b0, which held c1, unpublishes nothing: a Contributor does it unforced, in either order. A move is judged otherwise. With b1 still on c1, moving b0 to c2, which does not descend from c1, is a rewrite all the same, refused for a Contributor and admitted for a Maintainer.",
+  "ratified": {
+    "admit": [
+      {
+        "admitted": {
+          "commits": 0,
+          "new_current": null,
+          "releases": 0
+        }
+      },
+      {
+        "admitted": {
+          "commits": 0,
+          "new_current": null,
+          "releases": 0
+        }
+      },
+      {
+        "refused": "unauthorized"
+      },
+      {
+        "admitted": {
+          "commits": 1,
+          "new_current": null,
+          "releases": 0
+        }
+      }
+    ],
+    "receive": [],
+    "verify": null
+  },
+  "request": {
+    "admit": [
+      {
+        "state": {
+          "current": 0,
+          "refs": [
+            {
+              "ref": "refs/branches/b0",
+              "target": {
+                "commit": 1
+              }
+            }
+          ]
+        },
+        "tx": {
+          "authority": null,
+          "signer": 1,
+          "updates": [
+            {
+              "expected": null,
+              "force": false,
+              "new": {
+                "commit": 1
+              },
+              "ref": "refs/branches/b1"
+            },
+            {
+              "expected": {
+                "commit": 1
+              },
+              "force": false,
+              "new": null,
+              "ref": "refs/branches/b0"
+            }
+          ]
+        }
+      },
+      {
+        "state": {
+          "current": 0,
+          "refs": [
+            {
+              "ref": "refs/branches/b0",
+              "target": {
+                "commit": 1
+              }
+            }
+          ]
+        },
+        "tx": {
+          "authority": null,
+          "signer": 1,
+          "updates": [
+            {
+              "expected": {
+                "commit": 1
+              },
+              "force": false,
+              "new": null,
+              "ref": "refs/branches/b0"
+            },
+            {
+              "expected": null,
+              "force": false,
+              "new": {
+                "commit": 1
+              },
+              "ref": "refs/branches/b1"
+            }
+          ]
+        }
+      },
+      {
+        "state": {
+          "current": 0,
+          "refs": [
+            {
+              "ref": "refs/branches/b0",
+              "target": {
+                "commit": 1
+              }
+            },
+            {
+              "ref": "refs/branches/b1",
+              "target": {
+                "commit": 1
+              }
+            }
+          ]
+        },
+        "tx": {
+          "authority": null,
+          "signer": 1,
+          "updates": [
+            {
+              "expected": {
+                "commit": 1
+              },
+              "force": true,
+              "new": {
+                "commit": 2
+              },
+              "ref": "refs/branches/b0"
+            }
+          ]
+        }
+      },
+      {
+        "state": {
+          "current": 0,
+          "refs": [
+            {
+              "ref": "refs/branches/b0",
+              "target": {
+                "commit": 1
+              }
+            },
+            {
+              "ref": "refs/branches/b1",
+              "target": {
+                "commit": 1
+              }
+            }
+          ]
+        },
+        "tx": {
+          "authority": null,
+          "signer": 2,
+          "updates": [
+            {
+              "expected": {
+                "commit": 1
+              },
+              "force": true,
+              "new": {
+                "commit": 2
+              },
+              "ref": "refs/branches/b0"
+            }
+          ]
+        }
+      }
+    ],
+    "pin": 0,
+    "receive": [],
+    "store": {
+      "authorities": [
+        {
+          "id": 0,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            },
+            {
+              "key": 1,
+              "role": "contributor"
+            },
+            {
+              "key": 2,
+              "role": "maintainer"
+            }
+          ],
+          "prev": null,
+          "protected": [],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 1
+        }
+      ],
+      "commits": [
+        {
+          "cites": 0,
+          "id": 0,
+          "installs": null,
+          "parents": [],
+          "signature": {
+            "key": 0,
+            "valid": true
+          }
+        },
+        {
+          "cites": 0,
+          "id": 1,
+          "installs": null,
+          "parents": [
+            0
+          ],
+          "signature": {
+            "key": 0,
+            "valid": true
+          }
+        },
+        {
+          "cites": 0,
+          "id": 2,
+          "installs": null,
+          "parents": [
+            0
+          ],
+          "signature": {
+            "key": 0,
+            "valid": true
+          }
+        }
+      ],
+      "releases": []
+    },
+    "verify": null
+  }
+}

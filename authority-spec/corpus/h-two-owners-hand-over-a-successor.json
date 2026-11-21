@@ -1,0 +1,112 @@
+{
+  "expect": {
+    "admit": [],
+    "receive": [],
+    "verify": {
+      "conflicting": [],
+      "current_rejected": false,
+      "invalid": [],
+      "reached": [
+        {
+          "commit": 0
+        }
+      ]
+    }
+  },
+  "name": "h-two-owners-hand-over-a-successor",
+  "note": "H.5. k0 and k1 are both Owners. Both sign the successor, and k1 authors the commit that installs it. The successor bears the signature of the Owner who puts it into effect, so the commit is valid. div-a-successor-not-signed-by-the-boundary-author is the same handover with k0's signature alone.",
+  "ratified": {
+    "admit": [],
+    "receive": [],
+    "verify": {
+      "conflicting": [],
+      "current_rejected": false,
+      "invalid": [],
+      "reached": [
+        {
+          "commit": 0
+        }
+      ]
+    }
+  },
+  "request": {
+    "admit": [],
+    "pin": 0,
+    "receive": [],
+    "store": {
+      "authorities": [
+        {
+          "id": 0,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            },
+            {
+              "key": 1,
+              "role": "owner"
+            }
+          ],
+          "prev": null,
+          "protected": [],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            }
+          ],
+          "version": 1
+        },
+        {
+          "id": 1,
+          "members": [
+            {
+              "key": 0,
+              "role": "owner"
+            },
+            {
+              "key": 1,
+              "role": "owner"
+            }
+          ],
+          "prev": 0,
+          "protected": [],
+          "public_read": false,
+          "signatures": [
+            {
+              "key": 0,
+              "valid": true
+            },
+            {
+              "key": 1,
+              "valid": true
+            }
+          ],
+          "version": 2
+        }
+      ],
+      "commits": [
+        {
+          "cites": 0,
+          "id": 0,
+          "installs": 1,
+          "parents": [],
+          "signature": {
+            "key": 1,
+            "valid": true
+          }
+        }
+      ],
+      "releases": []
+    },
+    "verify": {
+      "current": null,
+      "roots": [
+        {
+          "commit": 0
+        }
+      ]
+    }
+  }
+}

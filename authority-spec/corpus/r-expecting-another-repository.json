@@ -24,29 +24,6 @@
   },
   "name": "r-expecting-another-repository",
   "note": "R.1: a chain that ends at a different genesis is a different repository. Authority 1 is another repository's genesis, and c1 is valid history of it. A receiver expecting this repository refuses it; a receiver expecting that one records it. The genesis is what the receiver expects, whatever the source holds.",
-  "ratified": {
-    "admit": [],
-    "receive": [
-      {
-        "refused": true
-      },
-      {
-        "recorded": [
-          {
-            "commit": 1
-          }
-        ]
-      },
-      {
-        "recorded": [
-          {
-            "commit": 0
-          }
-        ]
-      }
-    ],
-    "verify": null
-  },
   "request": {
     "admit": [],
     "pin": 0,
@@ -144,6 +121,29 @@
       ],
       "releases": []
     },
+    "verify": null
+  },
+  "unamended": {
+    "admit": [],
+    "receive": [
+      {
+        "refused": true
+      },
+      {
+        "recorded": [
+          {
+            "commit": 1
+          }
+        ]
+      },
+      {
+        "recorded": [
+          {
+            "commit": 0
+          }
+        ]
+      }
+    ],
     "verify": null
   }
 }

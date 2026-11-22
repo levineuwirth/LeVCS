@@ -27,40 +27,6 @@
   },
   "name": "div-d-deleting-a-ref-that-unpublishes",
   "note": "Divergence (d). b0 is the only ref reaching c1. P.4 does not mention deletion, so read literally any Contributor may delete an unprotected branch. The Rust treats a deletion that leaves history unreachable as a rewrite: it must be forced, and by a Maintainer. With another ref still reaching c1 (the last transaction) the readings agree.",
-  "ratified": {
-    "admit": [
-      {
-        "admitted": {
-          "commits": 0,
-          "new_current": null,
-          "releases": 0
-        }
-      },
-      {
-        "admitted": {
-          "commits": 0,
-          "new_current": null,
-          "releases": 0
-        }
-      },
-      {
-        "admitted": {
-          "commits": 0,
-          "new_current": null,
-          "releases": 0
-        }
-      },
-      {
-        "admitted": {
-          "commits": 0,
-          "new_current": null,
-          "releases": 0
-        }
-      }
-    ],
-    "receive": [],
-    "verify": null
-  },
   "request": {
     "admit": [
       {
@@ -248,6 +214,40 @@
       ],
       "releases": []
     },
+    "verify": null
+  },
+  "unamended": {
+    "admit": [
+      {
+        "admitted": {
+          "commits": 0,
+          "new_current": null,
+          "releases": 0
+        }
+      },
+      {
+        "admitted": {
+          "commits": 0,
+          "new_current": null,
+          "releases": 0
+        }
+      },
+      {
+        "admitted": {
+          "commits": 0,
+          "new_current": null,
+          "releases": 0
+        }
+      },
+      {
+        "admitted": {
+          "commits": 0,
+          "new_current": null,
+          "releases": 0
+        }
+      }
+    ],
+    "receive": [],
     "verify": null
   }
 }

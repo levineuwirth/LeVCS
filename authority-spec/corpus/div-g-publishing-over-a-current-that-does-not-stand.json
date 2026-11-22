@@ -23,36 +23,6 @@
   },
   "name": "div-g-publishing-over-a-current-that-does-not-stand",
   "note": "Divergence (g), for publication. c0 is published on b0, and the transaction puts a second branch on it, which newly exposes nothing. Rule P reads the signer's role in the current authority and takes that authority as given: with current at another repository's genesis (1), or at an authority that succeeds nothing (2), the Owner k0 is admitted, and the stranger k3 refused as no member. The Rust checks that current descends from the pinned genesis before it reads any role, and refuses all of it as invalid. With current at the pinned genesis the readings agree.",
-  "ratified": {
-    "admit": [
-      {
-        "admitted": {
-          "commits": 0,
-          "new_current": null,
-          "releases": 0
-        }
-      },
-      {
-        "admitted": {
-          "commits": 0,
-          "new_current": null,
-          "releases": 0
-        }
-      },
-      {
-        "refused": "unauthorized"
-      },
-      {
-        "admitted": {
-          "commits": 0,
-          "new_current": null,
-          "releases": 0
-        }
-      }
-    ],
-    "receive": [],
-    "verify": null
-  },
   "request": {
     "admit": [
       {
@@ -248,6 +218,36 @@
       ],
       "releases": []
     },
+    "verify": null
+  },
+  "unamended": {
+    "admit": [
+      {
+        "admitted": {
+          "commits": 0,
+          "new_current": null,
+          "releases": 0
+        }
+      },
+      {
+        "admitted": {
+          "commits": 0,
+          "new_current": null,
+          "releases": 0
+        }
+      },
+      {
+        "refused": "unauthorized"
+      },
+      {
+        "admitted": {
+          "commits": 0,
+          "new_current": null,
+          "releases": 0
+        }
+      }
+    ],
+    "receive": [],
     "verify": null
   }
 }

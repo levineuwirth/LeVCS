@@ -34,39 +34,6 @@
   },
   "name": "h-merge-of-incomparable-authorities",
   "note": "H.3: when the parents' effective authorities are incomparable, no authority satisfies it. c1 and c2 install two different successors of the genesis; a merge is invalid whichever it cites.",
-  "ratified": {
-    "admit": [],
-    "receive": [],
-    "verify": {
-      "conflicting": [],
-      "current_rejected": false,
-      "invalid": [
-        {
-          "commit": 3
-        },
-        {
-          "commit": 4
-        }
-      ],
-      "reached": [
-        {
-          "commit": 0
-        },
-        {
-          "commit": 1
-        },
-        {
-          "commit": 2
-        },
-        {
-          "commit": 3
-        },
-        {
-          "commit": 4
-        }
-      ]
-    }
-  },
   "request": {
     "admit": [],
     "pin": 0,
@@ -202,6 +169,39 @@
     "verify": {
       "current": null,
       "roots": [
+        {
+          "commit": 3
+        },
+        {
+          "commit": 4
+        }
+      ]
+    }
+  },
+  "unamended": {
+    "admit": [],
+    "receive": [],
+    "verify": {
+      "conflicting": [],
+      "current_rejected": false,
+      "invalid": [
+        {
+          "commit": 3
+        },
+        {
+          "commit": 4
+        }
+      ],
+      "reached": [
+        {
+          "commit": 0
+        },
+        {
+          "commit": 1
+        },
+        {
+          "commit": 2
+        },
         {
           "commit": 3
         },

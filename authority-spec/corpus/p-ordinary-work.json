@@ -21,26 +21,6 @@
   },
   "name": "p-ordinary-work",
   "note": "P.1 and P.2 at their simplest. A Contributor publishes a root commit to a repository that has published nothing, then a commit on top of it.",
-  "ratified": {
-    "admit": [
-      {
-        "admitted": {
-          "commits": 1,
-          "new_current": null,
-          "releases": 0
-        }
-      },
-      {
-        "admitted": {
-          "commits": 1,
-          "new_current": null,
-          "releases": 0
-        }
-      }
-    ],
-    "receive": [],
-    "verify": null
-  },
   "request": {
     "admit": [
       {
@@ -147,6 +127,26 @@
       ],
       "releases": []
     },
+    "verify": null
+  },
+  "unamended": {
+    "admit": [
+      {
+        "admitted": {
+          "commits": 1,
+          "new_current": null,
+          "releases": 0
+        }
+      },
+      {
+        "admitted": {
+          "commits": 1,
+          "new_current": null,
+          "releases": 0
+        }
+      }
+    ],
+    "receive": [],
     "verify": null
   }
 }

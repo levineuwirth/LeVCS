@@ -16,21 +16,6 @@
   },
   "name": "p-removed-member-publishes-nothing",
   "note": "Revocation, for publication. Authority 1 removes k1. k1 cannot sign a transaction (P.1), and the Owner cannot publish k1's commits for it: c2 cites the current authority, of which k1 is not a member (H.1), and c3 cites the old one on top of the commit that replaced it (H.3).",
-  "ratified": {
-    "admit": [
-      {
-        "refused": "unauthorized"
-      },
-      {
-        "refused": "invalid"
-      },
-      {
-        "refused": "invalid"
-      }
-    ],
-    "receive": [],
-    "verify": null
-  },
   "request": {
     "admit": [
       {
@@ -218,6 +203,21 @@
       ],
       "releases": []
     },
+    "verify": null
+  },
+  "unamended": {
+    "admit": [
+      {
+        "refused": "unauthorized"
+      },
+      {
+        "refused": "invalid"
+      },
+      {
+        "refused": "invalid"
+      }
+    ],
+    "receive": [],
     "verify": null
   }
 }

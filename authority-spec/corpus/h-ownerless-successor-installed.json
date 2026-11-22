@@ -19,24 +19,6 @@
   },
   "name": "h-ownerless-successor-installed",
   "note": "H.5 and D4. The successor leaves k0 a Contributor and has no Owner, so the commit installing it is invalid.",
-  "ratified": {
-    "admit": [],
-    "receive": [],
-    "verify": {
-      "conflicting": [],
-      "current_rejected": false,
-      "invalid": [
-        {
-          "commit": 0
-        }
-      ],
-      "reached": [
-        {
-          "commit": 0
-        }
-      ]
-    }
-  },
   "request": {
     "admit": [],
     "pin": 0,
@@ -99,6 +81,24 @@
     "verify": {
       "current": 0,
       "roots": [
+        {
+          "commit": 0
+        }
+      ]
+    }
+  },
+  "unamended": {
+    "admit": [],
+    "receive": [],
+    "verify": {
+      "conflicting": [],
+      "current_rejected": false,
+      "invalid": [
+        {
+          "commit": 0
+        }
+      ],
+      "reached": [
         {
           "commit": 0
         }

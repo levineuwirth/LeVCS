@@ -31,36 +31,6 @@
   },
   "name": "h-signatures-that-do-not-verify",
   "note": "H.1, and the same for a release. c1 and r0 are signed by an Owner's key, with a signature that does not verify.",
-  "ratified": {
-    "admit": [],
-    "receive": [],
-    "verify": {
-      "conflicting": [],
-      "current_rejected": false,
-      "invalid": [
-        {
-          "commit": 1
-        },
-        {
-          "release": 0
-        }
-      ],
-      "reached": [
-        {
-          "commit": 0
-        },
-        {
-          "commit": 1
-        },
-        {
-          "release": 0
-        },
-        {
-          "release": 1
-        }
-      ]
-    }
-  },
   "request": {
     "admit": [],
     "pin": 0,
@@ -137,6 +107,36 @@
     "verify": {
       "current": 0,
       "roots": [
+        {
+          "commit": 1
+        },
+        {
+          "release": 0
+        },
+        {
+          "release": 1
+        }
+      ]
+    }
+  },
+  "unamended": {
+    "admit": [],
+    "receive": [],
+    "verify": {
+      "conflicting": [],
+      "current_rejected": false,
+      "invalid": [
+        {
+          "commit": 1
+        },
+        {
+          "release": 0
+        }
+      ],
+      "reached": [
+        {
+          "commit": 0
+        },
         {
           "commit": 1
         },

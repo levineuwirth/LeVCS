@@ -29,34 +29,6 @@
   },
   "name": "r-a-public-repository-is-read-by-anyone",
   "note": "R.2. The current authority has public_read. A reader who signs with no key, one who signs with a key that is no member's, and a member are all sent the history, and record it.",
-  "ratified": {
-    "admit": [],
-    "receive": [],
-    "serve": [
-      {
-        "recorded": [
-          {
-            "commit": 0
-          }
-        ]
-      },
-      {
-        "recorded": [
-          {
-            "commit": 0
-          }
-        ]
-      },
-      {
-        "recorded": [
-          {
-            "commit": 0
-          }
-        ]
-      }
-    ],
-    "verify": null
-  },
   "request": {
     "admit": [],
     "pin": 0,
@@ -130,6 +102,34 @@
       ],
       "releases": []
     },
+    "verify": null
+  },
+  "unamended": {
+    "admit": [],
+    "receive": [],
+    "serve": [
+      {
+        "recorded": [
+          {
+            "commit": 0
+          }
+        ]
+      },
+      {
+        "recorded": [
+          {
+            "commit": 0
+          }
+        ]
+      },
+      {
+        "recorded": [
+          {
+            "commit": 0
+          }
+        ]
+      }
+    ],
     "verify": null
   }
 }

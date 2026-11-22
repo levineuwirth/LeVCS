@@ -63,68 +63,6 @@
   },
   "name": "r-read-permission-is-decided-in-the-current-authority",
   "note": "R.2 is decided in the source's current authority and no other. The genesis has k1 a Reader. Authority 1 removes k1 and adds k2; authority 2, its successor, is public. While the source's current authority is the genesis, k1 reads and k2 does not. Once it is authority 1, k2 reads and k1 does not, though k1's commit c2 is still in the history k2 receives. Once it is authority 2, anyone reads.",
-  "ratified": {
-    "admit": [],
-    "receive": [],
-    "serve": [
-      {
-        "recorded": [
-          {
-            "commit": 0
-          }
-        ]
-      },
-      {
-        "denied": true
-      },
-      {
-        "recorded": [
-          {
-            "commit": 0
-          },
-          {
-            "commit": 1
-          },
-          {
-            "commit": 2
-          }
-        ]
-      },
-      {
-        "denied": true
-      },
-      {
-        "denied": true
-      },
-      {
-        "recorded": [
-          {
-            "commit": 0
-          },
-          {
-            "commit": 1
-          },
-          {
-            "commit": 3
-          }
-        ]
-      },
-      {
-        "recorded": [
-          {
-            "commit": 0
-          },
-          {
-            "commit": 1
-          },
-          {
-            "commit": 3
-          }
-        ]
-      }
-    ],
-    "verify": null
-  },
   "request": {
     "admit": [],
     "pin": 0,
@@ -322,6 +260,68 @@
       ],
       "releases": []
     },
+    "verify": null
+  },
+  "unamended": {
+    "admit": [],
+    "receive": [],
+    "serve": [
+      {
+        "recorded": [
+          {
+            "commit": 0
+          }
+        ]
+      },
+      {
+        "denied": true
+      },
+      {
+        "recorded": [
+          {
+            "commit": 0
+          },
+          {
+            "commit": 1
+          },
+          {
+            "commit": 2
+          }
+        ]
+      },
+      {
+        "denied": true
+      },
+      {
+        "denied": true
+      },
+      {
+        "recorded": [
+          {
+            "commit": 0
+          },
+          {
+            "commit": 1
+          },
+          {
+            "commit": 3
+          }
+        ]
+      },
+      {
+        "recorded": [
+          {
+            "commit": 0
+          },
+          {
+            "commit": 1
+          },
+          {
+            "commit": 3
+          }
+        ]
+      }
+    ],
     "verify": null
   }
 }

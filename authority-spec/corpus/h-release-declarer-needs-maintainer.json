@@ -34,39 +34,6 @@
   },
   "name": "h-release-declarer-needs-maintainer",
   "note": "D5. Releases declared by a Reader (r0) and by a Contributor (r1) are invalid; by a Maintainer (r2) and by an Owner (r3), valid.",
-  "ratified": {
-    "admit": [],
-    "receive": [],
-    "verify": {
-      "conflicting": [],
-      "current_rejected": false,
-      "invalid": [
-        {
-          "release": 0
-        },
-        {
-          "release": 1
-        }
-      ],
-      "reached": [
-        {
-          "commit": 0
-        },
-        {
-          "release": 0
-        },
-        {
-          "release": 1
-        },
-        {
-          "release": 2
-        },
-        {
-          "release": 3
-        }
-      ]
-    }
-  },
   "request": {
     "admit": [],
     "pin": 0,
@@ -163,6 +130,39 @@
     "verify": {
       "current": 0,
       "roots": [
+        {
+          "release": 0
+        },
+        {
+          "release": 1
+        },
+        {
+          "release": 2
+        },
+        {
+          "release": 3
+        }
+      ]
+    }
+  },
+  "unamended": {
+    "admit": [],
+    "receive": [],
+    "verify": {
+      "conflicting": [],
+      "current_rejected": false,
+      "invalid": [
+        {
+          "release": 0
+        },
+        {
+          "release": 1
+        }
+      ],
+      "reached": [
+        {
+          "commit": 0
+        },
         {
           "release": 0
         },

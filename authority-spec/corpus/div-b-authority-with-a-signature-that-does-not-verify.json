@@ -22,23 +22,6 @@
   },
   "name": "div-b-authority-with-a-signature-that-does-not-verify",
   "note": "Divergence (b). Authority 1 carries the Owner's valid signature and a second one, by k1, that does not verify. The text asks for one Owner's signature. The Rust rejects an authority if any signature on it fails.",
-  "ratified": {
-    "admit": [],
-    "receive": [],
-    "verify": {
-      "conflicting": [],
-      "current_rejected": false,
-      "invalid": [],
-      "reached": [
-        {
-          "commit": 0
-        },
-        {
-          "commit": 1
-        }
-      ]
-    }
-  },
   "request": {
     "admit": [],
     "pin": 0,
@@ -117,6 +100,23 @@
     "verify": {
       "current": null,
       "roots": [
+        {
+          "commit": 1
+        }
+      ]
+    }
+  },
+  "unamended": {
+    "admit": [],
+    "receive": [],
+    "verify": {
+      "conflicting": [],
+      "current_rejected": false,
+      "invalid": [],
+      "reached": [
+        {
+          "commit": 0
+        },
         {
           "commit": 1
         }

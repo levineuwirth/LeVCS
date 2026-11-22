@@ -13,18 +13,6 @@
   },
   "name": "p-emptied-repository-cannot-restart",
   "note": "H.4 with P.2. current is authority 1 and every ref has been deleted, so nothing is published any more. The history that was published before (c1, on the root c0) is now newly exposed and cites the genesis, not the current authority. A fresh root citing the current authority (c2) breaks H.4. Nothing can be published again.",
-  "ratified": {
-    "admit": [
-      {
-        "refused": "invalid"
-      },
-      {
-        "refused": "invalid"
-      }
-    ],
-    "receive": [],
-    "verify": null
-  },
   "request": {
     "admit": [
       {
@@ -159,6 +147,18 @@
       ],
       "releases": []
     },
+    "verify": null
+  },
+  "unamended": {
+    "admit": [
+      {
+        "refused": "invalid"
+      },
+      {
+        "refused": "invalid"
+      }
+    ],
+    "receive": [],
     "verify": null
   }
 }

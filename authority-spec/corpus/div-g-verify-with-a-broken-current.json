@@ -15,20 +15,6 @@
   },
   "name": "div-g-verify-with-a-broken-current",
   "note": "Divergence (g), for verify. The replica's current authority is 2, which names the genesis as previous and was signed only by k1, not an Owner there. c0 cites the genesis, which authority 2 claims to descend from, so nothing conflicts under either reading. The Rust reports the current authority; the text has nothing to report it as.",
-  "ratified": {
-    "admit": [],
-    "receive": [],
-    "verify": {
-      "conflicting": [],
-      "current_rejected": false,
-      "invalid": [],
-      "reached": [
-        {
-          "commit": 0
-        }
-      ]
-    }
-  },
   "request": {
     "admit": [],
     "pin": 0,
@@ -118,6 +104,20 @@
     "verify": {
       "current": 2,
       "roots": [
+        {
+          "commit": 0
+        }
+      ]
+    }
+  },
+  "unamended": {
+    "admit": [],
+    "receive": [],
+    "verify": {
+      "conflicting": [],
+      "current_rejected": false,
+      "invalid": [],
+      "reached": [
         {
           "commit": 0
         }

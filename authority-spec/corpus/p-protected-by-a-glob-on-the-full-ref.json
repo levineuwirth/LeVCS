@@ -24,29 +24,6 @@
   },
   "name": "p-protected-by-a-glob-on-the-full-ref",
   "note": "P.4. A glob is matched against the full ref as well as the branch name, so refs/branches/b* protects b0 and not main.",
-  "ratified": {
-    "admit": [
-      {
-        "refused": "unauthorized"
-      },
-      {
-        "admitted": {
-          "commits": 1,
-          "new_current": null,
-          "releases": 0
-        }
-      },
-      {
-        "admitted": {
-          "commits": 1,
-          "new_current": null,
-          "releases": 0
-        }
-      }
-    ],
-    "receive": [],
-    "verify": null
-  },
   "request": {
     "admit": [
       {
@@ -158,6 +135,29 @@
       ],
       "releases": []
     },
+    "verify": null
+  },
+  "unamended": {
+    "admit": [
+      {
+        "refused": "unauthorized"
+      },
+      {
+        "admitted": {
+          "commits": 1,
+          "new_current": null,
+          "releases": 0
+        }
+      },
+      {
+        "admitted": {
+          "commits": 1,
+          "new_current": null,
+          "releases": 0
+        }
+      }
+    ],
+    "receive": [],
     "verify": null
   }
 }

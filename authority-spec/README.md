@@ -14,8 +14,8 @@ functions over an abstract object model, and checked two ways:
 The document stays normative. Where the Rust enforced something the document
 did not say, the rule is a named switch, and `DIVERGENCES.md` records it.
 The document was amended on 2026-11-21 to say all of them, so the reading
-called `implemented` below is the document as it stands, and the one called
-`ratified` is the document as first ratified, on 2026-10-04.
+called `amended` below is the document as it stands, and the one called
+`unamended` is the document as first ratified, on 2026-10-04.
 
 ## Layout
 
@@ -60,9 +60,9 @@ and says nothing of reads. The run reads these variables:
 
 - **`LEVCS_SPEC_TESTS`**: scenarios per property. The default is 2000.
 - **`LEVCS_SPEC_READING`**: the reading the Rust is held to.
-  - `implemented`, the default: the text as amended, which is the text as
+  - `amended`, the default: the text as it stands, which is the text as
     first ratified plus every recorded divergence. This run must pass.
-  - `ratified`: the text as first ratified, read literally. This run must
+  - `unamended`: the text as first ratified, read literally. This run must
     fail.
   - `without:a`, `without:b`, `without:c`, `without:d-force`,
     `without:d-delete`, `without:e`, `without:f`, `without:g`: everything
@@ -91,10 +91,10 @@ LEVCS_SPEC_ORACLE=$(cabal list-bin model-oracle) LEVCS_SPEC_READING=without:a ca
 
 `LeVCS.Authority.Reading` has one switch per recorded divergence.
 
-- **`ratified`** has every switch off: the text as first ratified.
-- **`implemented`** has every switch on: the text as amended.
+- **`unamended`** has every switch off: the text as first ratified.
+- **`amended`** has every switch on: the text as it stands.
 
-The differential run holds the Rust to `implemented`. So what a passing run
+The differential run holds the Rust to `amended`. So what a passing run
 says is exact: on the scenarios generated, the Rust implements the rules as
 first ratified, amended by the recorded divergences and nothing else.
 
@@ -107,8 +107,8 @@ every file in `corpus/` holds a request with its responses.
 - **Against the generators:** point `LEVCS_SPEC_ORACLE` at the program and
   set `LEVCS_SPEC_READING` to the reading it implements.
 - **Against the corpus:** each entry's `expect` is the answer under
-  `implemented`, and `ratified` the answer under the text as first
-  ratified, read literally.
+  `amended`, and `unamended` the answer under the text as first ratified,
+  read literally.
 - **Against any other reading:** `model-oracle` gives the model's answer to
   a request under the reading `LEVCS_SPEC_READING` names.
 

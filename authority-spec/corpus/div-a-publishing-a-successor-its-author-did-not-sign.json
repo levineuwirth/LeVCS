@@ -10,19 +10,6 @@
   },
   "name": "div-a-publishing-a-successor-its-author-did-not-sign",
   "note": "Divergence (a), for publication. The boundary commit of div-a-successor-not-signed-by-the-boundary-author, published with the move of current it calls for. Read literally it is a valid boundary by an Owner and is admitted. The Rust finds the commit invalid and refuses the transaction.",
-  "ratified": {
-    "admit": [
-      {
-        "admitted": {
-          "commits": 1,
-          "new_current": 1,
-          "releases": 0
-        }
-      }
-    ],
-    "receive": [],
-    "verify": null
-  },
   "request": {
     "admit": [
       {
@@ -111,6 +98,19 @@
       ],
       "releases": []
     },
+    "verify": null
+  },
+  "unamended": {
+    "admit": [
+      {
+        "admitted": {
+          "commits": 1,
+          "new_current": 1,
+          "releases": 0
+        }
+      }
+    ],
+    "receive": [],
     "verify": null
   }
 }

@@ -17,22 +17,6 @@
   },
   "name": "p-rewriting-a-branch-needs-maintainer",
   "note": "P.4. c2 does not descend from c1. Moving b0 from one to the other is refused for a Contributor and admitted for a Maintainer. Both transactions are marked as forced, so the readings agree.",
-  "ratified": {
-    "admit": [
-      {
-        "refused": "unauthorized"
-      },
-      {
-        "admitted": {
-          "commits": 1,
-          "new_current": null,
-          "releases": 0
-        }
-      }
-    ],
-    "receive": [],
-    "verify": null
-  },
   "request": {
     "admit": [
       {
@@ -164,6 +148,22 @@
       ],
       "releases": []
     },
+    "verify": null
+  },
+  "unamended": {
+    "admit": [
+      {
+        "refused": "unauthorized"
+      },
+      {
+        "admitted": {
+          "commits": 1,
+          "new_current": null,
+          "releases": 0
+        }
+      }
+    ],
+    "receive": [],
     "verify": null
   }
 }

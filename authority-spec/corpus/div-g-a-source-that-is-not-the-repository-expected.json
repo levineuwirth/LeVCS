@@ -19,28 +19,6 @@
   },
   "name": "div-g-a-source-that-is-not-the-repository-expected",
   "note": "Divergence (g). The receiver expects the repository of genesis 0. A source whose current authority is 1, another repository's genesis, is asked for nothing: no commit is received, so read literally none fails and nothing is recorded. A source whose current authority is 2, which only k1 signed and so succeeds nothing, is asked for the valid c0: read literally it is recorded. The Rust looks at the source's current authority before anything it sent and refuses both. Asked for nothing by a receiver expecting the repository it is, a source is recorded as nothing under either reading.",
-  "ratified": {
-    "admit": [],
-    "receive": [
-      {
-        "recorded": []
-      },
-      {
-        "recorded": [
-          {
-            "commit": 0
-          }
-        ]
-      },
-      {
-        "recorded": []
-      },
-      {
-        "recorded": []
-      }
-    ],
-    "verify": null
-  },
   "request": {
     "admit": [],
     "pin": 0,
@@ -152,6 +130,28 @@
       ],
       "releases": []
     },
+    "verify": null
+  },
+  "unamended": {
+    "admit": [],
+    "receive": [
+      {
+        "recorded": []
+      },
+      {
+        "recorded": [
+          {
+            "commit": 0
+          }
+        ]
+      },
+      {
+        "recorded": []
+      },
+      {
+        "recorded": []
+      }
+    ],
     "verify": null
   }
 }

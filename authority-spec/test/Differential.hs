@@ -16,9 +16,9 @@
 -- that sends everything it has whatever was asked for, and with every read
 -- asked of a real instance, which decides for itself whom to answer.
 --
--- The model is run under the 'implemented' reading, so agreement means that
--- the Rust implements the ratified rules amended by exactly the divergences
--- recorded in @DIVERGENCES.md@.
+-- The model is run under the 'amended' reading, which is the document as it
+-- stands. So agreement means that the Rust implements the rules as first
+-- ratified, amended by exactly the divergences recorded in @DIVERGENCES.md@.
 module Main (main) where
 
 import Control.Monad (forM_, unless, when)
@@ -49,15 +49,16 @@ import Oracle
 -- | @LEVCS_SPEC_TESTS@ sets how many scenarios each property runs.
 --
 -- @LEVCS_SPEC_READING@ holds the Rust to another reading instead:
--- @ratified@ for the literal text, or @without:a@ (and so on, by the letters
--- of @DIVERGENCES.md@) for everything but one recorded divergence. Each of
--- those runs is expected to fail, and what it shrinks to is a smallest
--- scenario on which the implementation and that reading part ways.
+-- @unamended@ for the text as first ratified, read literally, or
+-- @without:a@ (and so on, by the letters of @DIVERGENCES.md@) for everything
+-- but one recorded divergence. Each of those runs is expected to fail, and
+-- what it shrinks to is a smallest scenario on which the implementation and
+-- that reading part ways.
 main :: IO ()
 main = do
   n <- maybe 2000 (fromMaybe 2000 . readMaybe) <$> lookupEnv "LEVCS_SPEC_TESTS"
   asked <- lookupEnv "LEVCS_SPEC_READING"
-  let name = fromMaybe "implemented" asked
+  let name = fromMaybe "amended" asked
   rd <- maybe (die ("LEVCS_SPEC_READING: unknown reading " ++ name)) pure (readingNamed name)
   rules <- withOracle Rules $ \o ->
     checkSequential $
@@ -159,8 +160,8 @@ named rd o = property $
     let rules r = r {rsServe = []}
         given = rules (anResponse answer)
     given === rules (expected rd (caseRequest c))
-    when (rd == ratified) $ given === rules (caseRatified c)
-    when (rd == implemented) $ given === rules (caseImplemented c)
+    when (rd == unamended) $ given === rules (caseUnamended c)
+    when (rd == amended) $ given === rules (caseAmended c)
     forM_ (caseUnder c) $ \(reading, written) ->
       when (readingNamed reading == Just rd) $ given === rules written
 
@@ -196,7 +197,7 @@ serves' rd o gen = property $ do
       asked = zip (rqServe rq) specified
       private current = maybe False (not . aPublicRead) (current >>= lookupAuthority st)
       kept r = case r of Served _ -> True; _ -> False
-  cover 1 "the readings disagree on a read" (rsServe (expected ratified rq) /= rsServe (expected implemented rq))
+  cover 1 "the readings disagree on a read" (rsServe (expected unamended rq) /= rsServe (expected amended rq))
   cover 20 "a read kept" (any (kept . snd) asked)
   cover 20 "a reader sent nothing" (ServeDenied `elem` specified)
   cover 5 "a reader sent history it refuses" (ServeRefused `elem` specified)
@@ -224,8 +225,8 @@ namedTransfers rd o = property $
     let replicated r = (rsReceive r, rsServe r)
         made = replicated (anResponse answer)
     made === replicated (expected rd (caseRequest c))
-    when (rd == ratified) $ made === replicated (caseRatified c)
-    when (rd == implemented) $ made === replicated (caseImplemented c)
+    when (rd == unamended) $ made === replicated (caseUnamended c)
+    when (rd == amended) $ made === replicated (caseAmended c)
     forM_ (caseUnder c) $ \(reading, written) ->
       when (readingNamed reading == Just rd) $ made === replicated written
 
@@ -238,7 +239,7 @@ receives rd o gen = property $ do
   rq <- forAllWith (BL.unpack . encode . encodeRequest) gen
   unrepresentable rq === []
   let specified = rsReceive (expected rd rq)
-  cover 1 "the readings disagree on a transfer" (rsReceive (expected ratified rq) /= rsReceive (expected implemented rq))
+  cover 1 "the readings disagree on a transfer" (rsReceive (expected unamended rq) /= rsReceive (expected amended rq))
   cover 20 "a transfer recorded" (or [True | ReceiveRecorded _ <- specified])
   cover 20 "a transfer refused" (ReceiveRefused `elem` specified)
   cover 5 "a transfer of several roots recorded" (or [True | ((_, _, _ : _ : _), ReceiveRecorded _) <- zip (rqReceive rq) specified])
@@ -258,7 +259,7 @@ agrees rd o gen = property $ do
   rq <- forAllWith (BL.unpack . encode . encodeRequest) gen
   -- Both sides must be answering the same question.
   unrepresentable rq === []
-  cover 1 "the readings disagree" (expected ratified rq /= expected implemented rq)
+  cover 1 "the readings disagree" (expected unamended rq /= expected amended rq)
   unless (null (rqReceive rq)) $ do
     cover 0 "a transfer recorded" (or [True | ReceiveRecorded _ <- rsReceive (expected rd rq)])
     cover 0 "a transfer refused" (ReceiveRefused `elem` rsReceive (expected rd rq))

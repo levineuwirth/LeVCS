@@ -15,24 +15,6 @@
   },
   "name": "div-g-verify-with-another-repository-as-current",
   "note": "Divergence (g), for verify. The replica's current authority is 1, the genesis of another repository. c0 is valid and cites genesis 0. Read literally the canonical lineage is the one ending at current, whatever current is, so c0 is on a conflicting lineage. The Rust reports the current authority as not descending from the genesis and classifies nothing against it.",
-  "ratified": {
-    "admit": [],
-    "receive": [],
-    "verify": {
-      "conflicting": [
-        {
-          "commit": 0
-        }
-      ],
-      "current_rejected": false,
-      "invalid": [],
-      "reached": [
-        {
-          "commit": 0
-        }
-      ]
-    }
-  },
   "request": {
     "admit": [],
     "pin": 0,
@@ -122,6 +104,24 @@
     "verify": {
       "current": 1,
       "roots": [
+        {
+          "commit": 0
+        }
+      ]
+    }
+  },
+  "unamended": {
+    "admit": [],
+    "receive": [],
+    "verify": {
+      "conflicting": [
+        {
+          "commit": 0
+        }
+      ],
+      "current_rejected": false,
+      "invalid": [],
+      "reached": [
         {
           "commit": 0
         }

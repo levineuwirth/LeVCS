@@ -2,20 +2,20 @@
 -- did not say, the rule is a named switch here instead of a silent part of
 -- the model.
 --
--- 'ratified' is the text of @doc/authority-semantics.md@ as first ratified,
--- on 2026-10-04, read literally. 'implemented' is that text plus every
--- switch, and is what the differential run holds @levcs-identity@ to. So the
--- claim the run makes is exact: the Rust implements the rules as first
--- ratified, amended by these switches and nothing else. @DIVERGENCES.md@ has
--- one entry per switch.
+-- 'unamended' is the text of @doc/authority-semantics.md@ as first ratified,
+-- on 2026-10-04, read literally. 'amended' is that text plus every switch,
+-- and is what the differential run holds the Rust to. So the claim the run
+-- makes is exact: the Rust implements the rules as first ratified, amended
+-- by these switches and nothing else. @DIVERGENCES.md@ has one entry per
+-- switch.
 --
 -- The document was amended on 2026-11-21 to say what every switch says, so
--- 'implemented' is the document as it stands. Where a comment in this model
+-- 'amended' is the document as it stands. Where a comment in this model
 -- sets "the text" against a switch, it means the text as first ratified.
 module LeVCS.Authority.Reading
   ( Reading (..)
-  , ratified
-  , implemented
+  , unamended
+  , amended
   , divergences
   , readingNamed
   ) where
@@ -57,9 +57,9 @@ data Reading = Reading
   }
   deriving (Eq, Show)
 
--- | The ratified text, read literally.
-ratified :: Reading
-ratified =
+-- | The text as first ratified, read literally.
+unamended :: Reading
+unamended =
   Reading
     { successorSignedByBoundaryAuthor = False
     , everyAuthoritySignatureVerifies = False
@@ -71,9 +71,10 @@ ratified =
     , currentMustBeOnThePinnedChain = False
     }
 
--- | The ratified text with every recorded divergence applied.
-implemented :: Reading
-implemented =
+-- | The text as amended: the text as first ratified with every recorded
+-- divergence applied.
+amended :: Reading
+amended =
   Reading
     { successorSignedByBoundaryAuthor = True
     , everyAuthoritySignatureVerifies = True
@@ -86,24 +87,24 @@ implemented =
     }
 
 -- | Each recorded divergence under the letter @DIVERGENCES.md@ gives it,
--- with the 'implemented' reading less that one switch. Holding the Rust to
+-- with the 'amended' reading less that one switch. Holding the Rust to
 -- one of these must fail, or the switch is not needed and the entry is
 -- wrong.
 divergences :: [(String, Reading)]
 divergences =
-  [ ("a", implemented {successorSignedByBoundaryAuthor = False})
-  , ("b", implemented {everyAuthoritySignatureVerifies = False})
-  , ("c", implemented {installedAuthorityCanConflict = False})
-  , ("d-force", implemented {rewriteMustBeForced = False})
-  , ("d-delete", implemented {deletionCanUnpublish = False})
-  , ("e", implemented {ownerlessRejectedWhenCited = False})
-  , ("f", implemented {conflictRefusesTransfer = False})
-  , ("g", implemented {currentMustBeOnThePinnedChain = False})
+  [ ("a", amended {successorSignedByBoundaryAuthor = False})
+  , ("b", amended {everyAuthoritySignatureVerifies = False})
+  , ("c", amended {installedAuthorityCanConflict = False})
+  , ("d-force", amended {rewriteMustBeForced = False})
+  , ("d-delete", amended {deletionCanUnpublish = False})
+  , ("e", amended {ownerlessRejectedWhenCited = False})
+  , ("f", amended {conflictRefusesTransfer = False})
+  , ("g", amended {currentMustBeOnThePinnedChain = False})
   ]
 
--- | A reading by name: @ratified@, @implemented@, or @without:@ and a
+-- | A reading by name: @unamended@, @amended@, or @without:@ and a
 -- divergence's letter.
 readingNamed :: String -> Maybe Reading
-readingNamed "ratified" = Just ratified
-readingNamed "implemented" = Just implemented
+readingNamed "unamended" = Just unamended
+readingNamed "amended" = Just amended
 readingNamed name = stripPrefix "without:" name >>= (`lookup` divergences)

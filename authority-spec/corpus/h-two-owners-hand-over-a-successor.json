@@ -15,20 +15,6 @@
   },
   "name": "h-two-owners-hand-over-a-successor",
   "note": "H.5. k0 and k1 are both Owners. Both sign the successor, and k1 authors the commit that installs it. The successor bears the signature of the Owner who puts it into effect, so the commit is valid. div-a-successor-not-signed-by-the-boundary-author is the same handover with k0's signature alone.",
-  "ratified": {
-    "admit": [],
-    "receive": [],
-    "verify": {
-      "conflicting": [],
-      "current_rejected": false,
-      "invalid": [],
-      "reached": [
-        {
-          "commit": 0
-        }
-      ]
-    }
-  },
   "request": {
     "admit": [],
     "pin": 0,
@@ -103,6 +89,20 @@
     "verify": {
       "current": null,
       "roots": [
+        {
+          "commit": 0
+        }
+      ]
+    }
+  },
+  "unamended": {
+    "admit": [],
+    "receive": [],
+    "verify": {
+      "conflicting": [],
+      "current_rejected": false,
+      "invalid": [],
+      "reached": [
         {
           "commit": 0
         }

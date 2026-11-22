@@ -19,20 +19,6 @@
   },
   "name": "div-a-successor-not-signed-by-the-boundary-author",
   "note": "Divergence (a). k0 and k1 are both Owners. k0 signs the successor and k1 authors the commit that installs it. The text asks that the successor be signed by an Owner of its predecessor, which it is. The Rust also wants the commit's author among the successor's signers.",
-  "ratified": {
-    "admit": [],
-    "receive": [],
-    "verify": {
-      "conflicting": [],
-      "current_rejected": false,
-      "invalid": [],
-      "reached": [
-        {
-          "commit": 0
-        }
-      ]
-    }
-  },
   "request": {
     "admit": [],
     "pin": 0,
@@ -103,6 +89,20 @@
     "verify": {
       "current": null,
       "roots": [
+        {
+          "commit": 0
+        }
+      ]
+    }
+  },
+  "unamended": {
+    "admit": [],
+    "receive": [],
+    "verify": {
+      "conflicting": [],
+      "current_rejected": false,
+      "invalid": [],
+      "reached": [
         {
           "commit": 0
         }

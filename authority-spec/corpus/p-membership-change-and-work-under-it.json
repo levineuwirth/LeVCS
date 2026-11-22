@@ -30,35 +30,6 @@
   },
   "name": "p-membership-change-and-work-under-it",
   "note": "P.2 and P.3. c1 installs authority 1 and c2 is made under it. Published together they are refused. The boundary alone, moving current, is admitted, and c2 in a later transaction whose current authority is 1. A boundary that does not move current is refused, and so is moving current with no boundary.",
-  "ratified": {
-    "admit": [
-      {
-        "refused": "invalid"
-      },
-      {
-        "admitted": {
-          "commits": 1,
-          "new_current": 1,
-          "releases": 0
-        }
-      },
-      {
-        "admitted": {
-          "commits": 1,
-          "new_current": null,
-          "releases": 0
-        }
-      },
-      {
-        "refused": "invalid"
-      },
-      {
-        "refused": "invalid"
-      }
-    ],
-    "receive": [],
-    "verify": null
-  },
   "request": {
     "admit": [
       {
@@ -289,6 +260,35 @@
       ],
       "releases": []
     },
+    "verify": null
+  },
+  "unamended": {
+    "admit": [
+      {
+        "refused": "invalid"
+      },
+      {
+        "admitted": {
+          "commits": 1,
+          "new_current": 1,
+          "releases": 0
+        }
+      },
+      {
+        "admitted": {
+          "commits": 1,
+          "new_current": null,
+          "releases": 0
+        }
+      },
+      {
+        "refused": "invalid"
+      },
+      {
+        "refused": "invalid"
+      }
+    ],
+    "receive": [],
     "verify": null
   }
 }

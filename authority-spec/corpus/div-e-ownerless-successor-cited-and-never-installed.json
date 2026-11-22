@@ -22,23 +22,6 @@
   },
   "name": "div-e-ownerless-successor-cited-and-never-installed",
   "note": "Divergence (e). Authority 1 has no Owner. No commit installs it, so H.5 never looks at it; c1 only cites it, and k0 is a Contributor there. Read literally the commit is valid. The Rust rejects an ownerless successor wherever it appears in a chain.",
-  "ratified": {
-    "admit": [],
-    "receive": [],
-    "verify": {
-      "conflicting": [],
-      "current_rejected": false,
-      "invalid": [],
-      "reached": [
-        {
-          "commit": 0
-        },
-        {
-          "commit": 1
-        }
-      ]
-    }
-  },
   "request": {
     "admit": [],
     "pin": 0,
@@ -113,6 +96,23 @@
     "verify": {
       "current": null,
       "roots": [
+        {
+          "commit": 1
+        }
+      ]
+    }
+  },
+  "unamended": {
+    "admit": [],
+    "receive": [],
+    "verify": {
+      "conflicting": [],
+      "current_rejected": false,
+      "invalid": [],
+      "reached": [
+        {
+          "commit": 0
+        },
         {
           "commit": 1
         }

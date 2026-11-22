@@ -18,23 +18,6 @@
   },
   "name": "h-objects-the-roots-do-not-reach",
   "note": "A verdict is given to what the roots reach and to nothing else. c2 carries a signature that does not verify, and r0 is declared by a Contributor. Neither is behind the root c1, so neither is reported, as invalid or at all.",
-  "ratified": {
-    "admit": [],
-    "receive": [],
-    "verify": {
-      "conflicting": [],
-      "current_rejected": false,
-      "invalid": [],
-      "reached": [
-        {
-          "commit": 0
-        },
-        {
-          "commit": 1
-        }
-      ]
-    }
-  },
   "request": {
     "admit": [],
     "pin": 0,
@@ -117,6 +100,23 @@
     "verify": {
       "current": 0,
       "roots": [
+        {
+          "commit": 1
+        }
+      ]
+    }
+  },
+  "unamended": {
+    "admit": [],
+    "receive": [],
+    "verify": {
+      "conflicting": [],
+      "current_rejected": false,
+      "invalid": [],
+      "reached": [
+        {
+          "commit": 0
+        },
         {
           "commit": 1
         }

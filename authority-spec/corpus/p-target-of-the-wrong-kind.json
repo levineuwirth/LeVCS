@@ -26,31 +26,6 @@
   },
   "name": "p-target-of-the-wrong-kind",
   "note": "A branch names a commit and a release ref a release. b0 is protected. Pointing it at the valid release r0 is refused as invalid, for the Contributor k1 as for the Maintainer k2: what the ref would hold is wrong whoever asks, and that is found before the branch's protection is looked at. So is a release ref pointed at a commit. The stranger k3 is refused as unauthorized first (P.1).",
-  "ratified": {
-    "admit": [
-      {
-        "refused": "invalid"
-      },
-      {
-        "refused": "invalid"
-      },
-      {
-        "refused": "invalid"
-      },
-      {
-        "refused": "unauthorized"
-      },
-      {
-        "admitted": {
-          "commits": 0,
-          "new_current": null,
-          "releases": 1
-        }
-      }
-    ],
-    "receive": [],
-    "verify": null
-  },
   "request": {
     "admit": [
       {
@@ -248,6 +223,31 @@
         }
       ]
     },
+    "verify": null
+  },
+  "unamended": {
+    "admit": [
+      {
+        "refused": "invalid"
+      },
+      {
+        "refused": "invalid"
+      },
+      {
+        "refused": "invalid"
+      },
+      {
+        "refused": "unauthorized"
+      },
+      {
+        "admitted": {
+          "commits": 0,
+          "new_current": null,
+          "releases": 1
+        }
+      }
+    ],
+    "receive": [],
     "verify": null
   }
 }

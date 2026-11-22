@@ -24,37 +24,6 @@
   },
   "name": "div-g-a-source-serves-no-one-under-an-authority-it-cannot-prove",
   "note": "Divergence (g), at the source. The repository asked for is that of genesis 0. Authority 1 is another repository's genesis, and public; authority 2 names genesis 0 as its predecessor, is public, and only k1 signed it, so it succeeds nothing. Read literally, R.2 looks at the policy of whatever the source has as current, and both let anyone in: asked for nothing under authority 1 a reader records nothing, and asked for c0 under authority 2 a reader records it. An instance serves no one from a repository whose current authority it cannot follow back to the genesis the id pins: not the public, and not k0, who is an Owner of all three.",
-  "ratified": {
-    "admit": [],
-    "receive": [],
-    "serve": [
-      {
-        "recorded": []
-      },
-      {
-        "recorded": [
-          {
-            "commit": 0
-          }
-        ]
-      },
-      {
-        "recorded": [
-          {
-            "commit": 0
-          }
-        ]
-      },
-      {
-        "recorded": [
-          {
-            "commit": 0
-          }
-        ]
-      }
-    ],
-    "verify": null
-  },
   "request": {
     "admit": [],
     "pin": 0,
@@ -175,6 +144,37 @@
       ],
       "releases": []
     },
+    "verify": null
+  },
+  "unamended": {
+    "admit": [],
+    "receive": [],
+    "serve": [
+      {
+        "recorded": []
+      },
+      {
+        "recorded": [
+          {
+            "commit": 0
+          }
+        ]
+      },
+      {
+        "recorded": [
+          {
+            "commit": 0
+          }
+        ]
+      },
+      {
+        "recorded": [
+          {
+            "commit": 0
+          }
+        ]
+      }
+    ],
     "verify": null
   }
 }

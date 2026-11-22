@@ -16,21 +16,6 @@
   },
   "name": "p-work-made-under-an-older-authority",
   "note": "D1 and P.5. current is authority 1. c2 was made by k1, still a member, under authority 0 and never published. It is refused on a branch of its own, refused when two refs name it at once, and refused when a valid merge under the current authority (c3) brings it in: all of it is newly exposed, and none of it cites the current authority.",
-  "ratified": {
-    "admit": [
-      {
-        "refused": "invalid"
-      },
-      {
-        "refused": "invalid"
-      },
-      {
-        "refused": "invalid"
-      }
-    ],
-    "receive": [],
-    "verify": null
-  },
   "request": {
     "admit": [
       {
@@ -231,6 +216,21 @@
       ],
       "releases": []
     },
+    "verify": null
+  },
+  "unamended": {
+    "admit": [
+      {
+        "refused": "invalid"
+      },
+      {
+        "refused": "invalid"
+      },
+      {
+        "refused": "invalid"
+      }
+    ],
+    "receive": [],
     "verify": null
   }
 }

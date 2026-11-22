@@ -20,25 +20,6 @@
   },
   "name": "r-invalid-history-refuses-the-whole-transfer",
   "note": "R.1. c1 carries a signature that does not verify. A transfer that reaches it is refused whole, the valid c0 included; a transfer of c2, which does not reach it, is recorded.",
-  "ratified": {
-    "admit": [],
-    "receive": [
-      {
-        "refused": true
-      },
-      {
-        "recorded": [
-          {
-            "commit": 0
-          },
-          {
-            "commit": 2
-          }
-        ]
-      }
-    ],
-    "verify": null
-  },
   "request": {
     "admit": [],
     "pin": 0,
@@ -125,6 +106,25 @@
       ],
       "releases": []
     },
+    "verify": null
+  },
+  "unamended": {
+    "admit": [],
+    "receive": [
+      {
+        "refused": true
+      },
+      {
+        "recorded": [
+          {
+            "commit": 0
+          },
+          {
+            "commit": 2
+          }
+        ]
+      }
+    ],
     "verify": null
   }
 }

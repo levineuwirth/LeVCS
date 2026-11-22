@@ -23,41 +23,6 @@
   },
   "name": "div-f-receiving-history-on-a-conflicting-lineage",
   "note": "Divergence (f). The source's current authority is 1, and its branches hold c2, made under it, and c3, which cites authority 2, another successor of the genesis. Every commit passes Rule H, so read literally all four are received, and D2 has the disagreement reported, not refused. The Rust's receive refuses a transfer with anything on a conflicting lineage. Without c3 the readings agree.",
-  "ratified": {
-    "admit": [],
-    "receive": [
-      {
-        "recorded": [
-          {
-            "commit": 0
-          },
-          {
-            "commit": 1
-          },
-          {
-            "commit": 2
-          },
-          {
-            "commit": 3
-          }
-        ]
-      },
-      {
-        "recorded": [
-          {
-            "commit": 0
-          },
-          {
-            "commit": 1
-          },
-          {
-            "commit": 2
-          }
-        ]
-      }
-    ],
-    "verify": null
-  },
   "request": {
     "admit": [],
     "pin": 0,
@@ -198,6 +163,41 @@
       ],
       "releases": []
     },
+    "verify": null
+  },
+  "unamended": {
+    "admit": [],
+    "receive": [
+      {
+        "recorded": [
+          {
+            "commit": 0
+          },
+          {
+            "commit": 1
+          },
+          {
+            "commit": 2
+          },
+          {
+            "commit": 3
+          }
+        ]
+      },
+      {
+        "recorded": [
+          {
+            "commit": 0
+          },
+          {
+            "commit": 1
+          },
+          {
+            "commit": 2
+          }
+        ]
+      }
+    ],
     "verify": null
   }
 }

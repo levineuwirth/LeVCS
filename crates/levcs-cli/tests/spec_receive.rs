@@ -114,16 +114,17 @@ fn receive_and_an_instance_give_the_corpus_the_specified_answers() {
 
 /// The divergences that show in replication are divergences of `receive`
 /// and of an instance themselves: on their witnesses, what is transferred
-/// and what is read is not what the ratified text says, read literally.
+/// and what is read is not what the text as first ratified says, read
+/// literally.
 #[test]
-fn the_replication_witnesses_depart_from_the_ratified_text_as_run() {
+fn the_replication_witnesses_depart_from_the_unamended_text_as_run() {
     let mut receiver = spec_receive_support::Receiver::start();
     let (mut transferred, mut read) = (Vec::new(), Vec::new());
     for (name, entry) in corpus() {
         let replicated = |response: &Value| (transfers(response), reads(response));
-        let ratified = replicated(&entry["ratified"]);
+        let unamended = replicated(&entry["unamended"]);
         let specified = replicated(&entry["expect"]);
-        if ratified == specified {
+        if unamended == specified {
             continue;
         }
         let answer = receiver
@@ -131,13 +132,13 @@ fn the_replication_witnesses_depart_from_the_ratified_text_as_run() {
             .unwrap_or_else(|e| panic!("{name}: {e}"));
         assert_ne!(
             replicated(&answer),
-            ratified,
-            "{name}: replication does what the ratified text says"
+            unamended,
+            "{name}: replication does what the unamended text says"
         );
-        if ratified.0 != specified.0 {
+        if unamended.0 != specified.0 {
             transferred.push(name.clone());
         }
-        if ratified.1 != specified.1 {
+        if unamended.1 != specified.1 {
             read.push(name);
         }
     }

@@ -42,47 +42,6 @@
   },
   "name": "r-a-private-repository-is-read-by-its-members",
   "note": "R.2: \"a role of at least Reader there\". The current authority has no public_read. Every member reads it, whatever the role: k0 an Owner, k1 a Reader, k2 a Contributor and k3 a Maintainer. A reader with no key and one whose key is no member's are sent nothing.",
-  "ratified": {
-    "admit": [],
-    "receive": [],
-    "serve": [
-      {
-        "recorded": [
-          {
-            "commit": 0
-          }
-        ]
-      },
-      {
-        "recorded": [
-          {
-            "commit": 0
-          }
-        ]
-      },
-      {
-        "recorded": [
-          {
-            "commit": 0
-          }
-        ]
-      },
-      {
-        "recorded": [
-          {
-            "commit": 0
-          }
-        ]
-      },
-      {
-        "denied": true
-      },
-      {
-        "denied": true
-      }
-    ],
-    "verify": null
-  },
   "request": {
     "admit": [],
     "pin": 0,
@@ -191,6 +150,47 @@
       ],
       "releases": []
     },
+    "verify": null
+  },
+  "unamended": {
+    "admit": [],
+    "receive": [],
+    "serve": [
+      {
+        "recorded": [
+          {
+            "commit": 0
+          }
+        ]
+      },
+      {
+        "recorded": [
+          {
+            "commit": 0
+          }
+        ]
+      },
+      {
+        "recorded": [
+          {
+            "commit": 0
+          }
+        ]
+      },
+      {
+        "recorded": [
+          {
+            "commit": 0
+          }
+        ]
+      },
+      {
+        "denied": true
+      },
+      {
+        "denied": true
+      }
+    ],
     "verify": null
   }
 }

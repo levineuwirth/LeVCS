@@ -10,19 +10,6 @@
   },
   "name": "div-d-rewrite-that-is-not-forced",
   "note": "Divergence (d). A Maintainer moves b0 from c1 to c2, which does not descend from it, without marking the update as forced. P.4 asks for a Maintainer and says nothing of forcing. The Rust refuses an unforced rewrite from anyone.",
-  "ratified": {
-    "admit": [
-      {
-        "admitted": {
-          "commits": 1,
-          "new_current": null,
-          "releases": 0
-        }
-      }
-    ],
-    "receive": [],
-    "verify": null
-  },
   "request": {
     "admit": [
       {
@@ -125,6 +112,19 @@
       ],
       "releases": []
     },
+    "verify": null
+  },
+  "unamended": {
+    "admit": [
+      {
+        "admitted": {
+          "commits": 1,
+          "new_current": null,
+          "releases": 0
+        }
+      }
+    ],
+    "receive": [],
     "verify": null
   }
 }

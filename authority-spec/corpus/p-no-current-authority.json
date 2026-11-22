@@ -10,15 +10,6 @@
   },
   "name": "p-no-current-authority",
   "note": "D6. A replica with no current authority can publish nothing, even for an Owner of the genesis.",
-  "ratified": {
-    "admit": [
-      {
-        "refused": "unauthorized"
-      }
-    ],
-    "receive": [],
-    "verify": null
-  },
   "request": {
     "admit": [
       {
@@ -80,6 +71,15 @@
       ],
       "releases": []
     },
+    "verify": null
+  },
+  "unamended": {
+    "admit": [
+      {
+        "refused": "unauthorized"
+      }
+    ],
+    "receive": [],
     "verify": null
   }
 }

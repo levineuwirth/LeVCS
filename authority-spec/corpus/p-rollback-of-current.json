@@ -16,21 +16,6 @@
   },
   "name": "p-rollback-of-current",
   "note": "P.3. current is authority 1. An Owner cannot move it back to the genesis, and no transaction may name a ref under refs/authority.",
-  "ratified": {
-    "admit": [
-      {
-        "refused": "invalid"
-      },
-      {
-        "refused": "invalid"
-      },
-      {
-        "refused": "invalid"
-      }
-    ],
-    "receive": [],
-    "verify": null
-  },
   "request": {
     "admit": [
       {
@@ -187,6 +172,21 @@
       ],
       "releases": []
     },
+    "verify": null
+  },
+  "unamended": {
+    "admit": [
+      {
+        "refused": "invalid"
+      },
+      {
+        "refused": "invalid"
+      },
+      {
+        "refused": "invalid"
+      }
+    ],
+    "receive": [],
     "verify": null
   }
 }

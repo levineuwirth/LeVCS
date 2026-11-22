@@ -38,43 +38,6 @@
   },
   "name": "p-transaction-that-is-not-well-formed",
   "note": "What is not a transaction is refused as one, before anything else about it is looked at. A branch with no name, a name with an empty or a dot component, a ref named twice, and a deletion of a ref expected to be absent are all refused as invalid: for a Contributor, for a stranger (k3) who would otherwise be refused as unauthorized, and alongside an update that would otherwise be stale. A name with several components is a name.",
-  "ratified": {
-    "admit": [
-      {
-        "refused": "invalid"
-      },
-      {
-        "refused": "invalid"
-      },
-      {
-        "refused": "invalid"
-      },
-      {
-        "refused": "invalid"
-      },
-      {
-        "refused": "invalid"
-      },
-      {
-        "refused": "invalid"
-      },
-      {
-        "refused": "invalid"
-      },
-      {
-        "refused": "invalid"
-      },
-      {
-        "admitted": {
-          "commits": 1,
-          "new_current": null,
-          "releases": 0
-        }
-      }
-    ],
-    "receive": [],
-    "verify": null
-  },
   "request": {
     "admit": [
       {
@@ -321,6 +284,43 @@
       ],
       "releases": []
     },
+    "verify": null
+  },
+  "unamended": {
+    "admit": [
+      {
+        "refused": "invalid"
+      },
+      {
+        "refused": "invalid"
+      },
+      {
+        "refused": "invalid"
+      },
+      {
+        "refused": "invalid"
+      },
+      {
+        "refused": "invalid"
+      },
+      {
+        "refused": "invalid"
+      },
+      {
+        "refused": "invalid"
+      },
+      {
+        "refused": "invalid"
+      },
+      {
+        "admitted": {
+          "commits": 1,
+          "new_current": null,
+          "releases": 0
+        }
+      }
+    ],
+    "receive": [],
     "verify": null
   }
 }

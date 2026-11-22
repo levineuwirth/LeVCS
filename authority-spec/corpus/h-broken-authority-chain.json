@@ -28,33 +28,6 @@
   },
   "name": "h-broken-authority-chain",
   "note": "H.2. Authority 1 is signed only by k1, who is not an Owner of the genesis. Authority 2 is signed by the Owner and skips a version. Neither is a successor, so a commit citing either is invalid.",
-  "ratified": {
-    "admit": [],
-    "receive": [],
-    "verify": {
-      "conflicting": [],
-      "current_rejected": false,
-      "invalid": [
-        {
-          "commit": 1
-        },
-        {
-          "commit": 2
-        }
-      ],
-      "reached": [
-        {
-          "commit": 0
-        },
-        {
-          "commit": 1
-        },
-        {
-          "commit": 2
-        }
-      ]
-    }
-  },
   "request": {
     "admit": [],
     "pin": 0,
@@ -168,6 +141,33 @@
     "verify": {
       "current": 0,
       "roots": [
+        {
+          "commit": 1
+        },
+        {
+          "commit": 2
+        }
+      ]
+    }
+  },
+  "unamended": {
+    "admit": [],
+    "receive": [],
+    "verify": {
+      "conflicting": [],
+      "current_rejected": false,
+      "invalid": [
+        {
+          "commit": 1
+        },
+        {
+          "commit": 2
+        }
+      ],
+      "reached": [
+        {
+          "commit": 0
+        },
         {
           "commit": 1
         },

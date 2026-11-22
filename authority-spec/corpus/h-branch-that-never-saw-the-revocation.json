@@ -21,26 +21,6 @@
   },
   "name": "h-branch-that-never-saw-the-revocation",
   "note": "R.3: revoked authors are no obstacle. k1's commit c2 sits beside the revoking commit c1, not on top of it, so nothing behind c2 removed k1 and it stays valid.",
-  "ratified": {
-    "admit": [],
-    "receive": [],
-    "verify": {
-      "conflicting": [],
-      "current_rejected": false,
-      "invalid": [],
-      "reached": [
-        {
-          "commit": 0
-        },
-        {
-          "commit": 1
-        },
-        {
-          "commit": 2
-        }
-      ]
-    }
-  },
   "request": {
     "admit": [],
     "pin": 0,
@@ -131,6 +111,26 @@
     "verify": {
       "current": 1,
       "roots": [
+        {
+          "commit": 1
+        },
+        {
+          "commit": 2
+        }
+      ]
+    }
+  },
+  "unamended": {
+    "admit": [],
+    "receive": [],
+    "verify": {
+      "conflicting": [],
+      "current_rejected": false,
+      "invalid": [],
+      "reached": [
+        {
+          "commit": 0
+        },
         {
           "commit": 1
         },

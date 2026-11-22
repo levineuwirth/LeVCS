@@ -28,8 +28,8 @@ data Case = Case
   { caseName :: String
   , caseNote :: String
   , caseRequest :: Request
-  , caseRatified :: Response
-  , caseImplemented :: Response
+  , caseUnamended :: Response
+  , caseAmended :: Response
   , caseUnder :: [(String, Response)]
   -- ^ Answers written out for other readings, by the name
   -- 'LeVCS.Authority.Reading.readingNamed' knows them by. For a case about
@@ -43,8 +43,8 @@ corpusEntry k =
     { ceName = caseName k
     , ceNote = caseNote k
     , ceRequest = caseRequest k
-    , ceExpect = caseImplemented k
-    , ceRatified = caseRatified k
+    , ceExpect = caseAmended k
+    , ceUnamended = caseUnamended k
     }
 
 -- * Building
@@ -124,8 +124,8 @@ history name note st current roots literal strict =
     { caseName = name
     , caseNote = note
     , caseRequest = Request st (AuthId 0) (Just (AuthId <$> current, roots)) [] [] []
-    , caseRatified = answer literal
-    , caseImplemented = answer strict
+    , caseUnamended = answer literal
+    , caseAmended = answer strict
     , caseUnder = []
     }
   where
@@ -139,7 +139,7 @@ history name note st current roots literal strict =
 -- | A history case whose roots reach only the objects listed.
 reaching :: [Object] -> Case -> Case
 reaching objects k =
-  k {caseRatified = only (caseRatified k), caseImplemented = only (caseImplemented k)}
+  k {caseUnamended = only (caseUnamended k), caseAmended = only (caseAmended k)}
   where
     only rs = rs {rsVerify = (\v -> v {vrReached = Set.fromList objects}) <$> rsVerify rs}
 
@@ -149,16 +149,16 @@ under :: String -> ([Object], [Object]) -> Case -> Case
 under reading (invalid, conflicting) k = k {caseUnder = caseUnder k ++ [(reading, answer)]}
   where
     answer =
-      (caseImplemented k)
+      (caseAmended k)
         { rsVerify =
             (\v -> v {vrInvalid = Set.fromList invalid, vrConflicting = Set.fromList conflicting})
-              <$> rsVerify (caseImplemented k)
+              <$> rsVerify (caseAmended k)
         }
 
--- | A history case in which the implemented reading reports the replica's
+-- | A history case in which the amended reading reports the replica's
 -- current authority as no authority of this repository.
 rejectingCurrent :: Case -> Case
-rejectingCurrent k = k {caseImplemented = (caseImplemented k) {rsVerify = rejected <$> rsVerify (caseImplemented k)}}
+rejectingCurrent k = k {caseAmended = (caseAmended k) {rsVerify = rejected <$> rsVerify (caseAmended k)}}
   where
     rejected v = v {vrCurrentRejected = True}
 
@@ -175,8 +175,8 @@ publication name note st attempts =
     { caseName = name
     , caseNote = note
     , caseRequest = Request st (AuthId 0) Nothing [(s, t) | (s, t, _, _) <- attempts] [] []
-    , caseRatified = Response Nothing [d | (_, _, d, _) <- attempts] [] []
-    , caseImplemented = Response Nothing [d | (_, _, _, d) <- attempts] [] []
+    , caseUnamended = Response Nothing [d | (_, _, d, _) <- attempts] [] []
+    , caseAmended = Response Nothing [d | (_, _, _, d) <- attempts] [] []
     , caseUnder = []
     }
 
@@ -189,8 +189,8 @@ replication name note st transfers =
     { caseName = name
     , caseNote = note
     , caseRequest = Request st (AuthId 0) Nothing [] [(AuthId e, AuthId cur, roots) | (e, cur, roots, _, _) <- transfers] []
-    , caseRatified = Response Nothing [] [d | (_, _, _, d, _) <- transfers] []
-    , caseImplemented = Response Nothing [] [d | (_, _, _, _, d) <- transfers] []
+    , caseUnamended = Response Nothing [] [d | (_, _, _, d, _) <- transfers] []
+    , caseAmended = Response Nothing [] [d | (_, _, _, _, d) <- transfers] []
     , caseUnder = []
     }
 
@@ -211,8 +211,8 @@ permission name note st asked =
           []
           []
           [(AuthId <$> cur, maybe Anonymous (Holding . Key) who, roots) | (cur, who, roots, _, _) <- asked]
-    , caseRatified = Response Nothing [] [] [d | (_, _, _, d, _) <- asked]
-    , caseImplemented = Response Nothing [] [] [d | (_, _, _, _, d) <- asked]
+    , caseUnamended = Response Nothing [] [] [d | (_, _, _, d, _) <- asked]
+    , caseAmended = Response Nothing [] [] [d | (_, _, _, _, d) <- asked]
     , caseUnder = []
     }
 

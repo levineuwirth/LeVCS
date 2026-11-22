@@ -24,29 +24,6 @@
   },
   "name": "p-protected-branch-needs-maintainer",
   "note": "P.4. b0 is protected. A Contributor's update of it is refused, a Maintainer's is admitted, and the Contributor may still publish the same commit to an unprotected branch.",
-  "ratified": {
-    "admit": [
-      {
-        "refused": "unauthorized"
-      },
-      {
-        "admitted": {
-          "commits": 1,
-          "new_current": null,
-          "releases": 0
-        }
-      },
-      {
-        "admitted": {
-          "commits": 1,
-          "new_current": null,
-          "releases": 0
-        }
-      }
-    ],
-    "receive": [],
-    "verify": null
-  },
   "request": {
     "admit": [
       {
@@ -158,6 +135,29 @@
       ],
       "releases": []
     },
+    "verify": null
+  },
+  "unamended": {
+    "admit": [
+      {
+        "refused": "unauthorized"
+      },
+      {
+        "admitted": {
+          "commits": 1,
+          "new_current": null,
+          "releases": 0
+        }
+      },
+      {
+        "admitted": {
+          "commits": 1,
+          "new_current": null,
+          "releases": 0
+        }
+      }
+    ],
+    "receive": [],
     "verify": null
   }
 }

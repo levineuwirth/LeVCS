@@ -104,12 +104,13 @@ fn the_implementation_gives_every_corpus_entry_the_specified_verdicts() {
     );
 }
 
-/// The divergence witnesses are entries where the ratified text, read
-/// literally, gives a different answer from the one specified for the
-/// implementation. If one of them stops differing, a divergence has been
-/// closed and `authority-spec/DIVERGENCES.md` is out of date.
+/// The divergence witnesses are entries where the text as first ratified,
+/// read literally, gives a different answer from the text as amended, which
+/// is the one specified. `unamended` holds the first answer and `expect` the
+/// second. If the implementation gives the first on a witness, it has gone
+/// back on what `authority-spec/DIVERGENCES.md` records as settled there.
 #[test]
-fn every_divergence_witness_still_departs_from_the_ratified_text() {
+fn every_divergence_witness_still_departs_from_the_unamended_text() {
     let witnesses: Vec<(String, Value)> = corpus()
         .into_iter()
         .filter(|(name, _)| name.starts_with("div-"))
@@ -121,17 +122,17 @@ fn every_divergence_witness_still_departs_from_the_ratified_text() {
     );
     let mut seen = 0;
     for (name, entry) in &witnesses {
-        let ratified = rules_only(spec_support::compared(&entry["ratified"]).unwrap());
+        let unamended = rules_only(spec_support::compared(&entry["unamended"]).unwrap());
         // A witness that departs only in what an instance answers is not
         // one this crate can see either way.
-        if ratified == rules_only(spec_support::compared(&entry["expect"]).unwrap()) {
+        if unamended == rules_only(spec_support::compared(&entry["expect"]).unwrap()) {
             continue;
         }
         let answer = spec_support::answer(&entry["request"]).unwrap();
         assert_ne!(
             spec_support::compared(&answer).unwrap(),
-            ratified,
-            "{name}: the implementation now agrees with the ratified text here"
+            unamended,
+            "{name}: the implementation answers as the unamended text does here"
         );
         seen += 1;
     }

@@ -753,9 +753,9 @@ data CorpusEntry = CorpusEntry
   , ceNote :: String
   , ceRequest :: Request
   , ceExpect :: Response
-  -- ^ Under the 'implemented' reading.
-  , ceRatified :: Response
-  -- ^ Under the 'ratified' reading. It differs from 'ceExpect' exactly when
+  -- ^ Under the 'amended' reading.
+  , ceUnamended :: Response
+  -- ^ Under the 'unamended' reading. It differs from 'ceExpect' exactly when
   -- the entry witnesses a recorded divergence.
   }
   deriving (Eq, Show)
@@ -767,7 +767,7 @@ encodeCorpusEntry e =
     , "note" .= ceNote e
     , "request" .= encodeRequest (ceRequest e)
     , "expect" .= encodeResponse (ceExpect e)
-    , "ratified" .= encodeResponse (ceRatified e)
+    , "unamended" .= encodeResponse (ceUnamended e)
     ]
 
 parseCorpusEntry :: Value -> Parser CorpusEntry
@@ -777,4 +777,4 @@ parseCorpusEntry = withObject "corpus entry" $ \o ->
     <*> o .: "note"
     <*> (o .: "request" >>= parseRequest)
     <*> (o .: "expect" >>= parseResponse)
-    <*> (o .: "ratified" >>= parseResponse)
+    <*> (o .: "unamended" >>= parseResponse)

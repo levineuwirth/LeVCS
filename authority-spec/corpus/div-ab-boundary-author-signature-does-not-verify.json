@@ -19,20 +19,6 @@
   },
   "name": "div-ab-boundary-author-signature-does-not-verify",
   "note": "Divergences (a) and (b) together. k0 and k1 are both Owners. The successor carries k0's valid signature and one bearing k1's key that does not verify, and k1 authors the commit that installs it. The text asks for one Owner's signature, which k0's is. Each divergence refuses it by itself: (b) because a signature on the successor fails, and (a) because the boundary author has not signed it, a signature that does not verify being no signature.",
-  "ratified": {
-    "admit": [],
-    "receive": [],
-    "verify": {
-      "conflicting": [],
-      "current_rejected": false,
-      "invalid": [],
-      "reached": [
-        {
-          "commit": 0
-        }
-      ]
-    }
-  },
   "request": {
     "admit": [],
     "pin": 0,
@@ -107,6 +93,20 @@
     "verify": {
       "current": null,
       "roots": [
+        {
+          "commit": 0
+        }
+      ]
+    }
+  },
+  "unamended": {
+    "admit": [],
+    "receive": [],
+    "verify": {
+      "conflicting": [],
+      "current_rejected": false,
+      "invalid": [],
+      "reached": [
         {
           "commit": 0
         }

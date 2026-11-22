@@ -28,33 +28,6 @@
   },
   "name": "h-two-successors-when-replicas-meet",
   "note": "D2. This replica's current authority is 1. c3 cites authority 2, another successor of the genesis: historically valid, and on a conflicting lineage, which is not the same as invalid.",
-  "ratified": {
-    "admit": [],
-    "receive": [],
-    "verify": {
-      "conflicting": [
-        {
-          "commit": 3
-        }
-      ],
-      "current_rejected": false,
-      "invalid": [],
-      "reached": [
-        {
-          "commit": 0
-        },
-        {
-          "commit": 1
-        },
-        {
-          "commit": 2
-        },
-        {
-          "commit": 3
-        }
-      ]
-    }
-  },
   "request": {
     "admit": [],
     "pin": 0,
@@ -176,6 +149,33 @@
     "verify": {
       "current": 1,
       "roots": [
+        {
+          "commit": 2
+        },
+        {
+          "commit": 3
+        }
+      ]
+    }
+  },
+  "unamended": {
+    "admit": [],
+    "receive": [],
+    "verify": {
+      "conflicting": [
+        {
+          "commit": 3
+        }
+      ],
+      "current_rejected": false,
+      "invalid": [],
+      "reached": [
+        {
+          "commit": 0
+        },
+        {
+          "commit": 1
+        },
         {
           "commit": 2
         },

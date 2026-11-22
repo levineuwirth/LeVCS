@@ -22,27 +22,6 @@
   },
   "name": "h-root-commit-cites-the-genesis",
   "note": "H.4. A commit with no parents must cite the genesis (c1), not a later authority, however valid that authority is (c0).",
-  "ratified": {
-    "admit": [],
-    "receive": [],
-    "verify": {
-      "conflicting": [],
-      "current_rejected": false,
-      "invalid": [
-        {
-          "commit": 0
-        }
-      ],
-      "reached": [
-        {
-          "commit": 0
-        },
-        {
-          "commit": 1
-        }
-      ]
-    }
-  },
   "request": {
     "admit": [],
     "pin": 0,
@@ -115,6 +94,27 @@
     "verify": {
       "current": 1,
       "roots": [
+        {
+          "commit": 0
+        },
+        {
+          "commit": 1
+        }
+      ]
+    }
+  },
+  "unamended": {
+    "admit": [],
+    "receive": [],
+    "verify": {
+      "conflicting": [],
+      "current_rejected": false,
+      "invalid": [
+        {
+          "commit": 0
+        }
+      ],
+      "reached": [
         {
           "commit": 0
         },

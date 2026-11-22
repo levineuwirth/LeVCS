@@ -31,36 +31,6 @@
   },
   "name": "h-merge-of-comparable-authorities-cites-the-newer",
   "note": "H.3 as the merge rule. c1 puts authority 1 in effect and c2 is still under authority 0. A merge of the two must cite authority 1 (c4); citing authority 0 (c3) is invalid.",
-  "ratified": {
-    "admit": [],
-    "receive": [],
-    "verify": {
-      "conflicting": [],
-      "current_rejected": false,
-      "invalid": [
-        {
-          "commit": 3
-        }
-      ],
-      "reached": [
-        {
-          "commit": 0
-        },
-        {
-          "commit": 1
-        },
-        {
-          "commit": 2
-        },
-        {
-          "commit": 3
-        },
-        {
-          "commit": 4
-        }
-      ]
-    }
-  },
   "request": {
     "admit": [],
     "pin": 0,
@@ -173,6 +143,36 @@
     "verify": {
       "current": 1,
       "roots": [
+        {
+          "commit": 3
+        },
+        {
+          "commit": 4
+        }
+      ]
+    }
+  },
+  "unamended": {
+    "admit": [],
+    "receive": [],
+    "verify": {
+      "conflicting": [],
+      "current_rejected": false,
+      "invalid": [
+        {
+          "commit": 3
+        }
+      ],
+      "reached": [
+        {
+          "commit": 0
+        },
+        {
+          "commit": 1
+        },
+        {
+          "commit": 2
+        },
         {
           "commit": 3
         },

@@ -10,15 +10,6 @@
   },
   "name": "p-transaction-made-against-another-state",
   "note": "Rule P is evaluated against the single pre-transaction state. b0 holds c1, and the transaction was made when it held c0.",
-  "ratified": {
-    "admit": [
-      {
-        "refused": "stale"
-      }
-    ],
-    "receive": [],
-    "verify": null
-  },
   "request": {
     "admit": [
       {
@@ -113,6 +104,15 @@
       ],
       "releases": []
     },
+    "verify": null
+  },
+  "unamended": {
+    "admit": [
+      {
+        "refused": "stale"
+      }
+    ],
+    "receive": [],
     "verify": null
   }
 }

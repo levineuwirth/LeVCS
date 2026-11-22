@@ -370,7 +370,7 @@ buildHistory sc =
     st = foldl (flip (applyOp noCtx)) (genesisStore (hsGenesis sc) []) (hsOps sc)
     -- Under the stricter reading, so that the pick is an authority both
     -- readings accept as this repository's.
-    onChain = [a | a <- newestFirst (sAuthorities st), chainEndsAt implemented st pinId a]
+    onChain = [a | a <- newestFirst (sAuthorities st), chainEndsAt amended st pinId a]
 
 -- | The objects nothing else follows from. Every object is behind one.
 heads :: Store -> [Object]

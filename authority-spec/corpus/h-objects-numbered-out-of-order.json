@@ -27,32 +27,6 @@
   },
   "name": "h-objects-numbered-out-of-order",
   "note": "An object's number is a name and says nothing of order. Here everything refers to something with a higher number than its own: authority 3 succeeds authority 5, commit 1 is on commit 2, which is on the root commit 7, and release 4 follows release 9. It is honest history, two changes of authority and two releases, and all of it is valid.",
-  "ratified": {
-    "admit": [],
-    "receive": [],
-    "verify": {
-      "conflicting": [],
-      "current_rejected": false,
-      "invalid": [],
-      "reached": [
-        {
-          "commit": 1
-        },
-        {
-          "commit": 2
-        },
-        {
-          "commit": 7
-        },
-        {
-          "release": 4
-        },
-        {
-          "release": 9
-        }
-      ]
-    }
-  },
   "request": {
     "admit": [],
     "pin": 0,
@@ -184,6 +158,32 @@
         },
         {
           "release": 4
+        }
+      ]
+    }
+  },
+  "unamended": {
+    "admit": [],
+    "receive": [],
+    "verify": {
+      "conflicting": [],
+      "current_rejected": false,
+      "invalid": [],
+      "reached": [
+        {
+          "commit": 1
+        },
+        {
+          "commit": 2
+        },
+        {
+          "commit": 7
+        },
+        {
+          "release": 4
+        },
+        {
+          "release": 9
         }
       ]
     }

@@ -15,20 +15,6 @@
   },
   "name": "h-contributor-commit-under-a-protected-branch",
   "note": "H.1 has no protected-ref requirement: a commit does not record the ref it was made for. A Contributor's commit is valid whatever the branch policy.",
-  "ratified": {
-    "admit": [],
-    "receive": [],
-    "verify": {
-      "conflicting": [],
-      "current_rejected": false,
-      "invalid": [],
-      "reached": [
-        {
-          "commit": 0
-        }
-      ]
-    }
-  },
   "request": {
     "admit": [],
     "pin": 0,
@@ -78,6 +64,20 @@
     "verify": {
       "current": 0,
       "roots": [
+        {
+          "commit": 0
+        }
+      ]
+    }
+  },
+  "unamended": {
+    "admit": [],
+    "receive": [],
+    "verify": {
+      "conflicting": [],
+      "current_rejected": false,
+      "invalid": [],
+      "reached": [
         {
           "commit": 0
         }

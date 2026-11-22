@@ -34,39 +34,6 @@
   },
   "name": "h-revoked-author-on-the-revoking-commit",
   "note": "H.3, the revocation rule. c1 installs an authority without k1. On top of it, k1 can neither go on citing the old authority (c2) nor cite the new one, of which it is not a member (c4). The owner's commit under the new authority (c3) is valid.",
-  "ratified": {
-    "admit": [],
-    "receive": [],
-    "verify": {
-      "conflicting": [],
-      "current_rejected": false,
-      "invalid": [
-        {
-          "commit": 2
-        },
-        {
-          "commit": 4
-        }
-      ],
-      "reached": [
-        {
-          "commit": 0
-        },
-        {
-          "commit": 1
-        },
-        {
-          "commit": 2
-        },
-        {
-          "commit": 3
-        },
-        {
-          "commit": 4
-        }
-      ]
-    }
-  },
   "request": {
     "admit": [],
     "pin": 0,
@@ -181,6 +148,39 @@
     "verify": {
       "current": 1,
       "roots": [
+        {
+          "commit": 2
+        },
+        {
+          "commit": 3
+        },
+        {
+          "commit": 4
+        }
+      ]
+    }
+  },
+  "unamended": {
+    "admit": [],
+    "receive": [],
+    "verify": {
+      "conflicting": [],
+      "current_rejected": false,
+      "invalid": [
+        {
+          "commit": 2
+        },
+        {
+          "commit": 4
+        }
+      ],
+      "reached": [
+        {
+          "commit": 0
+        },
+        {
+          "commit": 1
+        },
         {
           "commit": 2
         },

@@ -40,8 +40,8 @@ main = do
           { ceName = name
           , ceNote = note
           , ceRequest = request
-          , ceExpect = expected implemented request
-          , ceRatified = expected ratified request
+          , ceExpect = expected amended request
+          , ceUnamended = expected unamended request
           }
     _ -> die "usage: write-corpus [add <name> <note> < request.json]"
 

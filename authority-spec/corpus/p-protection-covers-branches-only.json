@@ -17,22 +17,6 @@
   },
   "name": "p-protection-covers-branches-only",
   "note": "P.4. The policy is protected_branches. The glob * protects every branch, so a Contributor cannot create b1. It protects no release ref: the same Contributor publishes a release that a Maintainer declared.",
-  "ratified": {
-    "admit": [
-      {
-        "refused": "unauthorized"
-      },
-      {
-        "admitted": {
-          "commits": 0,
-          "new_current": null,
-          "releases": 1
-        }
-      }
-    ],
-    "receive": [],
-    "verify": null
-  },
   "request": {
     "admit": [
       {
@@ -149,6 +133,22 @@
         }
       ]
     },
+    "verify": null
+  },
+  "unamended": {
+    "admit": [
+      {
+        "refused": "unauthorized"
+      },
+      {
+        "admitted": {
+          "commits": 0,
+          "new_current": null,
+          "releases": 1
+        }
+      }
+    ],
+    "receive": [],
     "verify": null
   }
 }

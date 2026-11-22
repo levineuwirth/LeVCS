@@ -33,38 +33,6 @@
   },
   "name": "r-only-what-was-asked-for",
   "note": "A transfer is of the roots asked for, not of everything the source has. c0 and c1 are two unrelated roots, each with a commit on it. Asking for the branch at c2 records c0 and c2 and nothing of the other; asking for both records all four.",
-  "ratified": {
-    "admit": [],
-    "receive": [
-      {
-        "recorded": [
-          {
-            "commit": 0
-          },
-          {
-            "commit": 2
-          }
-        ]
-      },
-      {
-        "recorded": [
-          {
-            "commit": 0
-          },
-          {
-            "commit": 1
-          },
-          {
-            "commit": 2
-          },
-          {
-            "commit": 3
-          }
-        ]
-      }
-    ],
-    "verify": null
-  },
   "request": {
     "admit": [],
     "pin": 0,
@@ -161,6 +129,38 @@
       ],
       "releases": []
     },
+    "verify": null
+  },
+  "unamended": {
+    "admit": [],
+    "receive": [
+      {
+        "recorded": [
+          {
+            "commit": 0
+          },
+          {
+            "commit": 2
+          }
+        ]
+      },
+      {
+        "recorded": [
+          {
+            "commit": 0
+          },
+          {
+            "commit": 1
+          },
+          {
+            "commit": 2
+          },
+          {
+            "commit": 3
+          }
+        ]
+      }
+    ],
     "verify": null
   }
 }

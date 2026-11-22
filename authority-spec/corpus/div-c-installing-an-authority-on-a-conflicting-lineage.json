@@ -19,20 +19,6 @@
   },
   "name": "div-c-installing-an-authority-on-a-conflicting-lineage",
   "note": "Divergence (c). This replica's current authority is 1. c0 cites the genesis, which is on the replica's lineage, and installs authority 2, which is not. The text classifies a commit by the authority it cites. The Rust classifies what it installs as well.",
-  "ratified": {
-    "admit": [],
-    "receive": [],
-    "verify": {
-      "conflicting": [],
-      "current_rejected": false,
-      "invalid": [],
-      "reached": [
-        {
-          "commit": 0
-        }
-      ]
-    }
-  },
   "request": {
     "admit": [],
     "pin": 0,
@@ -118,6 +104,20 @@
     "verify": {
       "current": 1,
       "roots": [
+        {
+          "commit": 0
+        }
+      ]
+    }
+  },
+  "unamended": {
+    "admit": [],
+    "receive": [],
+    "verify": {
+      "conflicting": [],
+      "current_rejected": false,
+      "invalid": [],
+      "reached": [
         {
           "commit": 0
         }

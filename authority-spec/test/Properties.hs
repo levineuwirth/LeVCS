@@ -3,9 +3,10 @@
 -- | The rules checked against themselves. Nothing here runs the Rust.
 --
 -- These are consequences the document claims, or that it would be a defect
--- for the rules not to have. They are checked under both readings, because
--- a consequence that held only with the implementation's extra rules would
--- not be a consequence of the ratified text.
+-- for the rules not to have. They are checked under both readings, the text
+-- as first ratified and the text as amended, because a consequence that
+-- held only with what the amendment added would not have been a consequence
+-- of the text that first claimed it.
 module Main (main) where
 
 import Control.Monad (forM, forM_, unless, when)
@@ -46,16 +47,16 @@ main = do
     mapM
       checkParallel
       [ Group "generators" generators
-      , Group "Rule H" (bothReadings ruleH ++ [("the implemented reading only ever refuses more", implementedIsStricter)])
+      , Group "Rule H" (bothReadings ruleH ++ [("the amended reading only ever refuses more", amendedIsStricter)])
       , Group
           "Rule R"
           ( bothReadings ruleR
-              ++ [("the implemented reading only ever refuses more", implementedReceivesLess)]
+              ++ [("the amended reading only ever refuses more", amendedReceivesLess)]
           )
       , Group
           "Rule P"
           ( bothReadings ruleP
-              ++ [("the implemented reading only ever refuses more", implementedAdmitsLess)]
+              ++ [("the amended reading only ever refuses more", amendedAdmitsLess)]
           )
       , Group "named cases" namedCases
       ]
@@ -65,7 +66,7 @@ bothReadings :: [(String, Reading -> Property)] -> [(PropertyName, Property)]
 bothReadings props =
   [ (fromString (name ++ " [" ++ reading ++ "]"), prop rd)
   | (name, prop) <- props
-  , (reading, rd) <- [("ratified", ratified), ("implemented", implemented)]
+  , (reading, rd) <- [("unamended", unamended), ("amended", amended)]
   ]
 
 tests :: TestLimit
@@ -82,8 +83,8 @@ generators =
     , withTests tests . property $ do
         sc <- forAll genHScenario
         let History st current roots = buildHistory sc
-            verdicts = Map.elems (verify implemented st pinId current roots)
-            literal = Map.elems (verify ratified st pinId current roots)
+            verdicts = Map.elems (verify amended st pinId current roots)
+            literal = Map.elems (verify unamended st pinId current roots)
         cover 40 "some object valid" (Valid `elem` verdicts)
         cover 40 "some object invalid" (any invalid verdicts)
         cover 1 "some object on a conflicting lineage" (ConflictingLineage `elem` verdicts)
@@ -93,9 +94,9 @@ generators =
     ( "publications are a mix of outcomes"
     , withTests tests . property $ do
         sc <- forAll genPScenario
-        let tr = runP implemented sc
+        let tr = runP amended sc
             results = map atResult (tAttempts tr)
-            literal = map atResult (tAttempts (runP ratified sc))
+            literal = map atResult (tAttempts (runP unamended sc))
         cover 60 "a transaction admitted" (any isRight results)
         cover 20 "a transaction refused" (any isLeft results)
         cover 10 "current moved" (sCurrent (tFinal tr) /= Just pinId)
@@ -341,28 +342,28 @@ validityIsStable rd = withTests tests . property $ do
       annotateShow (n, o)
       violations rd part pinId o === violations rd whole pinId o
 
--- | Every recorded divergence is the implementation being stricter. If one
--- were ever looser, an object the ratified text refuses would be accepted,
+-- | Every recorded divergence is the amended text being stricter. If one
+-- were ever looser, an object the unamended text refuses would be accepted,
 -- and that would be a hole and not a divergence.
 --
 -- That is about what an object breaks, and it holds whatever the replica's
 -- current authority is: no clause broken under the literal text is unbroken
--- under the implemented reading. A conflicting lineage is not something an
+-- under the amended reading. A conflicting lineage is not something an
 -- object breaks. It is a report about the replica, and (g) changes whose
 -- report it is:
 --
 -- * where the current authority stands under both readings, a commit the
 --   literal text puts on a conflicting lineage is not plainly valid under
---   the implemented reading;
--- * where it does not stand under (g), the implemented reading reports the
+--   the amended reading;
+-- * where it does not stand under (g), the amended reading reports the
 --   authority and classifies nothing against it, which is what the witness
 --   @div-g-verify-with-another-repository-as-current@ shows.
-implementedIsStricter :: Property
-implementedIsStricter = withTests tests . property $ do
+amendedIsStricter :: Property
+amendedIsStricter = withTests tests . property $ do
   h@(History st current roots) <- forAll genHistory
-  let literal = verify ratified st pinId current roots
-      strict = verify implemented st pinId current roots
-      stands = maybe True (currentStands implemented st pinId) current
+  let literal = verify unamended st pinId current roots
+      strict = verify amended st pinId current roots
+      stands = maybe True (currentStands amended st pinId) current
       reported rd = fmap vrCurrentRejected (rsVerify (expected rd (historyRequest h)))
   cover 3 "a current authority that does not stand" (not stands)
   cover 30 "a current authority that stands" (isJust current && stands)
@@ -375,8 +376,8 @@ implementedIsStricter = withTests tests . property $ do
       _ -> success
   -- The literal text has no notion of a current authority that does not
   -- stand, so it never reports one.
-  reported ratified === Just False
-  reported implemented === Just (not stands)
+  reported unamended === Just False
+  reported amended === Just (not stands)
   unless stands $ assert (ConflictingLineage `notElem` Map.elems strict)
 
 -- * Rule P
@@ -554,14 +555,14 @@ emptiedCannotRestart rd = withTests 500 . property $ do
 
 -- | The publication side of \"only ever refuses more\". Every transaction,
 -- put to the same @S0@ under both readings, breaks at least as much under
--- 'implemented' as under 'ratified'; and where both admit it, they admit
+-- 'amended' as under 'unamended'; and where both admit it, they admit
 -- the same thing. The states come from running the script under each
 -- reading in turn, so both readings' reachable states are covered, but the
 -- two decisions compared are always about one transaction and one state.
-implementedAdmitsLess :: Property
-implementedAdmitsLess = withTests tests . property $ do
+amendedAdmitsLess :: Property
+amendedAdmitsLess = withTests tests . property $ do
   sc <- forAll genPScenario
-  let attempts = [(tStore tr, at) | rd <- [ratified, implemented], let tr = runP rd sc, at <- tAttempts tr]
+  let attempts = [(tStore tr, at) | rd <- [unamended, amended], let tr = runP rd sc, at <- tAttempts tr]
       decide rd (st, at) = admit rd st (atState at) (atTx at)
       broken = either flat (const Set.empty)
       -- One entry per clause, so that breaking a further clause of Rule H on
@@ -569,11 +570,11 @@ implementedAdmitsLess = withTests tests . property $ do
       flat = Set.fromList . concatMap each . Set.toList
       each (P2RuleH o cs) = [P2RuleH o (Set.singleton cl) | cl <- Set.toList cs]
       each v = [v]
-  cover 1 "implemented refuses what ratified admits" $
-    or [isRight (decide ratified a) && isLeft (decide implemented a) | a <- attempts]
+  cover 1 "amended refuses what unamended admits" $
+    or [isRight (decide unamended a) && isLeft (decide amended a) | a <- attempts]
   forM_ attempts $ \a -> do
-    let literal = decide ratified a
-        strict = decide implemented a
+    let literal = decide unamended a
+        strict = decide amended a
     annotateShow (snd a, literal, strict)
     assert (broken literal `Set.isSubsetOf` broken strict)
     case (literal, strict) of
@@ -722,16 +723,16 @@ anotherRepositoryIsRefused rd = withTests tests . property $ do
     genesisOf st = (sAuthorities st Map.! pinId) {aSigs = [Sig (Key 0) True]}
 
 -- | The replication side of \"only ever refuses more\": whatever the
--- implemented reading records, the literal text records, and as the same
+-- amended reading records, the literal text records, and as the same
 -- objects.
-implementedReceivesLess :: Property
-implementedReceivesLess = withTests tests . property $ do
+amendedReceivesLess :: Property
+amendedReceivesLess = withTests tests . property $ do
   sc <- forAll genHScenario
   let History st current roots = buildHistory sc
       source = fromMaybe pinId current
-      literal = examine ratified st pinId source roots
-      strict = examine implemented st pinId source roots
-  cover 0.3 "implemented refuses what ratified records" (kept literal && not (kept strict))
+      literal = examine unamended st pinId source roots
+      strict = examine amended st pinId source roots
+  cover 0.3 "amended refuses what unamended records" (kept literal && not (kept strict))
   cover 5 "both record it" (kept strict)
   annotateShow (literal, strict)
   when (kept strict) $ literal === strict
@@ -754,14 +755,14 @@ namedCases =
 
 caseIsAnswered :: Case -> PropertyT IO ()
 caseIsAnswered c = do
-  expected ratified (caseRequest c) === caseRatified c
-  expected implemented (caseRequest c) === caseImplemented c
+  expected unamended (caseRequest c) === caseUnamended c
+  expected amended (caseRequest c) === caseAmended c
   forM_ (caseUnder c) $ \(name, answer) -> do
     annotate name
     rd <- evalMaybe (readingNamed name)
     expected rd (caseRequest c) === answer
   -- A case witnesses a divergence exactly when it is named as one.
-  ("div-" `isPrefixOf` caseName c) === (caseRatified c /= caseImplemented c)
+  ("div-" `isPrefixOf` caseName c) === (caseUnamended c /= caseAmended c)
 
 -- | R.4: \"A historically valid commit citing a stale authority can be
 -- received under @refs\/remote\/…@, but it is still newly exposed when
@@ -774,7 +775,7 @@ receivedIsNotPublishable = do
       stale = OCommit (CommitId 2)
       -- A source that holds the stale commit on a branch, read by a member.
       source = State (rqPin rq) (Just (AuthId 1)) (Map.fromList [(Branch "b1", stale)])
-  forM_ [ratified, implemented] $ \rd -> do
+  forM_ [unamended, amended] $ \rd -> do
     received <- case everything rd (rqStore rq) source (Holding (Key 1)) of
       Recorded objects -> pure objects
       other -> annotateShow other >> failure
@@ -804,5 +805,5 @@ corpusAgreesWithRules = do
   entries <- forM files (readCorpus . ("corpus" </>))
   forM_ entries $ \e -> do
     annotate (ceName e)
-    expected implemented (ceRequest e) === ceExpect e
-    expected ratified (ceRequest e) === ceRatified e
+    expected amended (ceRequest e) === ceExpect e
+    expected unamended (ceRequest e) === ceUnamended e

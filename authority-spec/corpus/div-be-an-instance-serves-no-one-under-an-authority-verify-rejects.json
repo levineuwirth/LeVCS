@@ -21,34 +21,6 @@
   },
   "name": "div-be-an-instance-serves-no-one-under-an-authority-verify-rejects",
   "note": "Divergences (b) and (e), at the source. Authority 1 is a public successor of the genesis that k0 signed, with a second signature on it that does not verify. Authority 2 is a public successor that k0 signed and that has no Owner. Read literally each is a successor, and a reader of a source under either records c0. The Rust's verify and admit accept neither as an authority of the repository, and an instance proves its current authority as they do: under either it serves no one, though the authority's own policy would let anyone in. It used to prove the chain by its steps alone, serve anyone, and leave the reader to refuse what it was sent.",
-  "ratified": {
-    "admit": [],
-    "receive": [],
-    "serve": [
-      {
-        "recorded": [
-          {
-            "commit": 0
-          }
-        ]
-      },
-      {
-        "recorded": [
-          {
-            "commit": 0
-          }
-        ]
-      },
-      {
-        "recorded": [
-          {
-            "commit": 0
-          }
-        ]
-      }
-    ],
-    "verify": null
-  },
   "request": {
     "admit": [],
     "pin": 0,
@@ -164,6 +136,34 @@
       ],
       "releases": []
     },
+    "verify": null
+  },
+  "unamended": {
+    "admit": [],
+    "receive": [],
+    "serve": [
+      {
+        "recorded": [
+          {
+            "commit": 0
+          }
+        ]
+      },
+      {
+        "recorded": [
+          {
+            "commit": 0
+          }
+        ]
+      },
+      {
+        "recorded": [
+          {
+            "commit": 0
+          }
+        ]
+      }
+    ],
     "verify": null
   }
 }

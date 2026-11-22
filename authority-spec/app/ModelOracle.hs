@@ -1,7 +1,7 @@
 -- | The model itself, answering as an oracle.
 --
 -- Reads one request per line and writes the response the rules give it,
--- under the reading named by @LEVCS_SPEC_READING@ (@implemented@ if unset).
+-- under the reading named by @LEVCS_SPEC_READING@ (@amended@ if unset).
 -- Put in place of the Rust oracle,
 --
 -- > LEVCS_SPEC_ORACLE=$(cabal list-bin model-oracle) cabal test differential
@@ -27,7 +27,7 @@ import LeVCS.Harness.Wire
 
 main :: IO ()
 main = do
-  name <- fromMaybe "implemented" <$> lookupEnv "LEVCS_SPEC_READING"
+  name <- fromMaybe "amended" <$> lookupEnv "LEVCS_SPEC_READING"
   rd <- maybe (die ("LEVCS_SPEC_READING: unknown reading " ++ name)) pure (readingNamed name)
   loop rd
 

@@ -18,23 +18,6 @@
   },
   "name": "r-history-citing-an-authority-no-commit-installs",
   "note": "What is sent with history is everything it reaches, and a commit reaches the authority it cites. Authority 1 is a successor of the genesis that no commit installs; H.3 lets c1 cite it all the same, since it descends from what c1's parent put in effect. The source's current authority is still the genesis. A reader asking for c1 is sent authority 1 with it, through that citation and nothing else, and records both commits.",
-  "ratified": {
-    "admit": [],
-    "receive": [],
-    "serve": [
-      {
-        "recorded": [
-          {
-            "commit": 0
-          },
-          {
-            "commit": 1
-          }
-        ]
-      }
-    ],
-    "verify": null
-  },
   "request": {
     "admit": [],
     "pin": 0,
@@ -125,6 +108,23 @@
       ],
       "releases": []
     },
+    "verify": null
+  },
+  "unamended": {
+    "admit": [],
+    "receive": [],
+    "serve": [
+      {
+        "recorded": [
+          {
+            "commit": 0
+          },
+          {
+            "commit": 1
+          }
+        ]
+      }
+    ],
     "verify": null
   }
 }

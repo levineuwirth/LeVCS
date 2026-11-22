@@ -20,25 +20,6 @@
   },
   "name": "r-history-by-a-since-revoked-author",
   "note": "R.3, and the document's test. The source's current authority, 1, has removed k1. k1's commit c2, made beside the revoking commit c1, is received all the same.",
-  "ratified": {
-    "admit": [],
-    "receive": [
-      {
-        "recorded": [
-          {
-            "commit": 0
-          },
-          {
-            "commit": 1
-          },
-          {
-            "commit": 2
-          }
-        ]
-      }
-    ],
-    "verify": null
-  },
   "request": {
     "admit": [],
     "pin": 0,
@@ -139,6 +120,25 @@
       ],
       "releases": []
     },
+    "verify": null
+  },
+  "unamended": {
+    "admit": [],
+    "receive": [
+      {
+        "recorded": [
+          {
+            "commit": 0
+          },
+          {
+            "commit": 1
+          },
+          {
+            "commit": 2
+          }
+        ]
+      }
+    ],
     "verify": null
   }
 }

@@ -14,19 +14,6 @@
   },
   "name": "r-a-repository-with-no-current-authority-is-read-by-no-one",
   "note": "D6 leaves a repository with no current authority unspecified, and R.2 has no policy to read: no one is sent anything, not the Owner of its genesis.",
-  "ratified": {
-    "admit": [],
-    "receive": [],
-    "serve": [
-      {
-        "denied": true
-      },
-      {
-        "denied": true
-      }
-    ],
-    "verify": null
-  },
   "request": {
     "admit": [],
     "pin": 0,
@@ -87,6 +74,19 @@
       ],
       "releases": []
     },
+    "verify": null
+  },
+  "unamended": {
+    "admit": [],
+    "receive": [],
+    "serve": [
+      {
+        "denied": true
+      },
+      {
+        "denied": true
+      }
+    ],
     "verify": null
   }
 }

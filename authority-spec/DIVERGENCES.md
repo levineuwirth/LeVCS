@@ -1,4 +1,4 @@
-# Where the implementation and the ratified text part ways
+# Where the implementation and the text as first ratified part ways
 
 This records what writing the executable specification turned up.
 
@@ -9,8 +9,8 @@ part ways there. Each entry keeps what the text said as first ratified, on
 2026-10-04, because the switches, the witnesses and the runs that confirm
 them are built on it:
 
-- the reading the model calls `ratified` is the text as first ratified;
-- the reading it calls `implemented` is the text as amended.
+- the reading the model calls `unamended` is the text as first ratified;
+- the reading it calls `amended` is the text as it stands.
 
 Nothing else here has been decided. The readings, the untested
 requirements and the gaps are as they were, and each is still the owner's
@@ -34,15 +34,15 @@ There are six kinds of entry:
 ## Divergences, settled by the amendment of 2026-11-21
 
 In every one the Rust is stricter than the text was, never looser. Three
-properties named "the implemented reading only ever refuses more" check
+properties named "the amended reading only ever refuses more" check
 that:
 
 - **For history:** every clause an object breaks under the literal text, it
-  breaks under the implemented reading.
+  breaks under the amended reading.
 - **For publication:** every transaction, put to the same pre-state under
-  both readings, breaks at least as much under the implemented reading, and
+  both readings, breaks at least as much under the amended reading, and
   where both admit it they admit the same thing.
-- **For replication:** every transfer the implemented reading records, the
+- **For replication:** every transfer the amended reading records, the
   literal text records, as the same objects.
 
 Each was confirmed by holding the Rust to every divergence but that one

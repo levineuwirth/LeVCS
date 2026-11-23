@@ -79,7 +79,7 @@ pub enum Cmd {
     /// Direct peer-to-peer transfer (receiver side). Refused until it
     /// checks what it receives.
     Dial(DialArgs),
-    /// Move a repository to a new instance, preserving repo_id and history (§5.7).
+    /// Initialize a destination from genesis and send all local branches and releases in one push.
     Migrate(MigrateArgs),
 }
 
@@ -373,7 +373,7 @@ pub struct PushArgs {
     pub key: Option<String>,
     #[arg(long)]
     pub force: bool,
-    /// Measure the push, against the instance's limits, and send nothing.
+    /// Query remote state and report the size against the instance's limits without submitting a push.
     #[arg(long)]
     pub dry_run: bool,
     pub refs: Vec<String>,
@@ -416,6 +416,7 @@ pub struct ForkArgs {
 
 #[derive(Args, Debug)]
 pub struct InspectArgs {
+    /// The 64 lowercase hex digits from the repo_id line of levcs init. Omit the blake3: prefix.
     pub repo_id: String,
     #[arg(long)]
     pub from: Option<String>,

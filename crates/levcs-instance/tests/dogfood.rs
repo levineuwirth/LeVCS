@@ -385,11 +385,9 @@ async fn dogfood_three_instance_scenario() {
         other => panic!("expected 403 from mirror, got {other:?}"),
     }
 
-    // ---- 7. Migrate the repo to B by replaying init + history + release. ----
-    // This is what `levcs migrate` does end-to-end: re-init under the
-    // same authority, re-push the cloned commit pack, and re-push the
-    // release as its own pack (releases aren't reachable from commits,
-    // so the clone walk doesn't carry them).
+    // ---- 7. Populate B through the client under the same authority. ----
+    // This fixture sends branch history and the release in separate pushes.
+    // The migrate CLI sends all branch and release tips in one push.
     let release_bytes = tokio::task::spawn_blocking({
         let base = a_base.clone();
         let rid = setup.repo_id.clone();

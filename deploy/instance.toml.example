@@ -10,9 +10,9 @@
 # instance only loads a config file when --config is passed; the
 # systemd unit passes --config /etc/levcs/instance.toml.
 
-# Where repositories live on disk. Each repo is a subdirectory keyed
-# by its repo_id (BLAKE3-of-genesis-authority hex). The systemd unit
-# expects a `levcs` user that owns this path.
+# Where repositories live on disk. Each subdirectory is named for the repo_id
+# that levcs init prints, without its blake3: prefix (64 lowercase hex digits).
+# The systemd unit expects a `levcs` user that owns this path.
 root = "/var/lib/levcs"
 
 # Listen address. Loopback: reached through an SSH tunnel, or later
@@ -24,8 +24,8 @@ bind = "127.0.0.1:7117"
 
 # §4.3 storage mode. "full" stores every reachable object: the mode for
 # an instance that is a repository's source of truth. "release" takes
-# only release pushes; "metadata" takes no pushes, and was to be filled
-# by mirroring, which is refused.
+# only release ref updates. Their packs can include the released commit
+# and its ancestors. "metadata" refuses pushes. Mirrors are disabled.
 storage_mode = "full"
 
 # §6.6.4 merge handler policy. Pushes whose merge-records reference a
@@ -37,8 +37,8 @@ allowed_handlers = ["builtin"]
 # Keys that may create repositories on this instance, as
 # `levcs key show <label>` prints them. None by default: an instance
 # that names no creator accepts no new repository, and refuses to
-# start if an entry here is not a key. Name your own key to host
-# your repositories.
+# start if an entry here is not a key. The key signing an init must
+# also own the repository's genesis authority.
 creators = []
 # creators = ["ed25519:<64 hex digits>"]
 

@@ -196,22 +196,25 @@ it.
 
 ### 3. The first push
 
-Measure it first. A dry run reports what the push would send against
-what the instance says it takes, and sends nothing:
+With the tunnel open, measure the first push from this workspace.
 
 ```sh
 levcs push --dry-run --key primary
+```
+
+Read the reported object count, decoded bytes, largest object, request
+bytes, and limit comparison. They depend on the checkout and the refs
+the instance already holds. The dry run queries the instance but skips
+init and push. Even when it prints that the push exceeds a limit, the
+dry run can exit zero. The instance checks authority and history when
+it receives the actual push.
+
+For a new repository, `primary` must be both a genesis owner and a key
+listed in the destination's `creators`. Once the push fits the limits,
+publish the current branch.
+
+```sh
 levcs push --key primary
-```
-
-The LeVCS source is about 300 objects, under 5 MB decoded and under 2 MB
-as a request: far inside the defaults. A repository the instance does
-not hold yet is created from its genesis, which takes a key named in
-`creators`, and then pushed:
-
-```
-repo not yet on instance; initialising
-pushed 1 ref(s): 313 object(s)
 ```
 
 Each later push expects what the instance holds for each ref and sends
@@ -379,10 +382,14 @@ left by an earlier restore: move it away, or delete it once the restored
 instance has been checked. `levcs-restore` checks with the `levcs` on
 `PATH`, or with the binary the `LEVCS` environment variable names.
 
-The instance then serves the backup's state. A workspace holding work
-pushed after the backup is ahead of it, and its next push lands that work
-again. The gate runs both scripts, and a damaged backup (check 13), and
-these commands as written (check 15).
+The instance then serves the refs and authority in the backup. A
+workspace can push a later branch tip if its new history is admissible
+under that restored authority. Push each release ref you also need.
+If a membership change and work under its successor both occurred after
+the backup, one push cannot restore both. Keep the workspace and backup
+while you establish which refs and authority transitions need recovery.
+Gate check 13 exercises both scripts and a damaged backup. Check 15 runs
+the commands above as written.
 
 ### Updating the binary
 

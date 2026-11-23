@@ -4,25 +4,10 @@
 //! `StoreEngine`: shard routing, startup and recovery, lifecycle, and the
 //! `ArcSwap` committed/status roots.
 //!
-//! **Shared file.** Lead owns the signatures (D0); **B1 NamespaceTxn** fills
-//! the bodies (scope 2.1, 6-B1). Same pattern as `format.rs` and `drive.rs`:
-//! the public API must compile in D0 so A3 can write against real signatures
-//! in Wave A rather than retrofitting them in Wave B.
-//!
-//! # What is implemented here and what is not
-//!
-//! This is the first vertical slice: one retained [`RecoverySession`] across
-//! every shard, one shard writer per shard wired
-//! `GroupBuilder` -> `append_group_and_fence` -> [`ShardSubtree`] -> committed
-//! root CAS -> completion, and the publication ordering of scope 6.3. Startup
-//! states 1 and 2 are implemented — an absent or empty root is initialized
-//! under the root lock, and a valid `FORMAT` opens through production
-//! recovery. States 3 and 4, the signer pool and its suffix repair,
-//! coalescing, terminal
-//! retention, rotation/sealing, and `RepoSnapshot` are later B1 assignments
-//! and refuse with a [`StoreError::NotImplemented`] naming themselves. None of
-//! them returns a partial result or a plausible default; a caller that reaches
-//! one gets told which deliverable it is waiting on.
+//! One [`RecoverySession`] holds the root lock across all shards. A writer
+//! per shard groups validated submissions, fences their journal append, and
+//! publishes the shard's new state into the committed root. A repository
+//! snapshot captures one committed root for the lifetime of the read.
 //!
 //! # The ordering that matters most in this file
 //!
@@ -236,15 +221,9 @@ impl StoreEngine {
     /// modification. It never infers legacy state merely from a missing
     /// marker.
     ///
-    /// **This slice implements states 1 and 2**, including state 1's
-    /// crash-resume shape: a root whose initialization was interrupted is
-    /// recognized by the marker this path installs before it builds anything
-    /// and is finished rather than refused
-    /// ([`RootStartupState::InterruptedInitialization`]). States 3 and 4 are
-    /// still refused by name below, after a read-only classification and before
-    /// anything is written, so a caller cannot mistake "not built yet" for
-    /// "your root is broken". See [`classify_root`] for why the classification
-    /// itself creates nothing.
+    /// If initialization was interrupted, the engine recognizes the marker it
+    /// installed and resumes under the root lock. See `classify_root` for
+    /// the read-only checks that precede any writes.
     ///
     /// Recovery runs through **one** [`RecoverySession`] for every shard, and
     /// that session then moves into the engine. `LOCK` is root-wide: taking
@@ -283,11 +262,7 @@ impl StoreEngine {
                 Some(initialize_root_state_1(&layout, &options)?)
             }
             RootStartupState::Formatted => None,
-            // States 3 and 4 share one refusal because telling them apart is
-            // the legacy recognizer, and returning `UnrecognizedLayout` for a
-            // root that is in fact a legacy instance would tell an operator
-            // holding real data "refusing to modify" instead of the migration
-            // command. Nothing here has written, probed, or inferred.
+            // Only a recognized legacy root gets the migration diagnostic.
             RootStartupState::LegacyInstance => return Err(legacy_layout_refusal(&options.root)),
             RootStartupState::UnrecognizedLayout => {
                 return Err(unrecognized_layout_refusal(&options.root))

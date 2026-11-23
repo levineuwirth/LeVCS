@@ -944,16 +944,11 @@ fn build_deploy_archive(
     Ok((manifest, pack))
 }
 
-/// Move the local repository to a different instance, preserving repo_id
-/// and full history (§5.7). One-shot orchestration:
-///   1. /init the destination with the genesis authority object,
-///   2. push every branch and release in a single signed manifest,
-///      with a pack containing the closure of all refs and the current
-///      authority chain.
-///
-/// Idempotent at the wire level: if the destination already has the
-/// repo_id (e.g. a previous attempt got partway), init returns 409 and
-/// we skip straight to push.
+/// Initialize the destination from genesis, then push every local branch and
+/// release in one transaction (§5.7). Each ref is expected to be absent and
+/// the destination must admit all newly exposed history under Rule P.
+/// An existing repository is allowed at init. An existing target ref makes
+/// the subsequent push stale, including after a previously successful push.
 pub fn migrate(args: MigrateArgs) -> Result<()> {
     let repo = open_repo()?;
     let (_label, sk) = load_secret(args.key.as_deref())?;
@@ -1023,15 +1018,11 @@ pub fn migrate(args: MigrateArgs) -> Result<()> {
         updates,
         authority_hash: auth.to_hex(),
         timestamp: now_micros(),
-        // Mirror replication never force-pushes — every update through
-        // here is by construction a fast-forward (the source has the
-        // commits the destination is missing).
+        // Each update creates a ref on the destination.
         force: false,
     };
 
-    // Step 3: push. The destination verifies signatures end-to-end against
-    // the same authority chain we just sent — there's no trust delegation
-    // to the new instance, only authentication of the pusher.
+    // Step 3: submit the pack for admission against the destination's state.
     client.push(&sk, &repo_id, &pack, &manifest)?;
     eprintln!(
         "migrated {repo_id}: {} branch(es), {} release(s), {} object(s)",

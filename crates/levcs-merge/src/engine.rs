@@ -1,8 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Levi Neuwirth
 // SPDX-License-Identifier: Apache-2.0
 
-//! Cascade engine. Selects a handler by configured glob rule (with built-in
-//! defaults), and falls through on `NotApplicable`.
+//! Merge dispatch by path rule, with textual merge as the default and fallback.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

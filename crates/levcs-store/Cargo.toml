@@ -9,18 +9,15 @@ description = "Durable transaction spine for LeVCS instances: journal, recovery,
 [features]
 default = []
 
-# Deterministic crash-injection points. Compiled out entirely in release; see
-# `failpoints.rs`. Required by the crash matrix (scope 4-A3).
+# Enables the fault-injection hooks used by the crash matrix (scope 4-A3).
 failpoints = []
 
-# Journal-level drive API (`drive.rs`) used by the crash driver and the
-# P1-micro benchmark before `StoreEngine::submit` exists. Test/bench seam only;
-# never enabled in a release binary. See scope 2.1.
+# Direct journal access for the crash driver and journal benchmarks (scope 2.1).
 store-internals = []
 
-# Gates construction of `ValidatedTransaction`. Enabled only by validated
-# ingest (`levcs-instance`), this crate's own recovery path, and the Phase 2
-# migrator. Deliberately NOT reachable from `&StoreEngine`; see scope 2.2.
+# Exposes the construction token for `ValidatedTransaction` to callers.
+# The store harnesses use it today. Scope 2.2 reserves production use for
+# validated ingest, recovery, and migration.
 store-privileged = []
 
 # Long-run benchmark harness dependencies.

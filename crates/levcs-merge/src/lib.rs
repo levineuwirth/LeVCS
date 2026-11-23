@@ -1,12 +1,11 @@
 // SPDX-FileCopyrightText: 2026 Levi Neuwirth
 // SPDX-License-Identifier: Apache-2.0
 
-//! levcs-merge: cascading merge engine with built-in handlers.
+//! File merge handlers selected by path rule.
 //!
-//! Per spec §6 the engine is a cascade of handlers. Each handler can return
-//! `Merged`, `Conflict`, or `NotApplicable`. The engine selects handlers by
-//! file path / extension, applies the highest-priority applicable handler,
-//! and falls through on `NotApplicable`.
+//! The first matching path rule selects a handler. Textual merge is the
+//! default and the fallback when the selected handler is inapplicable.
+//! A handler's `Merged` or `Conflict` result ends dispatch.
 
 pub mod engine;
 pub mod format;

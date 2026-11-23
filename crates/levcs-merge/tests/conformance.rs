@@ -3,8 +3,8 @@
 
 //! Conformance corpus runner (§8.2).
 //!
-//! Walks `tests/corpus/` and runs every scenario through the default
-//! cascade engine. Each scenario lives in its own directory:
+//! Walks `tests/corpus/` and runs each scenario with its specified handler.
+//! Each scenario lives in its own directory:
 //!
 //! ```text
 //! tests/corpus/<NNN-scenario-name>/
@@ -15,11 +15,8 @@
 //!   expected.<ext>     # (optional) exact expected merged output
 //! ```
 //!
-//! The corpus is the canonical conformance fixture. Any independent
-//! implementation of LeVCS that produces the same outcome on every
-//! scenario here is conformant per §8.2; in particular every scenario
-//! tagged `git_false_conflict = true` is a case where naive Git
-//! produces a spurious conflict and LeVCS MUST resolve correctly.
+//! The corpus is the canonical conformance fixture. The manifest supplies
+//! the assertions. The Git comparison labels are counted separately.
 //!
 //! The runner deliberately does no expensive setup — it is one
 //! integration test that iterates the corpus, so adding a scenario
@@ -42,8 +39,8 @@ struct Manifest {
     /// the extension of `path`.
     #[serde(default)]
     input_ext: Option<String>,
-    /// True iff naive Git would produce a false conflict on this
-    /// scenario. Only used to compute corpus statistics; not asserted.
+    /// Git's built-in text merge conflicts on an expected clean result.
+    /// The runner counts this label without executing Git.
     #[serde(default)]
     git_false_conflict: bool,
     expected: Expected,
@@ -283,10 +280,7 @@ fn corpus_runs_clean() {
     );
 }
 
-/// Without a rule, no scenario reaches a structural handler: every one is
-/// merged by `textual`. The git-false-conflict scenarios then conflict as
-/// git would; that is the cost of not trusting the structural handlers
-/// until a validator can confirm their output.
+/// Without a rule, no scenario reaches a structural handler.
 #[test]
 fn default_engine_merges_every_scenario_textually() {
     for dir in collect_scenarios() {

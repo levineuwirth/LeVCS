@@ -1,11 +1,8 @@
 # LeVCS conformance corpus (§8.2)
 
 This directory is the canonical conformance fixture for the LeVCS merge
-engine. Any independent implementation of LeVCS that produces the same
-outcome on every scenario here is conformant per the spec's testing
-strategy: the scenarios tagged `git_false_conflict = true` are
-specifically the cases where naive Git produces a spurious conflict and
-LeVCS MUST resolve correctly.
+engine. Each manifest specifies the result its selected handler must
+produce on the supplied inputs.
 
 ## Layout
 
@@ -21,8 +18,21 @@ Each scenario lives in its own numbered directory:
 ```
 
 The runner is `crates/levcs-merge/tests/conformance.rs`. It walks this
-directory, reads each manifest, runs the engine on the inputs, and
-asserts the outcome matches.
+directory, configures a rule selecting the expected handler for the
+fixture path, and checks the result. A separate test checks that the
+default engine uses no structural handlers.
+
+`git_false_conflict = true` labels cases in which Git's built-in text
+merge reports a conflict and LeVCS is expected to merge the edits.
+The runner counts the labels. To reproduce the Git comparison, from a
+case directory run the following with its input extension. Exit status
+zero means a clean merge. For example, case 014 is a clean control in
+both systems and its output contains both authors' added lines.
+
+```sh
+# In 014-textual-disjoint-lines/
+git merge-file -p -- ours.log base.log theirs.log
+```
 
 ## Manifest schema
 

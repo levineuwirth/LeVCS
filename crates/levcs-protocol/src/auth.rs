@@ -6,7 +6,7 @@
 //! Signed requests carry these headers:
 //!
 //! ```text
-//! LeVCS-Key:       ed25519:<base64 public key>
+//! LeVCS-Key:       ed25519:<32-byte public key, 64 hex digits>
 //! LeVCS-Timestamp: <Unix microseconds>
 //! LeVCS-Nonce:     <16 random bytes, base64>
 //! LeVCS-Signature: ed25519:<base64 signature>

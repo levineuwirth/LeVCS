@@ -8,9 +8,9 @@
 //!   stale (audit H11). It now expects what the instance holds.
 //! - **What a push sends.** The whole history went every time. Now only
 //!   what the instance's refs do not already reach.
-//! - **What a push may be.** A push is measured, and checked against what
-//!   the instance says it takes, before anything is sent: `--dry-run`
-//!   reports the measure and sends nothing.
+//! - **What a push may be.** The CLI measures the pack against the limits
+//!   it reads from the instance. A dry run reports the result and skips
+//!   repository creation and push submission.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

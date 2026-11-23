@@ -22,12 +22,12 @@
 //!
 //! # Status
 //!
-//! D0: the sealed skeleton. The public API compiles and returns
-//! [`StoreError::NotImplemented`]; the lead-owned foundations — configuration
-//! validation, the durability syscall funnel, and the failpoint registry — are
-//! real. Wave A implements the format, journal, segments, index, checkpoints,
-//! and recovery; Wave B implements the engine, transactions, snapshots, and
-//! staging.
+//! [`StoreEngine::open`] initializes or recovers a root.
+//! [`StoreEngine::submit`] accepts an already validated transaction and
+//! returns a receipt after the journal fence and committed-root publication.
+//! Callers can read a repository snapshot, look up an operation's status,
+//! and request a checkpoint. The v1 HTTP instance uses the loose-object
+//! store. The rewrite plan assigns integration of this engine to Phase 3.
 //!
 //! # Physical format is internal
 //!
@@ -51,11 +51,9 @@ pub mod staging;
 pub mod transaction;
 pub mod types;
 
-// D0 scaffolding: the durability funnel is complete and unit-tested, but its
-// call sites are `journal.rs`, `segment.rs`, `checkpoint.rs`, and
-// `recovery.rs`, which land in Wave A. Remove this allow when A1's first
-// append path lands — after that, an unused durability primitive is a real
-// signal, not scaffolding.
+// Shared durability primitives for journal, segment, checkpoint, and recovery I/O.
+// The file-position helper `sys::cursor` has no callers. The default build
+// also matches on `sys::Fault` variants that only the fault harness constructs.
 #[allow(dead_code)]
 mod sys;
 

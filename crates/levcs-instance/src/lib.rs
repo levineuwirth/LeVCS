@@ -1405,10 +1405,8 @@ fn decode_push(s: &AppState, key: &PublicKey, body: &[u8]) -> Result<Pushed, Api
             manifest.updates.len()
         )));
     }
-    // §4.3: release-mode instances accept only release ref updates.
-    // Inter-release commits are not stored — `refs/branches/*` updates
-    // would require us to keep the commit chain. Reject early so the
-    // client gets a clear message before any object lands in the store.
+    // §4.3: release mode restricts ref updates. Objects in an admitted
+    // release pack can include the released commit and its ancestors.
     if s.config.storage_mode() == StorageMode::Release {
         for u in &manifest.updates {
             if !u.r#ref.starts_with("refs/releases/") {

@@ -1,35 +1,13 @@
 // SPDX-FileCopyrightText: 2026 Levi Neuwirth
 // SPDX-License-Identifier: Apache-2.0
 
-//! Journal-level drive API. Test and benchmark seam only.
+//! Direct journal access for tests and benchmarks (`store-internals`).
 //!
-//! **Shared file.** Lead owns the signatures (D0); **A1 JournalWriter** fills
-//! the bodies; **A3 StoreHarness** consumes it read-only (scope 2.1).
-//!
-//! # Why this exists
-//!
-//! A3's `store-crash-driver` and `store-bench` are separate binary crates that
-//! see only the public API, and `StoreEngine::submit` returns
-//! `NotImplemented` until B1 lands in Wave B. Without this seam neither of
-//! A3's Wave A acceptance criteria — a running crash matrix and a P1-micro
-//! number — is reachable, and Wave A would ship three packages of which one
-//! could not be exercised.
-//!
-//! # What it is not
-//!
-//! No engine, no status root, no sequencer, no signer. It appends
-//! caller-supplied pre-encoded frames and fences them. B1 does not build on
-//! it.
-//!
-//! # Divergence risk
-//!
-//! A test-only seam that appends frames without the sequencer can drift from
-//! the real append path, at which point the Wave A matrix certifies something
-//! the production writer does not do. The mitigation is structural: every
-//! function here must call the same `journal.rs` group-append and fence
-//! functions `engine.rs` calls, adding only frame construction. A Wave B test
-//! asserts that a group submitted through `submit` and the same group driven
-//! through this module produce byte-identical journal contents.
+//! The crash driver and journal benchmarks use [`ShardDrive`] to append
+//! caller-supplied frames directly to one shard. Its group append uses the
+//! same [`Journal::append_group_and_fence`] as [`crate::StoreEngine::submit`].
+//! Driving the journal directly bypasses transaction sequencing, evidence
+//! signing, and committed-root publication.
 
 #![cfg(feature = "store-internals")]
 

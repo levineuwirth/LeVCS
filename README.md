@@ -1,15 +1,13 @@
 # LeVCS
 
-A distributed version control system with first-class federation, signed
-authority chains, and a cascading merge engine. Content-addressed by
-BLAKE3, signed with Ed25519, and built to fix what git can't.
+A distributed version control system with signed repository membership,
+per-file merge rules, and a federation API. LeVCS addresses objects by
+BLAKE3 and signs commits, releases, and authority objects with Ed25519.
 
-> **Status: v0.2.2 — protocol substrate complete, workflow surface deferred.**
-> The object model, federation API, merge cascade, and instance server
-> all work end-to-end. There is no PR review surface, issue tracker, or
-> web UI yet — those are the next layer up. See
-> [`doc/technical-report.md`](doc/technical-report.md) for a full
-> framing of where this project is and why.
+> **Status on main (package version 0.2.2).** The CLI can push to and
+> clone from a v1 HTTP instance. The v2 storage and protocol work is
+> described in the [instance rewrite plan](doc/instance-throughput-rewrite-plan.md).
+> Review, issues, and a web UI are outside the current instance.
 
 ---
 
@@ -17,25 +15,25 @@ BLAKE3, signed with Ed25519, and built to fix what git can't.
 
 - **Identity is in the protocol.** A repo's membership is a versioned,
   signed authority object with explicit roles
-  (Reader/Contributor/Maintainer/Owner). Force-push enforcement and
-  push authorization are protocol-level, not server policy.
+  (Reader/Contributor/Maintainer/Owner). The instance checks pushes
+  against this authority, including the role required for a forced rewrite.
 - **Federation is first-class.** Every repo has a global `repo_id`
-  (BLAKE3 of its genesis authority), so it is the same repository on any
-  instance that holds it, and `migrate` moves it between instances with
-  its id and history intact. Mirroring between instances is designed, in
-  three storage modes (full / release-only / metadata-only), but refused
-  until a mirror checks what it receives.
+  derived by hashing the encoded genesis authority body with its
+  `repo_id` field zeroed. Clones use that ID to check the history they
+  receive. A running instance refuses mirror configuration until mirror
+  sync performs the same checks.
 - **Merge is configurable per file.** By default every file merges with a
   line-level three-way diff. A repository's `.levcs/merge.toml` can opt
   paths into format-aware handlers (JSON / YAML / TOML / XML / Markdown /
   prose), tree-sitter handlers for source code (Rust, Python, JS/TS, Go,
-  C/C++, Java, Ruby, Bash), or wasm-sandboxed plugins. The structural
+  C/C++, Java, Ruby, Bash). The merge library can also load WebAssembly
+  plugins. The CLI registers only the built-in handlers. The structural
   handlers are opt-in because they can lose, invent or reorder content
   while reporting a clean merge; they stay that way until a validator can
   confirm their output.
-- **BLAKE3, not SHA-1.** Tree-hashed, ~5 GiB/s on a laptop, 32-byte
-  IDs everywhere.
-- **Releases are signed objects**, not mutable name pointers.
+- **BLAKE3 object IDs** are 32 bytes. See the hashing benchmark below.
+- **Releases are signed objects** that name the commit being released
+  and the preceding release.
 
 For a deeper comparison and context, see the
 [technical report](doc/technical-report.md).
@@ -486,19 +484,21 @@ and updates. For now the instance listens on 127.0.0.1 and is reached
 through an SSH tunnel; the Caddy and nginx templates are for when it gets
 a public route.
 
-An instance creates a repository only for a key its config names in
-`creators`. The example config names none, so it accepts no new
-repository until you add yours (`levcs key show <label>` prints it). Then,
+An instance creates a repository only for a genesis owner whose key its
+config names in `creators`. The example config names none, so it accepts
+no new repository until you add yours (`levcs key show <label>` prints it). Then,
 with the tunnel open (`ssh -N -L 7117:127.0.0.1:7117 vps`), from the
 repository:
 
 ```sh
 levcs instance --set http://127.0.0.1:7117/levcs/v1
-levcs push --dry-run    # measured against the instance's limits; sends nothing
+levcs push --dry-run    # reads remote state and limits, then reports the push size
 levcs push              # the current branch; or name refs, such as refs/branches/main
 ```
 
-The first push of a repository the instance does not hold creates it
+Read the size report before pushing. A dry run skips init and push and
+can exit successfully even when it reports that a limit would be exceeded.
+The first actual push of a repository the instance does not hold creates it
 there from its genesis authority. Every push is checked against the
 authority (Rule P above), and one behind the instance is refused unless
 `--force`d by a maintainer. `instance --set` makes the repository a
@@ -520,11 +520,20 @@ levcs pull
 levcs merge "$(cat .levcs/refs/remote/origin/branches/main)"
 ```
 
-`inspect <repo_id> --from <url>` lists a repository's branches and its
-top-level tree without fetching it, and `migrate <url>` moves a
-repository to another instance with its id and history. The authority's
-policy can protect branches (`protected_branches`, globs that need a
-maintainer to update) and make a repository private (`public_read`
+`levcs inspect <repo_id> --from <url>` lists a public repository's
+branches, releases and top-level tree without cloning it. For `inspect`,
+use the 64 lowercase hex digits from the `repo_id` line of `levcs init`,
+omitting the `blake3:` prefix.
+
+To copy a repository to a fresh instance, `levcs migrate <url>` initializes
+it from genesis and submits all local branch and release tips in one push.
+The destination must be able to admit that history in one transaction.
+A membership change followed by work under the new authority requires separate
+publications. See the [migration procedure](doc/technical-report.md#44-federation)
+for destination checks and retry behavior.
+
+The authority's policy can protect branches (`protected_branches`, globs
+that need a maintainer to update) and make a repository private (`public_read`
 false, read only by members in requests signed with `--key`). The
 instance enforces both, but no command sets either yet: `init` makes a
 public repository with no protected branch.
@@ -565,10 +574,13 @@ doc/                 Technical report and architecture docs.
 cargo test --workspace
 ```
 
-Runs the full suite — unit tests, integration tests, federation
-end-to-end tests including the three-instance "dogfood" scenario, the
-merge conformance corpus, and property-based fuzz tests: about a
-thousand tests.
+This runs the default-feature Rust tests, including the three-instance
+federation scenario, the merge conformance corpus and the authority
+corpus replays. CI also runs the Phase 1 storage feature matrix and the
+Haskell authority properties. Its differential harness builds two Rust
+oracles and runs 20,000 generated scenarios per randomized property for
+history, admission, receiving, and instance reads. It calls admission
+directly. The deployment gate exercises publication through the server.
 
 The deployment gate drives a real instance with the binaries just built,
 as CI does after the tests:
@@ -595,9 +607,9 @@ cargo test -p levcs-merge --test proptest_textual
 
 ## Benchmarks
 
-Microbenchmarks live in each crate's `benches/` directory and use
-`criterion`. A reproducible runner with metadata capture and optional
-flamegraph generation is at `scripts/bench.sh`:
+The Criterion runner at `scripts/bench.sh` measures the pack codec,
+object hashing, and textual merges. It captures metadata and can
+generate flamegraphs:
 
 ```sh
 scripts/bench.sh --quick               # smoke test (~ a minute total)
@@ -616,8 +628,9 @@ Headline numbers on a Ryzen 7 laptop:
 - **Blob serialize + BLAKE3** at 1 MiB: ~190 µs (5.1 GiB/s).
 - **Textual three-way merge** of a 100 KiB document: ~4.6 ms.
 
-Pack encoding is the throughput floor at ~380 MiB/s — bottlenecked by
-zstd level 3 on incompressible data.
+Pack encoding measured about 380 MiB/s with zstd level 3 on
+incompressible data. The rewrite plan defines separate benchmarks for
+durable storage and end-to-end publication.
 
 ---
 
@@ -630,6 +643,14 @@ zstd level 3 on incompressible data.
 - **[`doc/authority-semantics.md`](doc/authority-semantics.md)** — The
   rules for valid history, replication and publication (Rules H, R and
   P), which `verify`, `pull`, `clone`, `push` and the instance enforce.
+- **[Executable authority model](authority-spec/README.md)** — How to run
+  the differential harness. Its [divergence record](authority-spec/DIVERGENCES.md)
+  explains the [November 21 amendments](doc/authority-semantics.md#amendments).
+  On main the readings are `amended` and `unamended`. At the v0.2.2 tag
+  their names were `implemented` and `ratified`, respectively.
+- **[Instance rewrite plan](doc/instance-throughput-rewrite-plan.md#12-implementation-phases-and-subagent-execution)**
+  — Phase order and exit criteria, including the separate
+  [Phase 1 storage evidence](doc/phase1-storage-spine-scope.md#7-phase-1-exit-criteria-and-evidence).
 - **[`deploy/README.md`](deploy/README.md)** — Comprehensive VPS
   deployment walkthrough.
 - **`spec/`** — The protocol specification and trust-root revision.
@@ -643,10 +664,11 @@ This is a young project. The most useful contributions right now are:
 
 1. **Trying it.** Run `levcs init` on a real project, push to a local
    instance, and report friction.
-2. **Workflow design.** The next major piece of work is the workflow
-   spec — PR/review surface, issues, CI conventions. Discussion welcome.
-3. **Plugin handlers.** The wasm plugin protocol exists; concrete
-   handlers (e.g. protobuf, SQL migrations) are needed to validate it.
+2. **Instance development.** The approved rewrite puts storage, validation,
+   and server integration ahead of review and CI features. The phase exits
+   above describe the evidence needed at each step.
+3. **Plugin handlers.** Library callers can test WebAssembly handlers
+   with `CascadeEngine::with_config_and_plugins`.
 4. **Tightening CI.** CI builds and tests the workspace, runs the
    deployment gate and the Phase 1 storage gate
    (`scripts/check-phase1.sh`), and checks formatting, clippy, a build on
@@ -668,6 +690,5 @@ Copyright 2026 Levi Neuwirth. LeVCS is licensed under the
 
 ## Citation
 
-If LeVCS supports academic work, please cite the release you used, by
-its tag. A formal citation entry will land with the workflow spec; in
-the meantime a repository-URL reference with the tag is fine.
+When citing LeVCS, give the repository URL and the release tag you used.
+For an untagged revision, give the full commit ID.

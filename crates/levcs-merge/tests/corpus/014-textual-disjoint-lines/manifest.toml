@@ -1,6 +1,6 @@
 description = "Textual: line additions in non-overlapping regions of the file merge cleanly via diff3"
 path = "audit.log"
-git_false_conflict = true
+git_false_conflict = false
 
 [expected]
 status = "merged"

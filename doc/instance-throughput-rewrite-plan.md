@@ -1839,6 +1839,191 @@ The integration suite's `cleanup_is_deferred_and_names_its_deliverable` is repla
 deleted — the distinction it stood for, that "nothing to do" and "cannot answer yet" are
 different results, is now asserted the other way round at the public surface.
 
+##### Contract review 2026-11-02-D
+
+`sys.rs`, the lead-owned durability funnel (scope 2.3), with the crash driver and the Wave B
+harness. Requested by the two gaps contract review 2026-11-02-C left in finding S2 of the
+2026-10-03 audit: a missing directory fsync was still invisible, the crash matrix passing with
+`fsync_dir` and `fsync_dir_fd` turned into counted no-ops, and the Wave B rows neither armed
+nor applied the model.
+
+**Directory entries in the model.** Every change to a directory entry now goes through one
+funnel function, `sys::entry`: the creates (`create_new_nofollow`,
+`open_or_create_regular_nofollow` and its truncating form, `create_directory_nofollow`), both
+renames, `link_noreplace`, `unlink`, and five new functions for what production did around the
+funnel (`create_dir`, `create_dir_all`, `remove_dir`, `open_or_create`, `create_truncated`).
+With the model armed, `entry` logs what undoing the change needs and then makes the change,
+both under the model's lock. A directory fsync logs the directory once it returns, together
+with where the log ended when it began, and covers only the changes logged before that point:
+a change made while an fsync ran may have missed it. Before recovery, `apply` undoes, newest
+first, every change whose directory has not been fsynced since, then puts back file contents.
+A change is undone only in the directory it was made in, identified by inode. If that
+directory is gone, or another directory now holds its name, it was removed durably and every
+name in it is unreachable. When `apply` itself recreates a directory by undoing an `rmdir`,
+the new directory stands in for the old one. This took two review rounds:
+
+- The first found that undoing by path alone acted on whichever directory held the name by
+  then.
+- The fix for that treated an `rmdir` whose record a fence covered as the directory's
+  removal. The second round found that this trusted removals that never happened: one the
+  kernel refused with `ENOTEMPTY`, or one whose writer died before making it. An unfenced
+  file inside the directory then survived the power loss, a false negative of the model.
+
+The directory check replaces that rule and trusts no record of a removal. A rename between
+directories, or of a
+directory, is refused with an error rather than modelled. The store makes neither: every
+rename it makes moves a file within one directory. A file an unlink removes or
+a replacing rename replaces is kept alive by a hard link in a graveyard beside the log. `apply`
+gives the name back to the same inode, so the log's account of the file's contents still
+applies; it also means no inode the model is tracking can be reused while the log exists. A
+change the kernel is about to refuse is not logged. A logged change that is not on disk,
+because the writer died between the record and the change, is not undone.
+
+**Scoped to a root.** `arm` now takes the root, and the model ignores everything outside it:
+directory entries by path, writes and fences by where the kernel says the descriptor points. A
+test process can therefore arm the model while other tests write elsewhere, and the crash
+driver's ACK journal, beside the root, is no longer logged. Paths are logged relative to the
+root and must be plain names, so `apply` can only act under the root. Taking the fault serial
+token clears an armed model, as it already cleared an armed fault: a test that panics while
+armed cannot clean up after itself.
+
+**What was done around the funnel.** Twelve production sites created or removed names
+directly:
+
+- six `create_dir_all` calls;
+- one `create_dir`;
+- one `remove_dir`;
+- four `File::options().create(true)` opens: the fresh-journal and quarantine temporaries, the
+  seal's recovery-prefix artifact, and staging's artifact temporaries.
+
+They now call the funnel functions above, which behave as the calls they replace did, with two
+small differences that no caller depends on:
+
+- The `O_TRUNC` of the two truncating opens becomes an uncounted `set_len(0)` that the model
+  can see, on a descriptor opened read-write so the model can read what it cuts. The
+  truncation is no longer atomic with the open, and a temporary that is writable but not
+  readable now fails to open.
+- `create_dir_all` makes one directory at a time through the funnel. For an ancestor that is
+  not a directory it reports `AlreadyExists` where `std` reported `NotADirectory`, and every
+  caller only passes the error on.
+
+No symlink hardening is added. `d0_contract`'s guard now forbids the raw forms outside
+`sys.rs`: `.create(`, `.create_new(`, `File::create(`, `File::create_new(`, `OFlags::CREATE`,
+`DirBuilder`, `fs::create_dir(`, `fs::create_dir_all(`, `fs::mkdir(`, `fs::remove_dir(`,
+`fs::remove_dir_all(`, `fs::hard_link(`, `fs::copy(`, `symlink(`, `renameat`, `unlinkat` and
+`linkat`. The list was widened in review, and nothing in `src/` outside `sys.rs` matches it.
+
+**The Wave B rows lose power.** `engine_matrix` arms the model before building each row's root
+and applies it between the close and the reopen. This covers `drive_submit_row` and the
+root-CAS contention row, so the oracle's `recovery_outcome` and the prior transaction's
+survival are asserted against what a power loss leaves. The store fences everything a row does
+before the close returns: the model logs between 43 and 90 records for each submit row, and
+some hundreds for each contention run, and undoes none. The rows therefore pass unchanged; what
+they gain is the ability to fail. Every row, the contention row included, now also asserts that
+the model logged something and that the power loss undid nothing (both added in review). A
+change a row leaves unfenced is a missing fence even where none of the oracle's six fields can
+see its loss.
+
+**The self-test mode.** The crash driver takes `--power-loss ignore-directory-fences`, which
+honours every `fdatasync` and no directory fsync, and `reconcile` reports
+`power_loss_entries`.
+
+**What the model still does not cover**:
+
+- **Partial outcomes.** The model takes only the outcome in which every unfenced change is
+  lost. A power loss may instead keep some unfenced changes and lose others, in an order the
+  store did not make them. A store that depends on a later change being lost whenever an
+  earlier one is kept is not exercised.
+- **Changes made around the funnel.** The guard forbids the forms it lists in `src/`, but
+  `src/bin` and the tests may still make them, and a form the list does not name would pass.
+- **Renames between directories, and of a directory.** These are refused, not modelled; a store
+  that began making either would fail loudly under the model.
+- **Directory inode reuse.** Fences are matched to directories by inode. On a filesystem that
+  reuses inodes (ext4, xfs), a fence on a new directory could cover changes still pending in a
+  removed one that had the same inode. tmpfs, where the CI suites run, does not reuse them.
+- **Ancestors of the root above its parent.** `arm` needs the root's parent to exist, so the
+  deepest-first fencing of ancestors in `create_and_fence_root_path` is never exercised.
+- **Symlinks inside the root.** `apply` acts only on paths under the root as written. A
+  directory symlink inside the root would lead its undo outside it. The store refuses such
+  links, and the tests plant links only at names the model never logs.
+- **Writes racing a fence on the same file.** An `fdatasync` record is logged after the fence
+  returns and carries no begin position, so a write racing a fence on the same file counts as
+  covered. The model assumes each file has one writer.
+- **The other in-process suites.** `frame_golden` and the recovery suites never crash and are
+  unaffected either way.
+
+**Evidence.** The acceptance experiment turned every directory fsync into a counted no-op.
+Before this change the crash matrix passed in that state. Now 11 of its 35 tests fail:
+
+- the Wave A rows' stores no longer open, because `FORMAT`'s entry is lost;
+- the Wave B rows lose the transaction acknowledged before the fault;
+- the root-CAS row's committed victim reads back absent;
+- the scenario tests that reconcile after a crash fail as well.
+
+`verify-store-recovery.sh --cycles 6 --skip-matrix` fails at its first cycle, whose store no
+longer opens.
+
+A permanent self-test pins the same result without a source change. A first writer builds the
+store and acknowledges two operations. A second acknowledges three and seals. A third
+acknowledges four into the journal the seal started. The reconciliation then reports
+`acknowledged_loss=0` with fences honoured. With directory fsyncs ignored it reports
+`acknowledged_loss=4`: the seal is undone whole, the second writer's group survives in the
+journal it was fenced into, and the new journal's name is lost with the third writer's frames.
+
+Thirty-one unit tests pin the directory model:
+
+- An unfenced creation is lost and a fenced one is kept.
+- Unfenced renames, replacing renames, unlinks, links and `rmdir`s are each undone.
+- A replacing rename gives back what it replaced, and an unlink gives the file back with its
+  durable contents.
+- Fenced unlinks and replacing renames are kept.
+- An unfenced directory takes what was fenced inside it, and an unfenced root is lost with
+  everything in it.
+- `create_dir_all` logs every directory it makes.
+- A fence on another directory covers nothing. A fence by descriptor covers like a fence by
+  name. A fence that began before a change does not cover it.
+- A rename between directories, or of a directory, is refused.
+- A recreated directory does not receive the old one's files, and a fenced file in it
+  survives the old one's undo.
+- A refused `rmdir`, or one logged but never made, does not take the changes inside it, and an
+  unfenced `rmdir` gives back what was unlinked inside it.
+- A root fenced in its parent is kept.
+- A torn directory change is cut by the next writer.
+- A fence cannot slip between a change's record and the change.
+- Refused changes, and changes logged but never made, are not undone.
+- Entries and writes outside the root are not modelled.
+- Ignoring directory fences keeps fenced data.
+- A second writer keeps its own graves.
+- `create_truncated` logs what it cuts.
+- Taking the serial token disarms the model.
+
+Mutation-checked, each killed by the test named for it:
+
+- a replacing rename's grave never restored;
+- an unfenced unlink never given back;
+- a fence covering changes logged while it ran;
+- a change made outside the model's lock;
+- a refused creation logged;
+- every writer numbering its graves from zero;
+- writes outside the root modelled;
+- the token leaving the model armed;
+- a rename undone whether or not it ran;
+- directory fences honoured in the self-test mode;
+- `create_truncated` cutting without logging;
+- a directory fence never logged;
+- a creation never undone;
+- a change undone in whatever directory holds its name;
+- a recreated directory not standing in for the one it replaces;
+- a fence on the root's parent covering nothing;
+- a torn directory change read as an error;
+- renames between directories, and of directories, logged;
+- the Wave B rows never armed, and the contention row never armed;
+- `ignore-directory-fences` honouring them;
+- a directory removed, and a name created with a computed flag, around the funnel.
+
+The acceptance mutation, rerun on the final tree, still fails the same 11 of 35 crash-matrix
+tests.
+
 ##### Contract review 2026-11-02-C
 
 `sys.rs`, the lead-owned durability funnel (scope 2.3), and the crash driver. Requested by

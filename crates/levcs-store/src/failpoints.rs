@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Deterministic crash-injection points, in one-to-one correspondence with
 //! the frozen `levcs_protocol::oracle::AppendFailpoint`.
 //!

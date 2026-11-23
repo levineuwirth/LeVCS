@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Instance HTTP server.
 //!
 //! Hosts repositories under a configured root directory. Each repository

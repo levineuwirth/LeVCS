@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! levcs-identity: keychains, authority objects, signing, verification.
 
 pub mod admission;

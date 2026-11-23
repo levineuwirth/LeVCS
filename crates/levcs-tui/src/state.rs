@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Pure state machine for the merge-review TUI.
 //!
 //! Lives separately from the terminal driver so it can be unit-tested

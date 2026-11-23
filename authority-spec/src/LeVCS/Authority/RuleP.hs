@@ -1,3 +1,6 @@
+-- SPDX-FileCopyrightText: 2026 Levi Neuwirth
+-- SPDX-License-Identifier: Apache-2.0
+
 -- | Rule P, publication: \"changing a repository's authoritative state\",
 -- \"evaluated against the single pre-transaction state @S0@\".
 module LeVCS.Authority.RuleP

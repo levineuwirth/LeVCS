@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Common helpers shared by all commands.
 
 use std::io::{self, Write};

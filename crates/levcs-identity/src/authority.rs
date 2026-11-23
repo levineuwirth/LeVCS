@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Authority objects per the v1.1 trust-root revision §3.3.
 //!
 //! The wire form is a deterministic binary encoding; TOML is used as a

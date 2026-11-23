@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! An independent reference implementation of the scope 3.3 frame, the scope
 //! 3.5 `CURRENT`/manifest codec, and the physical-image builders A2's
 //! acceptance tests need.

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 // The build script of each binary that says what it was built from
 // (`levcs`, `levcs-instance`), compiled into each by `include!`. The tests
 // in levcs-cli's tests/version.rs include it too, to test `describe`.

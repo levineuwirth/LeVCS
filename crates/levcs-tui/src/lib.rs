@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! levcs-tui: merge-review TUI per §6.7.
 //!
 //! Architecture:

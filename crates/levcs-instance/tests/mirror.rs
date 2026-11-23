@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Inter-instance mirroring (§5.6) and repository movement (§5.7).
 //!
 //! These tests boot two in-process instances and exercise the data

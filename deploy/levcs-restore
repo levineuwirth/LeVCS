@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-FileCopyrightText: 2026 Levi Neuwirth
+# SPDX-License-Identifier: Apache-2.0
+
 # levcs-restore ARCHIVE [ROOT]
 #
 # Put an archive levcs-backup made in place of an instance's root

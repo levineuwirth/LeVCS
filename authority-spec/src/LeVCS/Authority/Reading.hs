@@ -1,3 +1,6 @@
+-- SPDX-FileCopyrightText: 2026 Levi Neuwirth
+-- SPDX-License-Identifier: Apache-2.0
+
 -- | Where the implementation enforced something the text as first ratified
 -- did not say, the rule is a named switch here instead of a silent part of
 -- the model.

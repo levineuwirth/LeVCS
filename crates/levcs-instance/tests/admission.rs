@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Rule P at the instance: every push is admitted against the state the
 //! instance holds, never against what the request says.
 //!

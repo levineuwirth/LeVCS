@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! levcs-core: object model, hashing, and content-addressed object store
 //! for the LeVCS specification (v1.1 trust-root revision).
 

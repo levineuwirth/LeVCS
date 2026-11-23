@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Scope 4-A2 acceptance: `EIO` on a tail read.
 //!
 //! Its own test binary. The armed fault in `sys.rs` is a one-shot global, so a

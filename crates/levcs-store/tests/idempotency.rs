@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Scope 6-B1 deliverable 7 — resubmitting an operation that already committed.
 //!
 //! A retry is the normal case, not an error. A client that submitted, lost the

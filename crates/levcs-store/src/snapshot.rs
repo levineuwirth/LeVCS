@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! `RepoSnapshot`: an immutable committed repository view sharing persistent
 //! substructures with the committed root.
 //!

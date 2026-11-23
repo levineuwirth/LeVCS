@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Durable file replacement shared by the index, refs, and object store.
 //!
 //! Every writer used to stage through one fixed temporary name per target

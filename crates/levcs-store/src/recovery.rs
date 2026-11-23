@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Manifest and checkpoint fallback, interrupted-seal completion, tail
 //! adoption, sequence and event-chain verification, receipt reconstruction,
 //! and the readiness result.

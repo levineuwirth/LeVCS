@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Driving a crash-matrix row through the production `StoreEngine::submit`.
 //!
 //! **Owned by B4 StoreHarnessB** (scope 2.1, 6.6 deliverable 2).

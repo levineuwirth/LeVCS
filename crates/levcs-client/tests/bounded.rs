@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! A client reads what an instance sends only up to a limit. Bodies were
 //! read whole, and a pack's decoding budget applied only once its body had
 //! been buffered, however large.

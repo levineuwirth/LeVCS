@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! What an instance takes on at once, and how much one request may make it
 //! read, hold or decode. None of it was bounded: a push's pack could decode
 //! to many times the memory there is, a pack served walked history by

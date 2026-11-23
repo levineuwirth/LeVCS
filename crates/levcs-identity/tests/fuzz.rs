@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Robustness/fuzz tests for identity deserializers (§8.2).
 //!
 //! Mirror of `levcs-core/tests/fuzz.rs`, scoped to authority parsing

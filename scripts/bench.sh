@@ -23,6 +23,9 @@
 #   * Criterion writes its own results to target/criterion/ regardless of
 #     --output-dir; that directory is what's used for run-to-run diffing.
 
+# SPDX-FileCopyrightText: 2026 Levi Neuwirth
+# SPDX-License-Identifier: Apache-2.0
+
 set -euo pipefail
 
 MODE="criterion"

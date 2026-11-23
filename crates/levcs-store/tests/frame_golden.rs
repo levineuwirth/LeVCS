@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! A1 JournalWriter tests: the golden frame corpus, negative decode coverage
 //! for every completeness condition, and the durability counter assertions of
 //! scope 4-A1's acceptance.

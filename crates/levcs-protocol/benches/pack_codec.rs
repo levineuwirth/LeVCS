@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Pack encode/decode microbenchmarks.
 //!
 //! Goal: a baseline for the wire-path codec everyone hits on push and

@@ -1,3 +1,6 @@
+-- SPDX-FileCopyrightText: 2026 Levi Neuwirth
+-- SPDX-License-Identifier: Apache-2.0
+
 -- | Generators for the scripts of "LeVCS.Harness.Script".
 --
 -- Most of what they emit is what a well-behaved client would do, because a

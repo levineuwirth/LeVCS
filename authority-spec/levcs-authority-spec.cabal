@@ -6,7 +6,9 @@ description:
   Rules H, R and P of doc/authority-semantics.md as pure functions over an
   abstract object model, with property tests of the rules themselves and a
   differential run against the Rust implementation in levcs-identity.
-license:            NONE
+license:            Apache-2.0
+license-file:       LICENSE
+copyright:          2026 Levi Neuwirth
 build-type:         Simple
 extra-doc-files:    README.md
                     DIVERGENCES.md

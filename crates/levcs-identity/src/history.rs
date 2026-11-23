@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Whole-history verification: `doc/authority-semantics.md`, Rule H.
 //!
 //! `levcs verify` used to check one commit (HEAD) and the current authority

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! `levcs-instance` binary.
 //!
 //! Default invocation reads a TOML config file (`levcs-instance.toml` by

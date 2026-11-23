@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Identity-side commands: `levcs key ...` and `levcs authority ...`.
 
 use std::fs;

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Merging is textual unless configured otherwise, and every conflict must be
 //! resolved explicitly before a merge commits.
 //!

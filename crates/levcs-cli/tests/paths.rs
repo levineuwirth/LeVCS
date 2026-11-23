@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Path arguments, and the verb that used to act outside the repository.
 //!
 //! Two properties are pinned here. A relative path means what it says from

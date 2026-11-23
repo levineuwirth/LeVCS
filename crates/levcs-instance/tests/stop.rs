@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! The instance binary stops gracefully: SIGTERM, which `systemctl stop`
 //! sends, ends it with status 0 once what is in flight has finished. It
 //! used to die at the signal, mid-push if one was running, leaving the

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Property tests for object body codecs.
 //!
 //! Complements `fuzz.rs` (which throws random bytes at parsers and asserts

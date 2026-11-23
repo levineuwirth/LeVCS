@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Scope 6-B1 deliverable 8 and §7's namespace-isolation exit criterion,
 //! asserted through the public surface.
 //!

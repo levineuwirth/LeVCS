@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! JSON wire types used by the federation HTTP API.
 
 use std::collections::BTreeMap;

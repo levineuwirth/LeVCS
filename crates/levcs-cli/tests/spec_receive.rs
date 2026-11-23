@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Rule R against the executable specification in `authority-spec/`: every
 //! transfer of the committed corpus, made by `receive`, the function
 //! `clone`, `pull` and `fork` call, and every read in it, asked of an

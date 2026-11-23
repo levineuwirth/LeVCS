@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Scope 4-A2 acceptance: recovery step 10, receipt-table reconstruction and
 //! `first_receipt_visibility_micros` promotion.
 //!

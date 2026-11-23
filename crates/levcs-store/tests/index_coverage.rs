@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Index coverage is a property of *publications*, not of index entries.
 //!
 //! A delta layer's `through_shard_sequence` states that every frame from its

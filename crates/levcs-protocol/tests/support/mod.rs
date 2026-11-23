@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 #![allow(dead_code)]
 
 use levcs_core::{Blob, ObjectId, ObjectType};

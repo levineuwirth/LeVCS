@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! End-to-end integration tests driving the `levcs` binary like a user.
 
 use std::process::Command;

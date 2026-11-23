@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Inter-instance mirroring (§5.6).
 //!
 //! **Refused.** The binary will not start with a mirror configured

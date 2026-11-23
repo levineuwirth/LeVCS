@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! The oracle the Haskell differential run in `authority-spec/` drives for
 //! Rule R: `receive`, the function `clone`, `pull` and `fork` call, run on
 //! every transfer of every scenario, and an instance of `levcs-instance`

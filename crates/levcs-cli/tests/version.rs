@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! `levcs --version` names the commit the binary was built from, so that
 //! the build a machine runs can be told from another of the same version.
 

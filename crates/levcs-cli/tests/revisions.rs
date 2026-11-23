@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Revision specs (`HEAD~1`, `main^2`) on the commands that take a commit.
 
 use std::process::Command;

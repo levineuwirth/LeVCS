@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! `diff` text a parser can split, and `diff`/`status` in JSON for tools.
 //!
 //! A file's last line without a line ending used to print without one, so it

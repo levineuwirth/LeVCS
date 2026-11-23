@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Receiving published history from an instance: `clone`, `pull` and the
 //! read side of `fork` (`doc/authority-semantics.md`, Rule R).
 //!

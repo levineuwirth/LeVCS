@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Conformance corpus runner (§8.2).
 //!
 //! Walks `tests/corpus/` and runs every scenario through the default

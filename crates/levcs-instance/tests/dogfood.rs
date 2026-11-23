@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! End-to-end "dogfood" scenario.
 //!
 //! A single test that exercises a realistic federation topology in one

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Keychain file at `$XDG_CONFIG_HOME/levcs/keys.toml` (or per platform).
 //! Entries may be plaintext (`private = "ed25519:..."`) or encrypted
 //! (`private_encrypted = { ... }` with XChaCha20-Poly1305 + Argon2id).

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Minimal `.levcsignore` support: a list of glob patterns, evaluated against
 //! repository-relative paths. Patterns starting with `/` are anchored to the
 //! repo root; bare patterns match anywhere. Patterns prefixed with `!` are

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! End-to-end test for `levcs inspect`.
 //!
 //! Boots an in-process instance, pushes a repo with a small tree, then

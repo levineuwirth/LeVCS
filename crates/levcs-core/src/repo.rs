@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Repository: top-level structure that bundles object store, refs, index,
 //! and working-tree access. The on-disk layout per §2.6 is:
 //!

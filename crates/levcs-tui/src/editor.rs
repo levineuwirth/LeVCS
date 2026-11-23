@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! External-editor integration for the TUI's `e` key (§6.7).
 //!
 //! The editor flow is:

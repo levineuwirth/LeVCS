@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Admission: `doc/authority-semantics.md`, Rule P.
 //!
 //! Publication changes a repository's authoritative state. That is a push to

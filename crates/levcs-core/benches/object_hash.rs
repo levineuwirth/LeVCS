@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Object serialize + BLAKE3 hash microbenchmarks.
 //!
 //! Every commit, push, and clone pays this cost — content addressing

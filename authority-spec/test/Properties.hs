@@ -1,3 +1,6 @@
+-- SPDX-FileCopyrightText: 2026 Levi Neuwirth
+-- SPDX-License-Identifier: Apache-2.0
+
 {-# LANGUAGE OverloadedStrings #-}
 
 -- | The rules checked against themselves. Nothing here runs the Rust.

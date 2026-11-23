@@ -1,3 +1,6 @@
+-- SPDX-FileCopyrightText: 2026 Levi Neuwirth
+-- SPDX-License-Identifier: Apache-2.0
+
 -- | The model itself, answering as an oracle.
 --
 -- Reads one request per line and writes the response the rules give it,

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! `levcs push` against an instance.
 //!
 //! - **What a push expects.** A push said every ref it named was expected

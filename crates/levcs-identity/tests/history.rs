@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Rule H of `doc/authority-semantics.md`, case by case, through
 //! `verify_history`. Every history here is built object by object, because
 //! most of these cannot be made with the CLI: an honest `levcs` always cites

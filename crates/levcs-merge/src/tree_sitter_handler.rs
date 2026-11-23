@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Tree-sitter handler (§6.3.2).
 //!
 //! Parses base, ours, and theirs with a tree-sitter grammar and performs a

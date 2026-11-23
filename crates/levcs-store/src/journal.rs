@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Active append journal: group formation, `write_vectored`, sequence
 //! assignment, the single durability fence, and rotation.
 //!

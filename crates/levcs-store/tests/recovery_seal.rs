@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Scope 3.4 link-then-unlink: recovery's disposition of an `active/` journal
 //! when a seal was interrupted.
 //!

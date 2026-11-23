@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Shared harness support for A3's Phase 1 crash and benchmark work.
 //!
 //! `group_model` is the group-aware failpoint model of scope 4-A3 deliverable

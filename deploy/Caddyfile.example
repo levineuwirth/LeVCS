@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Levi Neuwirth
+# SPDX-License-Identifier: Apache-2.0
+
 # Caddy reverse-proxy block for levcs-instance.
 #
 # Caddy is the recommended front-end: automatic TLS via Let's Encrypt,

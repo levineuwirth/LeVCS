@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Generic LeVCS on-disk object framing.
 //!
 //! Per the v1.1 trust-root revision §2.1, every object on disk is laid out as:

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! `levcs clone` and `levcs pull` against an instance (Rule R).
 //!
 //! - **What is received is checked before it is written.** `clone`, `pull`

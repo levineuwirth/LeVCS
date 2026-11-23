@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Writing into a working tree without following links.
 //!
 //! Checkout used to write by pathname: `create_dir_all`, then `fs::write`.

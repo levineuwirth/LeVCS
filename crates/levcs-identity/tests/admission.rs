@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Rule P of `doc/authority-semantics.md`, case by case, through `admit`.
 //! Histories are built object by object, as for Rule H, because most of
 //! these cannot be made with an honest `levcs`.

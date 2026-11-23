@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Journal-level drive API. Test and benchmark seam only.
 //!
 //! **Shared file.** Lead owns the signatures (D0); **A1 JournalWriter** fills

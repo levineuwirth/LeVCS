@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Levi Neuwirth
+# SPDX-License-Identifier: Apache-2.0
+
 # nginx reverse-proxy block for levcs-instance.
 #
 # Use this if your VPS already runs nginx (e.g. fronting Forgejo) and

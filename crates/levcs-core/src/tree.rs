@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Tree object: an ordered set of (name, type, hash, mode) entries.
 //!
 //! Per §2.3.2, each entry is:

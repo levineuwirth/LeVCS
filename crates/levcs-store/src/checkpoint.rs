@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Rebuildable object, ref, and receipt checkpoints, and their atomic
 //! installation.
 //!

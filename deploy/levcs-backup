@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-FileCopyrightText: 2026 Levi Neuwirth
+# SPDX-License-Identifier: Apache-2.0
+
 # levcs-backup ARCHIVE [ROOT]
 #
 # Archive an instance's root (default /var/lib/levcs) to ARCHIVE, a

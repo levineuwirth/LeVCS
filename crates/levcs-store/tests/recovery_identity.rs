@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Scope 4-A2 acceptance: `root_uuid` and `journal_id` binding.
 //!
 //! Scope 3.1 makes `root_uuid` bind every `CURRENT`, manifest, journal,

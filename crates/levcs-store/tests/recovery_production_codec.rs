@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Cross-derivation check: A1's frozen codec in `format.rs` and A2's reference
 //! implementation of scope 3.3 must agree on every input.
 //!

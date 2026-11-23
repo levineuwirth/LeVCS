@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Instance merge-policy enforcement on push (§6.6.4).
 //!
 //! Each test boots an in-process instance, init's a repo via the client,

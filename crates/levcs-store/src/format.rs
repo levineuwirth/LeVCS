@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Physical on-disk format: frames, journal headers, segment footers,
 //! manifests, and checkpoints.
 //!

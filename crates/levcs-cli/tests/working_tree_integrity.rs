@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! The working tree keeps what is not committed, and levcs never reads it
 //! through a symlink.
 //!

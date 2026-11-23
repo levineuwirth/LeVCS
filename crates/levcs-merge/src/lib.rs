@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! levcs-merge: cascading merge engine with built-in handlers.
 //!
 //! Per spec §6 the engine is a cascade of handlers. Each handler can return

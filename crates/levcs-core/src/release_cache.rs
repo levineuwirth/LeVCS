@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Cached releases (§4.4).
 //!
 //! A working repository may keep release objects (and their reachable

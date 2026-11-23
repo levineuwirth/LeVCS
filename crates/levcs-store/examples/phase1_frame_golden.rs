@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Golden frame vector generator (scope 4-A1 deliverable 6).
 //!
 //! `cargo run -p levcs-store --example phase1_frame_golden > \

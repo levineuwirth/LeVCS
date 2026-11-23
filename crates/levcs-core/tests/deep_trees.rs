@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Walks of a tree and of a working tree, without recursion, and within
 //! what a working tree may hold.
 //!

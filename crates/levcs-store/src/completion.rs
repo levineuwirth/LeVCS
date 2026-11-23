@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Runtime-agnostic, one-to-many completion for submitted transactions.
 //!
 //! One in-flight transaction owns a [`SharedCompletion`]. Every caller that

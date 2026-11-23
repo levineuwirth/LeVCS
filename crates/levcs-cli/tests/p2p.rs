@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Peer-to-peer transfer (§7.3.6): `deploy` sends, `dial` receives.
 //!
 //! `dial` is refused until it checks what it receives against the genesis

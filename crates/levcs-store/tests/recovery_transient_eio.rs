@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Audit finding S1, and scope 3.8 step 5 as amended by contract review
 //! 2026-11-02-B: a read error in a shard's active journal refuses the open
 //! before that shard's recovery changes anything, so it can cost no

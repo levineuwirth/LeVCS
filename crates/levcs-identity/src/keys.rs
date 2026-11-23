@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Ed25519 key wrappers used throughout LeVCS. Public keys are 32-byte
 //! arrays; secret keys are 32-byte seeds, expanded as needed.
 

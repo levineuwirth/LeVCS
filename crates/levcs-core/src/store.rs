@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Filesystem object store, sharded by the first two hex characters of the
 //! object hash. Objects with hash `abcd1234...` live at
 //! `.levcs/objects/ab/cd1234...`.

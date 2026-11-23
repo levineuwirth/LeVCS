@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Blob object: an immutable byte sequence representing the contents of a
 //! single file. The blob body is the raw file contents byte-for-byte.
 

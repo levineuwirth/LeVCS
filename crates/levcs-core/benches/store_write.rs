@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Object-store loose-write throughput.
 //!
 //! Tier 1 measured the pure-CPU cost of serialize+hash. This is the

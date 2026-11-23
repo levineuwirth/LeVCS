@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Frozen logical and wire contracts for instance protocol v2.
 //!
 //! Phase 0 intentionally defines these types before the storage and HTTP

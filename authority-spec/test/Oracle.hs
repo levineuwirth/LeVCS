@@ -1,3 +1,6 @@
+-- SPDX-FileCopyrightText: 2026 Levi Neuwirth
+-- SPDX-License-Identifier: Apache-2.0
+
 -- | A Rust oracle, as a process that is asked one scenario at a time.
 module Oracle
   ( Oracle

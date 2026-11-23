@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! The Phase 1 crash matrix (scope 4-A3 deliverable 2).
 //!
 //! One row per `levcs_store::failpoints::Failpoint`, carried in

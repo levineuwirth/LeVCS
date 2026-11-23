@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Textual 3-way merge microbenchmarks.
 //!
 //! `similar`'s line diff is roughly O((N+M) D) where D is the edit

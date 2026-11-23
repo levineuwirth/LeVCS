@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Immutable sealed segments: bounded `pread` reads, the open-FD cache, and
 //! integrity checks. Also the shard's on-disk layout, the seal/rotate
 //! sequence of scope 3.4, and the manifest install of scope 3.5.

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Bounded invisible projection-staging sessions.
 //!
 //! B3 owns the storage mechanism. D0-B owns and freezes the adoption seam in

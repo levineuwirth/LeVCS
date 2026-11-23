@@ -1,3 +1,6 @@
+-- SPDX-FileCopyrightText: 2026 Levi Neuwirth
+-- SPDX-License-Identifier: Apache-2.0
+
 -- | Rule H, historical validity, and the terms it is stated in.
 --
 -- Every definition quotes the sentence of @doc/authority-semantics.md@ it

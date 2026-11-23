@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Property tests for the textual three-way merge handler (§6.1, §8.2).
 //!
 //! The merge engine has the largest blast radius of any module — every

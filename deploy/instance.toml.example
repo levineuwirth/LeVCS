@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Levi Neuwirth
+# SPDX-License-Identifier: Apache-2.0
+
 # Example levcs-instance config.
 #
 # Copy to /etc/levcs/instance.toml on the VPS and edit. The systemd

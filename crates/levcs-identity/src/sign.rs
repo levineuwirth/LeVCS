@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Signing helpers for commits, releases, and authority objects.
 
 use levcs_core::object::{ObjectType, SignatureEntry, SignedObject};

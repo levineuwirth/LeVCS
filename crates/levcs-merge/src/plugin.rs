@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Plugin handlers (§6.4).
 //!
 //! Each plugin is a WebAssembly module loaded into a sandboxed Wasmtime

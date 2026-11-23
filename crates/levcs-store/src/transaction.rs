@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! `ValidatedTransaction` and its sealed builder, the shard sequencer's
 //! mutable-precondition checks, receipts, idempotency, and terminal retention.
 //!

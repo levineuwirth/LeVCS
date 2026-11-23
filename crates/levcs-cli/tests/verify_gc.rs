@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! `verify` covers all history, and `gc` never turns damage into deletion.
 //!
 //! `verify` used to check HEAD and the current authority chain only; with

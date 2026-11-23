@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Scope 4-A2 acceptance: recovery step 2, the `CURRENT` -> manifest pointer
 //! and its fallback.
 //!

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Format handlers that round out §6.3.1: YAML, Markdown, prose, XML.
 //!
 //! YAML reuses the same recursive value merge as the JSON handler, parsing

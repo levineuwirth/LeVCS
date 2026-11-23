@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Repository-side commands: init, track, forget, commit, etc.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};

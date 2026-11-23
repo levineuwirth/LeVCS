@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Crash-matrix plumbing: fixture loading and child-process driving.
 //!
 //! The classifier itself is *not* here. It lives in `store-crash-driver`'s

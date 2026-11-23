@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Client-side instance interaction. Wraps `reqwest::blocking::Client` with
 //! request signing per §5.3 and provides typed methods for the §5.2
 //! endpoints.

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Robustness/fuzz tests for protocol deserializers (§8.2).
 //!
 //! Targets every parser an instance or peer could feed us bytes for:

@@ -1,3 +1,6 @@
+-- SPDX-FileCopyrightText: 2026 Levi Neuwirth
+-- SPDX-License-Identifier: Apache-2.0
+
 {-# LANGUAGE OverloadedStrings #-}
 
 -- | The JSON that the Rust oracle reads and answers, and that the corpus is

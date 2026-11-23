@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Index file at `.levcs/index`. Format from §2.5.
 //!
 //! magic       4 bytes   "LVIX"

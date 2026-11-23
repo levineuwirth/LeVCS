@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Several ref changes applied as one, and undone if they do not all land:
 //! when a write fails, and when the process dies part way.
 //!

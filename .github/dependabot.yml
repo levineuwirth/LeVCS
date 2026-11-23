@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Levi Neuwirth
+# SPDX-License-Identifier: Apache-2.0
+
 version: 2
 updates:
   # Crates: one weekly PR that moves Cargo.lock to the newest versions

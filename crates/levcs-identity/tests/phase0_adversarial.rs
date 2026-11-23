@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 use std::collections::HashMap;
 
 use levcs_core::object::SignatureEntry;

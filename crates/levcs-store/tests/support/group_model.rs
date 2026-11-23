@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! The group-aware failpoint model (scope 4-A3 deliverable 3, ruling 9.3).
 //!
 //! `levcs_protocol::oracle::append_publication_expectation` is a

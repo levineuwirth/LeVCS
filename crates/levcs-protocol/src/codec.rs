@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Small checked canonical-binary codec used by the frozen v2 contracts.
 //!
 //! This deliberately does not use serde. Signed protocol bytes must have one

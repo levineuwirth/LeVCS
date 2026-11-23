@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! `/health` operational endpoint smoke test.
 //!
 //! The reverse proxy in front of a deployed instance probes this for

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Reading history without writing the working tree: `show` and
 //! `log --name-status` (issue #12).
 //!

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Instance storage-mode enforcement on push (§4.3).
 //!
 //! Each test boots an in-process instance with a specific

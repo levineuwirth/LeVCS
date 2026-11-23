@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Who reaches a repository on an instance.
 //!
 //! - **Path confinement.** The id in a request is joined onto the

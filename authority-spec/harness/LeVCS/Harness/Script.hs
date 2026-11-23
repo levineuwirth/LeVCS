@@ -1,3 +1,6 @@
+-- SPDX-FileCopyrightText: 2026 Levi Neuwirth
+-- SPDX-License-Identifier: Apache-2.0
+
 -- | Scripts that build histories and publish them.
 --
 -- A script is a list of operations whose references are small integers

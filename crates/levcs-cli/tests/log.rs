@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! `log`: the whole first-parent line, `--since <rev>`, and `--release`.
 //!
 //! `log` stopped after 100 commits, and parsed `--since` and `--release`

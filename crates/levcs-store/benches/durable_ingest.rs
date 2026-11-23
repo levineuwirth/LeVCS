@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! P1-micro durable-ingest benchmark over `drive.rs`.
 //!
 //! **Owned by A3 StoreHarness** (scope 2.1, 4-A3 deliverable 6).

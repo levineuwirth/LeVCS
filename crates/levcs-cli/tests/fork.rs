@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! End-to-end fork test:
 //!   1. Spin up an in-process levcs instance.
 //!   2. Run the levcs binary to init a source repo, commit, point at the

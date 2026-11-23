@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Phase-0 durability and visibility reference oracles.
 //!
 //! These are deliberately small models, not the Phase-1 store. They freeze

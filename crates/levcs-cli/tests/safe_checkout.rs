@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Every command that writes the working tree writes it safely, and one
 //! that cannot leaves the repository where it was.
 //!

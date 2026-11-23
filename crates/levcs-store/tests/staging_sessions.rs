@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! B3 StagingSessions — scope 6.5 deliverables 1-5, asserted through the
 //! entry points a consumer actually calls.
 //!

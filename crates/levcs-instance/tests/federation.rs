@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Federation integration test: spin up an in-process instance, exercise the
 //! /instance/info and /repos/{id}/init paths over HTTP via the client.
 

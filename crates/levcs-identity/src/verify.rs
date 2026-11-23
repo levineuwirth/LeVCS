@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Verification algorithm from the v1.1 trust-root revision §3.6.
 //!
 //! Provides:

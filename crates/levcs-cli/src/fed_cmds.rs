@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Federation-side commands.
 //!
 //! These wrap `levcs-client` to talk to a configured instance. The instance

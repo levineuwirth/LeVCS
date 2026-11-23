@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Immutable publication roots for committed and in-flight store state.
 //!
 //! **Lead-owned (D0-B).** The types in this file are the boundary between the

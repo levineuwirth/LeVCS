@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Replays `authority-spec/corpus/` against `verify_history` and `admit`.
 //!
 //! Each entry is a scenario and the verdicts that the executable

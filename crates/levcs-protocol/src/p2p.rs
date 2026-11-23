@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Peer-to-peer transfer protocol (§7.3.6 — `deploy` / `dial`).
 //!
 //! Direct TCP exchange of release/branch contents between two trusted

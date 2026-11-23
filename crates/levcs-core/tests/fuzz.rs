@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Robustness/fuzz tests for object deserializers (§8.2).
 //!
 //! The spec requires: "All deserializers MUST be safe against malformed

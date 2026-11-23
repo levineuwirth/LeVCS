@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! GC reachability-walk throughput.
 //!
 //! The walk is currently inlined in the CLI's `gc` command (see

@@ -1,3 +1,6 @@
+-- SPDX-FileCopyrightText: 2026 Levi Neuwirth
+-- SPDX-License-Identifier: Apache-2.0
+
 -- | Named scenarios with their answers written out by hand.
 --
 -- The generated runs say that the model and the Rust agree. These say what

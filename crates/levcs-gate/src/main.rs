@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! `levcs-gate`: the deployment gate.
 //!
 //! An instance is relied on only after this passes on the host it will run

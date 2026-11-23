@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Scope 6-B1 deliverable 3 and scope 6.2 item 9 — `adopt_projection` through
 //! `StoreEngine::submit`, asserted through the public surface.
 //!

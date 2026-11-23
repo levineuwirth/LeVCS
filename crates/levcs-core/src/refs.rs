@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! References. Stored under `.levcs/refs/` as small text files containing one
 //! hex hash and a trailing newline. `HEAD` is at the top level of `.levcs/`.
 

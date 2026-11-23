@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Tests covering polish on construct/status/diff.
 
 use std::path::{Path, PathBuf};

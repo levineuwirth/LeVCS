@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Property tests for the pack codec.
 //!
 //! The hand-rolled fuzz suite in `fuzz.rs` covers panic-resistance under

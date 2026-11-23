@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! The one structural checker for a set of adopted `shard_sequence` values.
 //!
 //! **Owned by A3 StoreHarness.** Not a Cargo target: `src/bin/support/` holds

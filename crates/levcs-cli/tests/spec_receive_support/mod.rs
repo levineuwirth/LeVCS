@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Rule R, run for real, over the scenarios of the executable specification
 //! in `authority-spec/`: the receiver's side by `receive`, and the source's
 //! by an instance of `levcs-instance`.

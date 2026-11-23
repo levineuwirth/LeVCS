@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Merge metadata blob, written at `.levcs/merge-record` in the merge
 //! commit's tree (§6.5).
 

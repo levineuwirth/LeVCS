@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Publication from the command line: `doc/authority-semantics.md`, Rule P.
 //!
 //! Without an instance, a repository's authoritative state is its own

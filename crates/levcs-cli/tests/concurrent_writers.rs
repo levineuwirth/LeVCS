@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Several sessions writing one repository at once.
 //!
 //! This is the shape of a notes vault where independent agent sessions each

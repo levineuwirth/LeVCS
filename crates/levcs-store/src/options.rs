@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Store configuration and its startup validation.
 //!
 //! Lead-owned (scope 2.1). Plan §9 requires strict configuration: unknown

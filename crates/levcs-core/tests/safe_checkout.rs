@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Checkout writes only inside the working tree, never through a link, and
 //! checks the whole tree before writing anything.
 //!

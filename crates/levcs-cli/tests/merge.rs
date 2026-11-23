@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! End-to-end tests for the `levcs merge` command.
 
 use std::path::{Path, PathBuf};

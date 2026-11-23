@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Force-push enforcement (§5.4(e), §7.3.2).
 //!
 //! Spec rules:

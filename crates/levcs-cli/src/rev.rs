@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Revision specs: `HEAD`, a branch, a release by its label, a full hex id
 //! or a unique hex prefix of a commit or release, each optionally followed
 //! by `~N` (first parent, N times) and `^N` (the Nth parent, 1-based; `^0`

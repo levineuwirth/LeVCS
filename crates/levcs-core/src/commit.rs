@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Commit object body, per the v1.1 trust-root revision §2.2.
 //!
 //! Field           Type         Description

@@ -28,6 +28,9 @@
 # from the workload file, and this script settles 120 s between repetitions
 # after deleting the previous root (scope 8.2). Passing --seconds makes the
 # run a rehearsal, and warmup and settle default to zero with it.
+# SPDX-FileCopyrightText: 2026 Levi Neuwirth
+# SPDX-License-Identifier: Apache-2.0
+
 set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"

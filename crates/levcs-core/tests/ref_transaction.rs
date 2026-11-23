@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! A ref transaction that fails is put back, whatever its failing write
 //! reported, and says only what is true of the refs it leaves.
 //!

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! The Rust side of the executable specification in `authority-spec/`.
 //!
 //! `authority-spec/` states the rules of `doc/authority-semantics.md` over an

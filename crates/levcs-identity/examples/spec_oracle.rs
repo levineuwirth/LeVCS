@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! The oracle the Haskell differential run in `authority-spec/` drives.
 //!
 //! Reads one scenario per line on stdin and writes one answer per line on

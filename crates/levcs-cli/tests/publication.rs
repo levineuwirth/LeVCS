@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Rule P on the command line: every local command that moves a branch,
 //! release or authority ref publishes, in a repository with no instance.
 //!

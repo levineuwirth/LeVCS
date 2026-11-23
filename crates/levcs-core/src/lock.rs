@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! The repository lock: one exclusive advisory lock on `.levcs/lock`.
 //!
 //! Every command that mutates the index, a ref, or the working tree holds it

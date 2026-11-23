@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Levi Neuwirth
+# SPDX-License-Identifier: Apache-2.0
+
 #
 # Phase 1 gate. Supersedes check-phase0.sh by running it, so the Phase 0
 # freeze stays enforced for as long as Phase 1 is in progress.

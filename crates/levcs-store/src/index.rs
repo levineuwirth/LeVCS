@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! `(namespace, ObjectId) -> location` index: bounded in-memory delta,
 //! immutable memory-mapped sorted runs with Bloom filters, and the namespace
 //! catalog.

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! levcs-store: the durable transaction spine for LeVCS instances.
 //!
 //! One validated, durably acknowledged transaction service: append-only

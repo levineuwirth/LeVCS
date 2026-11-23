@@ -1,3 +1,6 @@
+-- SPDX-FileCopyrightText: 2026 Levi Neuwirth
+-- SPDX-License-Identifier: Apache-2.0
+
 -- | The objects that Rules H, R and P of @doc/authority-semantics.md@ speak
 -- about, with everything the rules never read left out.
 --

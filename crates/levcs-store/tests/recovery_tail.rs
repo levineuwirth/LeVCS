@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Scope 4-A2 acceptance: the tail scan, one dedicated test per case.
 //!
 //! Steps 5, 6, and 7 of scope 3.8. The scanner under test is

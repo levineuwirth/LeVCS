@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! The single funnel for every durability-relevant syscall.
 //!
 //! Lead-owned (scope 2.3). Nothing else in this crate may call

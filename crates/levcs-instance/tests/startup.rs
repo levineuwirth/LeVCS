@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! What the instance binary writes as it starts.
 
 use std::io::{BufRead, BufReader};

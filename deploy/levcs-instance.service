@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Levi Neuwirth
+# SPDX-License-Identifier: Apache-2.0
+
 [Unit]
 Description=LeVCS federation instance (§5.2)
 Documentation=https://github.com/levineuwirth/LeVCS/blob/main/deploy/README.md

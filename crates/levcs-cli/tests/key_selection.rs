@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Which key signs. A keychain shared by more than one hand (an owner and
 //! an agent contributor, in the vaults) must never have the owner's key
 //! chosen for a command that did not name it: the signature is the record

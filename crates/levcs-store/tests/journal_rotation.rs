@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! Scope 3.4 — sealing the active journal and continuing in a fresh one.
 //!
 //! A journal is preallocated. When a forming group no longer fits it, the shard

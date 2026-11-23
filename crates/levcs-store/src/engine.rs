@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Levi Neuwirth
+// SPDX-License-Identifier: Apache-2.0
+
 //! `StoreEngine`: shard routing, startup and recovery, lifecycle, and the
 //! `ArcSwap` committed/status roots.
 //!
